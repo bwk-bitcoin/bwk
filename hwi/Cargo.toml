@@ -82,3 +82,6 @@ crossbeam = { version = "0.8.4", features = ["crossbeam-channel"], optional = tr
 
 [dev-dependencies]
 hex-literal = "1.1"
+speculos = "0.1"
+regex = "1"
+miniscript = "12"
