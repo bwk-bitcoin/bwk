@@ -390,6 +390,7 @@ pub fn deserialize_pair(pair: raw::Pair) -> (Vec<u8>, Vec<u8>) {
     )
 }
 
+#[derive(Debug, Clone)]
 pub enum PartialSignature {
     /// signature stored in pbst.partial_sigs
     Sig(PublicKey, ecdsa::Signature),
@@ -437,6 +438,7 @@ pub enum PartialSignatureError {
     EcdsaSig(ecdsa::Error),
     TaprootSig(taproot::SigFromSliceError),
     TapLeaf(bitcoin::hashes::FromSliceError),
+    InvalidLength,
 }
 
 mod serialize {

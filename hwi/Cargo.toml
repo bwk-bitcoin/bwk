@@ -79,3 +79,6 @@ hex = { version = "0.4.3", optional = true }
 # service module (requires all device features)
 tracing = { version = "0.1.37", optional = true }
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"], optional = true }
+
+[dev-dependencies]
+hex-literal = "1.1"
