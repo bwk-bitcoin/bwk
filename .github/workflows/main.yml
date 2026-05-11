@@ -91,3 +91,118 @@ jobs:
         run: scripts/ci-checks.sh build
       - name: default build
         run: scripts/ci-checks.sh default-build
+
+  # ----------------------------------------------------------------------------
+  # Build the Ledger Bitcoin app once per device target, cached on
+  # (app version + builder image + device). Only re-runs the in-container
+  # `make` on cache miss; otherwise restores the .elf from the host cache and
+  # only re-uploads the artifact for the downstream speculos job.
+  # Version pins live in hwi/tests/speculos/versions.env so the local runner
+  # (hwi/tests/speculos/run.sh) and CI share a single source of truth.
+  # ----------------------------------------------------------------------------
+  ledger_app:
+    name: build ledger app (${{ matrix.device }})
+    needs: linter
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - device: nanox
+            sdk_env: NANOX_SDK
+          - device: nanosp
+            sdk_env: NANOSP_SDK
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load version pins
+        run: grep -E "^[A-Z_]+=" hwi/tests/speculos/versions.env >> "$GITHUB_ENV"
+
+      - name: Cache Ledger app .elf
+        id: cache-elf
+        uses: actions/cache@v4
+        with:
+          path: app-bitcoin-new/bin/app.elf
+          key: ledger-app-${{ matrix.device }}-${{ env.LEDGER_APP_VERSION }}-${{ env.LEDGER_APP_BUILDER_IMAGE }}
+
+      - name: Build Ledger Bitcoin app (${{ matrix.device }})
+        if: steps.cache-elf.outputs.cache-hit != 'true'
+        uses: addnab/docker-run-action@v3
+        with:
+          image: ${{ env.LEDGER_APP_BUILDER_IMAGE }}
+          options: -v ${{ github.workspace }}:/work -w /work -e SDK_VAR=${{ matrix.sdk_env }}
+          shell: bash
+          run: |
+            git clone --branch '${{ env.LEDGER_APP_VERSION }}' --depth 1 \
+              https://github.com/LedgerHQ/app-bitcoin-new.git
+            cd app-bitcoin-new
+            # SDK_VAR is the *name* of the SDK env var (e.g. NANOX_SDK); ${!SDK_VAR}
+            # bash-indirects through to the actual SDK path baked into the image.
+            make DEBUG=1 BOLOS_SDK="${!SDK_VAR}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ledger_app_${{ matrix.device }}
+          path: app-bitcoin-new/bin/app.elf
+          if-no-files-found: error
+          retention-days: 1
+
+  # ----------------------------------------------------------------------------
+  # Drive the LedgerSimulator transport (hwi/src/ledger.rs) against a real
+  # Ledger Bitcoin app running under Speculos for the button device families.
+  # The Rust `speculos` crate (https://crates.io/crates/speculos) spawns and
+  # controls the speculos process from the test binary.
+  # ----------------------------------------------------------------------------
+  speculos:
+    name: speculos integration (${{ matrix.device }})
+    needs: [tests, ledger_app]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        device: [nanox, nanosp]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load version pins
+        run: grep -E "^[A-Z_]+=" hwi/tests/speculos/versions.env >> "$GITHUB_ENV"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.85.0
+          cache: false
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libudev-dev pkg-config python3 python3-pip python3-venv \
+            libusb-1.0-0 qemu-user-static
+
+      - name: Cache pip wheels
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-speculos-${{ env.SPECULOS_VERSION }}
+
+      - name: Install Speculos
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install "speculos==${SPECULOS_VERSION}"
+          speculos --help >/dev/null
+
+      - name: Download Ledger app artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ledger_app_${{ matrix.device }}
+          path: ledger_app
+
+      # The Rust test binary (via the `speculos` crate) spawns / kills speculos
+      # itself; CI just sets the env vars and runs cargo. --test-threads=1
+      # serialises tests because they share one Speculos child via OnceLock.
+      - name: Run ignored speculos tests
+        env:
+          SPECULOS_ELF: ${{ github.workspace }}/ledger_app/app.elf
+          SPECULOS_MODEL: ${{ matrix.device }}
+        run: cargo test -p bwk-hwi --features ledger --test ledger_speculos -- --ignored --nocapture --test-threads=1
