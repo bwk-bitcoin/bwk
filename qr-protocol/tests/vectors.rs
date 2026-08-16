@@ -10,7 +10,7 @@ use bitcoin::{
 use bwk_qr_protocol::{self as protocol, request, response, types::Fingerprint, Message};
 use serde_json::Value;
 
-use common::{bitcoin_xpub, path, xpub};
+use common::{bip380, bip388, bitcoin_xpub, path, xpub};
 
 fn id() -> protocol::RequestId {
     protocol::RequestId([0, 1])
@@ -33,20 +33,6 @@ fn psbt() -> Vec<u8> {
     })
     .unwrap()
     .serialize()
-}
-
-fn bip380() -> request::DescriptorBody {
-    request::DescriptorBody::Bip380("wpkh([00000000/84h/1h/0h]xpub/0/*)".to_string())
-}
-
-fn bip388() -> request::DescriptorBody {
-    request::DescriptorBody::Bip388 {
-        keys: vec![
-            "[00000000/48h/1h/0h/2h]xpub".to_string(),
-            "[11111111/48h/1h/0h/2h]xpub".to_string(),
-        ],
-        policy: "wsh(sortedmulti(2,@0/**,@1/**))".to_string(),
-    }
 }
 
 fn register_descriptor_request(descriptor: Option<request::DescriptorBody>) -> Message {

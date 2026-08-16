@@ -34,7 +34,8 @@ let bytes = encode_response(&response)?;
 
 [`include/bwk_qr_protocol.h`](include/bwk_qr_protocol.h) is written by hand and
 covers the signer direction: decode a request, encode a response. There is no
-cbindgen and no build script.
+cbindgen and no build script. `tests/layout.rs` pins the size and alignment of every
+mirror type, so a change to the Rust side fails the tests until the header follows.
 
 ```c
 const bwk_qr_request *request = NULL;
