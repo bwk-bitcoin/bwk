@@ -55,6 +55,8 @@ macro_rules! error_display {
 
 pub mod decode;
 pub mod encode;
+#[cfg(feature = "ffi")]
+pub mod ffi;
 pub mod reader;
 pub mod request;
 pub mod response;

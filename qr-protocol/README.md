@@ -15,6 +15,8 @@ That keeps `secp256k1-sys` and its vendored C off the firmware build.
 
 - `bitcoin` adds `From`/`TryFrom` between those types and the `bitcoin` ones, for
   callers that already run on `std`. `bwk-qr` enables it.
+- `ffi` adds the C binding: `#[repr(C)]` mirrors of the message tree and four
+  exported functions.
 
 ## Rust
 
@@ -26,4 +28,63 @@ match decode(bytes)? {
     Message::Response(response) => { /* a wallet consumes it */ }
 }
 let bytes = encode_response(&response)?;
+```
+
+## C
+
+[`include/bwk_qr_protocol.h`](include/bwk_qr_protocol.h) is written by hand and
+covers the signer direction: decode a request, encode a response. There is no
+cbindgen and no build script.
+
+```c
+const bwk_qr_request *request = NULL;
+const char *err = NULL;
+if (bwk_qr_request_decode(bytes, len, &request, &err) != BWK_QR_OK) {
+    fprintf(stderr, "%s\n", err);
+    return 1;
+}
+/* read request->body.sign.psbt, then answer */
+bwk_qr_request_free(request);
+```
+
+Ownership: the library never frees your memory, and you never free its memory except
+through `bwk_qr_request_free` and `bwk_qr_buf_free`. On encode your struct is
+borrowed for the duration of the call only.
+
+The C functions return `BWK_QR_OK` on success or one of the C binding status codes
+from `include/bwk_qr_protocol.h` on failure. These codes are not the wire `ERROR`
+field from `ENCODING.md`; they report local decode, encode, or FFI failures.
+
+```
++-------------------+------------------+
+| Return code range | Source           |
++-------------------+------------------+
+| 0                 | Success          |
+| 100..199          | Byte reader      |
+| 200..299          | Protocol decoder |
+| 300..399          | Protocol encoder |
+| 400..499          | C binding        |
++-------------------+------------------+
+```
+
+A `staticlib` needs a global allocator and a panic handler, which a library cannot
+supply, so link this crate as an rlib from your own staticlib crate:
+
+```toml
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+bwk-qr-protocol = { version = "0.0.1", features = ["ffi"] }
+```
+
+```rust
+pub use bwk_qr_protocol::ffi::*;
+```
+
+[`examples/signer.c`](examples/signer.c) is a smoke test against that setup. It is
+compiled by hand rather than from CI, which keeps `cc` out of the build:
+
+```sh
+cc -I include -Wall -Wextra -o signer examples/signer.c path/to/libyourshim.a
 ```
