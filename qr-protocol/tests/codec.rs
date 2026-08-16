@@ -1,11 +1,13 @@
 #![cfg(feature = "bitcoin")]
 
-use bitcoin::bip32;
+mod common;
+
 use bwk_qr_protocol::{
-    decode, encode, encode_request, encode_response, reader, request, response,
-    types::{DerivationPath, Fingerprint, Xpub},
+    decode, encode, encode_request, encode_response, reader, request, response, types::Fingerprint,
     Message, MessageType, Request, RequestId, Response, MAX_DESCRIPTOR_ALIAS, REQUEST_ID_LEN,
 };
+
+use common::{path, xpub};
 
 // MAGIC is 6 bytes, so VERSION sits at index 6 and MSG_TYPE right after it
 const VERSION_OFFSET: usize = 6;
@@ -17,17 +19,6 @@ const STORED_VALUE_OFFSET: usize = HEADER_LEN + 5 + 2 + 1;
 
 fn id() -> RequestId {
     RequestId([42; REQUEST_ID_LEN])
-}
-
-fn path(path: &str) -> DerivationPath {
-    (&path.parse::<bip32::DerivationPath>().unwrap()).into()
-}
-
-fn xpub() -> Xpub {
-    (&"xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8"
-        .parse::<bip32::Xpub>()
-        .unwrap())
-        .into()
 }
 
 fn get_xpubs_request() -> Request {

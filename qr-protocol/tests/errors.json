@@ -1,0 +1,25 @@
+{
+  "vectors": [
+    {
+      "name": "error_response_user_declined",
+      "description": "Error response to a Signing request: MSG_TYPE 0xc4 is response, error, TYPE 0x04. ERROR is 0x01 (user declined) and ERROR_MESSAGE is \"signing was declined\" padded with 0x00 up to 32 bytes.",
+      "direction": "response",
+      "hex": "42495058585801c40001017369676e696e6720776173206465636c696e6564000000000000000000000000",
+      "decode_only": false
+    },
+    {
+      "name": "error_response_vendor",
+      "description": "Error response to a Signing request with the vendor code 0xff, where the meaning is only in ERROR_MESSAGE, here \"device is locked\".",
+      "direction": "response",
+      "hex": "42495058585801c40001ff646576696365206973206c6f636b656400000000000000000000000000000000",
+      "decode_only": false
+    },
+    {
+      "name": "error_response_reserved_code",
+      "description": "Error response to a Get Xpubs request with ERROR 0x0c, taken from the range reserved for future standard codes. A version 1 parser does not know it and must still accept the message and fall back to ERROR_MESSAGE.",
+      "direction": "response",
+      "hex": "42495058585801c100010c636f64652061646465642061667465722076657273696f6e2031000000000000",
+      "decode_only": false
+    }
+  ]
+}
