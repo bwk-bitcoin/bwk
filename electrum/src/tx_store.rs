@@ -6,7 +6,7 @@ use bwk_persist::{NoopBackend, PersistError, PersistenceBackend, RamStore, Store
 
 use crate::{
     coin_store::Update,
-    profile::{DefaultBackend, RamProfile, StorageProfile},
+    profile::{DefaultBackend, RamProfile, ScanProfile},
 };
 
 /// Logical store name used by [`PersistenceBackend`] implementations for
@@ -74,15 +74,15 @@ impl Inclusion {
 
 /// A structure to store Bitcoin transactions indexed by their txids.
 ///
-/// Generic over any [`StorageProfile`]: the wrapper picks up the
+/// Generic over any [`ScanProfile`]: the wrapper picks up the
 /// profile's `TxStore` slot, so today's RAM-backed default is
 /// [`RamStore`] via [`RamProfile`] but any other profile plugs in
 /// without touching this wrapper or its callers.
-pub struct TxStore<P: StorageProfile = RamProfile<DefaultBackend>> {
+pub struct TxStore<P: ScanProfile = RamProfile<DefaultBackend>> {
     store: P::TxStore,
 }
 
-impl<P: StorageProfile> Debug for TxStore<P> {
+impl<P: ScanProfile> Debug for TxStore<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TxStore")
             .field("len", &self.store.len().ok())
@@ -124,7 +124,7 @@ impl Default for TxStore<RamProfile<DefaultBackend>> {
     }
 }
 
-impl<P: StorageProfile> TxStore<P> {
+impl<P: ScanProfile> TxStore<P> {
     /// Wrap any `P::TxStore` impl produced by the profile.
     pub fn from_store(store: P::TxStore) -> Self {
         Self { store }
@@ -309,8 +309,8 @@ impl TxEntry {
     /// [`TxEntry`], starting `Inclusion::Unconfirmed` like the production
     /// insert path. Tests that need a confirmed entry mutate the inclusion
     /// via [`TxStore::update_inclusion`] after insertion.
-    #[cfg(all(test, feature = "test"))]
-    pub(crate) fn for_test(tx: bitcoin::Transaction) -> Self {
+    #[cfg(any(test, feature = "test"))]
+    pub fn for_test(tx: bitcoin::Transaction) -> Self {
         let weight = tx.weight().to_wu();
         Self {
             tx,

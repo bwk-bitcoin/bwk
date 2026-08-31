@@ -663,6 +663,7 @@ pub fn swap_to_sp(
 
 // TestEnv: integration test harness
 
+use bwk::bwk_electrum::config::ScannerConfig;
 use bwk_coin::{Coin, CoinSpendInfo, CoinStatus, KeyChain};
 use bwk_sign::HotSigner;
 
@@ -843,20 +844,18 @@ impl TestEnv {
             HotSigner::new_taproot_from_mnemonics(bitcoin::Network::Regtest, bip32_mnemonic())
                 .unwrap();
         let descriptor = signer.descriptors().into_iter().next().unwrap();
-        let sub = bwk::Account::new(bwk::Config {
-            data_dir: std::path::PathBuf::new(),
-            dir_name: String::new(),
-            account: "sub-tr".to_string(),
-            electrum_url: None,
-            electrum_port: None,
-            offline: Some(true),
-            network: bitcoin::Network::Regtest,
-            look_ahead: 20,
-            mnemonic: Some(bip32_mnemonic().to_string()),
+        let mut scanner = ScannerConfig::new(
             descriptor,
-            persist: false,
-            skip_labels: true,
-            persist_kind: bwk::persist::PersistenceKind::default(),
+            std::path::PathBuf::new(),
+            String::new(),
+            "sub-tr".to_string(),
+            bitcoin::Network::Regtest,
+            None,
+        );
+        scanner.stay_offline = true;
+        let sub = bwk::Account::new(bwk::Config {
+            scanner,
+            mnemonic: Some(bip32_mnemonic().to_string()),
         });
         account.add_sub_account(sub);
     }
@@ -868,20 +867,18 @@ impl TestEnv {
             HotSigner::new_wpkh_from_mnemonics(bitcoin::Network::Regtest, bip32_mnemonic())
                 .unwrap();
         let descriptor = signer.descriptors().into_iter().next().unwrap();
-        let sub = bwk::Account::new(bwk::Config {
-            data_dir: std::path::PathBuf::new(),
-            dir_name: String::new(),
-            account: "sub-sw".to_string(),
-            electrum_url: None,
-            electrum_port: None,
-            offline: Some(true),
-            network: bitcoin::Network::Regtest,
-            look_ahead: 20,
-            mnemonic: Some(bip32_mnemonic().to_string()),
+        let mut scanner = ScannerConfig::new(
             descriptor,
-            persist: false,
-            skip_labels: true,
-            persist_kind: bwk::persist::PersistenceKind::default(),
+            std::path::PathBuf::new(),
+            String::new(),
+            "sub-sw".to_string(),
+            bitcoin::Network::Regtest,
+            None,
+        );
+        scanner.stay_offline = true;
+        let sub = bwk::Account::new(bwk::Config {
+            scanner,
+            mnemonic: Some(bip32_mnemonic().to_string()),
         });
         account.add_sub_account(sub);
     }

@@ -1,23 +1,27 @@
-//! Shared regtest harness helpers for the `HeaderStore` integration tests.
-#![allow(dead_code)]
+//! Regtest harness: a bitcoind + electrs pair and the block helpers that
+//! drive them.
+//!
+//! The node binaries are looked up under `tests/bin` of the crate running the
+//! test, so each consumer ships its own pair.
 
 use std::{
     thread::sleep,
     time::{Duration, Instant},
 };
 
-pub use bwk_utils::test::{electrsd, start_electrs, wait_electrs_tip, TestBitcoinD};
-
-use electrsd::{
-    bitcoind::{
-        bitcoincore_rpc::{jsonrpc::serde_json::Value, RpcApi},
-        BitcoinD,
+use crate::test::{
+    electrsd::{
+        bitcoind::{
+            bitcoincore_rpc::{jsonrpc::serde_json::Value, RpcApi},
+            BitcoinD,
+        },
+        ElectrsD,
     },
-    ElectrsD,
+    start_electrs, wait_electrs_tip, TestBitcoinD,
 };
 
 pub fn bootstrap_electrs(txindex: bool) -> (String, u16, ElectrsD, TestBitcoinD) {
-    let (url, port, electrsd, bitcoind) = bwk_utils::test::bootstrap_electrs(txindex);
+    let (url, port, electrsd, bitcoind) = crate::test::bootstrap_electrs(txindex);
     generate(&bitcoind, 101);
     wait_electrs_tip(&bitcoind, &electrsd);
     (url, port, electrsd, bitcoind)
@@ -50,6 +54,13 @@ pub fn get_block_hash_str(bitcoind: &BitcoinD, height: u32) -> String {
         .unwrap()
 }
 
+pub fn invalidate_block(bitcoind: &BitcoinD, hash: String) {
+    bitcoind
+        .client
+        .call::<Value>("invalidateblock", &[hash.into()])
+        .unwrap();
+}
+
 /// Poll `cond` for up to `timeout`. Returns true if it ever held.
 pub fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut cond: F) -> bool {
     let start = Instant::now();
@@ -60,4 +71,10 @@ pub fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut cond: F) -> bool {
         sleep(Duration::from_millis(100));
     }
     cond()
+}
+
+/// Logger for the regtest tests. Unlike [`crate::test::setup_logger`] it keeps the
+/// `RUST_LOG` default, so bitcoind and electrs do not flood the output.
+pub fn init_logger() {
+    let _ = env_logger::builder().is_test(true).try_init();
 }

@@ -13,12 +13,12 @@ use std::{
 };
 
 use crate::{
-    account::{CoinState, Notification},
     address_store::{AddressEntry, AddressStatus, AddressStore, AddressTip},
-    config::Config,
+    coin_state::CoinState,
     header_store::HeaderStore,
     label_store::{LabelKey, LabelStore},
-    profile::{DefaultBackend, RamProfile, StorageProfile},
+    notification::Notification,
+    profile::{DefaultBackend, RamProfile, ScanProfile},
     tx_store::{Inclusion, InputMetadata, OutputMetadata, TxEntry, TxStore},
 };
 
@@ -92,33 +92,29 @@ pub struct Payment {
     pub timestamp: Option<u64>,
 }
 
-pub struct CoinStoreSource<P: StorageProfile = RamProfile<DefaultBackend>>(
-    Arc<Mutex<CoinStore<P>>>,
-);
+pub struct CoinStoreSource<P: ScanProfile = RamProfile<DefaultBackend>>(Arc<Mutex<CoinStore<P>>>);
 
-impl<P: StorageProfile> CoinStoreSource<P> {
+impl<P: ScanProfile> CoinStoreSource<P> {
     pub fn new(store: Arc<Mutex<CoinStore<P>>>) -> Self {
         Self(store)
     }
 }
 
-pub struct ChangeTipUpdater<P: StorageProfile = RamProfile<DefaultBackend>>(
-    Arc<Mutex<CoinStore<P>>>,
-);
+pub struct ChangeTipUpdater<P: ScanProfile = RamProfile<DefaultBackend>>(Arc<Mutex<CoinStore<P>>>);
 
-impl<P: StorageProfile> Clone for ChangeTipUpdater<P> {
+impl<P: ScanProfile> Clone for ChangeTipUpdater<P> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
-impl<P: StorageProfile> ChangeTipUpdater<P> {
-    pub(crate) fn new(store: Arc<Mutex<CoinStore<P>>>) -> Self {
+impl<P: ScanProfile> ChangeTipUpdater<P> {
+    pub fn new(store: Arc<Mutex<CoinStore<P>>>) -> Self {
         Self(store)
     }
 }
 
-impl<P: StorageProfile> ChangeTip for ChangeTipUpdater<P> {
+impl<P: ScanProfile> ChangeTip for ChangeTipUpdater<P> {
     fn next_index(&mut self) -> u32 {
         let mut store = self.0.lock().expect("poisoned");
         let index = store
@@ -131,7 +127,53 @@ impl<P: StorageProfile> ChangeTip for ChangeTipUpdater<P> {
     }
 }
 
-impl<P: StorageProfile> CoinSource for CoinStoreSource<P> {
+pub struct SpendRecorder<P: ScanProfile = RamProfile<DefaultBackend>> {
+    coin_store: Arc<Mutex<CoinStore<P>>>,
+}
+
+impl<P: ScanProfile> Clone for SpendRecorder<P> {
+    fn clone(&self) -> Self {
+        Self {
+            coin_store: self.coin_store.clone(),
+        }
+    }
+}
+
+impl<P: ScanProfile> SpendRecorder<P> {
+    pub fn new(coin_store: Arc<Mutex<CoinStore<P>>>) -> Self {
+        Self { coin_store }
+    }
+
+    pub fn get_coin(&self, outpoint: &OutPoint) -> Option<Coin> {
+        self.coin_store
+            .lock()
+            .expect("poisoned")
+            .get(outpoint)
+            .map(|e| e.coin)
+    }
+
+    pub fn address_scripts(&self) -> BTreeSet<ScriptBuf> {
+        self.coin_store
+            .lock()
+            .expect("poisoned")
+            .address_store()
+            .lock()
+            .expect("poisoned")
+            .entries()
+            .into_iter()
+            .map(|entry| entry.script())
+            .collect()
+    }
+
+    pub fn record_unconfirmed_spend(&self, tx: &bitcoin::Transaction) {
+        self.coin_store
+            .lock()
+            .expect("poisoned")
+            .record_unconfirmed_tx(tx.clone());
+    }
+}
+
+impl<P: ScanProfile> CoinSource for CoinStoreSource<P> {
     fn spendable_coins(&self) -> Vec<Coin> {
         self.0
             .lock()
@@ -150,7 +192,7 @@ impl<P: StorageProfile> CoinSource for CoinStoreSource<P> {
 /// TxStore update and acts as a cache for coins. It maintains mappings
 /// of outpoints to coin entries and tracks the history of script public
 /// keys (SPKs).
-pub struct CoinStore<P: StorageProfile = RamProfile<DefaultBackend>> {
+pub struct CoinStore<P: ScanProfile = RamProfile<DefaultBackend>> {
     store: BTreeMap<OutPoint, CoinEntry>,
     label_store: Arc<Mutex<LabelStore<P>>>,
     spk_to_outpoint: BTreeMap<ScriptBuf, HashSet<OutPoint>>,
@@ -160,7 +202,6 @@ pub struct CoinStore<P: StorageProfile = RamProfile<DefaultBackend>> {
     updates: Vec<Update>,
     derivator: SpkDerivator,
     notification: mpsc::Sender<Notification>,
-    config: Config,
     /// Pending claims indexed by server-reported height. A txid lands
     /// here when the server reports it at height H but the HeaderStore
     /// doesn't yet have a header at H; the next CTA resolves it.
@@ -274,7 +315,7 @@ impl SpkHistory {
     }
 }
 
-impl<P: StorageProfile> CoinStore<P> {
+impl<P: ScanProfile> CoinStore<P> {
     /// Creates a new instance of `CoinStore`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -286,7 +327,6 @@ impl<P: StorageProfile> CoinStore<P> {
         look_ahead: u32,
         tx_store: TxStore<P>,
         label_store: Arc<Mutex<LabelStore<P>>>,
-        config: Config,
         account_store: Arc<Mutex<P::AccountStore>>,
     ) -> Self {
         let derivator = SpkDerivator::new(descriptor, network).unwrap();
@@ -296,7 +336,6 @@ impl<P: StorageProfile> CoinStore<P> {
             recv_tip,
             change_tip,
             look_ahead,
-            config.clone(),
             account_store,
         )));
         Self {
@@ -309,7 +348,6 @@ impl<P: StorageProfile> CoinStore<P> {
             spk_history: BTreeMap::new(),
             notification,
             derivator,
-            config,
             pending_claims: BTreeMap::new(),
             merkle_in_flight: BTreeSet::new(),
         }
@@ -670,7 +708,7 @@ impl<P: StorageProfile> CoinStore<P> {
         let tx_store = &self.tx_store;
 
         let mut coins = BTreeMap::<OutPoint, CoinEntry>::new();
-        let descriptor = self.config.descriptor.clone();
+        let descriptor = self.derivator.descriptor();
 
         // NOTE: here we take the max satisfaction size at default, for descriptor with several
         // spending conditions, the correct satisfaction must be filled at tx crafting time.
@@ -983,7 +1021,7 @@ impl<P: StorageProfile> CoinStore<P> {
 
     /// Queues a pending claim, to be promoted by a future CTA once the
     /// HeaderStore has a header at that height.
-    pub(crate) fn insert_pending_claim(&mut self, claim: ClaimAt) {
+    pub fn insert_pending_claim(&mut self, claim: ClaimAt) {
         self.pending_claims
             .entry(claim.height)
             .or_default()
@@ -1030,7 +1068,7 @@ impl<P: StorageProfile> CoinStore<P> {
     }
 
     /// Snapshot of the pending-claims queue.
-    pub(crate) fn pending_claims_snapshot(&self) -> BTreeMap<u32, BTreeSet<Txid>> {
+    pub fn pending_claims_snapshot(&self) -> BTreeMap<u32, BTreeSet<Txid>> {
         self.pending_claims.clone()
     }
 
@@ -1553,10 +1591,8 @@ mod tests {
     //! drives funding/spending txs through the in-memory
     //! [`TxStore`].
     use super::*;
-    use crate::config::Config;
-    use bip39::Mnemonic;
-    use bwk_descriptor::{descriptor::ScriptType, wpkh_path};
-    use bwk_sign::HotSigner;
+    use bwk_descriptor::wpkh_path;
+    use bwk_sign::{bip39::Mnemonic, HotSigner};
     use bwk_utils::test::{funding_tx, spending_tx};
     use miniscript::bitcoin::bip32::ChildNumber;
     use std::sync::mpsc;
@@ -1569,16 +1605,6 @@ mod tests {
         let xpub = signer.xpub(&path);
         let derivator = SpkDerivator::new_wpkh(xpub, network).unwrap();
         let descriptor = derivator.descriptor();
-        let dummy_config = Config::new(
-            Some(mnemo.to_string()),
-            "addr_history_test".into(),
-            network,
-            ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
-            std::path::PathBuf::default(),
-            String::new(),
-            false,
-        )
-        .unwrap();
 
         let (notif_sender, _notif_recv) = mpsc::channel();
         let tx_store = TxStore::new();
@@ -1600,7 +1626,6 @@ mod tests {
             5, // look_ahead: populates spk indices 0..=5
             tx_store,
             label_store,
-            dummy_config,
             account_store,
         );
         (cs, derivator)

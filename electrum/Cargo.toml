@@ -14,6 +14,17 @@ exclude = ["tests/**"]
 crate-type = ["rlib", "cdylib", "staticlib"]
 doctest = false
 
+[features]
+default = []
+# Exposes the test-only constructors and accessors downstream crates need to
+# unit-test against the stores: the synthetic-chain header constructors, and
+# the tx-store entry and validation-state setters.
+test = ["bwk-utils/test", "bwk-persist/test"]
+# Adds the silent-payments notification variant.
+sp = []
+# Forwards the opt-in sqlite backend, reachable through `ScannerConfig::build_backend`.
+sqlite = ["bwk-persist/sqlite"]
+
 [dependencies]
 miniscript = { workspace = true, features = ["serde", "base64"] }
 bitcoin_slices.workspace = true
@@ -23,6 +34,9 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 hex-conservative.workspace = true
 bwk-backoff.workspace = true
+bwk-coin.workspace = true
+bwk-descriptor.workspace = true
+bwk-persist.workspace = true
 bwk-utils.workspace = true
 thiserror.workspace = true
 
@@ -34,3 +48,10 @@ native-tls = { workspace = true, features = ["vendored"] }
 [dev-dependencies]
 bwk-utils = { workspace = true, features = ["test"] }
 hex_lit.workspace = true
+temp-dir.workspace = true
+bwk-sign.workspace = true
+bwk-tx.workspace = true
+electrsd.workspace = true
+# The sibling test features this crate's own tests reach for, so it builds them
+# standalone and not only under a workspace-wide feature unification.
+bwk-persist = { workspace = true, features = ["test"] }

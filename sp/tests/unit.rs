@@ -15,12 +15,12 @@ use common::{
     TempDir,
 };
 
-use bwk::label_store::{LabelKey, LabelStore};
-use bwk_sp::{
-    account::{
-        coin_store::SpCoinStore, config::Config, tx_store::SpTxStore, Account, AccountError,
-    },
-    Notification, SpNotification,
+use bwk::bwk_electrum::{
+    label_store::{LabelKey, LabelStore},
+    notification::{Notification, SpNotification},
+};
+use bwk_sp::account::{
+    coin_store::SpCoinStore, config::Config, tx_store::SpTxStore, Account, AccountError,
 };
 
 #[test]

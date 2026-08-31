@@ -28,7 +28,6 @@ use {
         core::utils::common::SilentPaymentAddress,
         receiver::{bip39, SpReceiver},
         scan::{state::ScanState, ScanRuntimeConfig, ScanRuntimeConfigError},
-        LabelKey,
     },
     bitcoin::{
         hashes::Hash,
@@ -38,7 +37,11 @@ use {
         Amount, Network, OutPoint, ScriptBuf, TapSighashType, TxOut, Txid,
     },
     bwk::{
-        label_store::LabelStore,
+        bwk_electrum::{
+            config::ScannerConfig,
+            label_store::{LabelKey, LabelStore},
+            notification::{Notification, SpNotification},
+        },
         persist::{ConfigStore, NoopConfigStore},
     },
     miniscript::psbt::PsbtExt,
@@ -111,9 +114,9 @@ pub enum AccountError {
     #[error("broadcast error: {0}")]
     Broadcast(#[from] bwk::bwk_electrum::client::Error),
     #[error("failed to open account store: {0}")]
-    Open(#[from] bwk::OpenError),
+    Open(#[from] bwk::bwk_electrum::notification::OpenError),
     #[error("failed to start header store: {0}")]
-    HeaderStart(#[from] bwk::header_store::StartError),
+    HeaderStart(#[from] bwk::bwk_electrum::header_store::StartError),
     #[error("persistence error: {0}")]
     Persist(#[from] bwk::persist::PersistError),
     #[error("invalid scan runtime config: {0}")]
@@ -136,7 +139,7 @@ struct SpendAnalysis {
 #[cfg(feature = "mnemonic")]
 struct SubAccountSpendRecorder {
     scripts: BTreeSet<ScriptBuf>,
-    recorder: bwk::account::SpendRecorder,
+    recorder: bwk::bwk_electrum::coin_store::SpendRecorder,
 }
 
 #[cfg(feature = "mnemonic")]
@@ -159,13 +162,9 @@ fn p2tr_output_key(script: &ScriptBuf) -> Option<XOnlyPublicKey> {
         .flatten()
 }
 
-// Re-use unified Notification from bwk
-#[cfg(feature = "mnemonic")]
-pub use bwk::{Notification, SpNotification};
-
 #[cfg(feature = "mnemonic")]
 fn forward_header_progress(
-    header_store: &Arc<bwk::header_store::HeaderStore>,
+    header_store: &Arc<bwk::bwk_electrum::header_store::HeaderStore>,
     sender: mpsc::Sender<Notification>,
 ) {
     let rx = header_store.register_progress();
@@ -383,8 +382,8 @@ pub enum ScanMode {
 
 // PaymentType
 
-// Payment history is produced by the generic aggregator in `bwk::history`;
-// callers receive `bwk::coin_store::Payment`. See `Account::payment_history`.
+// Payment history is produced by the generic aggregator in `bwk_electrum::history`;
+// callers receive `bwk::bwk_electrum::coin_store::Payment`. See `Account::payment_history`.
 
 // Account
 
@@ -394,7 +393,7 @@ pub enum ScanMode {
 /// [`crate::profile::SpRamProfile<DefaultBackend>`].
 pub struct Account<
     P: crate::profile::SpStorageProfile = crate::profile::SpRamProfile<
-        crate::profile::DefaultBackend,
+        bwk::bwk_electrum::profile::DefaultBackend,
     >,
 > {
     pub(crate) sp_receiver: SpReceiver,
@@ -420,7 +419,7 @@ pub struct Account<
     sub_accounts: Vec<bwk::Account>,
     /// Shared HeaderStore handle every BIP32 sub-account's chain-tip-advance
     /// pass reads from.
-    pub(crate) header_store: Arc<bwk::header_store::HeaderStore>,
+    pub header_store: Arc<bwk::bwk_electrum::header_store::HeaderStore>,
     /// Electrum endpoint the shared HeaderStore currently follows, if any
     /// (the first sub-account descriptor carrying one). Used by
     /// `start_electrum` and `set_electrum_settings` to decide whether to
@@ -431,7 +430,7 @@ pub struct Account<
 // Constructors are tied to the default SpRamProfile because they open
 // concrete on-disk RamStore instances.
 #[cfg(feature = "mnemonic")]
-impl Account<crate::profile::SpRamProfile<crate::profile::DefaultBackend>> {
+impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBackend>> {
     // Constructors
 
     /// Create a new Account from configuration.
@@ -484,11 +483,11 @@ impl Account<crate::profile::SpRamProfile<crate::profile::DefaultBackend>> {
     }
 
     /// Like [`Account::with_config_store`] but sharing an existing
-    /// [`bwk::header_store::HeaderStore`] handle across every BIP32
+    /// [`bwk::bwk_electrum::header_store::HeaderStore`] handle across every BIP32
     /// sub-account instead of building one.
     pub fn with_header_store(
         config: Config,
-        header_store: Arc<bwk::header_store::HeaderStore>,
+        header_store: Arc<bwk::bwk_electrum::header_store::HeaderStore>,
     ) -> Result<Self, AccountError> {
         Self::with_header_store_and_runtime_config(
             config,
@@ -499,7 +498,7 @@ impl Account<crate::profile::SpRamProfile<crate::profile::DefaultBackend>> {
 
     pub fn with_header_store_and_runtime_config(
         config: Config,
-        header_store: Arc<bwk::header_store::HeaderStore>,
+        header_store: Arc<bwk::bwk_electrum::header_store::HeaderStore>,
         scan_runtime: ScanRuntimeConfig,
     ) -> Result<Self, AccountError> {
         Self::with_config_store_and_header_store(
@@ -513,7 +512,7 @@ impl Account<crate::profile::SpRamProfile<crate::profile::DefaultBackend>> {
     fn with_config_store_and_header_store(
         config: Config,
         config_store: Arc<dyn ConfigStore<Config>>,
-        header_store: Arc<bwk::header_store::HeaderStore>,
+        header_store: Arc<bwk::bwk_electrum::header_store::HeaderStore>,
         scan_runtime: ScanRuntimeConfig,
     ) -> Result<Self, AccountError> {
         // Validate config
@@ -547,24 +546,20 @@ impl Account<crate::profile::SpRamProfile<crate::profile::DefaultBackend>> {
             .iter()
             .enumerate()
             .map(|(i, sub_cfg)| {
+                let name = format!("{}-sub-{}", config.account_name, i);
+                let mut scanner = ScannerConfig::new(
+                    sub_cfg.descriptor.clone(),
+                    config.account_dir(),
+                    name.clone(),
+                    name,
+                    config.network,
+                    config.persist.then_some(config.persist_kind),
+                );
+                scanner.set_stay_offline(sub_cfg.endpoint.url().is_none());
+                scanner.set_endpoint(sub_cfg.endpoint.clone());
                 let bwk_config = bwk::Config {
-                    data_dir: config.account_dir(),
-                    dir_name: format!("{}-sub-{}", config.account_name, i),
-                    account: format!("{}-sub-{}", config.account_name, i),
-                    electrum_url: sub_cfg.electrum_url.clone(),
-                    electrum_port: sub_cfg.electrum_port,
-                    offline: if sub_cfg.electrum_url.is_none() {
-                        Some(true)
-                    } else {
-                        None
-                    },
-                    network: config.network,
-                    look_ahead: 20,
+                    scanner,
                     mnemonic: sub_cfg.mnemonic.clone().or_else(|| config.mnemonic.clone()),
-                    descriptor: sub_cfg.descriptor.clone(),
-                    persist: config.persist,
-                    skip_labels: true,
-                    persist_kind: config.persist_kind,
                 };
                 bwk::Account::try_new_with_sender_and_header_store(
                     bwk_config,
@@ -710,7 +705,8 @@ impl Account<crate::profile::SpRamProfile<crate::profile::DefaultBackend>> {
     /// configured sub-account descriptor carrying one.
     fn header_store_endpoint(config: &Config) -> Option<(String, u16)> {
         config
-            .electrum_endpoint()
+            .endpoint()
+            .server()
             .map(|(url, port)| (url.to_string(), port))
     }
 
@@ -721,14 +717,16 @@ impl Account<crate::profile::SpRamProfile<crate::profile::DefaultBackend>> {
     /// worker-less store.
     fn build_header_store(
         config: &Config,
-    ) -> Result<Arc<bwk::header_store::HeaderStore>, AccountError> {
-        let path = config
-            .persist
-            .then(|| config.account_dir().join(bwk::config::HEADERS_FILENAME));
+    ) -> Result<Arc<bwk::bwk_electrum::header_store::HeaderStore>, AccountError> {
+        let path = config.persist.then(|| {
+            config
+                .account_dir()
+                .join(bwk::bwk_electrum::config::HEADERS_FILENAME)
+        });
         let (url, port) = Self::header_store_endpoint(config).unzip();
         // Backfill from the birthday so the worker covers the scan range, whose
         // confirmation block times the scanner reads from this store.
-        Ok(bwk::header_store::HeaderStore::start_or_open(
+        Ok(bwk::bwk_electrum::header_store::HeaderStore::start_or_open(
             url,
             port,
             config.network,
@@ -827,13 +825,13 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     /// sub-account, de-duplicated per txid by the generic aggregator. Direction
     /// and amount are derived from additive input/output ownership, so change
     /// nets out and a tx that spends no SP coin produces no spurious SP entry.
-    pub fn payment_history(&self) -> Vec<bwk::coin_store::Payment> {
-        let mut sources: Vec<&dyn bwk::history::AccountHistory> =
-            vec![self as &dyn bwk::history::AccountHistory];
+    pub fn payment_history(&self) -> Vec<bwk::bwk_electrum::coin_store::Payment> {
+        let mut sources: Vec<&dyn bwk::bwk_electrum::history::AccountHistory> =
+            vec![self as &dyn bwk::bwk_electrum::history::AccountHistory];
         for sub in &self.sub_accounts {
-            sources.push(sub as &dyn bwk::history::AccountHistory);
+            sources.push(sub as &dyn bwk::bwk_electrum::history::AccountHistory);
         }
-        bwk::history::aggregate_payments(sources)
+        bwk::bwk_electrum::history::aggregate_payments(sources)
     } // Labels
 
     /// Update the label for a coin.
@@ -947,7 +945,11 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         }
         let endpoint = self.sub_accounts.iter().find_map(|a| {
             let config = a.get_config();
-            config.electrum_url.zip(config.electrum_port)
+            config
+                .scanner
+                .endpoint()
+                .server()
+                .map(|(url, port)| (url.to_string(), port))
         });
         self.follow_header_store_endpoint(endpoint);
     }
@@ -1302,7 +1304,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
                 return;
             }
         }
-        let Some((url, port)) = self.config.electrum_endpoint() else {
+        let Some((url, port)) = self.config.endpoint().server() else {
             let _ = self
                 .sender
                 .send(Notification::Sp(SpNotification::FailBroadcast {
@@ -1553,7 +1555,7 @@ pub struct OwnedAddress {
     pub address: String,
     pub account_name: String,
     pub source: AddressSource,
-    pub status: bwk::address_store::AddressStatus,
+    pub status: bwk::bwk_electrum::address_store::AddressStatus,
     pub funding_txids: std::collections::BTreeSet<bitcoin::Txid>,
     pub spending_txids: std::collections::BTreeSet<bitcoin::Txid>,
 }
@@ -1658,6 +1660,7 @@ mod tests {
     use super::*;
     use crate::receiver::OwnedOutput;
     use bitcoin::{absolute::Height, hashes::hash160, secp256k1::Parity};
+    use bwk::bwk_electrum::config::Endpoint;
     use std::path::PathBuf;
 
     fn test_config() -> Config {
@@ -1995,8 +1998,7 @@ mod tests {
         config::SubAccountConfig {
             descriptor,
             mnemonic: None,
-            electrum_url: None,
-            electrum_port: None,
+            endpoint: Endpoint::default(),
         }
     }
 
@@ -2012,7 +2014,7 @@ mod tests {
             offline_sub_account_config(&mnemonic, config.network),
         ];
 
-        let shared = bwk::header_store::HeaderStore::new_in_memory(config.network);
+        let shared = bwk::bwk_electrum::header_store::HeaderStore::new_in_memory(config.network);
         let account =
             Account::with_header_store(config, shared.clone()).expect("with_header_store");
 
@@ -2039,20 +2041,19 @@ mod tests {
         let descriptor = bwk_descriptor::SpkDerivator::new_wpkh(xpub, network)
             .unwrap()
             .descriptor();
-        bwk::Account::new(bwk::Config {
-            data_dir: std::path::PathBuf::new(),
-            dir_name: String::new(),
-            account: name.to_string(),
-            electrum_url: None,
-            electrum_port: None,
-            offline: Some(true),
-            network,
-            look_ahead: 5,
-            mnemonic: Some(mnemo.to_string()),
+        let mut scanner = ScannerConfig::new(
             descriptor,
-            persist: false,
-            skip_labels: true,
-            persist_kind: bwk::persist::PersistenceKind::default(),
+            std::path::PathBuf::new(),
+            String::new(),
+            name.to_string(),
+            network,
+            None,
+        );
+        scanner.stay_offline = true;
+        scanner.look_ahead = 5;
+        bwk::Account::new(bwk::Config {
+            scanner,
+            mnemonic: Some(mnemo.to_string()),
         })
     }
 
@@ -2135,7 +2136,10 @@ mod tests {
         assert_eq!(owned.len(), 1, "only the SP coin should show up");
         let entry = &owned[0];
         assert_eq!(entry.account_name, account.name());
-        assert_eq!(entry.status, bwk::address_store::AddressStatus::Used);
+        assert_eq!(
+            entry.status,
+            bwk::bwk_electrum::address_store::AddressStatus::Used
+        );
         assert_eq!(entry.funding_txids.len(), 1);
         assert!(entry.funding_txids.contains(&outpoint.txid));
         assert!(entry.spending_txids.is_empty());
@@ -2206,20 +2210,26 @@ mod tests {
             .lookup_owned_address(&canonical)
             .expect("SP-derived spk should be owned");
         assert_eq!(hit.account_name, account.name());
-        assert_eq!(hit.status, bwk::address_store::AddressStatus::Used);
+        assert_eq!(
+            hit.status,
+            bwk::bwk_electrum::address_store::AddressStatus::Used
+        );
         assert!(hit.funding_txids.contains(&outpoint.txid));
     }
 }
 
 #[cfg(feature = "mnemonic")]
-impl<P: crate::profile::SpStorageProfile> bwk::history::AccountHistory for Account<P> {
+impl<P: crate::profile::SpStorageProfile> bwk::bwk_electrum::history::AccountHistory
+    for Account<P>
+{
     fn tx_contributions(
         &self,
-    ) -> std::collections::BTreeMap<bitcoin::Txid, bwk::history::TxContribution> {
+    ) -> std::collections::BTreeMap<bitcoin::Txid, bwk::bwk_electrum::history::TxContribution> {
         use bitcoin::hashes::Hash;
         use std::collections::BTreeMap;
 
-        let mut map: BTreeMap<bitcoin::Txid, bwk::history::TxContribution> = BTreeMap::new();
+        let mut map: BTreeMap<bitcoin::Txid, bwk::bwk_electrum::history::TxContribution> =
+            BTreeMap::new();
 
         // Ownership comes from the coin store: a coin is an output we own (its
         // funding txid), and a coin marked `Spent { txid, .. }` is an input we
@@ -2236,7 +2246,7 @@ impl<P: crate::profile::SpStorageProfile> bwk::history::AccountHistory for Accou
                 }
                 received.status = received
                     .status
-                    .merge(bwk::coin_store::PaymentStatus::Verified);
+                    .merge(bwk::bwk_electrum::coin_store::PaymentStatus::Verified);
                 if let crate::receiver::OutputSpendStatus::Spent { txid, .. } = entry.status() {
                     let spent_in = bitcoin::Txid::from_byte_array(*txid);
                     let spent = map.entry(spent_in).or_default();
@@ -2254,7 +2264,9 @@ impl<P: crate::profile::SpStorageProfile> bwk::history::AccountHistory for Accou
                 let c = map.entry(e.txid).or_default();
                 if let Some(h) = e.height {
                     c.height = Some(h as u64);
-                    c.status = c.status.merge(bwk::coin_store::PaymentStatus::Verified);
+                    c.status = c
+                        .status
+                        .merge(bwk::bwk_electrum::coin_store::PaymentStatus::Verified);
                 }
                 if c.timestamp.is_none() {
                     c.timestamp = e.timestamp;

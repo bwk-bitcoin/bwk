@@ -18,13 +18,13 @@
 //!
 //! The store is promote-only with respect to wallet tx state: it never
 //! demotes a tx. Tx demotion (e.g. on a reorg) is owned by the
-//! scripthash-subscription + history path in `account.rs`, which resets a
-//! reported-height change back to `Inclusion::Unconfirmed` and re-claims it
-//! at the new height.
+//! scripthash-subscription + history path, which resets a reported-height
+//! change back to `Inclusion::Unconfirmed` and re-claims it at the new
+//! height.
 
-use crate::header_validator::{self, expected_genesis, Error as ValidatorError};
-use bwk_electrum::client::{
-    Client, Error as ClientError, HeaderError, HeaderRequest, HeaderResponse,
+use crate::{
+    client::{Client, Error as ClientError, HeaderError, HeaderRequest, HeaderResponse},
+    header_validator::{self, expected_genesis, Error as ValidatorError},
 };
 use bwk_persist::{
     HeaderBackend, NoopBackend, PersistError, PersistenceBackend, RamStore, Store,
@@ -501,8 +501,9 @@ where
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_validation_state_for_test(&self, state: HeaderValidationState) {
+    #[cfg(any(test, feature = "test"))]
+    #[allow(dead_code)]
+    pub fn set_validation_state_for_test(&self, state: HeaderValidationState) {
         self.set_validation_state(state);
     }
 
@@ -1908,7 +1909,7 @@ fn request_initial_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bwk_electrum::electrum::response::{ErrorResponse, ErrorResult};
+    use crate::electrum::response::{ErrorResponse, ErrorResult};
     use miniscript::bitcoin::{
         block::{Header, Version},
         consensus::serialize,
@@ -2263,7 +2264,7 @@ mod tests {
             resp_tx
                 .send(HeaderResponse::Error(HeaderError::GetHeadersDecode {
                     start: 70,
-                    source: bwk_electrum::client::DecodeError::HeadersAlignment(1),
+                    source: crate::client::DecodeError::HeadersAlignment(1),
                 }))
                 .unwrap();
             recv_get_headers(&req_rx, 70, 80);

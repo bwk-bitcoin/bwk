@@ -13,13 +13,15 @@ use std::{
 
 use crate::{
     core::receiving::Label,
+    profile::{SpRamProfile, SpStorageProfile},
     receiver::{OutputSpendStatus, OwnedOutput},
 };
 use bitcoin::{hashes::Hash, Amount, OutPoint, ScriptBuf};
-use bwk::persist::{NoopBackend, PersistError, PersistenceBackend, RamStore, Store};
+use bwk::{
+    bwk_electrum::profile::DefaultBackend,
+    persist::{NoopBackend, PersistError, PersistenceBackend, RamStore, Store},
+};
 use serde::{Deserialize, Serialize};
-
-use crate::profile::{DefaultBackend, SpRamProfile, SpStorageProfile};
 
 /// Logical store name used by [`PersistenceBackend`] implementations for
 /// the silent-payment coin store. Re-export of the canonical constant
@@ -373,9 +375,9 @@ impl<P: SpStorageProfile> SpCoinStore<P> {
             .into_iter()
             .map(|(script, (funding_txids, spending_txids))| {
                 let status = match funding_txids.len() {
-                    0 => bwk::address_store::AddressStatus::NotUsed,
-                    1 => bwk::address_store::AddressStatus::Used,
-                    _ => bwk::address_store::AddressStatus::Reused,
+                    0 => bwk::bwk_electrum::address_store::AddressStatus::NotUsed,
+                    1 => bwk::bwk_electrum::address_store::AddressStatus::Used,
+                    _ => bwk::bwk_electrum::address_store::AddressStatus::Reused,
                 };
                 SpAddressEntry {
                     script,
@@ -394,7 +396,7 @@ impl<P: SpStorageProfile> SpCoinStore<P> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpAddressEntry {
     pub script: ScriptBuf,
-    pub status: bwk::address_store::AddressStatus,
+    pub status: bwk::bwk_electrum::address_store::AddressStatus,
     pub funding_txids: std::collections::BTreeSet<bitcoin::Txid>,
     pub spending_txids: std::collections::BTreeSet<bitcoin::Txid>,
 }
@@ -954,7 +956,10 @@ mod tests {
         assert_eq!(entries.len(), 1);
         let e = &entries[0];
         assert_eq!(e.script, spk);
-        assert_eq!(e.status, bwk::address_store::AddressStatus::Used);
+        assert_eq!(
+            e.status,
+            bwk::bwk_electrum::address_store::AddressStatus::Used
+        );
         assert_eq!(e.funding_txids.len(), 1);
         assert!(e.funding_txids.contains(&op.txid));
         assert!(e.spending_txids.is_empty());
@@ -975,7 +980,10 @@ mod tests {
         let entries = store.addresses_with_status();
         assert_eq!(entries.len(), 1);
         let e = &entries[0];
-        assert_eq!(e.status, bwk::address_store::AddressStatus::Reused);
+        assert_eq!(
+            e.status,
+            bwk::bwk_electrum::address_store::AddressStatus::Reused
+        );
         assert_eq!(e.funding_txids.len(), 2);
         assert!(e.funding_txids.contains(&op_a.txid));
         assert!(e.funding_txids.contains(&op_b.txid));
@@ -992,7 +1000,10 @@ mod tests {
         let entries = store.addresses_with_status();
         assert_eq!(entries.len(), 1);
         let e = &entries[0];
-        assert_eq!(e.status, bwk::address_store::AddressStatus::Used);
+        assert_eq!(
+            e.status,
+            bwk::bwk_electrum::address_store::AddressStatus::Used
+        );
         assert_eq!(e.spending_txids.len(), 1);
         assert!(e
             .spending_txids

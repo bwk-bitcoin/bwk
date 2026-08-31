@@ -1,6 +1,17 @@
+pub mod address_store;
 pub mod client;
+pub mod coin_state;
+pub mod coin_store;
+pub mod config;
 pub mod electrum;
+pub mod header_store;
+pub mod header_validator;
+pub mod history;
+pub mod label_store;
+pub mod notification;
+pub mod profile;
 pub mod raw_client;
+pub mod tx_store;
 pub mod url;
 pub mod validation;
 

@@ -12,8 +12,25 @@ use std::{
 use bwk_backoff::Backoff;
 use bwk_coin::{Coin, KeyChain};
 use bwk_descriptor::derivator::SpkDerivator;
-use bwk_electrum::client::{CoinError, CoinRequest, CoinResponse};
-use bwk_persist::{ConfigStore, NoopConfigStore, PersistError, PersistenceBackend, Store};
+use bwk_electrum::{
+    address_store::{AddressEntry, AddressStatus, AddressTip},
+    client::{CoinError, CoinRequest, CoinResponse},
+    coin_state::CoinState,
+    coin_store::{
+        ChainUpdateOutcome, ChangeTipUpdater, ClaimAt, CoinEntry, CoinStore, CoinStoreSource,
+        Payment, PaymentStatus, PaymentType, SpendRecorder,
+    },
+    config::Tip,
+    header_store::HeaderStore,
+    history::{AccountHistory, TxContribution},
+    label_store::{LabelKey, LabelStore},
+    notification::{
+        Error, Notification, OpenError, TxListenerError, TxListenerNotif, ValidationFailure,
+    },
+    profile::{DefaultBackend, RamProfile},
+    tx_store::{Inclusion, TxEntry, TxStore},
+};
+use bwk_persist::{ConfigStore, NoopConfigStore, PersistenceBackend, Store};
 use bwk_sign::signing_manager::SigningManager;
 use bwk_tx::{tx_builder::TxBuilder, ChangeRecipientProvider};
 
@@ -24,242 +41,14 @@ use miniscript::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    address_store::{AddressEntry, AddressStatus, AddressTip},
-    coin_store::{
-        ChainUpdateOutcome, ChangeTipUpdater, ClaimAt, CoinEntry, CoinStore, CoinStoreSource,
-        Payment, PaymentStatus, PaymentType,
-    },
-    config::{Config, Tip},
-    header_store::{HeaderStore, InvalidCause},
-    history::{AccountHistory, TxContribution},
-    label_store::{LabelKey, LabelStore},
-    profile::{
-        DefaultBackend, OpenFromBackend, RamProfile, ReopenStatuses, StorageProfile, Stores,
-    },
-    tx_store::{Inclusion, TxEntry, TxStore},
+    config::Config,
+    profile::{OpenFromBackend, ReopenStatuses, StorageProfile, Stores},
 };
-
-#[cfg(test)]
-use crate::profile;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
 pub enum AddrAccount {
     Receive,
     Change,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-/// `confirmed_*` includes `ConfirmedUnverified` coins: confirmed on-chain,
-/// SPV proof still pending.
-pub struct CoinState {
-    pub coins: BTreeMap<OutPoint, Coin>,
-    pub confirmed_coins: usize,
-    pub confirmed_balance: u64,
-    pub unconfirmed_coins: usize,
-    pub unconfirmed_balance: u64,
-}
-
-/// Silent Payments notification variants (behind `sp` feature).
-#[cfg(feature = "sp")]
-#[derive(Debug, Clone)]
-pub enum SpNotification {
-    /// Scanner is starting
-    StartingScan,
-    /// Scan has started
-    ScanStarted { start: u32, end: u32 },
-    /// Scanner failed to start
-    FailStartScanning { message: String },
-    /// Scan failed during scanning
-    FailScan { message: String },
-    /// Scanner is stopping
-    StoppingScan,
-    /// Scanner has stopped
-    ScanStopped,
-    /// Receive (output) scan progress update
-    ScanReceiveProgress { current: u32, end: u32 },
-    /// Spend (input) sweep progress update
-    ScanSpendProgress { current: u32, end: u32 },
-    /// Scan completed successfully
-    ScanCompleted,
-    /// A new output was found
-    NewOutput(OutPoint),
-    /// An output was spent
-    OutputSpent(OutPoint),
-    /// Broadcast completed and local state was updated
-    Broadcasted { txid: Txid },
-    /// Broadcast failed before local state was updated
-    FailBroadcast { message: String },
-    /// Continuous mode: at chain tip, waiting for new blocks
-    WaitingForBlocks { tip_height: u32 },
-    /// Continuous mode: new block(s) detected
-    NewBlocksDetected { from_height: u32, to_height: u32 },
-}
-
-pub struct SpendRecorder<P: StorageProfile = RamProfile<DefaultBackend>> {
-    coin_store: Arc<Mutex<CoinStore<P>>>,
-}
-
-impl<P: StorageProfile> Clone for SpendRecorder<P> {
-    fn clone(&self) -> Self {
-        Self {
-            coin_store: self.coin_store.clone(),
-        }
-    }
-}
-
-impl<P: StorageProfile> SpendRecorder<P> {
-    pub fn get_coin(&self, outpoint: &OutPoint) -> Option<Coin> {
-        self.coin_store
-            .lock()
-            .expect("poisoned")
-            .get(outpoint)
-            .map(|e| e.coin)
-    }
-
-    pub fn address_scripts(&self) -> BTreeSet<ScriptBuf> {
-        self.coin_store
-            .lock()
-            .expect("poisoned")
-            .address_store()
-            .lock()
-            .expect("poisoned")
-            .entries()
-            .into_iter()
-            .map(|entry| entry.script())
-            .collect()
-    }
-
-    pub fn record_unconfirmed_spend(&self, tx: &bitcoin::Transaction) {
-        self.coin_store
-            .lock()
-            .expect("poisoned")
-            .record_unconfirmed_tx(tx.clone());
-    }
-}
-
-/// Notifications sent by an Account to signal events.
-#[derive(Debug)]
-pub enum Notification {
-    Electrum(TxListenerNotif),
-    AddressTipChanged,
-    CoinUpdate,
-    PaymentHistoryUpdated,
-    InvalidElectrumConfig,
-    InvalidLookAhead,
-    Stopped,
-    Error(Error),
-    /// A chain-tip-advance (CTA) pass mutated tx state in response to a
-    /// HeaderStore update.
-    HeaderStoreUpdated,
-    HeaderProgress(crate::header_store::HeaderProgressEvent),
-    /// A merkle proof failed verification, or the header store itself
-    /// failed validation; the affected entry was refused promotion.
-    ValidationFailed(ValidationFailure),
-    #[cfg(feature = "sp")]
-    Sp(SpNotification),
-}
-
-#[derive(Debug, Clone)]
-pub enum ValidationFailure {
-    /// Merkle proof for a tx at a height did not verify against the header.
-    MerkleProof { txid: Txid, height: u32 },
-    /// The header store rejected its own replay validation.
-    HeaderStore(InvalidCause),
-}
-
-impl From<TxListenerNotif> for Notification {
-    fn from(value: TxListenerNotif) -> Self {
-        Notification::Electrum(value)
-    }
-}
-
-impl From<Error> for Notification {
-    fn from(value: Error) -> Self {
-        Self::Error(value)
-    }
-}
-
-#[cfg(feature = "sp")]
-impl From<SpNotification> for Notification {
-    fn from(sp: SpNotification) -> Self {
-        Notification::Sp(sp)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum Error {
-    CreatePool,
-    JoinPool,
-    InvalidOutPoint,
-    CoinMissing,
-    InvalidDenomination,
-    RelayMissing,
-    WrongElectrumConfig,
-    PoolMissing,
-    WrongKeyType,
-    Satisfaction,
-    HeaderStoreRestart,
-}
-
-/// Error returned when opening an [`Account`]'s stores from disk.
-#[derive(Debug)]
-pub enum OpenError {
-    /// The config carried an empty account name.
-    EmptyAccount,
-    /// The persistence backend could not be built or the store bundle
-    /// could not be read (e.g. the account directory is already locked,
-    /// or a stored blob failed to decode).
-    Persist(PersistError),
-    /// The configured Electrum endpoint could not be reached while building
-    /// the account's [`HeaderStore`]. Fails loud rather than silently
-    /// opening a worker-less store (see [`Account::build_header_store`]).
-    HeaderStore(crate::header_store::StartError),
-}
-
-impl std::fmt::Display for OpenError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OpenError::EmptyAccount => write!(f, "account name must not be empty"),
-            OpenError::Persist(e) => write!(f, "{e}"),
-            OpenError::HeaderStore(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for OpenError {}
-
-impl From<PersistError> for OpenError {
-    fn from(e: PersistError) -> Self {
-        OpenError::Persist(e)
-    }
-}
-
-impl From<crate::header_store::StartError> for OpenError {
-    fn from(e: crate::header_store::StartError) -> Self {
-        OpenError::HeaderStore(e)
-    }
-}
-
-/// Represents notifications related to transaction listeners.
-#[derive(Debug)]
-pub enum TxListenerNotif {
-    Started,
-    Connected(String),
-    Error(TxListenerError),
-    Stopped,
-}
-
-/// Errors surfaced through [`TxListenerNotif::Error`].
-#[derive(Debug, thiserror::Error)]
-pub enum TxListenerError {
-    #[error("failed to create electrum client: {0}")]
-    Client(#[from] bwk_electrum::client::Error),
-    #[error(transparent)]
-    Coin(#[from] CoinError),
-    #[error("address store disconnected")]
-    AddressStoreDisconnected,
-    #[error("statuses store unavailable")]
-    StatusesUnavailable,
 }
 
 /// How a freshly spawned listener thread obtains the statuses store: either
@@ -327,33 +116,6 @@ impl<P: StorageProfile> Drop for Account<P> {
         if let Some(handle) = self.tx_listener.take() {
             let _ = handle.join();
         }
-    }
-}
-
-// RAM-specific adapter for callers that already hold a `RamStores<B>`
-// bundle. Forwards to the generic `from_stores`.
-impl Account<RamProfile<DefaultBackend>> {
-    #[cfg(test)]
-    fn from_ram_stores(
-        config: Config,
-        header_store: Arc<HeaderStore>,
-        sender: mpsc::Sender<Notification>,
-        ram: profile::RamStores<DefaultBackend>,
-    ) -> Self {
-        Self::from_stores(
-            config,
-            header_store,
-            sender,
-            default_config_store(),
-            Stores {
-                tx: ram.tx,
-                label: ram.label,
-                statuses: ram.statuses,
-                account: ram.account,
-                signers: ram.signers,
-            },
-            None,
-        )
     }
 }
 
@@ -456,24 +218,29 @@ impl<P: OpenFromBackend> Account<P> {
     /// [`HeaderStore::start`]) when `config` carries an Electrum endpoint
     /// and is not offline, file-backed/in-memory otherwise. Headers are
     /// always binary-backed through [`bwk_persist::HeaderBackend`] at
-    /// [`Config::headers_path`], independent of the account's own
-    /// persistence kind.
+    /// [`ScannerConfig::headers_path`](bwk_electrum::config::ScannerConfig::headers_path),
+    /// independent of the account's own persistence kind.
     ///
     /// Returns [`OpenError::HeaderStore`] if a configured (non-offline)
     /// endpoint cannot be reached: header-sync progress gates wallet
     /// `Verified` state, so a dead store must fail loud rather than open
     /// silently degraded.
     fn build_header_store(config: &Config) -> Result<Arc<HeaderStore<P::HeaderStore>>, OpenError> {
-        let path = config.persist.then(|| config.headers_path());
-        let (url, port) = if config.offline() {
+        let path = config
+            .scanner
+            .persistence
+            .is_some()
+            .then(|| config.scanner.headers_path());
+        let (url, port) = if config.scanner.stay_offline() {
             (None, None)
         } else {
-            (config.electrum_url.clone(), config.electrum_port)
+            let endpoint = config.scanner.endpoint();
+            (endpoint.url().map(str::to_string), endpoint.port())
         };
         Ok(HeaderStore::start_or_open(
             url,
             port,
-            config.network,
+            config.scanner.network,
             path,
             None,
         )?)
@@ -485,18 +252,20 @@ impl<P: OpenFromBackend> Account<P> {
         sender: mpsc::Sender<Notification>,
         config_store: Arc<dyn ConfigStore<Config>>,
     ) -> Result<Self, OpenError> {
-        if config.account.is_empty() {
+        if config.scanner.account.is_empty() {
             return Err(OpenError::EmptyAccount);
         }
-        let backend: Arc<dyn PersistenceBackend> = config.build_backend()?;
+        let backend: Arc<dyn PersistenceBackend> = config.scanner.build_backend()?;
         // Hot-signer material must not land on the SQLite DB; route the
         // SignerStore slot through a NoopBackend in that case.
-        let secrets_backend: Arc<dyn PersistenceBackend> =
-            if matches!(config.persist_kind, bwk_persist::PersistenceKind::Sqlite) {
-                Arc::new(bwk_persist::NoopBackend)
-            } else {
-                backend.clone()
-            };
+        let secrets_backend: Arc<dyn PersistenceBackend> = if matches!(
+            config.scanner.persistence,
+            Some(bwk_persist::PersistenceKind::Sqlite)
+        ) {
+            Arc::new(bwk_persist::NoopBackend)
+        } else {
+            backend.clone()
+        };
         let reopen_backend = backend.clone();
         let reopen_statuses: ReopenStatuses<P> =
             Arc::new(move || P::open_statuses(reopen_backend.clone()));
@@ -521,10 +290,8 @@ impl<P: OpenFromBackend> Account<P> {
         // The previous connection died; the shared HeaderStore worker still
         // holds the same dead socket, so reconnect it too or `Verified`
         // promotions would stall.
-        if let (Some(url), Some(port)) =
-            (self.config.electrum_url.clone(), self.config.electrum_port)
-        {
-            if let Err(e) = self.header_store.restart(url, port) {
+        if let Some((url, port)) = self.config.scanner.endpoint().server() {
+            if let Err(e) = self.header_store.restart(url.to_string(), port) {
                 log::error!("restart_electrum(): header store restart failed: {e}");
                 let _ = self
                     .sender
@@ -590,29 +357,28 @@ impl<P: StorageProfile> Account<P> {
         // look-ahead to recover the generated tip. Without this the generated tip
         // would climb by one look-ahead window on every reopen.
         let (stat_recv, stat_change) = max_tip_from_statuses(&stores.statuses);
-        let look_ahead = config.look_ahead;
+        let look_ahead = config.scanner.look_ahead;
         let receive = receive.max(stat_recv.saturating_sub(look_ahead));
         let change = change.max(stat_change.saturating_sub(look_ahead));
         let coin_store = Arc::new(Mutex::new(CoinStore::new(
-            config.network,
-            config.descriptor.clone(),
+            config.scanner.network,
+            config.scanner.descriptor.clone(),
             sender.clone(),
             receive,
             change,
-            config.look_ahead,
+            config.scanner.look_ahead,
             tx_store,
             label_store.clone(),
-            config.clone(),
             account_store.clone(),
         )));
         coin_store.lock().expect("poisoned").generate();
         let mut signing_manager = SigningManager::from_store(stores.signers);
         if let Some(mnemo) = config.mnemonic.clone() {
-            signing_manager.new_bip32_signer_from_mnemonic(config.network(), mnemo);
-            signing_manager.register_bip32_descriptor(config.descriptor.clone());
+            signing_manager.new_bip32_signer_from_mnemonic(config.scanner.network, mnemo);
+            signing_manager.register_bip32_descriptor(config.scanner.descriptor.clone());
         }
         let _ = account_store; // owned by CoinStore->AddressStore; not stored on Account
-        let offline = Arc::new(AtomicBool::new(config.offline()));
+        let offline = Arc::new(AtomicBool::new(config.scanner.stay_offline()));
         let mut account = Account {
             coin_store,
             label_store,
@@ -643,7 +409,8 @@ impl<P: StorageProfile> Account<P> {
     /// signer material stripped via [`Config::for_persistence`].
     fn persist_config(&self) {
         let mut cfg = self.config.for_persistence();
-        cfg.set_offline(self.offline.load(Ordering::Relaxed));
+        cfg.scanner
+            .set_stay_offline(self.offline.load(Ordering::Relaxed));
         if let Err(e) = self.config_store.save(&cfg) {
             log::warn!("config save failed: {e}");
         }
@@ -665,19 +432,19 @@ impl<P: StorageProfile> Account<P> {
 // Non (b)locking API
 impl<P: StorageProfile> Account<P> {
     pub fn network(&self) -> bitcoin::Network {
-        self.config.network()
+        self.config.scanner.network
     }
 
     pub fn name(&self) -> String {
-        self.config.account.clone()
+        self.config.scanner.account.clone()
     }
 
     pub fn descriptor_str(&self) -> String {
-        self.config.descriptor.to_string()
+        self.config.scanner.descriptor.to_string()
     }
 
     pub fn descriptor(&self) -> Descriptor<DescriptorPublicKey> {
-        self.config.descriptor.clone()
+        self.config.scanner.descriptor.clone()
     }
 
     pub fn receiver(&mut self) -> Option<mpsc::Receiver<Notification>> {
@@ -776,7 +543,7 @@ impl<P: StorageProfile> Account<P> {
 
     /// Returns a list of all historical payments
     pub fn payment_history(&self) -> Vec<Payment> {
-        crate::history::aggregate_payments([self as &dyn AccountHistory])
+        bwk_electrum::history::aggregate_payments([self as &dyn AccountHistory])
     }
 
     /// Record a just-broadcast spend as unconfirmed: owned inputs flip to
@@ -790,9 +557,7 @@ impl<P: StorageProfile> Account<P> {
     }
 
     pub fn spend_recorder(&self) -> SpendRecorder<P> {
-        SpendRecorder {
-            coin_store: self.coin_store.clone(),
-        }
+        SpendRecorder::new(self.coin_store.clone())
     }
 
     /// Updates the label of a coin identified by the given outpoint.
@@ -1007,17 +772,6 @@ impl<P: StorageProfile> Account<P> {
     pub fn generate_coins(&mut self) {
         self.coin_store().lock().expect("poisoned").generate();
     }
-    pub fn electrum_url(&self) -> String {
-        self.config.electrum_url()
-    }
-
-    pub fn electrum_port(&self) -> String {
-        self.config.electrum_port()
-    }
-
-    pub fn look_ahead(&self) -> String {
-        self.config.look_ahead()
-    }
 
     /// Starts listening for transactions on the specified address and port.
     ///
@@ -1105,7 +859,7 @@ impl<P: StorageProfile> Account<P> {
             let _ = notification.send(TxListenerNotif::Connected(addr).into());
             offline.store(false, Ordering::Relaxed);
             let mut cfg = config.for_persistence();
-            cfg.set_offline(false);
+            cfg.scanner.set_stay_offline(false);
             if let Err(e) = config_store.save(&cfg) {
                 log::warn!("start_listen_txs(): config save failed: {e}");
             }
@@ -1137,8 +891,7 @@ impl<P: StorageProfile> Account<P> {
     /// * `port` - The port of the Electrum server.
     pub fn set_electrum(&mut self, url: String, port: String) {
         if let Ok(port) = port.parse::<u16>() {
-            self.config.electrum_url = Some(url);
-            self.config.electrum_port = Some(port);
+            self.config.scanner.set_electrum(Some(url), Some(port));
             self.persist_config();
         } else {
             self.sender
@@ -1149,8 +902,7 @@ impl<P: StorageProfile> Account<P> {
 
     /// Sets the Electrum URL and port in memory without writing to file.
     pub fn set_electrum_config(&mut self, url: Option<String>, port: Option<u16>) {
-        self.config.electrum_url = url;
-        self.config.electrum_port = port;
+        self.config.scanner.set_electrum(url, port);
     }
 
     /// Starts the Electrum listener for the account.
@@ -1160,7 +912,10 @@ impl<P: StorageProfile> Account<P> {
         if self.tx_listener.as_ref().is_some_and(|h| h.is_finished()) {
             self.stop_listener();
         }
-        match (self.config.electrum_url.clone(), self.config.electrum_port) {
+        match (
+            self.config.scanner.endpoint().url().map(str::to_string),
+            self.config.scanner.endpoint().port(),
+        ) {
             (Some(addr), Some(port)) if self.tx_listener.is_none() => {
                 let (tx_listener, electrum_stop) = self.start_listen_txs(addr, port);
                 self.coin_store()
@@ -1216,7 +971,7 @@ impl<P: StorageProfile> Account<P> {
     /// * `look_ahead` - The look-ahead value to set.
     pub fn set_look_ahead(&mut self, look_ahead: String) {
         if let Ok(la) = look_ahead.parse::<u32>() {
-            self.config.look_ahead = la;
+            self.config.scanner.look_ahead = la;
             self.persist_config();
         } else {
             self.sender
@@ -1911,7 +1666,7 @@ fn apply_tx_merkle<P: StorageProfile>(
     let mut store = coin_store.lock().expect("poisoned");
     // The branch arrives in internal (little-endian) order from
     // `decode_tx_merkle_branch`, so it feeds `verify_merkle_branch` directly.
-    if crate::header_store::verify_merkle_branch(txid, branch, pos, expected_root) {
+    if bwk_electrum::header_store::verify_merkle_branch(txid, branch, pos, expected_root) {
         store
             .tx_store_mut()
             .update_inclusion(&txid, Inclusion::Verified { height, block_hash });
@@ -2022,7 +1777,6 @@ fn refresh_unconfirmed_history<P: StorageProfile>(
 #[cfg(all(test, feature = "test"))]
 mod tests {
     use super::*;
-    use crate::tx_store::TxStore;
     use bip39::Mnemonic;
     use bwk_coin::CoinStatus;
     use bwk_descriptor::descriptor::{wpkh, ScriptType};
@@ -2030,7 +1784,7 @@ mod tests {
         client::DecodeError,
         electrum::response::{ErrorResponse, ErrorResult},
     };
-    use bwk_persist::NoopBackend;
+    use bwk_persist::{NoopBackend, PersistenceKind};
     use bwk_sign::hot_signer::HotSigner;
     use bwk_utils::test::{funding_tx, setup_logger, spending_tx};
     use miniscript::bitcoin::{bip32::ChildNumber, Network};
@@ -2060,18 +1814,6 @@ mod tests {
             let (tip_sender, tip_receiver) = mpsc::channel();
             let (req_sender, req_receiver) = mpsc::channel();
             let (resp_sender, resp_receiver) = mpsc::channel();
-            let mnemo = Mnemonic::generate(12).unwrap();
-            let dummy_config = Config::new(
-                Some(mnemo.to_string()),
-                "dummy".into(),
-                Network::Regtest,
-                ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
-                PathBuf::default(),
-                String::new(),
-                false,
-            )
-            .unwrap();
-
             let mnemonic = bip39::Mnemonic::generate(12).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
             let signer =
@@ -2088,16 +1830,16 @@ mod tests {
             let account_store = Arc::new(Mutex::new(bwk_persist::RamStore::empty(
                 mock_backend.clone(),
                 bwk_persist::ACCOUNT_STORE_KEY,
-                crate::profile::encode_account_key,
-                crate::profile::encode_account_value,
+                bwk_electrum::profile::encode_account_key,
+                bwk_electrum::profile::encode_account_value,
             )));
             let statuses_store = bwk_persist::RamStore::open(
                 mock_backend,
                 bwk_persist::STATUSES_STORE_KEY,
-                crate::profile::encode_status_key,
-                crate::profile::decode_status_key,
-                crate::profile::encode_status_value,
-                crate::profile::decode_status_value,
+                bwk_electrum::profile::encode_status_key,
+                bwk_electrum::profile::decode_status_key,
+                bwk_electrum::profile::encode_status_value,
+                bwk_electrum::profile::decode_status_value,
             )
             .expect("open statuses RamStore");
             let coin_store = Arc::new(Mutex::new(CoinStore::new(
@@ -2109,7 +1851,6 @@ mod tests {
                 look_ahead,
                 tx_store,
                 label_store,
-                dummy_config,
                 account_store,
             )));
             coin_store.lock().expect("poisoned").init(tip_sender);
@@ -2161,16 +1902,6 @@ mod tests {
     fn bare_coin_store() -> (Arc<Mutex<CoinStore>>, SpkDerivator) {
         let (notif_sender, _notif_recv) = mpsc::channel();
         let mnemo = Mnemonic::generate(12).unwrap();
-        let dummy_config = Config::new(
-            Some(mnemo.to_string()),
-            "dummy".into(),
-            Network::Regtest,
-            ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
-            PathBuf::default(),
-            String::new(),
-            false,
-        )
-        .unwrap();
         let signer =
             HotSigner::new_from_mnemonics(bitcoin::Network::Regtest, &mnemo.to_string()).unwrap();
         let xpub = signer.xpub(&DerivationPath::from_str("m/84'/0'/0'/1").unwrap());
@@ -2181,8 +1912,8 @@ mod tests {
         let account_store = Arc::new(Mutex::new(bwk_persist::RamStore::empty(
             backend,
             bwk_persist::ACCOUNT_STORE_KEY,
-            crate::profile::encode_account_key,
-            crate::profile::encode_account_value,
+            bwk_electrum::profile::encode_account_key,
+            bwk_electrum::profile::encode_account_value,
         )));
         let coin_store = Arc::new(Mutex::new(CoinStore::new(
             bitcoin::Network::Regtest,
@@ -2193,7 +1924,6 @@ mod tests {
             20,
             TxStore::new(),
             label_store,
-            dummy_config,
             account_store,
         )));
         (coin_store, derivator)
@@ -2235,8 +1965,7 @@ mod tests {
     // `(N, txid)` entry must not linger in `pending_claims`.
     #[test]
     fn deep_reorg_clears_stale_pending_claims() {
-        use crate::header_store::HeaderStore;
-        use crate::tx_store::TxEntry;
+        use bwk_electrum::{header_store::HeaderStore, tx_store::TxEntry};
 
         let (coin_store, _derivator) = bare_coin_store();
 
@@ -2290,7 +2019,7 @@ mod tests {
     // from the chain" wedges the tx Unconfirmed forever once it folds.
     #[test]
     fn pending_claim_survives_tx_fetch_in_flight() {
-        use crate::header_store::HeaderStore;
+        use bwk_electrum::header_store::HeaderStore;
 
         let (coin_store, derivator) = bare_coin_store();
 
@@ -2359,8 +2088,7 @@ mod tests {
     // demoted to ConfirmedUnverified nor trigger a fresh GetTxMerkle.
     #[test]
     fn re_report_does_not_demote_verified() {
-        use crate::header_store::HeaderStore;
-        use crate::tx_store::TxEntry;
+        use bwk_electrum::{header_store::HeaderStore, tx_store::TxEntry};
 
         let (coin_store, _derivator) = bare_coin_store();
 
@@ -2423,8 +2151,7 @@ mod tests {
     // re-queued by the CTA pass, without mutating state or notifying.
     #[test]
     fn stuck_confirmed_unverified_refetched_by_cta() {
-        use crate::header_store::HeaderStore;
-        use crate::tx_store::TxEntry;
+        use bwk_electrum::{header_store::HeaderStore, tx_store::TxEntry};
 
         let (coin_store, _derivator) = bare_coin_store();
 
@@ -2475,8 +2202,7 @@ mod tests {
     // re-fetched by the CTA pass.
     #[test]
     fn verified_with_matching_hash_not_refetched_by_cta() {
-        use crate::header_store::HeaderStore;
-        use crate::tx_store::TxEntry;
+        use bwk_electrum::{header_store::HeaderStore, tx_store::TxEntry};
 
         let (coin_store, _derivator) = bare_coin_store();
 
@@ -2520,8 +2246,7 @@ mod tests {
     // `GetTxMerkle { H }`. It must NOT push the entry to `Unconfirmed`.
     #[test]
     fn same_height_reorg_reverifies_stale_block_hash() {
-        use crate::header_store::HeaderStore;
-        use crate::tx_store::TxEntry;
+        use bwk_electrum::{header_store::HeaderStore, tx_store::TxEntry};
         use miniscript::bitcoin::hashes::Hash;
 
         let (coin_store, _derivator) = bare_coin_store();
@@ -2586,7 +2311,7 @@ mod tests {
 
     #[test]
     fn history_waits_for_header_validation_then_promotes_reported_claim() {
-        use crate::header_store::{HeaderStore, HeaderValidationState};
+        use bwk_electrum::header_store::{HeaderStore, HeaderValidationState};
 
         let (coin_store, derivator) = bare_coin_store();
         let spk = derivator.receive_spk_at(0);
@@ -2659,8 +2384,7 @@ mod tests {
 
     #[test]
     fn merkle_errors_release_only_their_in_flight_fetch() {
-        use crate::header_store::HeaderStore;
-        use crate::tx_store::TxEntry;
+        use bwk_electrum::{header_store::HeaderStore, tx_store::TxEntry};
 
         let (coin_store, _derivator) = bare_coin_store();
         let tx = funding_tx(bitcoin::ScriptBuf::new(), 0.1);
@@ -2764,8 +2488,7 @@ mod tests {
     // wrong (N_old) height and wedge it ConfirmedUnverified forever.
     #[test]
     fn re_report_purges_stale_pending_claim() {
-        use crate::header_store::HeaderStore;
-        use crate::tx_store::TxEntry;
+        use bwk_electrum::{header_store::HeaderStore, tx_store::TxEntry};
 
         let (coin_store, _derivator) = bare_coin_store();
 
@@ -2850,11 +2573,11 @@ mod tests {
             ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
             dir.path().to_path_buf(),
             ".bwk".to_string(),
-            true, // persist
+            Some(PersistenceKind::Json),
         )
         .unwrap();
-        config.look_ahead = look_ahead;
-        config.set_offline(true);
+        config.scanner.look_ahead = look_ahead;
+        config.scanner.set_stay_offline(true);
         config
     }
 
@@ -2912,17 +2635,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = persisted_offline_config(&dir, 2);
 
-        let account_dir = config.account_dir();
+        let account_dir = config.scanner.account_dir();
         {
             let backend: Arc<dyn PersistenceBackend> =
                 Arc::new(bwk_persist::JsonBackend::open(account_dir).unwrap());
             let mut statuses = bwk_persist::RamStore::open(
                 backend,
                 bwk_persist::STATUSES_STORE_KEY,
-                crate::profile::encode_status_key,
-                crate::profile::decode_status_key,
-                crate::profile::encode_status_value,
-                crate::profile::decode_status_value,
+                bwk_electrum::profile::encode_status_key,
+                bwk_electrum::profile::decode_status_key,
+                bwk_electrum::profile::encode_status_value,
+                bwk_electrum::profile::decode_status_value,
             )
             .unwrap();
             statuses
@@ -2955,17 +2678,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = persisted_offline_config(&dir, look_ahead);
 
-        let account_dir = config.account_dir();
+        let account_dir = config.scanner.account_dir();
         {
             let backend: Arc<dyn PersistenceBackend> =
                 Arc::new(bwk_persist::JsonBackend::open(account_dir).unwrap());
             let mut statuses = bwk_persist::RamStore::open(
                 backend,
                 bwk_persist::STATUSES_STORE_KEY,
-                crate::profile::encode_status_key,
-                crate::profile::decode_status_key,
-                crate::profile::encode_status_value,
-                crate::profile::decode_status_value,
+                bwk_electrum::profile::encode_status_key,
+                bwk_electrum::profile::decode_status_key,
+                bwk_electrum::profile::encode_status_value,
+                bwk_electrum::profile::decode_status_value,
             )
             .unwrap();
             statuses
@@ -3153,14 +2876,21 @@ mod tests {
             ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
             PathBuf::default(),
             String::new(),
-            false,
+            None,
         )
         .unwrap();
         let header_store = HeaderStore::new_in_memory(Network::Regtest);
         let (sender, _receiver) = mpsc::channel();
-        let stores =
-            profile::open_ram_stores(Arc::new(NoopBackend) as DefaultBackend).expect("open stores");
-        let account = Account::from_ram_stores(config, header_store, sender, stores);
+        let backend = Arc::new(NoopBackend) as DefaultBackend;
+        let stores = RamProfile::open(backend.clone(), backend).expect("open stores");
+        let account: Account = Account::from_stores(
+            config,
+            header_store,
+            sender,
+            default_config_store(),
+            stores,
+            None,
+        );
         let spk = account.derivator().receive_spk_at(0);
         let tx = funding_tx(spk.clone(), 0.1);
         let txid = tx.compute_txid();
@@ -3308,7 +3038,7 @@ mod tests {
     // same-height hash-change case (`Verified -> ConfirmedUnverified`).
     #[test]
     fn reported_height_change_demotes_verified_to_unconfirmed() {
-        use crate::tx_store::TxEntry;
+        use bwk_electrum::tx_store::TxEntry;
 
         let (coin_store, derivator) = bare_coin_store();
 
@@ -3375,8 +3105,10 @@ mod tests {
     // `ValidationFailed(HeaderStore(_))`.
     #[test]
     fn invalid_header_store_blocks_promotion() {
-        use crate::header_store::{HeaderStore, HeaderValidationState, InvalidCause};
-        use crate::tx_store::TxEntry;
+        use bwk_electrum::{
+            header_store::{HeaderStore, HeaderValidationState, InvalidCause},
+            tx_store::TxEntry,
+        };
 
         let (coin_store, _derivator) = bare_coin_store();
 
@@ -3435,7 +3167,7 @@ mod tests {
     // height and the claim is rebuilt.
     #[test]
     fn reconnect_refreshes_history_for_unconfirmed_spk() {
-        use crate::tx_store::TxEntry;
+        use bwk_electrum::tx_store::TxEntry;
 
         let (coin_store, deriv) = bare_coin_store();
         let spk = deriv.receive_spk_at(2);
@@ -3496,8 +3228,7 @@ mod tests {
     // `VerifyFailed` state so it is not re-fetched every tick.
     #[test]
     fn handle_tx_merkle_tampered_branch_notifies() {
-        use crate::header_store::HeaderStore;
-        use crate::tx_store::TxEntry;
+        use bwk_electrum::{header_store::HeaderStore, tx_store::TxEntry};
 
         let (coin_store, _derivator) = bare_coin_store();
 
@@ -3566,8 +3297,7 @@ mod tests {
     // the replacement block instead of marking the transaction failed.
     #[test]
     fn handle_tx_merkle_hash_mismatch_requeues_replacement() {
-        use crate::header_store::HeaderStore;
-        use crate::tx_store::TxEntry;
+        use bwk_electrum::{header_store::HeaderStore, tx_store::TxEntry};
         use miniscript::bitcoin::hashes::Hash;
 
         let (coin_store, _derivator) = bare_coin_store();
@@ -3648,13 +3378,13 @@ mod integration_tests {
 
     use super::{Notification, TxListenerNotif};
     use crate::{
-        coin_store::Payment,
         config::{maybe_create_dir, Config},
         Account,
     };
     use bip39::Mnemonic;
     use bwk_descriptor::descriptor::ScriptType;
-    use bwk_electrum::client::Client;
+    use bwk_electrum::{client::Client, coin_store::Payment};
+    use bwk_persist::PersistenceKind;
     use bwk_utils::test::{
         bootstrap_electrs as start_electrs_test, electrsd, wait_electrs_tip, TempDir, TestBitcoinD,
     };
@@ -3844,11 +3574,11 @@ mod integration_tests {
             ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
             path,
             ".bwk".to_string(),
-            true,
+            Some(PersistenceKind::Json),
         )
         .unwrap();
-        config.network = Network::Regtest;
-        config.look_ahead = look_ahead;
+        config.scanner.network = Network::Regtest;
+        config.scanner.look_ahead = look_ahead;
         config.set_electrum_url(url.clone());
         config.set_electrum_port(port.to_string());
         config.set_mnemonic(mnemonic.to_string());
@@ -3967,10 +3697,10 @@ mod integration_tests {
             ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
             path,
             ".bwk".to_string(),
-            true,
+            Some(PersistenceKind::Json),
         )
         .unwrap();
-        config.look_ahead = look_ahead;
+        config.scanner.look_ahead = look_ahead;
         config.set_electrum_url(url.clone());
         config.set_electrum_port(port.to_string());
         config.set_mnemonic(mnemonic.to_string());
@@ -4096,9 +3826,9 @@ mod integration_tests {
         let mut sent = 0;
         for p in payments {
             match p.payment_type {
-                crate::coin_store::PaymentType::Receive => recv += 1,
-                crate::coin_store::PaymentType::Send => sent += 1,
-                crate::coin_store::PaymentType::ToSelf => {}
+                bwk_electrum::coin_store::PaymentType::Receive => recv += 1,
+                bwk_electrum::coin_store::PaymentType::Send => sent += 1,
+                bwk_electrum::coin_store::PaymentType::ToSelf => {}
             }
         }
         (recv, sent)
@@ -4127,11 +3857,11 @@ mod integration_tests {
             ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
             path,
             ".bwk".to_string(),
-            true,
+            Some(PersistenceKind::Json),
         )
         .unwrap();
-        config.network = Network::Regtest;
-        config.look_ahead = look_ahead;
+        config.scanner.network = Network::Regtest;
+        config.scanner.look_ahead = look_ahead;
         config.set_electrum_url(url.clone());
         config.set_electrum_port(port.to_string());
         config.set_mnemonic(mnemonic.to_string());
@@ -4207,11 +3937,11 @@ mod integration_tests {
             ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
             path,
             ".bwk".to_string(),
-            true,
+            Some(PersistenceKind::Json),
         )
         .unwrap();
-        config.network = Network::Regtest;
-        config.look_ahead = 20;
+        config.scanner.network = Network::Regtest;
+        config.scanner.look_ahead = 20;
         config.set_electrum_url(url);
         config.set_electrum_port(port.to_string());
         config.set_mnemonic(mnemonic.to_string());
@@ -4299,11 +4029,11 @@ mod integration_tests {
             ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
             path,
             ".bwk".to_string(),
-            true,
+            Some(PersistenceKind::Json),
         )
         .unwrap();
-        config.network = Network::Regtest;
-        config.look_ahead = look_ahead;
+        config.scanner.network = Network::Regtest;
+        config.scanner.look_ahead = look_ahead;
         config.set_electrum_url(url.clone());
         config.set_electrum_port(port.to_string());
         config.set_mnemonic(mnemonic.to_string());
@@ -4434,17 +4164,17 @@ mod sqlite_signer_exclusion {
             ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
             temp.path().to_path_buf(),
             "wallet".to_string(),
-            true,
+            Some(PersistenceKind::Json),
         )
         .expect("config");
-        cfg.set_offline(true);
-        cfg.persist_kind = PersistenceKind::Sqlite;
+        cfg.scanner.set_stay_offline(true);
+        cfg.scanner.persistence = Some(PersistenceKind::Sqlite);
 
         // Wire a FileConfigStore against the account dir's config.json,
         // build the account, drive a config save + a label write to
         // exercise multiple persist paths. SQLite mode must not write
         // the mnemonic anywhere under the account dir.
-        let account_dir = cfg.account_dir();
+        let account_dir = cfg.scanner.account_dir();
         let config_store: Arc<dyn ConfigStore<Config>> = Arc::new(FileConfigStore::<Config>::new(
             account_dir.join(CONFIG_FILENAME),
         ));
@@ -4469,12 +4199,12 @@ mod sqlite_signer_exclusion {
             ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
             temp.path().to_path_buf(),
             "wallet".to_string(),
-            true,
+            Some(PersistenceKind::Json),
         )
         .expect("config")
-        .with_persist_kind(PersistenceKind::Json);
+        .with_persistence(Some(PersistenceKind::Json));
 
-        let account_dir = cfg.account_dir();
+        let account_dir = cfg.scanner.account_dir();
         let config_path = account_dir.join(CONFIG_FILENAME);
         let config_store: Arc<dyn ConfigStore<Config>> =
             Arc::new(FileConfigStore::<Config>::new(config_path.clone()));

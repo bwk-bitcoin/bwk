@@ -46,12 +46,15 @@ tests locally. Commit messages must be single-line and follow existing style
 |                | wallets (Electrum backend)                                  |
 | bwk-sp         | Silent Payments account orchestrator (BIP352, Blindbit)     |
 | bwk-tx         | Transaction building, coin selection, fee estimation, PSBT  |
-| bwk-electrum   | Electrum protocol client (TCP/SSL)                          |
+| bwk-electrum   | Electrum protocol client (TCP/SSL), and the scan stores     |
+|                | (coins, txs, addresses, labels, headers)                    |
 | bwk-sign       | Hot signer, SigningManager for BIP32 key management         |
 | bwk-descriptor | Miniscript descriptor handling, SpkDerivator                |
 | bwk-keys       | Key derivation utilities (OXpriv, OXpub, KeyDerivator)      |
 | bwk-p2p        | Bitcoin P2P network client, DNS seed resolution             |
 | bwk-coin       | Coin domain types shared by bwk-tx and bwk-electrum         |
+| bwk-persist    | KV persistence: Store, RamStore, JSON/SQLite backends       |
+| bwk-hwi        | Hardware wallet transport and device drivers                |
 | bwk-error      | In-house derive for error impls, reached as `thiserror`     |
 | bwk-backoff    | Exponential backoff utility                                 |
 | bwk-utils      | Test helpers (behind `test` feature)                        |
@@ -81,10 +84,11 @@ Account (bwk/src/account.rs)
 
 ### Silent Payments Wallet (`bwk-sp`)
 ```
-Account (sp/src/account.rs)
+Account (sp/src/account/mod.rs)
 ├── SpReceiver - SP key management and scan matching
 ├── Blindbit transport - blockchain data via Blindbit oracle
-├── SpCoinStore, SpTxStore, SpLabelStore, ScanState
+├── SpCoinStore, SpTxStore, ScanState (bwk-sp's own)
+├── LabelStore (from bwk-electrum)
 └── Scanner thread (background block scanning)
 ```
 
@@ -129,7 +133,7 @@ Integration tests require the `test` feature flag which enables:
 - `bwk-tx/test`: TxBuilder test methods (fund_with_bitcoind, mark_tx_mined)
 
 Tests in `bwk/src/account.rs` use `electrsd` for regtest Electrum integration.
-Tests in `bwk-sp/tests/` use `blindbitd` for regtest Blindbit integration.
+Tests in `sp/tests/` use `blindbitd` for regtest Blindbit integration.
 
 ## External Dependencies
 

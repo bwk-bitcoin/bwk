@@ -1,7 +1,8 @@
-use std::{path::PathBuf, str::FromStr, sync::Arc};
+use std::{path::PathBuf, str::FromStr};
 
 use bwk_descriptor::descriptor::ScriptType;
-use bwk_persist::{self as persist, PersistenceBackend, PersistenceKind};
+use bwk_electrum::config::ScannerConfig;
+use bwk_persist::PersistenceKind;
 use bwk_sign::hot_signer::HotSigner;
 use miniscript::{bitcoin, Descriptor, DescriptorPublicKey};
 use serde::{Deserialize, Serialize};
@@ -38,24 +39,12 @@ fn base_dir() -> Option<PathBuf> {
 ///
 /// Lives on `Config` for backwards-compat with existing on-disk layouts;
 /// one could build its `FileConfigStore` path as
-/// `config.account_dir().join(Config::CONFIG_FILENAME)`.
+/// `config.scanner.account_dir().join(Config::CONFIG_FILENAME)`.
 pub const CONFIG_FILENAME: &str = "config.json";
-/// Filename for the binary `bwk_persist::HeaderBackend` cache under
-/// `Config::account_dir`. Headers are always binary-backed through
-/// `HeaderBackend`, independent of `persist_kind`; see the `header_store`
-/// module docs.
-pub const HEADERS_FILENAME: &str = "headers.bin";
-/// Logical store name for the bwk per-address-tip subscription map.
-/// Re-export of the canonical constant in [`bwk_persist`].
-pub const STATUSES_STORE_KEY: &str = bwk_persist::STATUSES_STORE_KEY;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const BASE_DIR_VAR_MISSING: &str = "HOME is unset or empty";
 #[cfg(target_os = "windows")]
 const BASE_DIR_VAR_MISSING: &str = "APPDATA is unset or empty";
-
-/// Row keys under the `account` store for the [`Tip`] singleton fields.
-const TIP_RECEIVE_ROW: &str = "receive_index";
-const TIP_CHANGE_ROW: &str = "change_index";
 
 /// Returns the OS-specific data directory under `dir_name`.
 ///
@@ -93,30 +82,15 @@ pub fn maybe_create_dir(dir: &PathBuf) {
 }
 
 /// Represents the configuration settings for the application.
+///
+/// Everything the scanner needs lives in [`Config::scanner`]; this struct adds
+/// only the wallet-level settings. The scanner half is flattened on the wire,
+/// so the serialized shape stays flat.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
-    #[serde(skip)]
-    pub data_dir: PathBuf,
-    #[serde(skip)]
-    pub dir_name: String,
-    pub account: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub electrum_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub electrum_port: Option<u16>,
-    #[serde(default)]
-    pub offline: Option<bool>,
-    pub network: bitcoin::Network,
-    pub look_ahead: u32,
+    #[serde(flatten)]
+    pub scanner: ScannerConfig,
     pub mnemonic: Option<String>,
-    pub descriptor: Descriptor<DescriptorPublicKey>,
-    pub persist: bool,
-    /// When true, the label store is not loaded from or persisted to disk.
-    /// Used by sp::Account to delegate label management to the parent's SpLabelStore.
-    #[serde(skip)]
-    pub skip_labels: bool,
-    #[serde(skip)]
-    pub persist_kind: PersistenceKind,
 }
 
 impl Config {
@@ -138,7 +112,7 @@ impl Config {
         script: ScriptType,
         data_dir: PathBuf,
         dir_name: String,
-        persist: bool,
+        persistence: Option<PersistenceKind>,
     ) -> Option<Config> {
         let descriptor = match script {
             ScriptType::Segwit(_) | ScriptType::Taproot(_) => {
@@ -152,33 +126,16 @@ impl Config {
             ScriptType::Descriptor(descriptor) => *descriptor,
         };
         Some(Config {
-            data_dir,
-            dir_name,
-            account,
-            electrum_url: None,
-            electrum_port: None,
-            network,
-            look_ahead: 20,
+            scanner: ScannerConfig::new(
+                descriptor,
+                data_dir,
+                dir_name,
+                account,
+                network,
+                persistence,
+            ),
             mnemonic,
-            descriptor,
-            persist,
-            persist_kind: PersistenceKind::default(),
-            offline: None,
-            skip_labels: false,
         })
-    }
-
-    /// Return the directory where this account's files (or SQLite DB) live.
-    pub fn account_dir(&self) -> PathBuf {
-        let mut dir = self.data_dir.clone();
-        dir.push(&self.dir_name);
-        dir.push(&self.account);
-        dir
-    }
-
-    /// Path to this account's binary header cache; see `HEADERS_FILENAME`.
-    pub fn headers_path(&self) -> PathBuf {
-        self.account_dir().join(HEADERS_FILENAME)
     }
 
     /// View of this config that's safe to persist to disk.
@@ -197,151 +154,43 @@ impl Config {
         }
     }
 
-    /// Construct the concrete persistence backend for this config.
-    ///
-    /// Returns [`NoopBackend`] when `persist` is false; otherwise a
-    /// [`JsonBackend`](bwk_persist::JsonBackend) rooted at
-    /// [`Config::account_dir`] when `persist_kind == Json`, or a
-    /// [`SqliteBackend`](bwk_persist::SqliteBackend) at
-    /// `{account_dir}/account.sqlite` when `persist_kind == Sqlite` (errors
-    /// if the `sqlite` feature is off).
-    pub fn build_backend(&self) -> Result<Arc<dyn PersistenceBackend>, persist::PersistError> {
-        let dir = self.account_dir();
-        persist::build_backend(self.persist.then_some(self.persist_kind), dir)
-    }
-    /// Allow to disable persistance of data, useful for tests
-    pub fn enable_persist(mut self, persist: bool) -> Self {
-        self.persist = persist;
-        self
-    }
-
-    /// Select the on-disk persistence backend (JSON default, or SQLite).
+    /// Select how this account persists, `None` disabling it entirely.
     ///
     /// Under [`PersistenceKind::Sqlite`], signer material (mnemonic / any
     /// private key) is never written to disk: not to `config.json`, not to
     /// the SQLite file, not to `.signers`. See [`bwk_persist`] for the
     /// full rule. Callers must re-supply the seed on the next run.
-    pub fn with_persist_kind(mut self, kind: PersistenceKind) -> Self {
-        self.persist_kind = kind;
+    pub fn with_persistence(mut self, persistence: Option<PersistenceKind>) -> Self {
+        self.scanner.persistence = persistence;
         self
     }
 
     /// Is this config configured to keep signer material out of on-disk
     /// writes?
     pub fn excludes_signer_data(&self) -> bool {
-        matches!(self.persist_kind, PersistenceKind::Sqlite)
+        matches!(self.scanner.persistence, Some(PersistenceKind::Sqlite))
     }
 
-    /// Returns the Electrum URL as a string.
-    pub fn electrum_url(&self) -> String {
-        self.electrum_url.clone().unwrap_or_default()
-    }
-    /// Returns the Electrum port as a string.
-    pub fn electrum_port(&self) -> String {
-        self.electrum_port
-            .map(|v| format!("{v}"))
-            .unwrap_or_default()
-    }
-    /// Returns the look-ahead value as a string.
-    pub fn look_ahead(&self) -> String {
-        self.look_ahead.to_string()
-    }
-    /// Returns the network as a `Network` instance.
-    pub fn network(&self) -> bitcoin::Network {
-        self.network
-    }
-    /// Sets the Electrum URL.
+    /// Sets the Electrum url.
     pub fn set_electrum_url(&mut self, url: String) {
-        self.electrum_url = Some(url);
+        let port = self.scanner.endpoint().port();
+        self.scanner.set_electrum(Some(url), port);
     }
     /// Sets the Electrum port from a string.
     pub fn set_electrum_port(&mut self, port: String) {
-        self.electrum_port = port.parse::<u16>().ok();
+        let url = self.scanner.endpoint().url().map(str::to_string);
+        self.scanner.set_electrum(url, port.parse::<u16>().ok());
     }
     /// Sets the look-ahead value from a string.
     pub fn set_look_ahead(&mut self, look_ahead: String) {
         if let Ok(la) = look_ahead.parse::<u32>() {
-            self.look_ahead = la;
+            self.scanner.look_ahead = la;
         }
-    }
-    /// Sets the network.
-    pub fn set_network(&mut self, network: bitcoin::Network) {
-        self.network = network;
     }
     /// Sets the mnemonic.
     pub fn set_mnemonic(&mut self, mnemonic: String) {
         self.mnemonic = Some(mnemonic);
     }
-    /// Sets the account name.
-    pub fn set_account(&mut self, name: String) {
-        self.account = name;
-    }
-    pub fn set_offline(&mut self, offline: bool) {
-        self.offline = Some(offline);
-    }
-    pub fn offline(&self) -> bool {
-        self.offline.unwrap_or(false)
-    }
-    pub fn dir_name(&self) -> &str {
-        &self.dir_name
-    }
-
-    pub fn data_dir(&self) -> PathBuf {
-        self.data_dir.clone()
-    }
-
-    /// Persists the tip information through the given backend.
-    ///
-    /// Writes two rows under the `account` store: `receive_index` and
-    /// `change_index`, each holding the JSON-encoded `u32`.
-    pub fn persist_tip(backend: &dyn PersistenceBackend, receive: u32, change: u32) {
-        let enc = |label: &str, v: u32| match serde_json::to_vec(&v) {
-            Ok(b) => Some(b),
-            Err(e) => {
-                log::error!("persist_tip encode {label}: {e}");
-                None
-            }
-        };
-        let recv_bytes = match enc("receive_index", receive) {
-            Some(b) => b,
-            None => return,
-        };
-        let chg_bytes = match enc("change_index", change) {
-            Some(b) => b,
-            None => return,
-        };
-        if let Err(e) =
-            backend.put_row(bwk_persist::ACCOUNT_STORE_KEY, TIP_RECEIVE_ROW, &recv_bytes)
-        {
-            log::error!("persist_tip put receive_index: {e}");
-            return;
-        }
-        if let Err(e) = backend.put_row(bwk_persist::ACCOUNT_STORE_KEY, TIP_CHANGE_ROW, &chg_bytes)
-        {
-            log::error!("persist_tip put change_index: {e}");
-        }
-    }
-
-    /// Retrieves the tip information through the given backend.
-    pub fn tip_from_backend(backend: &dyn PersistenceBackend) -> Tip {
-        let read = |row: &str| -> u32 {
-            match backend.get_row(bwk_persist::ACCOUNT_STORE_KEY, row) {
-                Ok(Some(bytes)) => serde_json::from_slice::<u32>(&bytes).unwrap_or_default(),
-                _ => 0,
-            }
-        };
-        Tip {
-            receive: read(TIP_RECEIVE_ROW),
-            change: read(TIP_CHANGE_ROW),
-        }
-    }
-}
-
-/// Represents the tip information for the current account.
-#[derive(Debug, Serialize, Deserialize, Default)]
-pub struct Tip {
-    pub receive: u32,
-    pub change: u32,
 }
 
 /// Checks if the provided descriptor string is valid.
@@ -372,20 +221,20 @@ pub mod tests {
             ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
             path.clone(),
             "wallet".to_string(),
-            true,
+            Some(PersistenceKind::Json),
         )
         .unwrap();
 
         let store: FileConfigStore<Config> =
-            FileConfigStore::new(cfg.account_dir().join(CONFIG_FILENAME));
+            FileConfigStore::new(cfg.scanner.account_dir().join(CONFIG_FILENAME));
         store.save(&cfg.for_persistence()).unwrap();
         let cfg2 = store.load().unwrap().expect("config persisted");
-        assert_eq!(cfg.account, cfg2.account);
-        assert_eq!(cfg2.account, "my_account");
+        assert_eq!(cfg.scanner.account, cfg2.scanner.account);
+        assert_eq!(cfg2.scanner.account, "my_account");
     }
 
     #[test]
-    fn set_electrum_url_keeps_hostname() {
+    fn set_electrum_url_sets_hostname() {
         let temp = temp_dir::TempDir::new().unwrap();
         let path = temp.child("storage");
         let mnemonic = bip39::Mnemonic::generate(12).unwrap();
@@ -396,13 +245,60 @@ pub mod tests {
             ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
             path,
             "wallet".to_string(),
-            true,
+            Some(PersistenceKind::Json),
         )
         .unwrap();
 
         cfg.set_electrum_url("electrum.pythcoiner.dev".to_string());
 
-        assert_eq!(cfg.electrum_url.unwrap(), "electrum.pythcoiner.dev");
+        assert_eq!(
+            cfg.scanner.endpoint().url(),
+            Some("electrum.pythcoiner.dev")
+        );
+    }
+
+    /// `scanner` is flattened, so the on-disk object must stay flat: no
+    /// `scanner` key, every scanner field at the top level.
+    #[test]
+    fn config_json_stays_flat() {
+        let temp = temp_dir::TempDir::new().unwrap();
+        let path = temp.child("storage");
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string();
+        let mut cfg = Config::new(
+            Some(mnemonic.clone()),
+            "alice".to_string(),
+            bitcoin::Network::Regtest,
+            ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
+            path,
+            "wallet".to_string(),
+            Some(PersistenceKind::Json),
+        )
+        .unwrap();
+        cfg.set_electrum_url("electrum.pythcoiner.dev".to_string());
+        cfg.set_electrum_port("50002".to_string());
+
+        let json = serde_json::to_string_pretty(&cfg).unwrap();
+        let expected = r#"{
+  "account": "alice",
+  "electrum_url": "electrum.pythcoiner.dev",
+  "electrum_port": 50002,
+  "stay_offline": false,
+  "network": "regtest",
+  "look_ahead": 20,
+  "descriptor": "wpkh([73c5da0a/84'/1'/0']tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M/<0;1>/*)#gwycrcrh",
+  "persistence": "json",
+  "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+}"#;
+        assert_eq!(json, expected);
+
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.scanner.account, "alice");
+        assert_eq!(back.scanner.network, bitcoin::Network::Regtest);
+        assert_eq!(back.scanner.look_ahead, 20);
+        assert_eq!(back.scanner.descriptor, cfg.scanner.descriptor);
+        assert_eq!(back.scanner.endpoint().port(), Some(50002));
+        assert_eq!(back.scanner.persistence, Some(PersistenceKind::Json));
+        assert_eq!(back.mnemonic, Some(mnemonic));
     }
 
     #[test]
@@ -417,10 +313,10 @@ pub mod tests {
             ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
             path.clone(),
             "wallet".to_string(),
-            true,
+            Some(PersistenceKind::Json),
         )
         .unwrap();
-        cfg.persist_kind = PersistenceKind::Sqlite;
+        cfg.scanner.persistence = Some(PersistenceKind::Sqlite);
 
         let view = cfg.for_persistence();
         assert!(
@@ -446,7 +342,7 @@ pub mod tests {
             ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
             path.clone(),
             "wallet".to_string(),
-            true,
+            Some(PersistenceKind::Json),
         )
         .unwrap();
 

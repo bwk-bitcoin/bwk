@@ -9,9 +9,9 @@ use std::{
 };
 
 use crate::{
-    account::Notification,
-    config::{Config, Tip},
-    profile::{DefaultBackend, RamProfile, StorageProfile},
+    config::Tip,
+    notification::Notification,
+    profile::{DefaultBackend, RamProfile, ScanProfile},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
@@ -33,23 +33,23 @@ pub struct AddressTip {
     pub change: u32,
 }
 
-pub struct ChangeTipUpdater<P: StorageProfile = RamProfile<DefaultBackend>>(
+pub struct ChangeTipUpdater<P: ScanProfile = RamProfile<DefaultBackend>>(
     Arc<Mutex<AddressStore<P>>>,
 );
 
-impl<P: StorageProfile> Clone for ChangeTipUpdater<P> {
+impl<P: ScanProfile> Clone for ChangeTipUpdater<P> {
     fn clone(&self) -> Self {
         ChangeTipUpdater(self.0.clone())
     }
 }
 
-impl<P: StorageProfile> ChangeTipUpdater<P> {
+impl<P: ScanProfile> ChangeTipUpdater<P> {
     pub fn new(store: Arc<Mutex<AddressStore<P>>>) -> Self {
         ChangeTipUpdater(store)
     }
 }
 
-impl<P: StorageProfile> ChangeTip for ChangeTipUpdater<P> {
+impl<P: ScanProfile> ChangeTip for ChangeTipUpdater<P> {
     fn next_index(&mut self) -> u32 {
         self.0.lock().expect("poisoned").next_change_index()
     }
@@ -69,7 +69,7 @@ impl<P: StorageProfile> ChangeTip for ChangeTipUpdater<P> {
 ///   tips changes.
 /// - `tx_listener`: Optional channel for sending address tip changes.
 /// - `look_ahead`: Number of addresses to generate ahead of the current tip.
-pub struct AddressStore<P: StorageProfile = RamProfile<DefaultBackend>> {
+pub struct AddressStore<P: ScanProfile = RamProfile<DefaultBackend>> {
     store: BTreeMap<ScriptBuf, AddressEntry>,
     recv_generated_tip: u32,
     change_generated_tip: u32,
@@ -77,11 +77,10 @@ pub struct AddressStore<P: StorageProfile = RamProfile<DefaultBackend>> {
     notification: mpsc::Sender<Notification>,
     tx_listener: Option<mpsc::Sender<AddressTip>>,
     look_ahead: u32,
-    config: Config,
     account_store: Arc<Mutex<P::AccountStore>>,
 }
 
-impl<P: StorageProfile> std::fmt::Debug for AddressStore<P> {
+impl<P: ScanProfile> std::fmt::Debug for AddressStore<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AddressStore")
             .field("store_len", &self.store.len())
@@ -94,15 +93,15 @@ impl<P: StorageProfile> std::fmt::Debug for AddressStore<P> {
 
 impl AddressStore<RamProfile<DefaultBackend>> {
     /// Convenience constructor for the default RAM profile: wraps a
-    /// noop-backed [`RamStore`] as the `AccountStore` so tests can use
-    /// `AddressStore::new(...)` without threading a full profile.
+    /// noop-backed [`RamStore`](bwk_persist::RamStore) as the `AccountStore`
+    /// so tests can use `AddressStore::new(...)` without threading a full
+    /// profile.
     pub fn new(
         derivator: SpkDerivator,
         notification: mpsc::Sender<Notification>,
         recv_tip: u32,
         change_tip: u32,
         look_ahead: u32,
-        config: Config,
     ) -> Self {
         use bwk_persist::{NoopBackend, RamStore};
         use std::sync::Arc;
@@ -119,23 +118,20 @@ impl AddressStore<RamProfile<DefaultBackend>> {
             recv_tip,
             change_tip,
             look_ahead,
-            config,
             account_store,
         )
     }
 }
 
-impl<P: StorageProfile> AddressStore<P> {
+impl<P: ScanProfile> AddressStore<P> {
     /// Creates a new `AddressStore` wrapping the given account-store
     /// `Arc<Mutex<_>>` (used to persist the `Tip` singleton).
-    #[allow(clippy::too_many_arguments)]
     pub fn with_account_store(
         derivator: SpkDerivator,
         notification: mpsc::Sender<Notification>,
         recv_tip: u32,
         change_tip: u32,
         look_ahead: u32,
-        config: Config,
         account_store: Arc<Mutex<P::AccountStore>>,
     ) -> Self {
         let mut store = Self {
@@ -146,7 +142,6 @@ impl<P: StorageProfile> AddressStore<P> {
             notification,
             tx_listener: None,
             look_ahead,
-            config,
             account_store,
         };
         store.populate_maybe();
@@ -176,7 +171,6 @@ impl<P: StorageProfile> AddressStore<P> {
             // fail to connect to electrum
             let _ = tx_listener.send(AddressTip { recv, change });
         }
-        let _ = &self.config;
         let mut store = self.account_store.lock().expect("poisoned");
         Tip::persist(
             &mut *store,
@@ -644,12 +638,10 @@ impl AddressEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bwk_descriptor::{derivator::SpkDerivator, descriptor::ScriptType, tr_path};
+    use bwk_descriptor::{derivator::SpkDerivator, tr_path};
     use bwk_sign::HotSigner;
     use bwk_tx::{ChangeRecipientProvider, FinalizationContext, PsbtOutputInfo, RecipientProvider};
     use miniscript::bitcoin::{bip32::ChildNumber, Network};
-    use miniscript::{Descriptor, DescriptorPublicKey};
-    use temp_dir::TempDir;
 
     fn test_derivator() -> SpkDerivator {
         let nw = Network::Regtest;
@@ -659,34 +651,18 @@ mod tests {
         SpkDerivator::new_tr(xpub, nw).unwrap()
     }
 
-    fn test_config(descriptor: Descriptor<DescriptorPublicKey>) -> Config {
-        let tmp = TempDir::new().expect("tempdir");
-        Config::new(
-            None, // no mnemonic needed with ScriptType::Descriptor
-            "test".to_string(),
-            Network::Regtest,
-            ScriptType::Descriptor(Box::new(descriptor)),
-            tmp.path().to_path_buf(),
-            "test".to_string(),
-            false, // don't persist
-        )
-        .expect("valid config")
-    }
-
     #[test]
     fn change_recipient_provider_tracks_correct_index() {
         let (tx, _rx) = mpsc::channel();
         let network = Network::Regtest;
         let derivator = test_derivator();
         let descriptor = derivator.descriptor();
-        let config = test_config(descriptor.clone());
 
         // Create AddressStore with change_generated_tip = 5
         let store = AddressStore::new(
             derivator, tx, 0,  // recv_tip
             5,  // change_tip - start at index 5
             20, // look_ahead
-            config,
         );
         let store = Arc::new(Mutex::new(store));
 
@@ -733,14 +709,11 @@ mod tests {
         // newly-generated receive address must still be returned.
         let (tx, _rx) = mpsc::channel();
         let derivator = test_derivator();
-        let descriptor = derivator.descriptor();
-        let config = test_config(descriptor);
 
         let mut store = AddressStore::new(
             derivator, tx, 0,  // recv_tip
             0,  // change_tip stays at 0
             20, // look_ahead
-            config,
         );
 
         // Generate a fresh receive address; this bumps recv_generated_tip to 1
@@ -764,10 +737,8 @@ mod tests {
         // the store, and a foreign script must be ignored, never panic.
         let (tx, _rx) = mpsc::channel();
         let derivator = test_derivator();
-        let descriptor = derivator.descriptor();
-        let config = test_config(descriptor);
 
-        let mut store = AddressStore::new(derivator.clone(), tx, 0, 0, 2, config);
+        let mut store = AddressStore::new(derivator.clone(), tx, 0, 0, 2);
 
         let high_index = store.change_watch_tip() + 5;
         let spk = derivator.change_at(high_index).script_pubkey();
@@ -804,9 +775,8 @@ mod tests {
         let network = Network::Regtest;
         let derivator = test_derivator();
         let descriptor = derivator.descriptor();
-        let config = test_config(descriptor.clone());
 
-        let store = AddressStore::new(derivator, tx, 0, 0, 20, config);
+        let store = AddressStore::new(derivator, tx, 0, 0, 20);
         let store = Arc::new(Mutex::new(store));
 
         let tip_updater = ChangeTipUpdater::new(store);

@@ -12,7 +12,7 @@ pub mod receiver;
 pub mod scan;
 mod thread_pool;
 
-pub use bwk::{self, label_store::LabelKey, Notification, SpNotification};
+pub use bwk;
 
 // Re-export external types for convenience
 pub use bitcoin;

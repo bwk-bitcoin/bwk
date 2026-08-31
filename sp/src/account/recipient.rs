@@ -459,7 +459,7 @@ fn batch_derive_sp_scripts(
 /// BIP32 sub-accounts so it can derive secret keys for mixed-input transactions.
 pub struct SpSecretProvider<
     P: crate::profile::SpStorageProfile = crate::profile::SpRamProfile<
-        crate::profile::DefaultBackend,
+        bwk::bwk_electrum::profile::DefaultBackend,
     >,
 > {
     coin_store: Arc<Mutex<SpCoinStore<P>>>,

@@ -4,7 +4,7 @@ use bwk_persist::{NoopBackend, PersistError, PersistenceBackend, RamStore, Store
 use miniscript::bitcoin::{self, address::NetworkUnchecked, OutPoint};
 use serde::{Deserialize, Serialize};
 
-use crate::profile::{DefaultBackend, RamProfile, StorageProfile};
+use crate::profile::{DefaultBackend, RamProfile, ScanProfile};
 
 /// Logical store name used by [`PersistenceBackend`] implementations for
 /// the bwk label store.
@@ -30,13 +30,13 @@ pub fn decode_label(bytes: &[u8]) -> Result<String, PersistError> {
     serde_json::from_slice(bytes).map_err(|e| PersistError::Serde(format!("decode label: {e}")))
 }
 
-/// A store for managing labels. Generic over any [`StorageProfile`];
+/// A store for managing labels. Generic over any [`ScanProfile`];
 /// internally wraps the profile's `LabelStore` slot (`P::LabelStore`).
-pub struct LabelStore<P: StorageProfile = RamProfile<DefaultBackend>> {
+pub struct LabelStore<P: ScanProfile = RamProfile<DefaultBackend>> {
     store: P::LabelStore,
 }
 
-impl<P: StorageProfile> std::fmt::Debug for LabelStore<P> {
+impl<P: ScanProfile> std::fmt::Debug for LabelStore<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LabelStore")
             .field("entries", &self.store.len().ok())
@@ -81,7 +81,7 @@ impl Default for LabelStore<RamProfile<DefaultBackend>> {
     }
 }
 
-impl<P: StorageProfile> LabelStore<P> {
+impl<P: ScanProfile> LabelStore<P> {
     /// Wrap any `P::LabelStore` impl produced by the profile.
     pub fn from_store(store: P::LabelStore) -> Self {
         Self { store }

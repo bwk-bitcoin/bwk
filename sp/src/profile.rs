@@ -1,7 +1,7 @@
 //! Storage profile for `bwk_sp::Account`.
 //!
 //! Names the two SP-specific stores (coins / SP txs). Labels are
-//! stored through [`bwk::LabelStore`] directly: silent-payment label
+//! stored through [`bwk::bwk_electrum::label_store::LabelStore`] directly: silent-payment label
 //! keys are a strict subset of bwk's `LabelKey` (no `Address` variant
 //! is ever produced by SP code paths), so a separate type would just
 //! duplicate the encode/decode plumbing.
@@ -9,11 +9,12 @@
 use std::marker::PhantomData;
 
 use bitcoin::{OutPoint, Txid};
-use bwk::persist::{PersistenceBackend, RamStore, Store};
+use bwk::{
+    bwk_electrum::profile::DefaultBackend,
+    persist::{PersistenceBackend, RamStore, Store},
+};
 
 use crate::account::{coin_store::SpCoinEntry, tx_store::SpTxEntry};
-
-pub use bwk::profile::DefaultBackend;
 
 /// Names the two SP-specific stores.
 pub trait SpStorageProfile: 'static + Send + Sync {

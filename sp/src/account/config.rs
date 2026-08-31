@@ -9,7 +9,10 @@ use std::{
 };
 
 use bitcoin::{bip32::ChildNumber, Network};
-use bwk::miniscript::{Descriptor, DescriptorPublicKey};
+use bwk::{
+    bwk_electrum::config::Endpoint,
+    miniscript::{Descriptor, DescriptorPublicKey},
+};
 use bwk_sign::{bwk_descriptor, HotSigner};
 use serde::{Deserialize, Serialize};
 
@@ -40,12 +43,11 @@ pub struct Config {
     // Backend
     /// Blindbit server URL for chain data
     pub blindbit_url: String,
-    /// Electrum server URL for broadcasting spends (blindbit is read-only).
-    #[serde(default)]
-    pub electrum_url: Option<String>,
-    /// Electrum server port for broadcasting spends.
-    #[serde(default)]
-    pub electrum_port: Option<u16>,
+    /// Electrum server used to broadcast spends (blindbit is read-only).
+    /// Private so [`Endpoint`] stays the only way to move it, see
+    /// [`Endpoint::set`].
+    #[serde(flatten)]
+    endpoint: Endpoint,
 
     // Persistence
     /// Base directory for account data
@@ -86,10 +88,9 @@ pub struct SubAccountConfig {
     /// mnemonics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mnemonic: Option<String>,
-    /// Electrum server URL (optional, offline if not set)
-    pub electrum_url: Option<String>,
-    /// Electrum server port
-    pub electrum_port: Option<u16>,
+    /// Electrum server this sub-account watches, offline while unset.
+    #[serde(flatten)]
+    pub endpoint: Endpoint,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -119,8 +120,7 @@ impl Config {
             scan_sk: None,
             spend_key: None,
             blindbit_url,
-            electrum_url: None,
-            electrum_port: None,
+            endpoint: Endpoint::default(),
             data_dir,
             persist: true,
             persist_kind: bwk::persist::PersistenceKind::default(),
@@ -170,8 +170,7 @@ impl Config {
             scan_sk: Some(scan_sk),
             spend_key: Some(spend_key),
             blindbit_url,
-            electrum_url: None,
-            electrum_port: None,
+            endpoint: Endpoint::default(),
             data_dir,
             persist: true,
             persist_kind: bwk::persist::PersistenceKind::default(),
@@ -223,18 +222,20 @@ impl Config {
         self.blindbit_url = url;
     }
 
-    /// Returns the Electrum broadcast endpoint, if both url and port are set.
-    pub fn electrum_endpoint(&self) -> Option<(&str, u16)> {
-        match (&self.electrum_url, self.electrum_port) {
-            (Some(url), Some(port)) => Some((url.as_str(), port)),
-            _ => None,
-        }
+    /// The Electrum server this account broadcasts through.
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
     }
 
-    /// Set the Electrum server endpoint used to broadcast spends.
+    /// Set the Electrum server endpoint used to broadcast spends, see
+    /// [`Endpoint::set`].
     pub fn set_electrum_endpoint(&mut self, url: String, port: u16) {
-        self.electrum_url = Some(url);
-        self.electrum_port = Some(port);
+        self.endpoint.set(Some(url), Some(port));
+    }
+
+    /// Forget the Electrum endpoint, see [`Endpoint::clear`].
+    pub fn clear_electrum_endpoint(&mut self) {
+        self.endpoint.clear();
     }
 
     /// Set the dust limit in satoshis.
@@ -332,8 +333,7 @@ impl Config {
         self.descriptors.push(SubAccountConfig {
             descriptor,
             mnemonic,
-            electrum_url: None,
-            electrum_port: None,
+            endpoint: Endpoint::default(),
         });
     }
 
@@ -461,7 +461,7 @@ mod tests {
 
         config.set_electrum_endpoint("electrum.pythcoiner.dev".to_string(), 50001);
 
-        assert_eq!(config.electrum_url.unwrap(), "electrum.pythcoiner.dev");
+        assert_eq!(config.endpoint().url(), Some("electrum.pythcoiner.dev"));
     }
 
     #[test]
@@ -478,8 +478,7 @@ mod tests {
             .to_string()
             .starts_with("wpkh("));
         assert!(config.descriptors[0].mnemonic.is_none());
-        assert!(config.descriptors[0].electrum_url.is_none());
-        assert!(config.descriptors[0].electrum_port.is_none());
+        assert!(config.descriptors[0].endpoint.server().is_none());
     }
 
     #[test]
@@ -496,8 +495,7 @@ mod tests {
             .to_string()
             .starts_with("tr("));
         assert!(config.descriptors[0].mnemonic.is_none());
-        assert!(config.descriptors[0].electrum_url.is_none());
-        assert!(config.descriptors[0].electrum_port.is_none());
+        assert!(config.descriptors[0].endpoint.server().is_none());
     }
 
     #[test]

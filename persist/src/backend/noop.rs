@@ -1,13 +1,13 @@
 //! No-op backend: discards writes, reads always return absent.
 //!
-//! Used when persistence is disabled (e.g. `Config::enable_persist(false)`
+//! Used when persistence is disabled (e.g. `Config::with_persistence(None)`
 //! or tests).
 
 use super::PersistenceBackend;
 use crate::PersistError;
 
 /// A backend that discards all writes and reads as absent. Used when
-/// persistence is disabled (e.g. `Config::enable_persist(false)` or tests).
+/// persistence is disabled (e.g. `Config::with_persistence(None)` or tests).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopBackend;
 

@@ -20,6 +20,8 @@
 use std::time::{Duration, Instant};
 
 use bwk_sp::bitcoin;
+#[cfg(not(feature = "instrumentation"))]
+use bwk_sp::bwk::bwk_electrum::notification::{Notification, SpNotification};
 
 /// How often a progress line is printed.
 const PRINT_INTERVAL_SECS: f64 = 1.0;
@@ -501,7 +503,9 @@ mod instrumented {
             tx_store: Arc::new(Mutex::new(bwk_sp::account::tx_store::SpTxStore::new())),
             scan_state: Arc::new(Mutex::new(bwk_sp::scan::state::ScanState::new(start))),
             sender: _sender,
-            header_store: bwk::header_store::HeaderStore::new_in_memory(params.network),
+            header_store: bwk::bwk_electrum::header_store::HeaderStore::new_in_memory(
+                params.network,
+            ),
         };
         // Seed one synthetic owned outpoint at the first scanned height so the spend
         // (input) sweep always runs over every block, process_spends short-circuits on an
@@ -1114,7 +1118,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     while let Ok(notif) = rx.recv() {
         match notif {
-            bwk_sp::Notification::Sp(bwk_sp::SpNotification::ScanStarted { start, end }) => {
+            Notification::Sp(SpNotification::ScanStarted { start, end }) => {
                 block_count = u64::from(end - start + 1);
                 scan_start = Some(Instant::now());
                 last_print = Instant::now();
@@ -1127,36 +1131,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  dust limit:   {dust} sat");
                 println!("scanning (real Account, OneShot)...");
             }
-            bwk_sp::Notification::Sp(bwk_sp::SpNotification::ScanReceiveProgress {
-                current,
-                end,
-            }) => report_progress(
-                "recv ",
-                current,
-                end,
-                scan_start,
-                block_count,
-                &mut last_print,
-            ),
-            bwk_sp::Notification::Sp(bwk_sp::SpNotification::ScanSpendProgress {
-                current,
-                end,
-            }) => report_progress(
-                "spend",
-                current,
-                end,
-                scan_start,
-                block_count,
-                &mut last_print,
-            ),
-            bwk_sp::Notification::Sp(bwk_sp::SpNotification::ScanCompleted) => {
+            Notification::Sp(SpNotification::ScanReceiveProgress { current, end }) => {
+                report_progress(
+                    "recv ",
+                    current,
+                    end,
+                    scan_start,
+                    block_count,
+                    &mut last_print,
+                )
+            }
+            Notification::Sp(SpNotification::ScanSpendProgress { current, end }) => {
+                report_progress(
+                    "spend",
+                    current,
+                    end,
+                    scan_start,
+                    block_count,
+                    &mut last_print,
+                )
+            }
+            Notification::Sp(SpNotification::ScanCompleted) => {
                 if let Some(t0) = scan_start {
                     elapsed = t0.elapsed();
                 }
                 break;
             }
-            bwk_sp::Notification::Sp(bwk_sp::SpNotification::FailStartScanning { message })
-            | bwk_sp::Notification::Sp(bwk_sp::SpNotification::FailScan { message }) => {
+            Notification::Sp(SpNotification::FailStartScanning { message })
+            | Notification::Sp(SpNotification::FailScan { message }) => {
                 return Err(format!("scan failed: {message}").into());
             }
             _ => {}

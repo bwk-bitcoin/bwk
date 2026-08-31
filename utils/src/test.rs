@@ -1,3 +1,5 @@
+pub mod regtest;
+
 use std::{
     env,
     ops::{Deref, DerefMut},

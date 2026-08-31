@@ -5,9 +5,12 @@
 use std::{str::FromStr, sync::Arc};
 
 use bitcoin::{Transaction, Txid};
-use bwk::persist::{NoopBackend, PersistError, PersistenceBackend, RamStore, Store};
+use bwk::{
+    bwk_electrum::profile::DefaultBackend,
+    persist::{NoopBackend, PersistError, PersistenceBackend, RamStore, Store},
+};
 
-use crate::profile::{DefaultBackend, SpRamProfile, SpStorageProfile};
+use crate::profile::{SpRamProfile, SpStorageProfile};
 use serde::{Deserialize, Serialize};
 
 pub const STORE_KEY: &str = bwk::persist::TXS_STORE_KEY;
