@@ -609,7 +609,7 @@ impl<P: ScanProfile> CoinStore<P> {
             for txid in diff.removed.keys() {
                 store.remove(txid);
             }
-            // Reset to Unconfirmed; re-claim handled in resolve_reported_heights.
+            // Reset to Unconfirmed; the re-claim is queued by record_reported_heights.
             for txid in diff.changed.keys() {
                 store.update_inclusion(txid, Inclusion::Unconfirmed);
             }
@@ -617,7 +617,7 @@ impl<P: ScanProfile> CoinStore<P> {
 
         // A demoted tx must not keep a stale pending claim, or a later CTA
         // would re-promote it at the old height. Still-confirmed txs are
-        // re-queued by resolve_reported_heights in the same history pass.
+        // re-queued by record_reported_heights in the same history pass.
         for txid in diff.changed.keys() {
             self.drop_all_pending_claims(txid);
         }
@@ -1028,23 +1028,6 @@ impl<P: ScanProfile> CoinStore<P> {
             .insert(claim.txid);
     }
 
-    /// Queue server-reported heights without promoting against the header store.
-    pub fn queue_reported_heights(&mut self, reported: &[ClaimAt]) -> bool {
-        let before = self.pending_claims.clone();
-        for &claim in reported {
-            self.prune_pending_claim(claim);
-            match self
-                .tx_store
-                .get(&claim.txid)
-                .map(|e| e.inclusion().clone())
-            {
-                Some(Inclusion::Unconfirmed) | None => self.insert_pending_claim(claim),
-                Some(_) => {}
-            }
-        }
-        before != self.pending_claims
-    }
-
     /// Drops `keep.txid` from every pending-claim height set other than
     /// `keep.height`. A reorg can re-report the same tx at a new height;
     /// this keeps at most one pending claim per txid so a later CTA never
@@ -1124,15 +1107,13 @@ impl<P: ScanProfile> CoinStore<P> {
         to_fetch.push(claim);
     }
 
-    /// Promote server-reported `(txid, height)` claims with a known header,
-    /// queue the rest in `pending_claims`. The caller persists, regenerates
-    /// and dispatches the returned fetches.
-    pub fn resolve_reported_heights(
-        &mut self,
-        header_store: &HeaderStore<P::HeaderStore>,
-        reported: &[ClaimAt],
-    ) -> ChainUpdateOutcome {
-        let mut to_fetch: Vec<ClaimAt> = Vec::new();
+    /// Queue every server-reported `(txid, height)` claim in
+    /// `pending_claims`. The scanner has no view of the validated chain, so
+    /// promotion is left to the reconciler's
+    /// [`resolve_pending_claims`](Self::resolve_pending_claims) pass. Returns
+    /// whether the queue changed.
+    pub fn record_reported_heights(&mut self, reported: &[ClaimAt]) -> bool {
+        let before = self.pending_claims.clone();
         for &ClaimAt { txid, height } in reported {
             // `reported` carries EVERY confirmed tx in each scripthash history,
             // not just the ones whose height changed. This pass is promote-only:
@@ -1140,7 +1121,6 @@ impl<P: ScanProfile> CoinStore<P> {
             // by history (`update_spk_history` resets changed txs to Unconfirmed),
             // so a tx already ConfirmedUnverified or Verified is left untouched.
             let current = self.tx_store.get(&txid).map(|e| e.inclusion().clone());
-            let have_header = header_store.block_hash(height);
 
             // Invariant: a txid has AT MOST ONE pending claim, its latest
             // server-reported height. A reorg can re-report the same tx at a
@@ -1148,8 +1128,8 @@ impl<P: ScanProfile> CoinStore<P> {
             // would linger and, because `on_chain_update` iterates ascending,
             // promote the tx to the wrong (lower) height, wedging it
             // ConfirmedUnverified forever (its merkle proof at the old height
-            // fails). So before inserting/queueing this claim, drop `txid` from
-            // every OTHER height-set.
+            // fails). So before queueing this claim, drop `txid` from every
+            // OTHER height-set.
             //
             // (A tx fully removed from the chain, `diff.removed` -> `store.remove`,
             // is not re-reported here and so keeps its stale pending entry until
@@ -1158,20 +1138,7 @@ impl<P: ScanProfile> CoinStore<P> {
             self.prune_pending_claim(ClaimAt { txid, height });
 
             match current {
-                // Unconfirmed with a known header: promote and fetch its proof.
-                Some(Inclusion::Unconfirmed) if have_header.is_some() => {
-                    let block_hash = have_header.expect("header present");
-                    Self::promote_claim(
-                        &mut self.tx_store,
-                        &mut self.merkle_in_flight,
-                        &txid,
-                        height,
-                        block_hash,
-                        &mut to_fetch,
-                    );
-                }
-                // Unconfirmed but no header yet, or tx not in the store yet:
-                // queue the claim for a future CTA to promote.
+                // Unconfirmed, or the tx bytes have not landed yet.
                 Some(Inclusion::Unconfirmed) | None => {
                     self.insert_pending_claim(ClaimAt { txid, height });
                 }
@@ -1179,8 +1146,7 @@ impl<P: ScanProfile> CoinStore<P> {
                 Some(_) => {}
             }
         }
-        let changed = !to_fetch.is_empty();
-        ChainUpdateOutcome { to_fetch, changed }
+        before != self.pending_claims
     }
 
     /// Re-queue the merkle fetch of every still-`ConfirmedUnverified` entry
@@ -1531,7 +1497,7 @@ impl CoinEntry {
     /// Returns the derivation path associated with the coin.
     ///
     /// # Returns
-    /// A tuple containing the `AddrAccount` and the index of the coin's derivation path.
+    /// A tuple containing the `KeyChain` and the index of the coin's derivation path.
     /// Returns `None` for non-descriptor coins (e.g., Silent Payment coins).
     pub fn deriv(&self) -> Option<(KeyChain, u32)> {
         match &self.coin.spend_info {
@@ -1990,12 +1956,11 @@ mod tests {
         let txid = tx.compute_txid();
         cs.tx_store.update(crate::tx_store::TxEntry::for_test(tx));
 
-        // Server reports the tx confirmed at height H. With no synced header,
-        // resolve_reported_heights queues it and leaves it Unconfirmed.
+        // Server reports the tx confirmed at height H. The scan only queues
+        // the claim, leaving the tx Unconfirmed.
         let height = 200u32;
         cs.update_spk_history(spk.clone(), vec![(txid, Some(height as u64))]);
-        let no_header = HeaderStore::new_in_memory(bitcoin::Network::Regtest);
-        cs.resolve_reported_heights(&no_header, &[ClaimAt { txid, height }]);
+        cs.record_reported_heights(&[ClaimAt { txid, height }]);
         assert!(cs
             .pending_claims_snapshot()
             .get(&height)

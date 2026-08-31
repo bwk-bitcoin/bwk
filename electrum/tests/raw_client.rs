@@ -6,21 +6,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-mod common;
-
 use bwk_electrum::{
     electrum::{request::Request, response::*},
     raw_client::Client,
 };
-use bwk_utils::test::electrsd::bitcoind::bitcoincore_rpc::RpcApi;
+use bwk_utils::test::{regtest::bootstrap_electrs, TestBitcoinD};
+use electrsd::{bitcoind::bitcoincore_rpc::RpcApi, ElectrsD};
 use miniscript::bitcoin::{hex::FromHex, OutPoint, Script};
 use serde_json::Value;
 
-use bwk_utils::test::TestBitcoinD;
-use common::bootstrap_electrs;
-
-fn tcp_client() -> (Client, bwk_utils::test::electrsd::ElectrsD, TestBitcoinD) {
-    let (url, port, electrs, bitcoind) = bootstrap_electrs(false);
+fn tcp_client() -> (Client, ElectrsD, TestBitcoinD) {
+    let (url, port, electrs, bitcoind) = bootstrap_electrs();
     let mut c = Client::new().tcp(&url, port);
     c.try_connect(None).unwrap();
     (c, electrs, bitcoind)

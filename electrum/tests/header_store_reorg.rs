@@ -29,7 +29,7 @@ fn drain(rx: &mpsc::Receiver<()>, timeout: Duration) -> usize {
 
 #[test]
 fn header_store_follows_tip_and_resolves_reorg() {
-    let (url, port, _electrsd, bitcoind) = bootstrap_electrs(false);
+    let (url, port, _electrsd, bitcoind) = bootstrap_electrs();
     let base_height = get_block_height(&bitcoind);
 
     let tmp = TempDir::new().unwrap();
@@ -37,7 +37,7 @@ fn header_store_follows_tip_and_resolves_reorg() {
 
     let store =
         HeaderStore::start(url, port, Network::Regtest, Some(path), Some(base_height)).unwrap();
-    let rx = store.register();
+    let rx = store.register_chain_tick();
 
     // Wait for the worker to backfill up to the current tip.
     assert!(

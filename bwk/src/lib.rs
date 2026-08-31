@@ -9,7 +9,6 @@ pub use profile::StorageProfile;
 pub use sync::SyncEstimator;
 
 pub use account::Account;
-pub use bwk_electrum::{parse_electrum_url, ElectrumScheme};
 pub use config::Config;
 
 // Re-exports

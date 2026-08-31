@@ -6,8 +6,7 @@
 use std::sync::Arc;
 
 use bwk_electrum::profile::{
-    decode_status_key, decode_status_value, encode_status_key, encode_status_value,
-    open_ram_stores, DefaultBackend, RamProfile, ScanProfile,
+    DefaultBackend, OpenScanFromBackend, RamProfile, ScanProfile, ScanStores,
 };
 use bwk_persist::{PersistError, PersistenceBackend, RamStore, Store};
 use bwk_sign::{
@@ -16,7 +15,7 @@ use bwk_sign::{
     },
     JsonSigner,
 };
-use miniscript::bitcoin::{bip32, block::Header};
+use miniscript::bitcoin::bip32;
 
 /// A [`ScanProfile`] that also stores signers.
 pub trait StorageProfile: ScanProfile {
@@ -29,17 +28,9 @@ impl<B: PersistenceBackend + Clone + 'static> StorageProfile for RamProfile<B> {
 
 /// The scanning stores plus the signer store.
 pub struct Stores<P: StorageProfile> {
-    pub tx: P::TxStore,
-    pub label: P::LabelStore,
-    pub statuses: P::StatusesStore,
-    pub account: P::AccountStore,
+    pub scan: ScanStores<P>,
     pub signers: P::SignerStore,
 }
-
-/// Reopens the statuses store from the backend, the fallback an account takes
-/// when a panicked listener could not hand its own store back.
-pub type ReopenStatuses<P> =
-    Arc<dyn Fn() -> Result<<P as ScanProfile>::StatusesStore, PersistError> + Send + Sync>;
 
 /// Profiles that can open their full store bundle from a pair of backends.
 ///
@@ -47,19 +38,11 @@ pub type ReopenStatuses<P> =
 /// [`bwk_persist::PersistenceKind::Sqlite`] the caller passes
 /// [`bwk_persist::NoopBackend`] so signer state never reaches the database;
 /// otherwise both arguments are the same handle.
-pub trait OpenFromBackend:
-    StorageProfile<HeaderStore = RamStore<DefaultBackend, u32, [u8; Header::SIZE]>> + Sized
-{
+pub trait OpenFromBackend: StorageProfile + OpenScanFromBackend {
     fn open(
         backend: Arc<dyn PersistenceBackend>,
         secrets_backend: Arc<dyn PersistenceBackend>,
     ) -> Result<Stores<Self>, PersistError>;
-
-    /// Reopen just the statuses store, the recovery path when a panicked
-    /// listener thread cannot hand its store back.
-    fn open_statuses(
-        backend: Arc<dyn PersistenceBackend>,
-    ) -> Result<Self::StatusesStore, PersistError>;
 }
 
 impl OpenFromBackend for RamProfile<DefaultBackend> {
@@ -67,12 +50,8 @@ impl OpenFromBackend for RamProfile<DefaultBackend> {
         backend: Arc<dyn PersistenceBackend>,
         secrets_backend: Arc<dyn PersistenceBackend>,
     ) -> Result<Stores<Self>, PersistError> {
-        let ram = open_ram_stores(backend)?;
         Ok(Stores {
-            tx: ram.tx,
-            label: ram.label,
-            statuses: ram.statuses,
-            account: ram.account,
+            scan: <Self as OpenScanFromBackend>::open(backend)?,
             signers: RamStore::open(
                 secrets_backend,
                 bwk_persist::SIGNERS_STORE_KEY,
@@ -82,18 +61,5 @@ impl OpenFromBackend for RamProfile<DefaultBackend> {
                 decode_json_signer,
             )?,
         })
-    }
-
-    fn open_statuses(
-        backend: Arc<dyn PersistenceBackend>,
-    ) -> Result<Self::StatusesStore, PersistError> {
-        RamStore::open(
-            backend,
-            bwk_persist::STATUSES_STORE_KEY,
-            encode_status_key,
-            decode_status_key,
-            encode_status_value,
-            decode_status_value,
-        )
     }
 }

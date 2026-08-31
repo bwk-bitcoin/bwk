@@ -236,7 +236,7 @@ impl<P: ScanProfile> TxStore<P> {
             // The txid may not be in the store yet: a History response can
             // report a height change for a tx whose body has not arrived via
             // the `Txs` round-trip. It will get the correct inclusion once its
-            // entry lands and `resolve_reported_heights` re-claims it, so this
+            // entry lands and its queued claim resolves, so this
             // is a no-op rather than a panic (which would kill the listener).
             Ok(false) => log::debug!("TxStore::update_inclusion: missing txid {txid}"),
             Err(e) => log::error!("TxStore::update_inclusion: {e}"),

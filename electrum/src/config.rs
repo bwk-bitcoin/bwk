@@ -9,6 +9,7 @@ use std::{path::PathBuf, sync::Arc};
 use miniscript::{Descriptor, DescriptorPublicKey};
 use serde::{Deserialize, Serialize};
 
+use bwk_descriptor::{derivator, descriptor::DescriptorDerivator};
 use bwk_persist::{PersistError, PersistenceBackend, PersistenceKind};
 
 /// Filename for the binary header cache under [`ScannerConfig::account_dir`].
@@ -119,6 +120,14 @@ impl ScannerConfig {
         }
     }
 
+    /// Check the descriptor is one the scan can derive from: multipath,
+    /// unhardened, wildcarded and on `network`. Callers run it before opening
+    /// any store, so a descriptor the derivator rejects errors out instead of
+    /// panicking once the coin store is built.
+    pub fn validate_descriptor(&self) -> Result<(), derivator::Error> {
+        self.descriptor.spk_derivator(self.network).map(|_| ())
+    }
+
     /// Open the persistence backend this config selects, rooted at
     /// [`ScannerConfig::account_dir`]. `NoopBackend` when `persistence` is
     /// `None`.
@@ -153,11 +162,6 @@ impl ScannerConfig {
         dir.push(&self.dir_name);
         dir.push(&self.account);
         dir
-    }
-
-    /// This account's binary header cache.
-    pub fn headers_path(&self) -> PathBuf {
-        self.account_dir().join(HEADERS_FILENAME)
     }
 
     pub fn stay_offline(&self) -> bool {

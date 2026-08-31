@@ -8,36 +8,52 @@ High-level account orchestrator that ties together UTXO tracking, address
 generation, transaction history, and labels. Handles background sync with
 Electrum server and emits notifications on state changes.
 
-**Scope:** Account lifecycle, stores (coins/txs/addresses/labels), Electrum
-sync thread, change address management. Does NOT handle signing (use bwk-sign)
-or transaction construction (use bwk-tx).
+**Scope:** Account lifecycle, pairing an `ElectrumScanner` with a `HeaderStore`
+and reconciling them, signer management, change address management. The stores
+and the sync thread live in bwk-electrum. Does NOT handle signing itself (use
+bwk-sign) or transaction construction (use bwk-tx).
 
 ## Usage
 
 ```rust
-use bwk::{Account, Config};
-use miniscript::bitcoin::Network;
+use bwk::{
+    bwk_descriptor::descriptor::ScriptType,
+    bwk_electrum::notification::{Notification, TxListenerNotif},
+    miniscript::bitcoin::{bip32::ChildNumber, Network},
+    persist::PersistenceKind,
+    Account, Config,
+};
 
-// Create account from descriptor
-let config = Config::new(descriptor, Network::Regtest)
-    .electrum("ssl://127.0.0.1", 50001)
-    .data_dir(data_path);
-let mut account = Account::try_new(config).expect("failed to open account");
+// An account derived from `mnemonic`, persisted as JSON under
+// `data_dir/.bwk/my_account`. `ScriptType::Descriptor` takes a descriptor
+// instead, and then no mnemonic is needed.
+let mut config = Config::new(
+    Some(mnemonic),
+    "my_account".to_string(),
+    Network::Regtest,
+    ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
+    data_dir,
+    ".bwk".to_string(),
+    Some(PersistenceKind::Json),
+)
+.expect("a Segwit account needs a mnemonic");
+config.set_electrum_url("127.0.0.1".to_string());
+config.set_electrum_port("50001".to_string());
 
-// Take notification receiver (can only be called once)
-let receiver = account.receiver().unwrap();
+// Opening with an endpoint configured connects and starts syncing;
+// `stop_electrum` / `start_electrum` idle and resume it afterwards.
+let mut account: Account = Account::try_new(config).expect("failed to open account");
 
-// Start Electrum sync
-account.start();
+// Take the notification receiver (only the first call returns it).
+let receiver = account.receiver().expect("receiver");
 
-// Handle notifications
-loop {
-    match receiver.recv() {
-        Ok(Notification::CoinUpdate) => {
-            let state = account.coin_state();
-            println!("Balance: {}", state.confirmed_balance);
+for notification in receiver {
+    match notification {
+        Notification::CoinUpdate => {
+            let state = account.spendable_coins();
+            println!("confirmed balance: {}", state.confirmed_balance);
         }
-        Ok(Notification::Stopped) => break,
+        Notification::Electrum(TxListenerNotif::Stopped) => break,
         _ => {}
     }
 }
@@ -45,18 +61,30 @@ loop {
 
 ## Architecture
 
+`Account` owns two independent halves and reconciles them. The scanner records
+what the server reports; the header store validates the chain and fetches
+inclusion proofs. Neither knows about the other, and only the reconcile pass
+touches both. Three Electrum connections in total: one for the scanner, two for
+the header store, because `Client::listen_headers` and `Client::listen_txs`
+each consume the `Client`, so a connection hosts exactly one typed listener.
+
 ```
-Electrum server
-     │
-     ▼
-listen_txs() thread ◄──► AddressStore (watch tip updates)
-     │
-     ▼
-CoinStore.handle_history_response() / handle_txs_response()
-     │
-     ▼
-TxStore (raw txs + metadata)
-     │
+Electrum server              Electrum server          Electrum server
+     │  (scanner conn)            │  (header conn)         │  (merkle conn)
+     ▼                            ▼                        ▼
+listen_txs() thread          HeaderStore worker       merkle client
+     │  ◄──► AddressStore         │                        │
+     ▼                            ▼                        ▼
+CoinStore.handle_history_    validated header chain   MerkleProof
+  response()                      │                        │
+CoinStore.handle_txs_             └────────────────────────┘
+  response()                                  │
+CoinStore.record_reported_                    │
+  heights()                                   │
+     │                                        │
+     ▼                                        ▼
+TxStore (raw txs + metadata)  ◄──── Account reconcile thread
+     │                                (promote, verify, stamp times)
      ▼
 CoinStore.generate() ──► coins cache + address statuses
      │

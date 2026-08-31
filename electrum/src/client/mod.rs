@@ -32,7 +32,8 @@ use tx_listener::listen_txs;
 const SEND_MAX_RETRIES: usize = 3;
 const SEND_RETRY_DELAY: Duration = Duration::from_millis(300);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const MERKLE_HASH_BYTES: usize = 32;
+/// Length of one merkle branch sibling.
+pub const MERKLE_HASH_BYTES: usize = 32;
 const SHORT_HEX_BYTES: usize = 8;
 
 #[derive(Debug, thiserror::Error)]

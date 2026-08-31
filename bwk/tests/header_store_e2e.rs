@@ -124,7 +124,7 @@ where
 #[test]
 fn multi_account_shared_header_store() {
     init_logger();
-    let (url, port, _electrsd, bitcoind) = bootstrap_electrs(false);
+    let (url, port, _electrsd, bitcoind) = bootstrap_electrs();
 
     let header_store = HeaderStore::start(url.clone(), port, Network::Regtest, None, None).unwrap();
 
@@ -274,7 +274,7 @@ fn multi_account_shared_header_store() {
 #[test]
 fn reorg_reconfirms_verified() {
     init_logger();
-    let (url, port, _electrsd, bitcoind) = bootstrap_electrs(false);
+    let (url, port, _electrsd, bitcoind) = bootstrap_electrs();
 
     let header_store = HeaderStore::start(url.clone(), port, Network::Regtest, None, None).unwrap();
 
@@ -389,7 +389,7 @@ fn reorg_reconfirms_verified() {
 #[test]
 fn restart_requeues_stranded_merkle_fetch() {
     init_logger();
-    let (url, port, electrsd, bitcoind) = bootstrap_electrs(false);
+    let (url, port, electrsd, bitcoind) = bootstrap_electrs();
 
     let header_store = HeaderStore::start(url.clone(), port, Network::Regtest, None, None).unwrap();
     let chain_tip = get_block_height(&bitcoind);
@@ -445,7 +445,7 @@ fn restart_requeues_stranded_merkle_fetch() {
 #[test]
 fn sparse_anchor_above_retarget_boundary_syncs_and_verifies() {
     init_logger();
-    let (url, port, _electrsd, bitcoind) = bootstrap_electrs(false);
+    let (url, port, _electrsd, bitcoind) = bootstrap_electrs();
 
     // Mine past 2 * 2016 blocks in chunks (single huge generatetoaddress
     // calls can hit the RPC timeout).

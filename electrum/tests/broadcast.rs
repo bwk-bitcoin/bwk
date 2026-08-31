@@ -1,18 +1,15 @@
-mod common;
-
 use bwk_electrum::client::{Client, Error};
+use bwk_utils::test::regtest::bootstrap_electrs;
 use miniscript::bitcoin::{
     self, absolute, transaction, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
-
-use common::bootstrap_electrs;
 
 /// A tx referencing a non-existent UTXO triggers `Response::Error` from electrs;
 /// the new `broadcast_tx` must map that to `Error::Rejected` rather than the
 /// opaque `Error::WrongResponse` returned by `broadcast`.
 #[test]
 fn broadcast_tx_rejection_is_typed() {
-    let (url, port, _electrs, _bitcoind) = bootstrap_electrs(false);
+    let (url, port, _electrs, _bitcoind) = bootstrap_electrs();
     let mut client = Client::new(&url, port).expect("connect");
 
     // Random outpoint guaranteed not to exist on regtest.

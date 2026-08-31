@@ -1,16 +1,19 @@
-mod common;
-
 use bwk_electrum::client::Client;
-use bwk_utils::test::{
-    electrsd::bitcoind::bitcoincore_rpc::{self, RpcApi},
-    wait_electrs_tip,
+use bwk_utils::test::{regtest::bootstrap_electrs_with_args, wait_electrs_tip, TestBitcoinD};
+use electrsd::{
+    bitcoind::bitcoincore_rpc::{self, RpcApi},
+    ElectrsD,
 };
 use miniscript::bitcoin::{
     self, absolute, transaction, Address, Amount, Network, OutPoint, Psbt, ScriptBuf, Sequence,
     Transaction, TxIn, TxOut, Witness,
 };
 
-use common::bootstrap_electrs;
+/// `-txindex`, so the node hands back any raw tx by txid and not only the ones
+/// its own wallet holds.
+fn bootstrap_electrs() -> (String, u16, ElectrsD, TestBitcoinD) {
+    bootstrap_electrs_with_args(&["-txindex"])
+}
 
 fn rpc_address(rpc: &bitcoincore_rpc::Client) -> Address {
     let raw: String = rpc.call("getnewaddress", &[]).unwrap();
@@ -26,7 +29,7 @@ fn mine_to_address(rpc: &bitcoincore_rpc::Client, n: u64, addr: &Address) {
 
 #[test]
 fn validate_psbt_reports_reused_output() {
-    let (url, port, electrs, bitcoind) = bootstrap_electrs(true);
+    let (url, port, electrs, bitcoind) = bootstrap_electrs();
     let rpc = &bitcoind.client;
 
     let addr = rpc_address(rpc);
@@ -59,7 +62,7 @@ fn validate_psbt_reports_reused_output() {
 
 #[test]
 fn validate_psbt_clean_when_no_history() {
-    let (url, port, electrs, bitcoind) = bootstrap_electrs(true);
+    let (url, port, electrs, bitcoind) = bootstrap_electrs();
     let rpc = &bitcoind.client;
 
     let addr = rpc_address(rpc);
@@ -88,7 +91,7 @@ fn validate_psbt_clean_when_no_history() {
 
 #[test]
 fn validate_psbt_skips_op_return() {
-    let (url, port, _electrs, _bitcoind) = bootstrap_electrs(true);
+    let (url, port, _electrs, _bitcoind) = bootstrap_electrs();
     let mut client = Client::new(&url, port).expect("connect");
 
     use bitcoin::script::PushBytesBuf;
@@ -112,7 +115,7 @@ fn validate_psbt_reports_spent_input() {
     use bitcoin::consensus::encode::deserialize as consensus_deserialize;
     use hex_conservative::FromHex;
 
-    let (url, port, electrs, bitcoind) = bootstrap_electrs(true);
+    let (url, port, electrs, bitcoind) = bootstrap_electrs();
     let rpc = &bitcoind.client;
 
     let mining_addr = rpc_address(rpc);

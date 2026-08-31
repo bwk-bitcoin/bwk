@@ -162,9 +162,14 @@ pub struct RamStores<B: PersistenceBackend + Clone + 'static> {
     pub account: RamStore<B, String, Vec<u8>>,
 }
 
+/// Reopens the statuses store from the backend, the fallback a scanner takes
+/// when a panicked listener could not hand its own store back.
+pub type ReopenStatuses<P> =
+    Arc<dyn Fn() -> Result<<P as ScanProfile>::StatusesStore, PersistError> + Send + Sync>;
+
 /// Profile-generic counterpart of [`RamStores`]: the typed stores a
 /// [`ScanProfile`] declares, opened and ready to be handed to
-/// `Account::from_stores`.
+/// [`ElectrumScanner::from_stores`](crate::scanner::ElectrumScanner::from_stores).
 pub struct ScanStores<P: ScanProfile> {
     pub tx: P::TxStore,
     pub label: P::LabelStore,

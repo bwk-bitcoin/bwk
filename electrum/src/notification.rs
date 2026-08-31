@@ -4,9 +4,7 @@
 use miniscript::bitcoin::OutPoint;
 use miniscript::bitcoin::Txid;
 
-use bwk_persist::PersistError;
-
-use crate::{client::CoinError, header_store::InvalidCause};
+use crate::{header_store::InvalidCause, tx_listener};
 
 /// Notifications sent by an Account to signal events.
 #[derive(Debug)]
@@ -17,12 +15,17 @@ pub enum Notification {
     PaymentHistoryUpdated,
     InvalidElectrumConfig,
     InvalidLookAhead,
-    Stopped,
-    Error(Error),
+    /// The header store could not be restarted against its endpoint, so the
+    /// chain it promotes against stops advancing.
+    HeaderStoreRestart,
     /// A chain-tip-advance (CTA) pass mutated tx state in response to a
     /// HeaderStore update.
     HeaderStoreUpdated,
     HeaderProgress(crate::header_store::HeaderProgressEvent),
+    /// The header store's merkle client ended, so no inclusion proof is
+    /// fetched any more; confirmed entries stay unverified until the store
+    /// is restarted.
+    MerkleFetchStopped,
     /// A merkle proof failed verification, or the header store itself
     /// failed validation; the affected entry was refused promotion.
     ValidationFailed(ValidationFailure),
@@ -80,70 +83,10 @@ impl From<TxListenerNotif> for Notification {
     }
 }
 
-impl From<Error> for Notification {
-    fn from(value: Error) -> Self {
-        Self::Error(value)
-    }
-}
-
 #[cfg(feature = "sp")]
 impl From<SpNotification> for Notification {
     fn from(sp: SpNotification) -> Self {
         Notification::Sp(sp)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum Error {
-    CreatePool,
-    JoinPool,
-    InvalidOutPoint,
-    CoinMissing,
-    InvalidDenomination,
-    RelayMissing,
-    WrongElectrumConfig,
-    PoolMissing,
-    WrongKeyType,
-    Satisfaction,
-    HeaderStoreRestart,
-}
-
-/// Error returned when opening a scan's stores from disk.
-#[derive(Debug)]
-pub enum OpenError {
-    /// The config carried an empty account name.
-    EmptyAccount,
-    /// The persistence backend could not be built or the store bundle
-    /// could not be read (e.g. the account directory is already locked,
-    /// or a stored blob failed to decode).
-    Persist(PersistError),
-    /// The configured Electrum endpoint could not be reached while building
-    /// the account's [`HeaderStore`](crate::header_store::HeaderStore). Fails
-    /// loud rather than silently opening a worker-less store.
-    HeaderStore(crate::header_store::StartError),
-}
-
-impl std::fmt::Display for OpenError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OpenError::EmptyAccount => write!(f, "account name must not be empty"),
-            OpenError::Persist(e) => write!(f, "{e}"),
-            OpenError::HeaderStore(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for OpenError {}
-
-impl From<PersistError> for OpenError {
-    fn from(e: PersistError) -> Self {
-        OpenError::Persist(e)
-    }
-}
-
-impl From<crate::header_store::StartError> for OpenError {
-    fn from(e: crate::header_store::StartError) -> Self {
-        OpenError::HeaderStore(e)
     }
 }
 
@@ -152,19 +95,6 @@ impl From<crate::header_store::StartError> for OpenError {
 pub enum TxListenerNotif {
     Started,
     Connected(String),
-    Error(TxListenerError),
+    Error(tx_listener::Error),
     Stopped,
-}
-
-/// Errors surfaced through [`TxListenerNotif::Error`].
-#[derive(Debug, thiserror::Error)]
-pub enum TxListenerError {
-    #[error("failed to create electrum client: {0}")]
-    Client(#[from] crate::client::Error),
-    #[error(transparent)]
-    Coin(#[from] CoinError),
-    #[error("address store disconnected")]
-    AddressStoreDisconnected,
-    #[error("statuses store unavailable")]
-    StatusesUnavailable,
 }

@@ -31,7 +31,7 @@ use temp_dir::TempDir;
 
 #[test]
 fn restart_from_cache_skips_full_validation() {
-    let (url, port, _electrsd, bitcoind) = bootstrap_electrs(false);
+    let (url, port, _electrsd, bitcoind) = bootstrap_electrs();
 
     let persist_dir = TempDir::new().unwrap();
     let persist_path = persist_dir.path().join(HEADERS_FILENAME);
@@ -148,7 +148,7 @@ fn restart_from_cache_skips_full_validation() {
 #[test]
 fn deep_reorg_below_anchor_resyncs() {
     init_logger();
-    let (url, port, _electrsd, bitcoind) = bootstrap_electrs(false);
+    let (url, port, _electrsd, bitcoind) = bootstrap_electrs();
 
     // Mine extra blocks so we can anchor the cache above genesis and then
     // reorg below that anchor.

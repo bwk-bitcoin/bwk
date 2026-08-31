@@ -46,8 +46,8 @@ tests locally. Commit messages must be single-line and follow existing style
 |                | wallets (Electrum backend)                                  |
 | bwk-sp         | Silent Payments account orchestrator (BIP352, Blindbit)     |
 | bwk-tx         | Transaction building, coin selection, fee estimation, PSBT  |
-| bwk-electrum   | Electrum protocol client (TCP/SSL), and the scan stores     |
-|                | (coins, txs, addresses, labels, headers)                    |
+| bwk-electrum   | Electrum protocol client (TCP/SSL), ElectrumScanner, and    |
+|                | the scan stores, the header chain and the reconcile pass    |
 | bwk-sign       | Hot signer, SigningManager for BIP32 key management         |
 | bwk-descriptor | Miniscript descriptor handling, SpkDerivator                |
 | bwk-keys       | Key derivation utilities (OXpriv, OXpub, KeyDerivator)      |
@@ -74,13 +74,24 @@ See crate READMEs for usage examples:
 ### Standard Wallet (`bwk`)
 ```
 Account (bwk/src/account.rs)
-├── CoinStore (manages UTXOs, derives addresses via SpkDerivator)
-├── TxStore (transaction history)
-├── LabelStore (user labels)
+├── ElectrumScanner (bwk-electrum, records what the server reports)
+│   ├── CoinStore (UTXOs, derives addresses via SpkDerivator, and owns
+│   │   the TxStore holding the raw txs and their inclusion state)
+│   ├── LabelStore (user labels)
+│   └── listener thread (its own Electrum connection)
+├── HeaderFollower (holds the HeaderStore: validated header chain, two
+│   Electrum connections of its own, one for the header worker and one
+│   for the merkle-proof client, and keeps it on the scanner's endpoint)
 ├── SigningManager (hot signers)
-├── HeaderStore (validated header chain for SPV verification)
-└── Electrum client thread (background sync)
+└── Reconciler (bwk-electrum, its own thread: promotes what the scanner
+    recorded against the header chain, verifies proofs)
 ```
+
+The scanner and the header validator are independent and never talk to each
+other: the scanner has no header store and never sees a merkle request or
+response, and the validator never touches the coin stores. The `Reconciler`
+pairs them, promoting `ConfirmedUnverified` to `Verified` and stamping
+confirmation times through `ElectrumScanner::coin_store`.
 
 ### Silent Payments Wallet (`bwk-sp`)
 ```
@@ -128,12 +139,18 @@ take the receiver.
 ## Testing
 
 Integration tests require the `test` feature flag which enables:
-- `bwk-utils/test`: Test helpers (funding_tx, corepc_node utilities)
+- `bwk-electrum/test`: Test-only store constructors and accessors (synthetic
+  header chains, tx-entry and validation-state setters)
+- `bwk-utils/test`: Test helpers (funding_tx, corepc_node utilities, and the
+  shared regtest harness in `utils/src/test/regtest.rs`)
 - `bwk-sign/test`: Test signer constructors
 - `bwk-tx/test`: TxBuilder test methods (fund_with_bitcoind, mark_tx_mined)
+- `bwk-persist/test`: Test-only accessors on the backends (on-disk paths)
+- `logger`: env_logger as the global logger, so tests get log output
 
-Tests in `bwk/src/account.rs` use `electrsd` for regtest Electrum integration.
-Tests in `sp/tests/` use `blindbitd` for regtest Blindbit integration.
+Tests in `bwk/src/account.rs` and `electrum/tests/` use `electrsd` for regtest
+Electrum integration, all through `bwk_utils::test::regtest`. Tests in
+`sp/tests/` use `blindbitd` for regtest Blindbit integration.
 
 ## External Dependencies
 

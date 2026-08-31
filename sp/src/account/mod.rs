@@ -114,7 +114,7 @@ pub enum AccountError {
     #[error("broadcast error: {0}")]
     Broadcast(#[from] bwk::bwk_electrum::client::Error),
     #[error("failed to open account store: {0}")]
-    Open(#[from] bwk::bwk_electrum::notification::OpenError),
+    Open(#[from] bwk::bwk_electrum::open::Error),
     #[error("failed to start header store: {0}")]
     HeaderStart(#[from] bwk::bwk_electrum::header_store::StartError),
     #[error("persistence error: {0}")]
@@ -536,6 +536,11 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
 
         // Create/load stores
         let (coin_store, label_store, tx_store, scan_state) = Self::create_or_load_stores(&config)?;
+
+        // Once per account, not per reconciler: every sub-account shares this
+        // header store, so registering per reconciler would report the same
+        // event to this channel as many times as there are sub-accounts.
+        header_store.register_notifications(sender.clone());
 
         let header_store_endpoint = Self::header_store_endpoint(&config);
         forward_header_progress(&header_store, sender.clone());

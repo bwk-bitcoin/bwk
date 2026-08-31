@@ -23,8 +23,14 @@
 //! height.
 
 use crate::{
-    client::{Client, Error as ClientError, HeaderError, HeaderRequest, HeaderResponse},
+    client::{
+        Client, CoinError, CoinRequest, CoinResponse, Error as ClientError, HeaderError,
+        HeaderRequest, HeaderResponse, MERKLE_HASH_BYTES,
+    },
+    fanout::{Fanout, ListenerId},
     header_validator::{self, expected_genesis, Error as ValidatorError},
+    notification::Notification,
+    worker::Worker,
 };
 use bwk_persist::{
     HeaderBackend, NoopBackend, PersistError, PersistenceBackend, RamStore, Store,
@@ -38,7 +44,7 @@ use miniscript::bitcoin::{
     BlockHash, Network, TxMerkleNode, Txid, Work,
 };
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -95,9 +101,7 @@ where
 {
     network: Network,
     inner: Mutex<Inner<S>>,
-    // No bound or explicit deregister: `notify_listeners` drops any sender
-    // whose receiver is gone, so this only ever holds live listeners.
-    listeners: Mutex<Vec<mpsc::Sender<()>>>,
+    listeners: Fanout<()>,
     progress_listeners: Mutex<ProgressListeners>,
     /// Authoritative writer token. Only the worker holding the current token
     /// may mutate the store, enforced by checking it under the inner lock in
@@ -110,11 +114,119 @@ where
     stopped: AtomicBool,
     /// Backfill floor remembered at `start`, reused by `restart`. `None`
     /// until a worker is spawned.
-    worker: Mutex<Option<WorkerHandle>>,
+    worker: Mutex<Option<BackfillFloor>>,
+    /// Request side of the header worker's client, kept so `stop` can close
+    /// the connection instead of waiting out the worker's receive timeout.
+    header_req: Mutex<Option<mpsc::Sender<HeaderRequest>>>,
+    /// Request side of the dedicated merkle-proof client, `None` until a
+    /// worker is spawned and replaced on every `restart`. The scan side never
+    /// sees it: proof fetching rides the validator's own connection.
+    merkle_req: Mutex<Option<mpsc::Sender<CoinRequest>>>,
+    /// The fetches this store issues, and who is waiting for each of them.
+    merkle: Arc<MerkleRouter>,
+    /// Where this store reports its own events. A store shared by several
+    /// consumers reports to each of them, one registration per consumer.
+    notifications: Fanout<Notification>,
+    /// The header worker and the merkle forwarder. `stop` signals them and
+    /// leaves them parked rather than blocking, and `Drop` joins them: they
+    /// hold the electrum connections open until they exit. The
+    /// replay-validation thread is deliberately not here: it holds an `Arc` to
+    /// this store, so it can be the last owner and run this `Drop` itself,
+    /// where joining it would be a self-join.
+    header_worker: Mutex<Worker>,
+    merkle_worker: Mutex<Worker>,
+}
+
+/// How a fetch issued through [`HeaderStore::fetch_merkle`] resolved. A
+/// failure is fanned out like a proof, so a requester that reserved a slot for
+/// this fetch frees it and asks again on a later pass instead of waiting for an
+/// answer that never comes.
+#[derive(Debug, Clone)]
+pub enum MerkleOutcome {
+    Proof(MerkleProof),
+    Failed { txid: Txid, height: u32 },
+}
+
+impl MerkleOutcome {
+    /// The fetch this outcome ends, as the `(txid, height)` it was issued for.
+    pub fn claim(&self) -> (Txid, u32) {
+        match self {
+            Self::Proof(proof) => (proof.txid, proof.height),
+            Self::Failed { txid, height } => (*txid, *height),
+        }
+    }
+}
+
+/// The merkle fan-out plus the table that routes an outcome back to whoever
+/// asked for that transaction, so a store shared by several reconcilers wakes
+/// only the one the answer belongs to.
+#[derive(Debug, Default)]
+struct MerkleRouter {
+    listeners: Fanout<MerkleOutcome>,
+    /// Requesters of the fetches still waiting for an answer. Two reconcilers
+    /// can want the same fetch, so a `(txid, height)` maps to a set of them. An
+    /// entry a superseded client left behind is consumed by the next answer
+    /// for that fetch.
+    pending: Mutex<HashMap<(Txid, u32), BTreeSet<ListenerId>>>,
+}
+
+impl MerkleRouter {
+    fn record(&self, txid: Txid, height: u32, requester: ListenerId) {
+        self.pending
+            .lock()
+            .expect("poisoned")
+            .entry((txid, height))
+            .or_default()
+            .insert(requester);
+    }
+
+    /// Hand `outcome` to whoever asked for that fetch. With nobody recorded (a
+    /// fetch issued before a restart, or an answer the server repeated) it goes
+    /// to every listener rather than being dropped: an outcome the requester
+    /// never sees leaves it holding an in-flight slot.
+    fn deliver(&self, outcome: MerkleOutcome) {
+        let requesters = self
+            .pending
+            .lock()
+            .expect("poisoned")
+            .remove(&outcome.claim());
+        match requesters {
+            Some(ids) => {
+                for id in ids {
+                    self.listeners.notify_one(id, outcome.clone());
+                }
+            }
+            None => self.listeners.notify(outcome),
+        }
+    }
+
+    /// End every fetch still waiting for an answer, for when the client that
+    /// would have answered them is gone.
+    fn fail_pending(&self) {
+        let pending = std::mem::take(&mut *self.pending.lock().expect("poisoned"));
+        for ((txid, height), ids) in pending {
+            for id in ids {
+                self.listeners
+                    .notify_one(id, MerkleOutcome::Failed { txid, height });
+            }
+        }
+    }
+}
+
+/// A merkle branch the server returned for a fetch issued through
+/// [`HeaderStore::fetch_merkle`].
+#[derive(Debug, Clone)]
+pub struct MerkleProof {
+    pub txid: Txid,
+    pub height: u32,
+    /// Siblings in internal (little-endian) order, ready to feed
+    /// [`verify_merkle_branch`].
+    pub branch: Vec<[u8; MERKLE_HASH_BYTES]>,
+    pub pos: u32,
 }
 
 #[derive(Debug)]
-struct WorkerHandle {
+struct BackfillFloor {
     min_height: Option<u32>,
 }
 
@@ -259,11 +371,17 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
                 store,
                 validation_state: HeaderValidationState::Valid,
             }),
-            listeners: Mutex::new(Vec::new()),
+            listeners: Fanout::default(),
             progress_listeners: Mutex::new(ProgressListeners::default()),
             writer_token: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
             worker: Mutex::new(None),
+            header_req: Mutex::new(None),
+            merkle_req: Mutex::new(None),
+            merkle: Arc::default(),
+            notifications: Fanout::default(),
+            header_worker: Mutex::default(),
+            merkle_worker: Mutex::default(),
         })
     }
 
@@ -293,13 +411,7 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
         // silently returning a worker-less store: header-sync progress
         // gates wallet `Verified` state, so the caller must know the store
         // is degraded and can re-attempt.
-        let client = Client::new(&electrum_url, electrum_port).map_err(|e| {
-            log::warn!(
-                "HeaderStore::start: fail to create electrum client {electrum_url}:{electrum_port}: {e}"
-            );
-            StartError::Connect(e)
-        })?;
-        store.spawn_worker(client, min_height);
+        store.spawn_worker(&electrum_url, electrum_port, min_height)?;
         Ok(store)
     }
 
@@ -329,40 +441,123 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
         })
     }
 
-    /// Reconnect the background worker to `url:port` after the previous
-    /// connection died. Clears the stop flag and bumps the writer token so the
-    /// superseded worker self-exits and its in-flight mutations become no-ops,
-    /// then spawns a fresh worker (the sole writer under the new token) reusing
-    /// the backfill floor remembered at [`start`](Self::start).
+    /// Reconnect both connections to `url:port` after the previous ones died.
+    /// Closes the previous pair, clears the stop flag and bumps the writer
+    /// token so the superseded worker self-exits and its in-flight mutations
+    /// become no-ops, then spawns a fresh worker (the sole writer under the new
+    /// token) reusing the backfill floor remembered at [`start`](Self::start).
     pub fn restart(self: &Arc<Self>, url: String, port: u16) -> Result<(), StartError> {
         let min_height = self.remembered_min_height();
+        // Close the previous pair rather than leaving its sockets open until
+        // the superseded worker times out and drops its request sender.
+        self.stop();
         self.stopped.store(false, Ordering::SeqCst);
         self.writer_token.fetch_add(1, Ordering::SeqCst);
-        let client = Client::new(&url, port).map_err(|e| {
-            log::warn!("HeaderStore::restart: fail to create electrum client {url}:{port}: {e}");
-            StartError::Connect(e)
-        })?;
-        self.spawn_worker(client, min_height);
+        self.spawn_worker(&url, port, min_height)
+    }
+
+    /// Connect a fresh worker pair to `url:port` and record the backfill floor
+    /// with the writer token it was spawned under: the header worker that
+    /// drives sync and reorg resolution, plus the merkle client the validator
+    /// fetches inclusion proofs over.
+    fn spawn_worker(
+        self: &Arc<Self>,
+        url: &str,
+        port: u16,
+        min_height: Option<u32>,
+    ) -> Result<(), StartError> {
+        let client = connect(url, port)?;
+        // A second connection on purpose: the header worker's loop is a strict
+        // sequence of header fetches that blocks on each answer, so proof
+        // traffic multiplexed into it would stall sync behind every proof.
+        let merkle = connect(url, port)?;
+        let (req_tx, resp_rx) = client.listen_headers::<HeaderRequest, HeaderResponse>();
+        let token = self.writer_token.load(Ordering::SeqCst);
+        *self.worker.lock().expect("poisoned") = Some(BackfillFloor { min_height });
+        *self.header_req.lock().expect("poisoned") = Some(req_tx.clone());
+        self.spawn_merkle_client(merkle, token);
+        let weak = Arc::downgrade(self);
+        let network = self.network;
+        self.header_worker
+            .lock()
+            .expect("poisoned")
+            .start(move |_| run_worker(weak, network, min_height, token, req_tx, resp_rx));
         Ok(())
     }
 
-    /// Idle the background worker without spawning a replacement. Sets the stop
-    /// flag so the running worker self-exits the next time it checks in,
-    /// leaving the store worker-less until a later `restart` reconnects it.
-    pub fn stop(self: &Arc<Self>) {
-        self.stopped.store(true, Ordering::SeqCst);
-    }
-
-    /// Wire `client` to a fresh worker thread, recording the worker handle
-    /// and the writer token it was spawned under.
-    fn spawn_worker(self: &Arc<Self>, client: Client, min_height: Option<u32>) {
-        let (req_tx, resp_rx) = client.listen_headers::<HeaderRequest, HeaderResponse>();
-        let token = self.writer_token.load(Ordering::SeqCst);
-        *self.worker.lock().expect("poisoned") = Some(WorkerHandle { min_height });
+    /// Wire `client` as the merkle-proof fetcher: its request sender replaces
+    /// the previous one, and a forwarding thread routes every answer back to
+    /// the listener that asked for it. The thread ends when the client's
+    /// response channel closes, which [`stop`](Self::stop) and `Drop` trigger
+    /// by asking the client to close.
+    fn spawn_merkle_client(self: &Arc<Self>, client: Client, token: u64) {
+        let (req_tx, resp_rx) = client.listen_txs::<CoinRequest, CoinResponse>();
+        *self.merkle_req.lock().expect("poisoned") = Some(req_tx);
+        let merkle = self.merkle.clone();
         let weak = Arc::downgrade(self);
-        let network = self.network;
-        thread::spawn(move || run_worker(weak, network, min_height, token, req_tx, resp_rx));
+        self.merkle_worker
+            .lock()
+            .expect("poisoned")
+            .start(move |_| forward_merkle_proofs(resp_rx, merkle, weak, token));
     }
+}
+
+/// Route every answer the merkle client returns back to the listener that
+/// asked for it, until the client's response channel closes. Split out of
+/// [`HeaderStore::spawn_merkle_client`] so the exit path can be driven directly.
+fn forward_merkle_proofs<S>(
+    resp_rx: mpsc::Receiver<CoinResponse>,
+    merkle: Arc<MerkleRouter>,
+    weak: Weak<HeaderStore<S>>,
+    token: u64,
+) where
+    S: Store<Key = u32, Value = [u8; Header::SIZE]> + Send + 'static,
+{
+    for resp in resp_rx {
+        let outcome = match resp {
+            CoinResponse::TxMerkle {
+                txid,
+                height,
+                branch,
+                pos,
+            } => MerkleOutcome::Proof(MerkleProof {
+                txid,
+                height,
+                branch,
+                pos,
+            }),
+            CoinResponse::Stopped => break,
+            CoinResponse::Error(e) => {
+                log::warn!("HeaderStore merkle client: {e}");
+                match e {
+                    // A stale height across a reorg, or transient server
+                    // trouble: both name the fetch they end, so report it and
+                    // let the requester ask again on a later pass.
+                    CoinError::MerkleFetch { txid, height, .. }
+                    | CoinError::MerkleDecode { txid, height, .. } => {
+                        MerkleOutcome::Failed { txid, height }
+                    }
+                    _ => continue,
+                }
+            }
+            other => {
+                log::warn!("HeaderStore merkle client: unexpected {}", other.summary());
+                continue;
+            }
+        };
+        merkle.deliver(outcome);
+    }
+    if let Some(store) = weak.upgrade() {
+        store.merkle_client_ended(token);
+    }
+}
+
+/// Open an electrum connection, tagging a failure as [`StartError::Connect`].
+fn connect(url: &str, port: u16) -> Result<Client, StartError> {
+    Client::new(url, port).map_err(|e| {
+        log::warn!("HeaderStore: fail to create electrum client {url}:{port}: {e}");
+        StartError::Connect(e)
+    })
 }
 
 impl<S> HeaderStore<S>
@@ -376,11 +571,17 @@ where
                 store,
                 validation_state: HeaderValidationState::Unchecked,
             }),
-            listeners: Mutex::new(Vec::new()),
+            listeners: Fanout::default(),
             progress_listeners: Mutex::new(ProgressListeners::default()),
             writer_token: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
             worker: Mutex::new(None),
+            header_req: Mutex::new(None),
+            merkle_req: Mutex::new(None),
+            merkle: Arc::default(),
+            notifications: Fanout::default(),
+            header_worker: Mutex::default(),
+            merkle_worker: Mutex::default(),
         });
         store.start_replay_validation();
         store
@@ -720,10 +921,7 @@ where
     }
 
     fn notify_listeners(&self) {
-        // `send` fails once the receiver is dropped; pruning those here is what
-        // lets `listeners` stay unbounded-but-leak-free without a deregister.
-        let mut listeners = self.listeners.lock().expect("poisoned");
-        listeners.retain(|tx| tx.send(()).is_ok());
+        self.listeners.notify(());
     }
 
     fn publish_progress(&self, event: HeaderProgressEvent) {
@@ -823,10 +1021,78 @@ where
 
     /// Register a listener notified (via an empty `()`) on every chain
     /// update. Drop the returned receiver to deregister.
-    pub fn register(&self) -> mpsc::Receiver<()> {
-        let (tx, rx) = mpsc::channel();
-        self.listeners.lock().expect("poisoned").push(tx);
-        rx
+    pub fn register_chain_tick(&self) -> mpsc::Receiver<()> {
+        self.listeners.register()
+    }
+
+    /// Register `id` as a listener for how the fetches it issues resolve:
+    /// [`fetch_merkle`](Self::fetch_merkle) routes an outcome back by that id.
+    /// A listener restarting on a fresh channel registers under the same id,
+    /// so the store does not keep the one it left behind.
+    pub fn register_merkle_outcome(&self, id: ListenerId) -> mpsc::Receiver<MerkleOutcome> {
+        self.merkle.listeners.register_as(id)
+    }
+
+    /// Route this store's own events to `sender`. Registered once per consumer
+    /// by whoever owns the store: a store shared by several consumers reports
+    /// to each of them exactly once.
+    pub fn register_notifications(&self, sender: mpsc::Sender<Notification>) {
+        self.notifications.register_sender(sender);
+    }
+
+    fn notify_merkle_fetch_stopped(&self) {
+        self.notifications
+            .notify_with(|| Notification::MerkleFetchStopped);
+    }
+
+    /// True while this store has a live worker pair: `false` when it was
+    /// opened with no endpoint, when `stop` idled it, or once both its threads
+    /// have exited.
+    pub fn running(&self) -> bool {
+        !self.stopped.load(Ordering::SeqCst)
+            && (self.header_worker.lock().expect("poisoned").running()
+                || self.merkle_worker.lock().expect("poisoned").running())
+    }
+
+    /// The merkle forwarder spawned under `token` exited: clear the request
+    /// side it owned and report that no proof is being fetched any more. A
+    /// `restart` (which bumps the token) already installed a newer client, and
+    /// a `stop` already took the sender, so neither has anything to report.
+    fn merkle_client_ended(&self, token: u64) {
+        if self.writer_token.load(Ordering::SeqCst) != token {
+            return;
+        }
+        // Nothing is left to answer the fetches this client was holding.
+        self.merkle.fail_pending();
+        let mut slot = self.merkle_req.lock().expect("poisoned");
+        if slot.take().is_none() {
+            return;
+        }
+        drop(slot);
+        self.notify_merkle_fetch_stopped();
+    }
+
+    /// Ask the server to prove `txid` is included in the block at `height`, on
+    /// behalf of `requester`: the answer goes back to that listener alone. With
+    /// no client to ask, the fetch resolves right away as
+    /// [`MerkleOutcome::Failed`] rather than being dropped in silence: a
+    /// requester holding a slot for it must learn it is over.
+    pub fn fetch_merkle(&self, requester: ListenerId, txid: Txid, height: u32) {
+        self.merkle.record(txid, height, requester);
+        let sent = match self.merkle_req.lock().expect("poisoned").as_ref() {
+            Some(req) => req.send(CoinRequest::GetTxMerkle { txid, height }).is_ok(),
+            None => false,
+        };
+        if !sent {
+            self.merkle.deliver(MerkleOutcome::Failed { txid, height });
+        }
+    }
+
+    /// Route merkle fetches to `req` instead of an electrum client, so a test
+    /// can observe them against a store built with no worker.
+    #[cfg(any(test, feature = "test"))]
+    pub fn set_merkle_sender_for_test(&self, req: mpsc::Sender<CoinRequest>) {
+        *self.merkle_req.lock().expect("poisoned") = Some(req);
     }
 
     /// Register a listener for header validation progress. If a lifecycle event
@@ -850,6 +1116,49 @@ where
         if let Err(e) = inner.store.flush() {
             log::error!("HeaderStore::insert_unchecked flush: {e}");
         }
+    }
+}
+
+// Bounded exactly like the struct: `Drop` may not add bounds, so `stop` cannot
+// live in the `Send + 'static` block above.
+impl<S> HeaderStore<S>
+where
+    S: Store<Key = u32, Value = [u8; Header::SIZE]>,
+{
+    /// Idle both connections without spawning a replacement, leaving the store
+    /// worker-less until a later `restart` reconnects it. The header worker
+    /// returns on `Stopped` instead of waiting out its receive timeout, and the
+    /// merkle forwarder ends when its response channel closes. Does not block:
+    /// the threads are left parked for `Drop` to join.
+    ///
+    /// Every fetch still waiting ends as [`MerkleOutcome::Failed`] here rather
+    /// than on the forwarder's own exit: a `restart` bumps the writer token
+    /// before that exit lands, which makes it a no-op, and a requester that
+    /// never hears back holds its in-flight slot forever.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        self.merkle.fail_pending();
+        if let Some(req) = self.header_req.lock().expect("poisoned").take() {
+            let _ = req.send(HeaderRequest::Stop);
+        }
+        if let Some(req) = self.merkle_req.lock().expect("poisoned").take() {
+            let _ = req.send(CoinRequest::Stop);
+        }
+        self.header_worker.lock().expect("poisoned").stop();
+        self.merkle_worker.lock().expect("poisoned").stop();
+    }
+}
+
+impl<S> Drop for HeaderStore<S>
+where
+    S: Store<Key = u32, Value = [u8; Header::SIZE]>,
+{
+    fn drop(&mut self) {
+        // The worker threads hold the electrum connections open; signal them
+        // first so the joins do not wait out the worker's receive timeout.
+        self.stop();
+        self.header_worker.lock().expect("poisoned").join();
+        self.merkle_worker.lock().expect("poisoned").join();
     }
 }
 
@@ -2548,7 +2857,7 @@ mod tests {
         // live store still holds the cache file's advisory lock, so a second
         // open would return AlreadyOpen.
         let persisted_before = fs::read(&path).unwrap();
-        let rx = store.register();
+        let rx = store.register_chain_tick();
 
         let fork_h = 1;
         let candidate = build_branch(active_chain[fork_h as usize], 2, 2, 0x80);
@@ -2585,7 +2894,7 @@ mod tests {
     fn accepted_higher_work_candidate_replaces_branch_once() {
         let active_chain = build_chain(4);
         let store = store_with_chain(&active_chain);
-        let rx = store.register();
+        let rx = store.register_chain_tick();
 
         let fork_h = 1;
         let candidate = build_branch(active_chain[fork_h as usize], 2, 3, 0x90);
@@ -2667,13 +2976,19 @@ mod tests {
                 store: typed,
                 validation_state: HeaderValidationState::Validating,
             }),
-            listeners: Mutex::new(Vec::new()),
+            listeners: Fanout::default(),
             progress_listeners: Mutex::new(ProgressListeners::default()),
             writer_token: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
             worker: Mutex::new(None),
+            header_req: Mutex::new(None),
+            merkle_req: Mutex::new(None),
+            merkle: Arc::default(),
+            notifications: Fanout::default(),
+            header_worker: Mutex::default(),
+            merkle_worker: Mutex::default(),
         });
-        let rx = store.register();
+        let rx = store.register_chain_tick();
 
         store.finish_replay_validation_success();
 
@@ -2969,11 +3284,252 @@ mod tests {
         assert_eq!(store.tip(), None);
     }
 
+    /// A merkle client that dies leaves no live request sender behind and says
+    /// so, otherwise every later fetch is dropped in silence and the entries it
+    /// would have proved stay `ConfirmedUnverified` for good.
+    #[test]
+    fn a_dead_merkle_client_clears_its_sender_and_reports() {
+        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let (notif_tx, notif_rx) = mpsc::channel();
+        store.register_notifications(notif_tx);
+        let (req_tx, _req_rx) = mpsc::channel();
+        store.set_merkle_sender_for_test(req_tx);
+        let token = store.writer_token.load(Ordering::SeqCst);
+
+        let (resp_tx, resp_rx) = mpsc::channel();
+        let merkle = store.merkle.clone();
+        let forwarder = thread::spawn({
+            let weak = Arc::downgrade(&store);
+            move || forward_merkle_proofs(resp_rx, merkle, weak, token)
+        });
+        drop(resp_tx);
+        forwarder.join().expect("forwarder panicked");
+
+        assert!(store.merkle_req.lock().expect("poisoned").is_none());
+        assert!(matches!(
+            notif_rx.try_recv(),
+            Ok(Notification::MerkleFetchStopped)
+        ));
+    }
+
+    /// A superseded forwarder must stay quiet: `restart` bumps the token and
+    /// installs a newer client, so the old one clearing or reporting would
+    /// wrongly say no proof is being fetched.
+    #[test]
+    fn a_superseded_merkle_forwarder_reports_nothing() {
+        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let (notif_tx, notif_rx) = mpsc::channel();
+        store.register_notifications(notif_tx);
+        let (req_tx, _req_rx) = mpsc::channel();
+        store.set_merkle_sender_for_test(req_tx);
+        let stale = store.writer_token.load(Ordering::SeqCst);
+        store.writer_token.fetch_add(1, Ordering::SeqCst);
+
+        let (resp_tx, resp_rx) = mpsc::channel();
+        let merkle = store.merkle.clone();
+        let forwarder = thread::spawn({
+            let weak = Arc::downgrade(&store);
+            move || forward_merkle_proofs(resp_rx, merkle, weak, stale)
+        });
+        drop(resp_tx);
+        forwarder.join().expect("forwarder panicked");
+
+        assert!(store.merkle_req.lock().expect("poisoned").is_some());
+        assert!(notif_rx.try_recv().is_err());
+    }
+
+    /// A merkle failure names the fetch it ends, so it must reach the
+    /// listeners: dropped, the requester keeps a slot for an answer that never
+    /// comes and never asks again.
+    #[test]
+    fn a_failed_merkle_fetch_reaches_the_listeners() {
+        use crate::client::DecodeError;
+
+        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let outcomes = store.register_merkle_outcome(ListenerId::next());
+        let token = store.writer_token.load(Ordering::SeqCst);
+
+        let (resp_tx, resp_rx) = mpsc::channel();
+        let merkle = store.merkle.clone();
+        let forwarder = thread::spawn({
+            let weak = Arc::downgrade(&store);
+            move || forward_merkle_proofs(resp_rx, merkle, weak, token)
+        });
+        let txid = Txid::from_byte_array([0x42; 32]);
+        resp_tx
+            .send(CoinResponse::Error(CoinError::MerkleDecode {
+                txid,
+                height: 7,
+                source: DecodeError::MerkleHashLength { index: 0, got: 31 },
+            }))
+            .unwrap();
+        drop(resp_tx);
+        forwarder.join().expect("forwarder panicked");
+
+        assert!(matches!(
+            outcomes.try_recv(),
+            Ok(MerkleOutcome::Failed { txid: t, height: 7 }) if t == txid
+        ));
+    }
+
+    /// One outcome must reach the reconciler that asked for it and nobody
+    /// else: on a store shared by several reconcilers, every other one would
+    /// otherwise wake and take its coin-store lock to look up a txid that
+    /// belongs to a different sub-account.
+    #[test]
+    fn a_merkle_outcome_reaches_only_its_requester() {
+        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let (req_tx, req_rx) = mpsc::channel();
+        store.set_merkle_sender_for_test(req_tx);
+        let requester = ListenerId::next();
+        let mine = store.register_merkle_outcome(requester);
+        let theirs = store.register_merkle_outcome(ListenerId::next());
+        let token = store.writer_token.load(Ordering::SeqCst);
+        let txid = Txid::from_byte_array([0x11; 32]);
+
+        store.fetch_merkle(requester, txid, 7);
+        assert!(matches!(
+            req_rx.try_recv(),
+            Ok(CoinRequest::GetTxMerkle { txid: t, height: 7 }) if t == txid
+        ));
+
+        let (resp_tx, resp_rx) = mpsc::channel();
+        let merkle = store.merkle.clone();
+        let forwarder = thread::spawn({
+            let weak = Arc::downgrade(&store);
+            move || forward_merkle_proofs(resp_rx, merkle, weak, token)
+        });
+        resp_tx
+            .send(CoinResponse::TxMerkle {
+                txid,
+                height: 7,
+                branch: Vec::new(),
+                pos: 0,
+            })
+            .unwrap();
+        drop(resp_tx);
+        forwarder.join().expect("forwarder panicked");
+
+        assert!(matches!(
+            mine.try_recv(),
+            Ok(MerkleOutcome::Proof(proof)) if proof.txid == txid
+        ));
+        assert!(matches!(theirs.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    /// An outcome nobody is recorded against (a fetch issued before a restart,
+    /// or an answer the server repeated) goes to every listener: dropping it
+    /// would leave a requester holding a slot for an answer it never hears.
+    #[test]
+    fn an_unrequested_merkle_outcome_reaches_every_listener() {
+        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let first = store.register_merkle_outcome(ListenerId::next());
+        let second = store.register_merkle_outcome(ListenerId::next());
+        let txid = Txid::from_byte_array([0x22; 32]);
+
+        store
+            .merkle
+            .deliver(MerkleOutcome::Failed { txid, height: 5 });
+
+        assert!(matches!(
+            first.try_recv(),
+            Ok(MerkleOutcome::Failed { txid: t, height: 5 }) if t == txid
+        ));
+        assert!(matches!(
+            second.try_recv(),
+            Ok(MerkleOutcome::Failed { txid: t, height: 5 }) if t == txid
+        ));
+    }
+
+    /// Nothing answers a fetch its client did not outlive, so the fetch must be
+    /// failed when the client goes: the requester frees its slot and asks again
+    /// over the next connection.
+    #[test]
+    fn a_dead_merkle_client_fails_its_pending_fetches() {
+        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let requester = ListenerId::next();
+        let outcomes = store.register_merkle_outcome(requester);
+        let (req_tx, _req_rx) = mpsc::channel();
+        store.set_merkle_sender_for_test(req_tx);
+        let token = store.writer_token.load(Ordering::SeqCst);
+        let txid = Txid::from_byte_array([0x33; 32]);
+        store.fetch_merkle(requester, txid, 9);
+
+        let (resp_tx, resp_rx) = mpsc::channel();
+        let merkle = store.merkle.clone();
+        let forwarder = thread::spawn({
+            let weak = Arc::downgrade(&store);
+            move || forward_merkle_proofs(resp_rx, merkle, weak, token)
+        });
+        drop(resp_tx);
+        forwarder.join().expect("forwarder panicked");
+
+        assert!(matches!(
+            outcomes.try_recv(),
+            Ok(MerkleOutcome::Failed { txid: t, height: 9 }) if t == txid
+        ));
+    }
+
+    /// A `restart` bumps the writer token before the superseded forwarder
+    /// exits, which makes its own `merkle_client_ended` a no-op: idling must
+    /// therefore fail the pending fetches itself, or the reconciler of a wallet
+    /// sharing the store never asks for its proofs again.
+    #[test]
+    fn an_idled_store_fails_its_pending_fetches() {
+        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let requester = ListenerId::next();
+        let outcomes = store.register_merkle_outcome(requester);
+        let (req_tx, _req_rx) = mpsc::channel();
+        store.set_merkle_sender_for_test(req_tx);
+        let txid = Txid::from_byte_array([0x44; 32]);
+        store.fetch_merkle(requester, txid, 9);
+
+        store.stop();
+
+        assert!(matches!(
+            outcomes.try_recv(),
+            Ok(MerkleOutcome::Failed { txid: t, height: 9 }) if t == txid
+        ));
+    }
+
+    /// The notification sender is registered once by whoever owns the store,
+    /// not once per reconciler, so a store several reconcilers share reports
+    /// each of its events to that channel exactly once.
+    #[test]
+    fn a_notification_sender_registered_once_hears_an_event_once() {
+        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let (notif_tx, notif_rx) = mpsc::channel();
+        store.register_notifications(notif_tx);
+        let _first = store.register_merkle_outcome(ListenerId::next());
+        let _second = store.register_merkle_outcome(ListenerId::next());
+        let (req_tx, _req_rx) = mpsc::channel();
+        store.set_merkle_sender_for_test(req_tx);
+        let token = store.writer_token.load(Ordering::SeqCst);
+
+        let (resp_tx, resp_rx) = mpsc::channel();
+        let merkle = store.merkle.clone();
+        let forwarder = thread::spawn({
+            let weak = Arc::downgrade(&store);
+            move || forward_merkle_proofs(resp_rx, merkle, weak, token)
+        });
+        drop(resp_tx);
+        forwarder.join().expect("forwarder panicked");
+
+        assert!(matches!(
+            notif_rx.try_recv(),
+            Ok(Notification::MerkleFetchStopped)
+        ));
+        assert!(matches!(
+            notif_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
     #[test]
     fn register_returns_a_live_receiver() {
         let store = HeaderStore::new_in_memory(Network::Regtest);
-        let _rx = store.register();
-        assert_eq!(store.listeners.lock().unwrap().len(), 1);
+        let _rx = store.register_chain_tick();
+        assert_eq!(store.listeners.listener_count(), 1);
     }
 
     // Verify the merkle helper using hand-rolled vectors.
