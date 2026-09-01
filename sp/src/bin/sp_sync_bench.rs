@@ -1074,7 +1074,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         args.url.clone(),
         data_dir.clone(),
     )?
-    .enable_persist(true);
+    .with_persistence(Some(bwk::persist::PersistenceKind::Json));
     // Match the instrumented path: 0 means "disabled" (no dust filter).
     config.set_dust_limit(if dust == 0 { None } else { Some(dust) });
     config.set_birthday_height(Some(start));

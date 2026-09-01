@@ -52,17 +52,13 @@ pub struct Config {
     // Persistence
     /// Base directory for account data
     pub data_dir: PathBuf,
-    /// Whether to persist data to disk (not serialized)
-    #[serde(skip)]
-    pub persist: bool,
-    /// Which on-disk backend to use when `persist` is true.
+    /// Which backend keeps this account's data, `None` for in-memory only.
     ///
-    /// `Json` (default): byte-for-byte compatible with the pre-backend
-    /// layout. `Sqlite`: single `account.sqlite` file per account;
-    /// signer material (mnemonic / scan_sk / spend_key) is stripped from
-    /// everything written to disk and must be re-supplied on the next run.
-    #[serde(skip)]
-    pub persist_kind: bwk::persist::PersistenceKind,
+    /// `Json`: byte-for-byte compatible with the pre-backend layout.
+    /// `Sqlite`: single `account.sqlite` file per account; signer material
+    /// (mnemonic / scan_sk / spend_key) is stripped from everything written
+    /// to disk and must be re-supplied on the next run.
+    pub persistence: Option<bwk::persist::PersistenceKind>,
 
     // Scanning
     /// Minimum output value in satoshis to consider (dust filter)
@@ -122,8 +118,7 @@ impl Config {
             blindbit_url,
             endpoint: Endpoint::default(),
             data_dir,
-            persist: true,
-            persist_kind: bwk::persist::PersistenceKind::default(),
+            persistence: Some(bwk::persist::PersistenceKind::default()),
             dust_limit: None,
             birthday_height: None,
             descriptors: Vec::new(),
@@ -172,8 +167,7 @@ impl Config {
             blindbit_url,
             endpoint: Endpoint::default(),
             data_dir,
-            persist: true,
-            persist_kind: bwk::persist::PersistenceKind::default(),
+            persistence: Some(bwk::persist::PersistenceKind::default()),
             dust_limit: None,
             birthday_height: None,
             descriptors: Vec::new(),
@@ -337,26 +331,24 @@ impl Config {
         });
     }
 
-    /// Enable or disable persistence (builder pattern).
-    pub fn enable_persist(mut self, persist: bool) -> Self {
-        self.persist = persist;
-        self
-    }
-
-    /// Select the on-disk backend (JSON default, or SQLite).
+    /// Select the backend that keeps this account's data, `None` for
+    /// in-memory only (builder pattern).
     ///
     /// Under [`bwk::persist::PersistenceKind::Sqlite`], signer material
     /// (mnemonic / scan_sk / spend_key) is stripped from everything
     /// written to disk and must be re-supplied on the next run.
-    pub fn with_persist_kind(mut self, kind: bwk::persist::PersistenceKind) -> Self {
-        self.persist_kind = kind;
+    pub fn with_persistence(mut self, persistence: Option<bwk::persist::PersistenceKind>) -> Self {
+        self.persistence = persistence;
         self
     }
 
     /// Whether this config is configured to keep signer material out of
     /// on-disk writes.
     pub fn excludes_signer_data(&self) -> bool {
-        matches!(self.persist_kind, bwk::persist::PersistenceKind::Sqlite)
+        matches!(
+            self.persistence,
+            Some(bwk::persist::PersistenceKind::Sqlite)
+        )
     } // Path helpers
 
     /// Returns the account-specific data directory.
@@ -450,7 +442,7 @@ mod tests {
         assert!(config.spend_key.is_none());
         assert_eq!(config.blindbit_url, "https://blindbit.example.com");
         assert_eq!(config.data_dir, PathBuf::from("/tmp/bwk-test"));
-        assert!(config.persist); // Default is true
+        assert!(config.persistence.is_some()); // Default is on
         assert!(config.dust_limit.is_none());
         assert!(config.birthday_height.is_none());
     }
@@ -612,7 +604,7 @@ mod tests {
         assert!(config.mnemonic.is_none());
         assert!(config.scan_sk.is_some());
         assert!(config.spend_key.is_some());
-        assert!(config.persist);
+        assert!(config.persistence.is_some());
     }
 
     #[test]
@@ -719,8 +711,7 @@ mod tests {
         assert_eq!(config.mnemonic, loaded.mnemonic);
         assert_eq!(config.blindbit_url, loaded.blindbit_url);
         assert_eq!(config.data_dir, loaded.data_dir);
-        // persist is skipped during serialization, so it won't roundtrip
-        assert!(!loaded.persist); // Default for bool is false
+        assert_eq!(config.persistence, loaded.persistence);
     }
 
     #[test]
@@ -738,12 +729,15 @@ mod tests {
     }
 
     #[test]
-    fn test_config_enable_persist_builder() {
-        let config = test_config().enable_persist(false);
-        assert!(!config.persist);
+    fn test_config_with_persistence_builder() {
+        let config = test_config().with_persistence(None);
+        assert!(config.persistence.is_none());
 
-        let config = config.enable_persist(true);
-        assert!(config.persist);
+        let config = config.with_persistence(Some(bwk::persist::PersistenceKind::Json));
+        assert_eq!(
+            config.persistence,
+            Some(bwk::persist::PersistenceKind::Json)
+        );
     }
 
     #[test]
@@ -780,6 +774,7 @@ mod tests {
         assert_eq!(config.network, loaded.network);
         assert_eq!(config.mnemonic, loaded.mnemonic);
         assert_eq!(config.blindbit_url, loaded.blindbit_url);
+        assert_eq!(config.persistence, loaded.persistence);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
@@ -813,7 +808,7 @@ mod tests {
         config
             .add_segwit_sub_account_from_mnemonic(&unique_mnemonic)
             .expect("external sub-account");
-        config.persist_kind = bwk::persist::PersistenceKind::Sqlite;
+        config.persistence = Some(bwk::persist::PersistenceKind::Sqlite);
 
         let view = config.for_persistence();
         assert!(view.mnemonic.is_none());

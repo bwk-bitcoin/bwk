@@ -78,7 +78,7 @@ fn test_account_new_invalid_no_keys() {
         "https://blindbit.example.com".to_string(),
         dir.path().to_path_buf(),
     )
-    .enable_persist(false);
+    .with_persistence(None);
 
     // Remove the mnemonic
     config.mnemonic = None;
@@ -104,7 +104,7 @@ fn test_account_new_invalid_bad_mnemonic() {
         "https://blindbit.example.com".to_string(),
         dir.path().to_path_buf(),
     )
-    .enable_persist(false);
+    .with_persistence(None);
 
     let result = Account::new(config);
     match result {
@@ -145,7 +145,7 @@ fn test_account_new_invalid_empty_url() {
         String::new(), // Empty URL
         dir.path().to_path_buf(),
     )
-    .enable_persist(false);
+    .with_persistence(None);
 
     let result = Account::new(config);
     match result {

@@ -44,7 +44,7 @@ fn account_with_birthday(name: &str, env: &TestEnv) -> bwk_sp::account::Account 
         env.url(),
         std::path::PathBuf::from("/unused"),
     )
-    .enable_persist(false);
+    .with_persistence(None);
     config.set_birthday_height(Some(env.next_scan_height()));
     bwk_sp::account::Account::new(config).expect("create test account")
 }
@@ -913,7 +913,7 @@ fn test_background_scanner_detects_new_blocks(env: &mut TestEnv) {
         blindbit_url.clone(),
         dir.path().to_path_buf(),
     )
-    .enable_persist(false);
+    .with_persistence(None);
     config.set_birthday_height(Some(env.next_scan_height()));
 
     let mut account = bwk_sp::account::Account::new(config).unwrap();
@@ -1119,7 +1119,7 @@ fn test_full_wallet_flow(env: &mut TestEnv) {
         blindbit_url.clone(),
         dir.path().to_path_buf(),
     )
-    .enable_persist(false);
+    .with_persistence(None);
 
     let mut account = bwk_sp::account::Account::new(config).unwrap();
     account

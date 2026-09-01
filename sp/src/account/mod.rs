@@ -558,7 +558,7 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
                     name.clone(),
                     name,
                     config.network,
-                    config.persist.then_some(config.persist_kind),
+                    config.persistence,
                 );
                 scanner.set_stay_offline(sub_cfg.endpoint.url().is_none());
                 scanner.set_endpoint(sub_cfg.endpoint.clone());
@@ -674,7 +674,7 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
     // (see the free `create_backend` helper below for the backend
     // constructor: it's pure w.r.t. `P`.)
 
-    /// Create or load stores based on config.persist + persist_kind.
+    /// Create or load stores based on `config.persistence`.
     ///
     /// Builds a single backend ([`bwk::persist::JsonBackend`] or
     /// [`bwk::persist::SqliteBackend`]) from the config and threads it into
@@ -685,10 +685,8 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
             .birthday_height
             .unwrap_or_else(|| config.min_birthday_height());
 
-        let backend: Arc<dyn bwk::persist::PersistenceBackend> = bwk::persist::build_backend(
-            config.persist.then_some(config.persist_kind),
-            config.account_dir(),
-        )?;
+        let backend: Arc<dyn bwk::persist::PersistenceBackend> =
+            bwk::persist::build_backend(config.persistence, config.account_dir())?;
 
         let coin_store =
             SpCoinStore::load_from_backend(backend.clone(), crate::account::coin_store::STORE_KEY)?;
@@ -723,7 +721,7 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
     fn build_header_store(
         config: &Config,
     ) -> Result<Arc<bwk::bwk_electrum::header_store::HeaderStore>, AccountError> {
-        let path = config.persist.then(|| {
+        let path = config.persistence.is_some().then(|| {
             config
                 .account_dir()
                 .join(bwk::bwk_electrum::config::HEADERS_FILENAME)
@@ -883,7 +881,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     /// Update the Blindbit server URL.
     pub fn set_blindbit_url(&mut self, url: String) {
         self.config.blindbit_url = url;
-        if self.config.persist {
+        if self.config.persistence.is_some() {
             self.persist_config();
         }
     }
@@ -1675,7 +1673,7 @@ mod tests {
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string(),
             "https://blindbit.example.com".to_string(),
             PathBuf::from("/tmp/bwk-sp-account-test"),
-        ).enable_persist(false)
+        ).with_persistence(None)
     }
 
     #[test]
