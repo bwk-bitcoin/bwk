@@ -8,7 +8,7 @@ use miniscript::{
         self, absolute, bip32::DerivationPath, key::rand, psbt, Psbt, ScriptBuf, TxIn, Witness,
     },
     psbt::PsbtExt,
-    Descriptor, DescriptorPublicKey,
+    DefiniteDescriptorKey, Descriptor, DescriptorPublicKey,
 };
 use serde::{Deserialize, Serialize};
 
@@ -184,25 +184,7 @@ impl Coin {
         };
 
         let (kc, index) = coin_path;
-
-        let mut descriptors = descriptor
-            .clone()
-            .into_single_descriptors()
-            .map_err(|_| Error::MultiDescriptor)?
-            .into_iter();
-        let recv = descriptors.next().ok_or(Error::MultiDescriptor)?;
-        let change = descriptors.next().ok_or(Error::MultiDescriptor)?;
-
-        let descr = match kc {
-            KeyChain::Receive => recv
-                .at_derivation_index(index)
-                .map_err(|_| Error::Derivation)?,
-            KeyChain::Change => change
-                .at_derivation_index(index)
-                .map_err(|_| Error::Derivation)?,
-
-            KeyChain::Custom(_) => return Err(Error::KeyChain),
-        };
+        let descr = derive_descriptor(descriptor, kc, index)?;
 
         let dummy_tx = bitcoin::Transaction {
             version: bitcoin::transaction::Version::TWO,
@@ -234,6 +216,32 @@ impl Coin {
             ..Default::default()
         })
     }
+}
+
+/// Derive the definite descriptor of a keychain at an index, out of a two-path
+/// multipath descriptor.
+pub fn derive_descriptor(
+    descriptor: &Descriptor<DescriptorPublicKey>,
+    keychain: KeyChain,
+    index: u32,
+) -> Result<Descriptor<DefiniteDescriptorKey>, Error> {
+    let mut descriptors = descriptor
+        .clone()
+        .into_single_descriptors()
+        .map_err(|_| Error::MultiDescriptor)?
+        .into_iter();
+    let recv = descriptors.next().ok_or(Error::MultiDescriptor)?;
+    let change = descriptors.next().ok_or(Error::MultiDescriptor)?;
+
+    let single = match keychain {
+        KeyChain::Receive => recv,
+        KeyChain::Change => change,
+        KeyChain::Custom(_) => return Err(Error::KeyChain),
+    };
+
+    single
+        .at_derivation_index(index)
+        .map_err(|_| Error::Derivation)
 }
 
 pub fn shuffle_coins(mut vec: Vec<Coin>) -> Vec<Coin> {

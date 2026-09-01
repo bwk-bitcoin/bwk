@@ -10,7 +10,7 @@ use miniscript::{
 };
 use serde::{Deserialize, Serialize};
 
-use bwk_coin::{ChangeTip, Coin, KeyChain};
+use bwk_coin::{derive_descriptor, ChangeTip, Coin, KeyChain};
 
 use crate::{transaction::Amount, Error};
 
@@ -175,49 +175,32 @@ impl TryFrom<Recipient> for bitcoin::psbt::Output {
 
 impl Recipient {
     pub fn to_psbt_output(&self) -> Result<bitcoin::psbt::Output, Error> {
-        if let (Some(descr), Some((kc, index))) = (&self.descriptor, &self.origin) {
-            let descriptors = descr
-                .clone()
-                .into_single_descriptors()
-                .map_err(|_| Error::MultiDescriptor)?;
-            let recv = descriptors.first().ok_or(Error::MultiDescriptor)?;
-            let change = descriptors.get(1).ok_or(Error::MultiDescriptor)?;
+        let (Some(descr), Some((kc, index))) = (&self.descriptor, &self.origin) else {
+            return Ok(bitcoin::psbt::Output::default());
+        };
+        let descr = derive_descriptor(descr, *kc, *index)?;
 
-            let descr = match kc {
-                KeyChain::Receive => recv
-                    .at_derivation_index(*index)
-                    .map_err(|_| Error::Derivation)?,
-                KeyChain::Change => change
-                    .at_derivation_index(*index)
-                    .map_err(|_| Error::Derivation)?,
+        let dummy_tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![self.clone().into()],
+        };
 
-                KeyChain::Custom(_) => return Err(Error::KeyChain),
-            };
+        let mut dummy_psbt = bitcoin::Psbt {
+            unsigned_tx: dummy_tx,
+            version: 0,
+            xpub: Default::default(),
+            proprietary: Default::default(),
+            unknown: Default::default(),
+            inputs: Default::default(),
+            outputs: vec![bitcoin::psbt::Output::default()],
+        };
 
-            let dummy_tx = bitcoin::Transaction {
-                version: bitcoin::transaction::Version::TWO,
-                lock_time: absolute::LockTime::ZERO,
-                input: vec![],
-                output: vec![self.clone().into()],
-            };
+        PsbtExt::update_output_with_descriptor(&mut dummy_psbt, 0, &descr)
+            .map_err(|_| Error::Update)?;
 
-            let mut dummy_psbt = bitcoin::Psbt {
-                unsigned_tx: dummy_tx,
-                version: 0,
-                xpub: Default::default(),
-                proprietary: Default::default(),
-                unknown: Default::default(),
-                inputs: Default::default(),
-                outputs: vec![bitcoin::psbt::Output::default()],
-            };
-
-            PsbtExt::update_output_with_descriptor(&mut dummy_psbt, 0, &descr)
-                .map_err(|_| Error::Update)?;
-
-            Ok(dummy_psbt.outputs[0].clone())
-        } else {
-            Ok(bitcoin::psbt::Output::default())
-        }
+        Ok(dummy_psbt.outputs[0].clone())
     }
 }
 
@@ -258,48 +241,7 @@ impl RecipientProvider for Recipient {
     }
 
     fn to_psbt_output(&self) -> Result<bitcoin::psbt::Output, Error> {
-        if let (Some(descr), Some((kc, index))) = (&self.descriptor, &self.origin) {
-            let descriptors = descr
-                .clone()
-                .into_single_descriptors()
-                .map_err(|_| Error::MultiDescriptor)?;
-            let recv = descriptors.first().ok_or(Error::MultiDescriptor)?;
-            let change = descriptors.get(1).ok_or(Error::MultiDescriptor)?;
-
-            let descr = match kc {
-                KeyChain::Receive => recv
-                    .at_derivation_index(*index)
-                    .map_err(|_| Error::Derivation)?,
-                KeyChain::Change => change
-                    .at_derivation_index(*index)
-                    .map_err(|_| Error::Derivation)?,
-                KeyChain::Custom(_) => return Err(Error::KeyChain),
-            };
-
-            let dummy_tx = bitcoin::Transaction {
-                version: bitcoin::transaction::Version::TWO,
-                lock_time: absolute::LockTime::ZERO,
-                input: vec![],
-                output: vec![self.clone().into()],
-            };
-
-            let mut dummy_psbt = bitcoin::Psbt {
-                unsigned_tx: dummy_tx,
-                version: 0,
-                xpub: Default::default(),
-                proprietary: Default::default(),
-                unknown: Default::default(),
-                inputs: Default::default(),
-                outputs: vec![bitcoin::psbt::Output::default()],
-            };
-
-            PsbtExt::update_output_with_descriptor(&mut dummy_psbt, 0, &descr)
-                .map_err(|_| Error::Update)?;
-
-            Ok(dummy_psbt.outputs[0].clone())
-        } else {
-            Ok(bitcoin::psbt::Output::default())
-        }
+        Recipient::to_psbt_output(self)
     }
 
     fn network(&self) -> Network {
