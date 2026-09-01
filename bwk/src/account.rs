@@ -4,12 +4,8 @@ use std::{
     sync::{mpsc, Arc},
 };
 
-use bwk_coin::Coin;
-use bwk_descriptor::derivator::SpkDerivator;
 use bwk_electrum::{
-    address_store::AddressEntry,
-    coin_state::CoinState,
-    coin_store::{ChangeTipUpdater, CoinEntry, CoinStoreSource, Payment, SpendRecorder},
+    coin_store::{ChangeTipUpdater, SpendRecorder},
     header_follower::HeaderFollower,
     header_store::HeaderStore,
     history::{AccountHistory, TxContribution},
@@ -18,16 +14,12 @@ use bwk_electrum::{
     profile::{DefaultBackend, RamProfile, ReopenStatuses},
     reconcile::Reconciler,
     scanner::ElectrumScanner,
-    tx_store::TxEntry,
 };
 use bwk_persist::{ConfigStore, NoopConfigStore, PersistenceBackend};
 use bwk_sign::signing_manager::SigningManager;
 use bwk_tx::{tx_builder::TxBuilder, ChangeRecipientProvider};
 
-use miniscript::{
-    bitcoin::{self, OutPoint, Txid},
-    Descriptor, DescriptorPublicKey,
-};
+use miniscript::bitcoin::{self, Txid};
 
 use crate::{
     config::Config,
@@ -303,20 +295,10 @@ impl<P: StorageProfile> Account<P> {
         &self.scanner
     }
 
-    pub fn network(&self) -> bitcoin::Network {
-        self.scanner.network()
-    }
-
-    pub fn name(&self) -> String {
-        self.scanner.name()
-    }
-
-    pub fn descriptor_str(&self) -> String {
-        self.scanner.descriptor_str()
-    }
-
-    pub fn descriptor(&self) -> Descriptor<DescriptorPublicKey> {
-        self.scanner.descriptor()
+    /// Mutable counterpart of [`Account::scanner`], for the scanner calls that
+    /// take `&mut self` (address generation, endpoint changes).
+    pub fn scanner_mut(&mut self) -> &mut ElectrumScanner<P> {
+        &mut self.scanner
     }
 
     pub fn receiver(&mut self) -> Option<mpsc::Receiver<Notification>> {
@@ -330,10 +312,6 @@ impl<P: StorageProfile> Account<P> {
             scanner: self.scanner.config().clone(),
             mnemonic: self.mnemonic.clone(),
         }
-    }
-
-    pub fn coin_source(&self) -> CoinStoreSource<P> {
-        self.scanner.coin_source()
     }
 
     pub fn sign(&self, psbt: String) {
@@ -356,68 +334,15 @@ impl<P: StorageProfile> Account<P> {
         let tip_updater = ChangeTipUpdater::new(self.scanner.coin_store().clone());
         let change_provider = Box::new(ChangeRecipientProvider::new_with_updater(
             tip_updater,
-            self.descriptor(),
-            self.network(),
+            self.scanner.descriptor(),
+            self.scanner.network(),
         ));
         let coin_source = Box::new(self.scanner.coin_source());
         TxBuilder::new(change_provider).coin_source(coin_source)
     }
 
-    pub fn balance(&self) -> (u64, Vec<Payment>) {
-        self.scanner.balance()
-    }
-
-    /// Returns a map of coins associated with the account.
-    pub fn coins(&self) -> BTreeMap<OutPoint, CoinEntry> {
-        self.scanner.coins()
-    }
-
-    /// Returns the coin matching the given outpoint if found, else None.
-    pub fn get_coin(&self, outpoint: &OutPoint) -> Option<Coin> {
-        self.scanner.get_coin(outpoint)
-    }
-
-    /// Returns spendable coins for the account.
-    pub fn spendable_coins(&self) -> CoinState {
-        self.scanner.spendable_coins()
-    }
-
-    /// Returns a list of all historical transactions
-    pub fn tx_history(&self) -> Vec<TxEntry> {
-        self.scanner.tx_history()
-    }
-
-    /// Returns a list of all historical payments
-    pub fn payment_history(&self) -> Vec<Payment> {
-        self.scanner.payment_history()
-    }
-
-    /// Record a just-broadcast spend as unconfirmed: owned inputs flip to
-    /// `Spent` and any owned change is surfaced immediately, before the listener
-    /// or a scan sees the tx on-chain.
-    pub fn record_unconfirmed_spend(&self, tx: &bitcoin::Transaction) {
-        self.scanner.record_unconfirmed_spend(tx);
-    }
-
     pub fn spend_recorder(&self) -> SpendRecorder<P> {
         SpendRecorder::new(self.scanner.coin_store().clone())
-    }
-
-    /// Updates the label of a coin identified by the given outpoint.
-    ///
-    /// An empty `label` removes the label instead of setting it.
-    pub fn update_coin_label(&self, outpoint: String, label: String) {
-        self.scanner.update_coin_label(outpoint, label);
-    }
-
-    /// Generates a new receiving address entry for the account.
-    pub fn new_addr(&mut self) -> AddressEntry {
-        self.scanner.new_addr()
-    }
-
-    #[allow(unused)]
-    fn new_change_addr(&mut self) -> bitcoin::Address {
-        self.scanner.new_change_addr()
     }
 }
 
@@ -427,58 +352,9 @@ impl<P: StorageProfile> AccountHistory for Account<P> {
     }
 }
 
-// Derivation specific implementation
-impl<P: StorageProfile> Account<P> {
-    /// Returns the derivator associated with the account.
-    pub fn derivator(&self) -> SpkDerivator {
-        self.scanner.derivator()
-    }
-
-    #[allow(unused)] // Internal usage only
-    fn recv_at(&self, index: u32) -> bitcoin::Address {
-        self.scanner.recv_at(index)
-    }
-
-    #[allow(unused)] // Internal usage only
-    fn change_at(&self, index: u32) -> bitcoin::Address {
-        self.scanner.change_at(index)
-    }
-
-    /// Returns the current receiving watch tip index.
-    pub fn recv_watch_tip(&self) -> u32 {
-        self.scanner.recv_watch_tip()
-    }
-
-    /// Returns the current change watch tip index.
-    pub fn change_watch_tip(&self) -> u32 {
-        self.scanner.change_watch_tip()
-    }
-
-    pub fn generated_addresses(
-        &self,
-    ) -> (
-        Vec<AddressEntry>, /* receive */
-        Vec<AddressEntry>, /* change*/
-    ) {
-        self.scanner.generated_addresses()
-    }
-
-    /// Snapshot of every address entry the account currently tracks
-    /// (receive + change, all derivation indices). Cloned, so the
-    /// caller doesn't hold any lock.
-    pub fn address_entries(&self) -> Vec<AddressEntry> {
-        self.scanner.address_entries()
-    }
-}
-
 // Electrum specific implementation. Bound to `OpenFromBackend`, which pins the
 // header store to the concrete backend-backed one the worker drives.
 impl<P: OpenFromBackend> Account<P> {
-    /// Re-generate coin_store from tx_store
-    pub fn generate_coins(&mut self) {
-        self.scanner.generate_coins();
-    }
-
     /// Sets the Electrum server URL and port for the account.
     pub fn set_electrum(&mut self, url: String, port: String) {
         if let Ok(port) = port.parse::<u16>() {
@@ -489,11 +365,6 @@ impl<P: OpenFromBackend> Account<P> {
                 .send(Notification::InvalidElectrumConfig)
                 .expect("cannot fail");
         }
-    }
-
-    /// Sets the Electrum URL and port in memory without writing to file.
-    pub fn set_electrum_config(&mut self, url: Option<String>, port: Option<u16>) {
-        self.scanner.set_electrum(url, port);
     }
 
     /// Start every Electrum connection this account drives: the scanner's
@@ -564,9 +435,12 @@ mod tests {
     use bwk_descriptor::descriptor::ScriptType;
     use bwk_persist::{PersistenceKind, Store};
     use bwk_sign::hot_signer::HotSigner;
-    use miniscript::bitcoin::{
-        bip32::{ChildNumber, DerivationPath},
-        Network, ScriptBuf,
+    use miniscript::{
+        bitcoin::{
+            bip32::{ChildNumber, DerivationPath},
+            Network, ScriptBuf,
+        },
+        Descriptor, DescriptorPublicKey,
     };
     use std::{path::PathBuf, str::FromStr};
     use temp_dir::TempDir;
@@ -631,24 +505,24 @@ mod tests {
         {
             let mut account: Account = Account::new(config);
             for _ in 0..10 {
-                account.new_change_addr();
+                account.scanner_mut().new_change_addr();
             }
-            derivator = account.derivator();
-            assert!(account.change_watch_tip() >= 10);
+            derivator = account.scanner().derivator();
+            assert!(account.scanner().change_watch_tip() >= 10);
             drop(account);
         }
 
         // Reopen: the tip must be restored (fix 1), not reset to 0.
         let account: Account = Account::new(saved);
         assert!(
-            account.change_watch_tip() >= 10,
+            account.scanner().change_watch_tip() >= 10,
             "change tip must survive restart, got {}",
-            account.change_watch_tip()
+            account.scanner().change_watch_tip()
         );
 
         // History for a change script past the restored window must extend the
         // store rather than panic (fix 3).
-        let beyond = account.change_watch_tip() + 5;
+        let beyond = account.scanner().change_watch_tip() + 5;
         let spk = derivator.change_at(beyond).script_pubkey();
         {
             let mut store = account.scanner.coin_store().lock().expect("poisoned");
@@ -657,7 +531,7 @@ mod tests {
             store.handle_history_response(map);
         }
         assert!(
-            account.change_watch_tip() > beyond,
+            account.scanner().change_watch_tip() > beyond,
             "store must extend to cover the reported high-index script"
         );
         drop(account);
@@ -692,9 +566,9 @@ mod tests {
 
         let account: Account = Account::new(config);
         assert!(
-            account.change_watch_tip() >= 30,
+            account.scanner().change_watch_tip() >= 30,
             "change tip must be floored by the statuses max index, got {}",
-            account.change_watch_tip()
+            account.scanner().change_watch_tip()
         );
         drop(account);
     }
@@ -738,7 +612,7 @@ mod tests {
 
         let account: Account = Account::new(config);
         assert_eq!(
-            account.change_watch_tip(),
+            account.scanner().change_watch_tip(),
             generated + look_ahead + 1,
             "generated tip must not be inflated by the look-ahead on reopen"
         );
@@ -935,13 +809,13 @@ mod integration_tests {
         sleep(Duration::from_millis(300));
 
         let recv_addr = account.scanner.new_recv_addr();
-        let change_addr = account.new_change_addr();
+        let change_addr = account.scanner_mut().new_change_addr();
 
         send_to_address(&bitcoind, &recv_addr, Amount::from_btc(0.1).unwrap());
         generate(&bitcoind, BLOCKS);
         wait_until_timeout(
             || {
-                let coins = account.coins();
+                let coins = account.scanner().coins();
                 coins.len() == 1
             },
             TIMEOUT,
@@ -952,51 +826,51 @@ mod integration_tests {
         generate(&bitcoind, BLOCKS);
         wait_until_timeout(
             || {
-                let coins = account.coins();
+                let coins = account.scanner().coins();
                 coins.len() == 2
             },
             TIMEOUT,
         );
 
         // receive at look_ahead bound
-        let recv_addr = account.recv_at(look_ahead);
+        let recv_addr = account.scanner().recv_at(look_ahead);
         send_to_address(&bitcoind, &recv_addr, Amount::from_btc(0.1).unwrap());
         generate(&bitcoind, BLOCKS);
         wait_until_timeout(
             || {
-                let coins = account.coins();
+                let coins = account.scanner().coins();
                 coins.len() == 3
             },
             TIMEOUT,
         );
 
         // change at look_ahead bound
-        let change_addr = account.change_at(look_ahead);
+        let change_addr = account.scanner().change_at(look_ahead);
         send_to_address(&bitcoind, &change_addr, Amount::from_btc(0.1).unwrap());
         generate(&bitcoind, BLOCKS);
         wait_until_timeout(
             || {
-                let coins = account.coins();
+                let coins = account.scanner().coins();
                 coins.len() == 4
             },
             TIMEOUT,
         );
 
-        let undiscovered_tip = account.recv_watch_tip() + 1;
+        let undiscovered_tip = account.scanner().recv_watch_tip() + 1;
 
         // receive beyond the look_ahead bound
-        let recv_addr = account.recv_at(undiscovered_tip);
+        let recv_addr = account.scanner().recv_at(undiscovered_tip);
         send_to_address(&bitcoind, &recv_addr, Amount::from_btc(0.1).unwrap());
         generate(&bitcoind, BLOCKS);
-        let coins = account.coins();
+        let coins = account.scanner().coins();
         // the coin is not detected for receiving address
         assert_eq!(coins.len(), 4);
 
         // change beyond the look_ahead bound
-        let change_addr = account.change_at(undiscovered_tip);
+        let change_addr = account.scanner().change_at(undiscovered_tip);
         send_to_address(&bitcoind, &change_addr, Amount::from_btc(0.1).unwrap());
         generate(&bitcoind, BLOCKS);
-        let coins = account.coins();
+        let coins = account.scanner().coins();
         // the coin is not detected for change address
         assert_eq!(coins.len(), 4);
 
@@ -1005,17 +879,17 @@ mod integration_tests {
         account.scanner.new_recv_addr();
         wait_until_timeout(
             || {
-                let coins = account.coins();
+                let coins = account.scanner().coins();
                 coins.len() == 5
             },
             TIMEOUT,
         );
 
-        account.new_change_addr();
-        account.new_change_addr();
+        account.scanner_mut().new_change_addr();
+        account.scanner_mut().new_change_addr();
         wait_until_timeout(
             || {
-                let coins = account.coins();
+                let coins = account.scanner().coins();
                 coins.len() == 6
             },
             TIMEOUT,
@@ -1057,7 +931,7 @@ mod integration_tests {
         sleep(Duration::from_millis(300));
 
         let recv_addr = account.scanner.new_recv_addr();
-        let change_addr = account.new_change_addr();
+        let change_addr = account.scanner_mut().new_change_addr();
 
         sleep(Duration::from_secs(1));
 
@@ -1083,13 +957,13 @@ mod integration_tests {
 
         wait_until_timeout(
             || {
-                let coins = account.coins();
+                let coins = account.scanner().coins();
                 coins.len() == 2
             },
             TIMEOUT,
         );
 
-        let coins = account.coins();
+        let coins = account.scanner().coins();
         let coins_height: BTreeMap<_, _> =
             coins.into_iter().map(|(c, e)| (c, e.height())).collect();
 
@@ -1132,7 +1006,7 @@ mod integration_tests {
         let new_h = get_block_hash_str(&bitcoind, height_before_reorg);
         assert_ne!(h_before_reorg, new_h);
 
-        let coins = account.coins();
+        let coins = account.scanner().coins();
         // there is still 2 coins
         assert_eq!(coins.len(), 2);
     }
@@ -1147,7 +1021,12 @@ mod integration_tests {
         bitcoind: &BitcoinD,
         amount: u64,
     ) -> (bitcoin::Txid, u32) {
-        let coins = account.spendable_coins().coins.into_values().collect();
+        let coins = account
+            .scanner()
+            .spendable_coins()
+            .coins
+            .into_values()
+            .collect();
         builder.new_template();
         builder.tx_template.inputs = coins;
         builder.dummy_external_output(amount);
@@ -1176,11 +1055,12 @@ mod integration_tests {
     #[cfg(feature = "test")]
     fn wait_coins_verified(account: &Account, count: usize, timeout: u64) {
         let verified = || {
-            let coins = account.coins();
+            let coins = account.scanner().coins();
             if coins.len() != count || coins.values().any(|c| c.status() != CoinStatus::Confirmed) {
                 return false;
             }
             let proved: BTreeSet<Txid> = account
+                .scanner()
                 .tx_history()
                 .iter()
                 .filter(|tx| matches!(tx.inclusion(), Inclusion::Verified { .. }))
@@ -1192,6 +1072,7 @@ mod integration_tests {
             wait_until(Duration::from_secs(timeout), verified),
             "expected {count} verified coins, got {:?}",
             account
+                .scanner()
                 .coins()
                 .values()
                 .map(|c| c.status())
@@ -1251,7 +1132,7 @@ mod integration_tests {
         let blocks = receive(&mut account, &bitcoind, 200_000);
         wait_until_timeout(
             || {
-                let coins = account.coins();
+                let coins = account.scanner().coins();
                 coins.len() == 1
             },
             block_wait(blocks),
@@ -1259,13 +1140,13 @@ mod integration_tests {
         let (_, blocks) = spend(&mut account, &mut builder, &bitcoind, 100_000);
         wait_until_timeout(
             || {
-                let payments = account.payment_history();
+                let payments = account.scanner().payment_history();
                 payments.len() == 2
             },
             block_wait(blocks),
         );
 
-        let payments = account.payment_history();
+        let payments = account.scanner().payment_history();
         assert_eq!(2, payments.len());
         let sorted = sort_payments(&payments);
         assert_eq!(sorted, (1, 1));
@@ -1274,6 +1155,7 @@ mod integration_tests {
         wait_until_timeout(
             || {
                 account
+                    .scanner()
                     .payment_history()
                     .iter()
                     .filter(|p| p.height.is_some())
@@ -1282,6 +1164,7 @@ mod integration_tests {
             block_wait(5),
         );
         let confirmed: Vec<_> = account
+            .scanner()
             .payment_history()
             .into_iter()
             .filter(|p| p.height.is_some())
@@ -1430,11 +1313,11 @@ mod integration_tests {
             let mut prev_blocks = receive(&mut account, &bitcoind, 100_000_000);
             for _ in 0..15 {
                 wait_until_timeout(
-                    || !account.spendable_coins().coins.is_empty(),
+                    || !account.scanner().spendable_coins().coins.is_empty(),
                     block_wait(prev_blocks),
                 );
                 sleep(Duration::from_millis(1000));
-                let coins = account.spendable_coins();
+                let coins = account.scanner().spendable_coins();
                 let balance = coins
                     .coins
                     .into_iter()
@@ -1484,14 +1367,14 @@ mod integration_tests {
             // iterations of generate-and-index, the listener thread can
             // be queued up well past `block_wait(prev_blocks)`'s 30 s
             // floor under CI / CPU pressure.
-            wait_until_timeout(|| account.payment_history().len() >= 16, 120);
-            let payments = account.payment_history();
+            wait_until_timeout(|| account.scanner().payment_history().len() >= 16, 120);
+            let payments = account.scanner().payment_history();
             assert_eq!(payments.len(), 16);
         }
 
         let account: Account = Account::new(saved_config);
         sleep(Duration::from_millis(300));
-        let payments = account.payment_history();
+        let payments = account.scanner().payment_history();
         assert_eq!(payments.len(), 16);
     }
 }
