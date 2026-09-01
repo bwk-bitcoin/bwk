@@ -11,9 +11,10 @@ use crate::{
     },
 };
 
+use bwk_coin::{Coin, CoinSpendInfo};
 use bwk_tx::{
-    coin::CoinSpendInfo, transaction::Amount, Coin, Error as TxError, FinalizationContext,
-    PsbtOutputInfo, RecipientProvider, SpPartialSecretProvider,
+    transaction::Amount, Error as TxError, FinalizationContext, PsbtOutputInfo, RecipientProvider,
+    SpPartialSecretProvider,
 };
 
 const TR_OUTPUT_WEIGHT: u64 = 172;

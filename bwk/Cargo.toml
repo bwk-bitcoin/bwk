@@ -22,6 +22,7 @@ bwk-descriptor.workspace = true
 bwk-persist.workspace = true
 bwk-sign = { workspace = true, default-features = false, features = ["sp"] }
 bwk-utils.workspace = true
+bwk-coin.workspace = true
 bwk-tx.workspace = true
 
 miniscript.workspace = true

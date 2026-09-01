@@ -25,6 +25,7 @@ pub use tx_store::Inclusion;
 
 // Re-exports
 pub use bwk_backoff;
+pub use bwk_coin;
 pub use bwk_descriptor;
 pub use bwk_electrum;
 pub use bwk_keys;

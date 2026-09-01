@@ -1,18 +1,29 @@
+//! Coin domain types.
+//!
+//! These describe what scanning finds and what spending consumes, so they sit
+//! below both `bwk-electrum` and `bwk-tx` rather than inside either.
+
 use miniscript::{
     bitcoin::{
-        self, absolute,
-        key::rand,
-        psbt::{self},
-        Psbt, ScriptBuf, TxIn, Witness,
+        self, absolute, bip32::DerivationPath, key::rand, psbt, Psbt, ScriptBuf, TxIn, Witness,
     },
     psbt::PsbtExt,
     Descriptor, DescriptorPublicKey,
 };
 use serde::{Deserialize, Serialize};
 
-use bitcoin::bip32::DerivationPath;
-
-use crate::Error;
+/// Errors constructing or converting a [`Coin`].
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("failed to derive the descriptor")]
+    Derivation,
+    #[error("unknown keychain")]
+    KeyChain,
+    #[error("expected a single-path descriptor")]
+    MultiDescriptor,
+    #[error("failed to update the psbt input")]
+    Update,
+}
 
 /// Witness satisfaction weight (WU) of a single taproot key-spend input:
 /// Schnorr sig 64 + sighash byte 1 + witness-stack length byte 1 = 66.
@@ -229,6 +240,52 @@ pub fn shuffle_coins(mut vec: Vec<Coin>) -> Vec<Coin> {
     use rand::seq::SliceRandom;
     vec.shuffle(&mut rand::thread_rng());
     vec
+}
+
+/// Trait for managing change address index tip.
+/// Implemented by wallet types that need to track the next change index.
+/// Called by RecipientProvider implementations when deriving new change addresses.
+pub trait ChangeTip {
+    fn next_index(&mut self) -> u32;
+}
+
+pub trait CoinSource {
+    fn spendable_coins(&self) -> Vec<Coin>;
+    #[cfg(feature = "test")]
+    fn add_coin(&mut self, _coin: Coin) {}
+    #[cfg(feature = "test")]
+    fn remove_coin(&mut self, _coin: &Coin) {}
+}
+
+#[cfg(feature = "test")]
+impl CoinSource for std::collections::BTreeMap<miniscript::bitcoin::OutPoint, Coin> {
+    fn spendable_coins(&self) -> Vec<Coin> {
+        self.values().cloned().collect()
+    }
+
+    fn add_coin(&mut self, coin: Coin) {
+        self.insert(coin.outpoint, coin);
+    }
+
+    fn remove_coin(&mut self, coin: &Coin) {
+        self.remove(&coin.outpoint);
+    }
+}
+
+/// Estimate the satisfaction size for an input, returning the result
+/// in weight units (WU).
+/// Note: The output of this function represent the worst case scenario.
+pub fn max_input_satisfaction_size(descriptor: &Descriptor<DescriptorPublicKey>) -> usize {
+    descriptor
+        .clone()
+        .into_single_descriptors()
+        .expect("multikey")
+        .first()
+        .expect("multikey")
+        .clone()
+        .max_weight_to_satisfy()
+        .expect("invalid descriptor")
+        .to_wu() as usize
 }
 
 #[cfg(test)]

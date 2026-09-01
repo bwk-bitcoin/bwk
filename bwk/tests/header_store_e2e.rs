@@ -52,8 +52,8 @@ use bwk::{
     tx_store::Inclusion,
     Account,
 };
+use bwk_coin::CoinStatus;
 use bwk_descriptor::descriptor::ScriptType;
-use bwk_tx::CoinStatus;
 use electrsd::bitcoind::{
     bitcoincore_rpc::{jsonrpc::serde_json::Value, RpcApi},
     BitcoinD,

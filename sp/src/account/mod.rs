@@ -1013,7 +1013,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
             for (outpoint, entry) in sub.coins() {
                 let spendable = !matches!(
                     entry.status(),
-                    bwk_tx::CoinStatus::Spent | bwk_tx::CoinStatus::BeingSpend,
+                    bwk_coin::CoinStatus::Spent | bwk_coin::CoinStatus::BeingSpend,
                 );
                 out.insert(
                     outpoint,
@@ -1104,7 +1104,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
                     if let Some(entry) = sub.coins().get(outpoint) {
                         if matches!(
                             entry.status(),
-                            bwk_tx::CoinStatus::Spent | bwk_tx::CoinStatus::BeingSpend
+                            bwk_coin::CoinStatus::Spent | bwk_coin::CoinStatus::BeingSpend
                         ) {
                             return Err(TxRequestError::CoinNotSpendable(*outpoint));
                         }
@@ -1234,14 +1234,14 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
 
         // Merge coin sources from all sub-accounts, enriching BIP32 coins
         // with their secret keys for SP partial secret computation.
-        let bip32_sources: Vec<Box<dyn bwk_tx::CoinSource>> = self
+        let bip32_sources: Vec<Box<dyn bwk_coin::CoinSource>> = self
             .sub_accounts
             .iter()
             .map(|a| {
                 Box::new(KeyedBip32Source::new(
                     Box::new(a.coin_source()),
                     a.master_xprivs(),
-                )) as Box<dyn bwk_tx::CoinSource>
+                )) as Box<dyn bwk_coin::CoinSource>
             })
             .collect();
         let merged_source = Box::new(MergedCoinSource::new(sp_source, bip32_sources));
@@ -1538,7 +1538,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum AddressSource {
     SilentPayment(bitcoin::Txid),
-    Bip32(bwk_tx::coin::KeyChain, u32),
+    Bip32(bwk_coin::KeyChain, u32),
     Unknown,
 }
 
@@ -1607,12 +1607,12 @@ pub fn backend_block_height(blindbit_url: String) -> Result<u32, AccountError> {
 }
 
 #[cfg(feature = "mnemonic")]
-/// Build a [`bwk_tx::Coin`] from an SP outpoint + entry, suitable for
+/// Build a [`bwk_coin::Coin`] from an SP outpoint + entry, suitable for
 /// `TxBuilder::add_input`. The taproot key-spend satisfaction weight
-/// ([`bwk_tx::TAPROOT_KEYSPEND_SATISFACTION_WU`]) is used because SP outputs
+/// ([`bwk_coin::TAPROOT_KEYSPEND_SATISFACTION_WU`]) is used because SP outputs
 /// are always single-key taproot.
-pub fn sp_coin_entry_to_coin(outpoint: OutPoint, entry: &SpCoinEntry) -> bwk_tx::Coin {
-    bwk_tx::Coin {
+pub fn sp_coin_entry_to_coin(outpoint: OutPoint, entry: &SpCoinEntry) -> bwk_coin::Coin {
+    bwk_coin::Coin {
         txout: bitcoin::TxOut {
             value: entry.amount(),
             script_pubkey: entry.script().clone(),
@@ -1620,10 +1620,10 @@ pub fn sp_coin_entry_to_coin(outpoint: OutPoint, entry: &SpCoinEntry) -> bwk_tx:
         outpoint,
         height: Some(entry.height() as u64),
         sequence: bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
-        status: bwk_tx::CoinStatus::Confirmed,
+        status: bwk_coin::CoinStatus::Confirmed,
         label: None,
-        satisfaction_size: bwk_tx::TAPROOT_KEYSPEND_SATISFACTION_WU,
-        spend_info: bwk_tx::CoinSpendInfo::Sp {
+        satisfaction_size: bwk_coin::TAPROOT_KEYSPEND_SATISFACTION_WU,
+        spend_info: bwk_coin::CoinSpendInfo::Sp {
             derivation: bitcoin::bip32::DerivationPath::default(),
             tweak: *entry.tweak(),
         },

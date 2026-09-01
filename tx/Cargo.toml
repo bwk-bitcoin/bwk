@@ -14,6 +14,7 @@ miniscript = { workspace = true, features = ["serde"] }
 bitcoin.workspace = true
 bitcoin.features = ["rand-std"]
 rand.workspace = true
+bwk-coin.workspace = true
 thiserror.workspace = true
 bwk-descriptor.workspace = true
 
@@ -25,4 +26,4 @@ bwk-utils.optional = true
 
 [features]
 default = []
-test = ["dep:bwk-sign", "dep:bwk-utils", "bwk-utils/test"]
+test = ["dep:bwk-sign", "dep:bwk-utils", "bwk-utils/test", "bwk-coin/test"]

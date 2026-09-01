@@ -1,6 +1,3 @@
-#![allow(clippy::large_enum_variant)]
-
-pub mod coin;
 pub mod coin_selection;
 pub mod descr_fingerprint;
 pub mod error;
@@ -10,9 +7,6 @@ pub mod template;
 pub mod transaction;
 pub mod tx_builder;
 
-pub use coin::{
-    Coin, CoinSourceKind, CoinSpendInfo, CoinStatus, KeyChain, TAPROOT_KEYSPEND_SATISFACTION_WU,
-};
 pub use coin_selection::{CoinCandidate, CoinSelector, DefaultCoinSelector};
 pub use descr_fingerprint::DescrFingerprint;
 pub use error::Error;
@@ -25,6 +19,6 @@ pub use transaction::{
     estimated_weight_raw, process_fees, Amount, Drain, FeeResult, Fees, TransactionResult,
     TxTemplate, Warning,
 };
-pub use tx_builder::{ChangeTip, CoinSource, TxBuilder};
+pub use tx_builder::TxBuilder;
 
 pub const DUST_AMOUNT: u64 = 5_000;

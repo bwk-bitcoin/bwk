@@ -51,6 +51,7 @@ tests locally. Commit messages must be single-line and follow existing style
 | bwk-descriptor | Miniscript descriptor handling, SpkDerivator                |
 | bwk-keys       | Key derivation utilities (OXpriv, OXpub, KeyDerivator)      |
 | bwk-p2p        | Bitcoin P2P network client, DNS seed resolution             |
+| bwk-coin       | Coin domain types shared by bwk-tx and bwk-electrum         |
 | bwk-error      | In-house derive for error impls, reached as `thiserror`     |
 | bwk-backoff    | Exponential backoff utility                                 |
 | bwk-utils      | Test helpers (behind `test` feature)                        |
@@ -62,6 +63,7 @@ See crate READMEs for usage examples:
 - [sign/README.md](sign/README.md): SigningManager, Signer trait
 - [descriptor/README.md](descriptor/README.md): SpkDerivator, descriptor helpers
 - [electrum/README.md](electrum/README.md): Electrum client modes
+- [coin/README.md](coin/README.md): coin domain types
 - [error/README.md](error/README.md): the in-house error derive
 
 ## Architecture

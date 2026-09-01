@@ -1,0 +1,22 @@
+[package]
+name = "bwk-coin"
+version = "0.0.1"
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+keywords.workspace = true
+readme.workspace = true
+description = "Coin domain types shared by scanning and transaction building"
+
+[features]
+default = []
+# Adds the mutating `CoinSource` methods and the impl for a plain
+# `BTreeMap<OutPoint, Coin>`, so a test can stand in for a wallet's coin store.
+test = []
+
+[dependencies]
+miniscript = { workspace = true, features = ["serde"] }
+bitcoin = { workspace = true, features = ["rand-std"] }
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true

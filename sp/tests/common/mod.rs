@@ -663,8 +663,8 @@ pub fn swap_to_sp(
 
 // TestEnv: integration test harness
 
+use bwk_coin::{Coin, CoinSpendInfo, CoinStatus, KeyChain};
 use bwk_sign::HotSigner;
-use bwk_tx::{Coin, CoinSpendInfo, CoinStatus, KeyChain};
 
 /// Mnemonic for BIP32 coins (different from SP mnemonics).
 pub fn bip32_mnemonic() -> &'static str {

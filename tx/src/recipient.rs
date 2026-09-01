@@ -10,12 +10,9 @@ use miniscript::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    coin::{Coin, KeyChain},
-    transaction::Amount,
-    tx_builder::ChangeTip,
-    Error,
-};
+use bwk_coin::{ChangeTip, Coin, KeyChain};
+
+use crate::{transaction::Amount, Error};
 
 /// Context passed during transaction finalization.
 /// Contains all information needed to create output scripts.

@@ -403,11 +403,7 @@ pub struct SpAddressEntry {
 
 use std::sync::Mutex;
 
-use bwk_tx::{
-    coin::{CoinSpendInfo, CoinStatus},
-    tx_builder::CoinSource,
-    Coin,
-};
+use bwk_coin::{Coin, CoinSource, CoinSpendInfo, CoinStatus};
 
 use bitcoin::{
     bip32::{Fingerprint, Xpriv},

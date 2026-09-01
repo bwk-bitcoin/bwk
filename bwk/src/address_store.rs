@@ -1,6 +1,6 @@
+use bwk_coin::{ChangeTip, KeyChain};
 use bwk_descriptor::derivator::SpkDerivator;
 use bwk_persist::Store;
-use bwk_tx::{coin::KeyChain, tx_builder::ChangeTip};
 use miniscript::bitcoin::{self, address::NetworkUnchecked, Script, ScriptBuf, Txid};
 use serde::{Deserialize, Serialize};
 use std::{

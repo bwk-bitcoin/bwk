@@ -10,12 +10,13 @@ recipients through the `RecipientProvider` trait.
 
 **Scope:** Transaction construction, coin selection algorithm, fee calculation,
 PSBT creation. Does NOT handle signing (use bwk-sign), broadcasting (use
-bwk-electrum), or UTXO tracking (use bwk or bwk-sp).
+bwk-electrum), or UTXO tracking (use bwk or bwk-sp), and does not define the
+coin types it selects over (they come from bwk-coin).
 
 ## Usage
 
 ```rust
-use bwk_tx::{TxBuilder, Recipient, Fees, Coin};
+use bwk_tx::{TxBuilder, Recipient, Fees};
 
 // Create builder with change provider
 let mut builder = TxBuilder::new(change_provider);
@@ -41,6 +42,9 @@ let psbt = result.psbt;
 - `ChangeTip`: Manages change address index progression
 - `CoinCandidate`: Coin with value and satisfaction weight for selection
 
+The coin domain types this builder works over, `Coin`, `CoinSource` and
+`ChangeTip`, are defined in bwk-coin and re-used by bwk-electrum.
+
 ## Coin Selection
 
 Weighted random selection algorithm that:
@@ -52,5 +56,4 @@ Weighted random selection algorithm that:
 
 - `TxBuilder`: Main builder with fluent API
 - `TxTemplate`: Inputs, outputs, and fee specification
-- `Coin`: UTXO with script, value, and derivation info
 - `Fees`: Fee specification (sat/vB, msat/vB, or absolute)

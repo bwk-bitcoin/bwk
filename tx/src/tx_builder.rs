@@ -2,15 +2,17 @@ use crate::{
     coin_selection::{CoinSelector, DefaultCoinSelector},
     recipient::SpPartialSecretProvider,
     transaction::{process_transaction, tx_estimated_weight, Amount, Error},
-    Coin, Fees, Recipient, RecipientProvider, TransactionResult, TxTemplate,
+    Fees, Recipient, RecipientProvider, TransactionResult, TxTemplate,
 };
 use bitcoin::Psbt;
+use bwk_coin::{Coin, CoinSource};
 
 #[cfg(feature = "test")]
 use {
-    crate::{coin::KeyChain, FinalizationContext, PsbtOutputInfo, Warning},
+    crate::{FinalizationContext, PsbtOutputInfo, Warning},
     bitcoin::bip32::ChildNumber,
     bitcoin::Network,
+    bwk_coin::{CoinSpendInfo, CoinStatus, KeyChain},
     bwk_descriptor::{tr_path, wpkh_path, SpkDerivator},
     bwk_sign::HotSigner,
     bwk_sign::Signer,
@@ -25,36 +27,6 @@ use {
     miniscript::{Descriptor, DescriptorPublicKey},
     std::collections::BTreeMap,
 };
-
-/// Trait for managing change address index tip.
-/// Implemented by wallet types that need to track the next change index.
-/// Called by RecipientProvider implementations when deriving new change addresses.
-pub trait ChangeTip {
-    fn next_index(&mut self) -> u32;
-}
-
-pub trait CoinSource {
-    fn spendable_coins(&self) -> Vec<Coin>;
-    #[cfg(feature = "test")]
-    fn add_coin(&mut self, _coin: Coin) {}
-    #[cfg(feature = "test")]
-    fn remove_coin(&mut self, _coin: &Coin) {}
-}
-
-#[cfg(feature = "test")]
-impl CoinSource for BTreeMap<OutPoint, Coin> {
-    fn spendable_coins(&self) -> Vec<Coin> {
-        self.values().cloned().collect()
-    }
-
-    fn add_coin(&mut self, coin: Coin) {
-        self.insert(coin.outpoint, coin);
-    }
-
-    fn remove_coin(&mut self, coin: &Coin) {
-        self.remove(&coin.outpoint);
-    }
-}
 
 pub struct TxBuilder {
     change_provider: Box<dyn RecipientProvider>,
@@ -387,7 +359,7 @@ impl TxBuilder {
     }
 
     pub fn mark_tx_mined(&mut self) {
-        use crate::transaction::max_input_satisfaction_size;
+        use bwk_coin::max_input_satisfaction_size;
 
         let this_descriptor = self.derivator().descriptor();
 
@@ -424,10 +396,10 @@ impl TxBuilder {
                             },
                             height: Some(0),
                             sequence: Sequence::ZERO,
-                            status: crate::CoinStatus::Confirmed,
+                            status: CoinStatus::Confirmed,
                             label: None,
                             satisfaction_size: max_input_satisfaction_size(&descriptor) as u64,
-                            spend_info: crate::CoinSpendInfo::Bip32 {
+                            spend_info: CoinSpendInfo::Bip32 {
                                 coin_path: origin,
                                 descriptor,
                                 secret_key: None,
@@ -442,8 +414,8 @@ impl TxBuilder {
     pub fn receive_coin(&mut self, coin: Coin) {
         let this_descriptor = self.derivator().descriptor();
         let matches = match &coin.spend_info {
-            crate::CoinSpendInfo::Bip32 { descriptor, .. } => *descriptor == this_descriptor,
-            crate::CoinSpendInfo::Sp { .. } => false,
+            CoinSpendInfo::Bip32 { descriptor, .. } => *descriptor == this_descriptor,
+            CoinSpendInfo::Sp { .. } => false,
         };
         if !matches {
             return;
@@ -485,7 +457,7 @@ impl TxBuilder {
         self.derivator().receive_at(index)
     }
     pub fn fund_with_bitcoind(&mut self, bitcoind: &mut corepc_node::Client, amount: u64) -> Coin {
-        use crate::transaction::max_input_satisfaction_size;
+        use bwk_coin::max_input_satisfaction_size;
 
         let index: u8 = random();
         let addr = self.receive_address_at(index as u32);
@@ -515,10 +487,10 @@ impl TxBuilder {
             },
             height: Some(height),
             sequence: Sequence::ZERO,
-            status: crate::CoinStatus::Confirmed,
+            status: CoinStatus::Confirmed,
             label: None,
             satisfaction_size: satisfaction as u64,
-            spend_info: crate::CoinSpendInfo::Bip32 {
+            spend_info: CoinSpendInfo::Bip32 {
                 coin_path: (KeyChain::Receive, index as u32),
                 descriptor: self.derivator().descriptor(),
                 secret_key: None,
@@ -576,9 +548,7 @@ pub mod test {
     }
 
     pub fn receive_coin(amount: u64, derivator: &SpkDerivator, index: u32) -> Coin {
-        use crate::{
-            coin::KeyChain, transaction::max_input_satisfaction_size, CoinSpendInfo, CoinStatus,
-        };
+        use bwk_coin::{max_input_satisfaction_size, CoinSpendInfo, CoinStatus, KeyChain};
 
         let spk = derivator.receive_at(index).script_pubkey();
         let txout = TxOut {
@@ -674,7 +644,7 @@ pub mod test {
     }
 
     pub fn self_recipient(amount: u64, derivator: &SpkDerivator, index: u32) -> Recipient {
-        use crate::coin::KeyChain;
+        use bwk_coin::KeyChain;
 
         let address = derivator.receive_at(index).as_unchecked().clone();
         Recipient {
@@ -714,9 +684,7 @@ pub mod test {
     }
 
     pub fn funding_coin(amount: u64, derivator: &SpkDerivator, index: u32) -> Coin {
-        use crate::{
-            coin::KeyChain, transaction::max_input_satisfaction_size, CoinSpendInfo, CoinStatus,
-        };
+        use bwk_coin::{max_input_satisfaction_size, CoinSpendInfo, CoinStatus, KeyChain};
 
         let spk = derivator.receive_at(index).script_pubkey();
         let descriptor = derivator.descriptor();

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use bitcoin::Weight;
 use rand::random_range;
 
-use crate::Coin;
+use bwk_coin::Coin;
 
 /// Trait abstracting what coin selection needs from a spendable coin.
 /// Implement this for any coin type to use the generic selection algorithm.

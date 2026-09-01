@@ -10,11 +10,12 @@ use std::{
 };
 
 use bwk_backoff::Backoff;
+use bwk_coin::{Coin, KeyChain};
 use bwk_descriptor::derivator::SpkDerivator;
 use bwk_electrum::client::{CoinError, CoinRequest, CoinResponse};
 use bwk_persist::{ConfigStore, NoopConfigStore, PersistError, PersistenceBackend, Store};
 use bwk_sign::signing_manager::SigningManager;
-use bwk_tx::{coin::KeyChain, tx_builder::TxBuilder, ChangeRecipientProvider, Coin};
+use bwk_tx::{tx_builder::TxBuilder, ChangeRecipientProvider};
 
 use miniscript::{
     bitcoin::{self, BlockHash, OutPoint, ScriptBuf, TxMerkleNode, Txid},
@@ -2023,6 +2024,7 @@ mod tests {
     use super::*;
     use crate::tx_store::TxStore;
     use bip39::Mnemonic;
+    use bwk_coin::CoinStatus;
     use bwk_descriptor::descriptor::{wpkh, ScriptType};
     use bwk_electrum::{
         client::DecodeError,
@@ -2030,7 +2032,6 @@ mod tests {
     };
     use bwk_persist::NoopBackend;
     use bwk_sign::hot_signer::HotSigner;
-    use bwk_tx::CoinStatus;
     use bwk_utils::test::{funding_tx, setup_logger, spending_tx};
     use miniscript::bitcoin::{bip32::ChildNumber, Network};
     use std::{path::PathBuf, str::FromStr, sync::mpsc::TryRecvError, time::Duration};

@@ -1,10 +1,7 @@
-use bwk_descriptor::derivator::SpkDerivator;
-use bwk_tx::{
-    coin::{self, KeyChain},
-    transaction::max_input_satisfaction_size,
-    tx_builder::{ChangeTip, CoinSource},
-    Coin, CoinStatus,
+use bwk_coin::{
+    max_input_satisfaction_size, ChangeTip, Coin, CoinSource, CoinSpendInfo, CoinStatus, KeyChain,
 };
+use bwk_descriptor::derivator::SpkDerivator;
 use miniscript::{
     bitcoin::{self, address::NetworkUnchecked, OutPoint, ScriptBuf, Sequence, Txid},
     Descriptor, DescriptorPublicKey,
@@ -697,9 +694,9 @@ impl<P: StorageProfile> CoinStore<P> {
                     let height = entry.height();
                     let status = CoinStatus::from(entry.inclusion());
                     let spk = match addr.account() {
-                        coin::KeyChain::Receive => self.derivator.receive_at(addr.index()),
-                        coin::KeyChain::Change => self.derivator.change_at(addr.index()),
-                        coin::KeyChain::Custom(_) => unimplemented!(),
+                        KeyChain::Receive => self.derivator.receive_at(addr.index()),
+                        KeyChain::Change => self.derivator.change_at(addr.index()),
+                        KeyChain::Custom(_) => unimplemented!(),
                     }
                     .script_pubkey();
                     assert!(spk == txout.script_pubkey);
@@ -718,7 +715,7 @@ impl<P: StorageProfile> CoinStore<P> {
                         status,
                         label,
                         satisfaction_size: satisfaction as u64,
-                        spend_info: bwk_tx::CoinSpendInfo::Bip32 {
+                        spend_info: CoinSpendInfo::Bip32 {
                             coin_path: (addr.account(), addr.index()),
                             descriptor: descriptor.clone(),
                             secret_key: None,
@@ -1406,7 +1403,7 @@ impl Update {
 /// The `CoinEntry` struct contains information about the coin's height,
 /// status, associated coin data, and the address it belongs to.
 pub struct CoinEntry {
-    pub coin: coin::Coin,
+    pub coin: Coin,
     pub address: bitcoin::Address<NetworkUnchecked>,
 }
 
@@ -1500,7 +1497,7 @@ impl CoinEntry {
     /// Returns `None` for non-descriptor coins (e.g., Silent Payment coins).
     pub fn deriv(&self) -> Option<(KeyChain, u32)> {
         match &self.coin.spend_info {
-            bwk_tx::CoinSpendInfo::Bip32 { coin_path, .. } => Some(*coin_path),
+            CoinSpendInfo::Bip32 { coin_path, .. } => Some(*coin_path),
             #[allow(unreachable_patterns)]
             _ => None,
         }
@@ -1526,7 +1523,7 @@ impl CoinEntry {
     /// Panics for non-descriptor coins.
     pub fn rust_address(&self) -> AddressEntry {
         let (account, index) = match &self.coin.spend_info {
-            bwk_tx::CoinSpendInfo::Bip32 { coin_path, .. } => *coin_path,
+            CoinSpendInfo::Bip32 { coin_path, .. } => *coin_path,
             #[allow(unreachable_patterns)]
             _ => panic!("rust_address not supported for non-descriptor coins"),
         };

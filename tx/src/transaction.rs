@@ -1,15 +1,12 @@
-use miniscript::{
-    bitcoin::{self, absolute, Network, Psbt, TxOut, Weight},
-    Descriptor, DescriptorPublicKey,
-};
+use miniscript::bitcoin::{self, absolute, Network, Psbt, TxOut, Weight};
 use serde::{Deserialize, Serialize};
 
+use bwk_coin::{shuffle_coins, Coin, CoinSource};
+
 use crate::{
-    coin::shuffle_coins,
     coin_selection::CoinSelector,
     recipient::{FinalizationContext, PsbtOutputInfo, RecipientProvider, SpPartialSecretProvider},
-    tx_builder::CoinSource,
-    Coin, DUST_AMOUNT,
+    DUST_AMOUNT,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
@@ -432,22 +429,6 @@ pub enum Amount {
     Anchor,
 }
 
-/// Estimate the satisfaction size for an input, returning the result
-/// in weight units (WU).
-/// Note: The output of this function represent the worst case scenario.
-pub fn max_input_satisfaction_size(descriptor: &Descriptor<DescriptorPublicKey>) -> usize {
-    descriptor
-        .clone()
-        .into_single_descriptors()
-        .expect("multikey")
-        .first()
-        .expect("multikey")
-        .clone()
-        .max_weight_to_satisfy()
-        .expect("invalid descriptor")
-        .to_wu() as usize
-}
-
 /// Estimates the maximum possible weight of an unsigned transaction
 pub fn tx_estimated_weight(tx_template: &TxTemplate) -> Weight {
     let input_weights: Vec<u64> = tx_template
@@ -756,10 +737,10 @@ pub fn process_transaction(
 #[cfg(all(test, feature = "test"))]
 mod test {
     use super::*;
-    use crate::coin::KeyChain;
     use crate::tx_builder::test::{
         external_recipient, funding_coin, sum_inputs, sum_outputs, tr_signer,
     };
+    use bwk_coin::KeyChain;
     use miniscript::bitcoin;
 
     #[test]
