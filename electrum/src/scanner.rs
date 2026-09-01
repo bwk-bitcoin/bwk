@@ -527,7 +527,9 @@ impl<P: ScanProfile> AccountHistory for ElectrumScanner<P> {
 impl<P: ScanProfile> ElectrumScanner<P> {
     /// Point the scan at `url`/`port`. Takes effect on the next
     /// [`start`](Self::start); an already-running listener keeps its
-    /// connection until it is restarted.
+    /// connection until it is restarted. A different endpoint resets the
+    /// certificate policy, see
+    /// [`ScannerConfig::set_electrum`](crate::config::ScannerConfig::set_electrum).
     pub fn set_electrum(&mut self, url: Option<String>, port: Option<u16>) {
         self.config.set_electrum(url, port);
     }
@@ -610,6 +612,7 @@ impl<P: ScanProfile> ElectrumScanner<P> {
         // Fallback for a panicked previous listener that could not hand its
         // store back: the thread reopens it from disk rather than giving up.
         let reopen_statuses = self.reopen_statuses.clone();
+        let certificate_check = self.config.endpoint().certificate_check();
 
         self.listener.start(move |stop_request| {
             let statuses_store = match source {
@@ -640,7 +643,7 @@ impl<P: ScanProfile> ElectrumScanner<P> {
                 let _ = handback_tx.send(statuses_store);
                 return;
             }
-            let client = match crate::client::Client::new(&addr, port) {
+            let client = match crate::client::Client::new(&addr, port, certificate_check) {
                 Ok(c) => c,
                 Err(e) => {
                     log::error!("spawn_listener(): fail to create electrum client {e}");

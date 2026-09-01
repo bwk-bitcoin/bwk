@@ -59,6 +59,16 @@ for notification in receiver {
 }
 ```
 
+An `ssl://` endpoint is verified against the system trust store by default.
+Passing `bwk_electrum::raw_client::CertificateCheck::DangerAcceptInvalid` to
+`config.scanner.set_certificate_check()` drops that check entirely: the chain
+of trust, the expiry and the hostname are all skipped, so any party on the
+network path can impersonate the server. It is what a self-signed or onion
+server needs, and it is unsafe against anything else. The account hands the
+same policy to its scanner connection and to both of the header store's
+connections. Pointing the config at another endpoint puts the check back, so
+the choice is made once per server.
+
 ## Architecture
 
 `Account` owns two independent halves and reconciles them. The scanner records

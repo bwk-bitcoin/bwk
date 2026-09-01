@@ -683,6 +683,26 @@ pub fn bip32_mnemonic() -> &'static str {
     "legal winner thank year wave sausage worth useful legal winner thank yellow"
 }
 
+/// Attach an offline sub-account watching `signer`'s only descriptor, signed
+/// by the BIP32 mnemonic every sub-account here shares.
+#[allow(dead_code)]
+fn add_offline_sub_account(account: &mut bwk_sp::account::Account, name: &str, signer: &HotSigner) {
+    let descriptor = signer.descriptors().into_iter().next().unwrap();
+    let mut config = ScannerConfig::new(
+        descriptor,
+        std::path::PathBuf::new(),
+        String::new(),
+        name.to_string(),
+        bitcoin::Network::Regtest,
+        None,
+    );
+    config.stay_offline = true;
+    let scanner = ElectrumScanner::try_new(config).unwrap();
+    account
+        .add_sub_account(scanner, Some(bip32_mnemonic().to_string()))
+        .expect("add_sub_account");
+}
+
 /// Satisfaction weight for a taproot key-spend input (same as SP coins).
 #[allow(dead_code)]
 const TR_KEYSPEND_SATISFACTION_WEIGHT: u64 = 66;
@@ -857,20 +877,7 @@ impl TestEnv {
         let signer =
             HotSigner::new_taproot_from_mnemonics(bitcoin::Network::Regtest, bip32_mnemonic())
                 .unwrap();
-        let descriptor = signer.descriptors().into_iter().next().unwrap();
-        let mut config = ScannerConfig::new(
-            descriptor,
-            std::path::PathBuf::new(),
-            String::new(),
-            "sub-tr".to_string(),
-            bitcoin::Network::Regtest,
-            None,
-        );
-        config.set_stay_offline(true);
-        let sub = ElectrumScanner::try_new(config).unwrap();
-        account
-            .add_sub_account(sub, Some(bip32_mnemonic().to_string()))
-            .expect("add_sub_account");
+        add_offline_sub_account(account, "sub-tr", &signer);
     }
 
     /// Add a segwit (P2WPKH) sub-account to an SP account so it can sign
@@ -879,20 +886,7 @@ impl TestEnv {
         let signer =
             HotSigner::new_wpkh_from_mnemonics(bitcoin::Network::Regtest, bip32_mnemonic())
                 .unwrap();
-        let descriptor = signer.descriptors().into_iter().next().unwrap();
-        let mut config = ScannerConfig::new(
-            descriptor,
-            std::path::PathBuf::new(),
-            String::new(),
-            "sub-sw".to_string(),
-            bitcoin::Network::Regtest,
-            None,
-        );
-        config.set_stay_offline(true);
-        let sub = ElectrumScanner::try_new(config).unwrap();
-        account
-            .add_sub_account(sub, Some(bip32_mnemonic().to_string()))
-            .expect("add_sub_account");
+        add_offline_sub_account(account, "sub-sw", &signer);
     }
 
     /// Create a funded taproot coin via bitcoind.

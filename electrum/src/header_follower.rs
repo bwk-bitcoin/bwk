@@ -26,6 +26,7 @@ use crate::{
     header_store::{HeaderStore, StartError},
     notification::Notification,
     profile::{OpenScanFromBackend, ScanProfile},
+    raw_client::CertificateCheck,
     reconcile::Reconciler,
 };
 
@@ -82,11 +83,12 @@ impl<P: OpenScanFromBackend> HeaderFollower<P> {
         let path = persistence
             .is_some()
             .then(|| account_dir.join(HEADERS_FILENAME));
-        let (url, port) = match &endpoint {
-            Some(e) => (e.url().map(str::to_string), e.port()),
-            None => (None, None),
+        let (url, port, certificate_check) = match &endpoint {
+            Some(e) => (e.url().map(str::to_string), e.port(), e.certificate_check()),
+            None => (None, None, CertificateCheck::default()),
         };
-        let store = HeaderStore::start_or_open(url, port, network, path, min_height)?;
+        let store =
+            HeaderStore::start_or_open(url, port, network, path, min_height, certificate_check)?;
         Ok(Self {
             store,
             owned: true,
@@ -118,9 +120,10 @@ impl<P: OpenScanFromBackend> HeaderFollower<P> {
     }
 
     /// Reconnect to `target` whatever the store believes it follows: the caller
-    /// noticed the socket is dead, which the store cannot see by itself. Not
-    /// gated on ownership (see the module doc); the proofs another wallet had
-    /// in flight on the dropped merkle client resolve as
+    /// noticed the socket is dead, which the store cannot see by itself. A
+    /// `target` naming no server idles the store instead. Not gated on
+    /// ownership (see the module doc); the proofs another wallet had in flight
+    /// on the dropped merkle client resolve as
     /// [`MerkleOutcome::Failed`](crate::header_store::MerkleOutcome::Failed),
     /// so its own pass asks again.
     pub fn reconnect<'a>(
@@ -132,7 +135,9 @@ impl<P: OpenScanFromBackend> HeaderFollower<P> {
             self.stop();
             return;
         };
-        let restarted = self.store.restart(url.to_string(), port);
+        let restarted = self
+            .store
+            .restart(url.to_string(), port, target.certificate_check());
         if let Err(e) = restarted {
             log::error!("HeaderFollower::reconnect(): header store restart failed: {e}");
             let _ = self.notification.send(Notification::HeaderStoreRestart);

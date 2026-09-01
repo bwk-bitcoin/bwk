@@ -8,7 +8,7 @@ use std::{
 
 use bwk_electrum::{
     electrum::{request::Request, response::*},
-    raw_client::Client,
+    raw_client::{CertificateCheck, Client},
 };
 use bwk_utils::test::{regtest::bootstrap_electrs, TestBitcoinD};
 use electrsd::{bitcoind::bitcoincore_rpc::RpcApi, ElectrsD};
@@ -107,7 +107,9 @@ fn ssl_client_wo_certificate() {
         let (url, port) = split_url(address);
         let mut client = Client::new().ssl(&url, port);
         assert!(client.try_connect(None).is_err());
-        let mut client = client.verif_certificate(false);
+        let mut client = client
+            .certificate_check(CertificateCheck::DangerAcceptInvalid)
+            .unwrap();
         client.try_connect(None).unwrap();
         // blocking recv
         client.send_str("ping");
@@ -153,7 +155,8 @@ fn tcp_clone() {
 
 fn timeout_template(url: &str, port: u16, ssl: bool) {
     let mut client = Client::new_ssl_maybe(url, port, ssl)
-        .verif_certificate(false)
+        .certificate_check(CertificateCheck::DangerAcceptInvalid)
+        .unwrap()
         .read_timeout(Some(Duration::from_millis(100)));
     client.try_connect(None).unwrap();
     let start = Instant::now();
@@ -165,7 +168,9 @@ fn timeout_template(url: &str, port: u16, ssl: bool) {
         r#"Err(TcpStream(Os { code: 11, kind: WouldBlock, message: "Resource temporarily unavailable" }))"#
     );
 
-    let mut client = Client::new_ssl_maybe(url, port, ssl).verif_certificate(false);
+    let mut client = Client::new_ssl_maybe(url, port, ssl)
+        .certificate_check(CertificateCheck::DangerAcceptInvalid)
+        .unwrap();
     client.try_connect(None).unwrap();
     client
         .set_read_timeout(Some(Duration::from_millis(500)))

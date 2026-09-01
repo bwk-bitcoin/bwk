@@ -1,4 +1,4 @@
-use bwk_electrum::client::Client;
+use bwk_electrum::{client::Client, raw_client::CertificateCheck};
 use bwk_utils::test::{regtest::bootstrap_electrs_with_args, wait_electrs_tip, TestBitcoinD};
 use electrsd::{
     bitcoind::bitcoincore_rpc::{self, RpcApi},
@@ -36,7 +36,7 @@ fn validate_psbt_reports_reused_output() {
     mine_to_address(rpc, 110, &addr);
     wait_electrs_tip(&bitcoind, &electrs);
 
-    let mut client = Client::new(&url, port).expect("connect");
+    let mut client = Client::new(&url, port, CertificateCheck::Validate).expect("connect");
 
     let unsigned = Transaction {
         version: transaction::Version(2),
@@ -69,7 +69,7 @@ fn validate_psbt_clean_when_no_history() {
     mine_to_address(rpc, 110, &addr);
     wait_electrs_tip(&bitcoind, &electrs);
 
-    let mut client = Client::new(&url, port).expect("connect");
+    let mut client = Client::new(&url, port, CertificateCheck::Validate).expect("connect");
 
     // Fresh address: getnewaddress returns one that has never received funds.
     let fresh = rpc_address(rpc);
@@ -92,7 +92,7 @@ fn validate_psbt_clean_when_no_history() {
 #[test]
 fn validate_psbt_skips_op_return() {
     let (url, port, _electrs, _bitcoind) = bootstrap_electrs();
-    let mut client = Client::new(&url, port).expect("connect");
+    let mut client = Client::new(&url, port, CertificateCheck::Validate).expect("connect");
 
     use bitcoin::script::PushBytesBuf;
     let op_return = ScriptBuf::new_op_return(PushBytesBuf::try_from(b"hello".to_vec()).unwrap());
@@ -170,7 +170,7 @@ fn validate_psbt_reports_spent_input() {
     mine_to_address(rpc, 1, &mining_addr);
     wait_electrs_tip(&bitcoind, &electrs);
 
-    let mut client = Client::new(&url, port).expect("connect");
+    let mut client = Client::new(&url, port, CertificateCheck::Validate).expect("connect");
     let unsigned = Transaction {
         version: transaction::Version(2),
         lock_time: absolute::LockTime::Blocks(absolute::Height::ZERO),

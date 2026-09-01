@@ -44,11 +44,9 @@ let mut config = ScannerConfig::new(
     Network::Bitcoin,
     Some(PersistenceKind::Json),
 );
-config.electrum_url = Some("ssl://electrum.example.com".to_string());
-config.electrum_port = Some(50002);
+config.set_electrum(Some("ssl://electrum.example.com".to_string()), Some(50002));
 
 let mut scanner: ElectrumScanner = ElectrumScanner::try_new(config)?;
-let notifications = scanner.receiver().unwrap();
 // The constructor starts nothing; the caller decides when to connect.
 scanner.start();
 
@@ -60,10 +58,13 @@ for (outpoint, entry) in scanner.coins() {
 ### Async Listener (Recommended)
 
 ```rust
-use bwk_electrum::client::{Client, CoinRequest, CoinResponse};
+use bwk_electrum::{
+    client::{Client, CoinRequest, CoinResponse},
+    raw_client::CertificateCheck,
+};
 
 // Connect to server
-let client = Client::new("ssl://electrum.example.com", 50002)?;
+let client = Client::new("ssl://electrum.example.com", 50002, CertificateCheck::Validate)?;
 
 // Start listener thread, get channel pair
 let (sender, receiver) = client.listen_txs::<CoinRequest, CoinResponse>();
@@ -99,10 +100,15 @@ loop {
 }
 ```
 
+`CertificateCheck::DangerAcceptInvalid` drops certificate verification
+entirely: the chain of trust, the expiry and the hostname are all skipped, so
+any party on the network path can impersonate the server. It is what a
+self-signed or onion server needs, and it is unsafe against anything else.
+
 ### Sync Methods
 
 ```rust
-let mut client = Client::new("127.0.0.1", 50001)?;
+let mut client = Client::new("127.0.0.1", 50001, CertificateCheck::Validate)?;
 
 // Fetch transaction
 let tx = client.get_tx(txid)?;
@@ -154,7 +160,15 @@ Consumer
 
 ## Local Development
 
-For self-signed certificates (regtest):
+A self-signed server (regtest, a LAN host) needs the check turned off. Nothing
+authenticates the peer while it is off, so keep it to servers you reach over a
+path you trust:
 ```rust
-let client = Client::new_local("127.0.0.1", 50001)?;
+let client = Client::new("ssl://127.0.0.1", 50002, CertificateCheck::DangerAcceptInvalid)?;
 ```
+
+`ScannerConfig` carries the same policy for an `ElectrumScanner`, on the
+`Endpoint` holding the server it was picked for. `ScannerConfig::new` starts it
+at `CertificateCheck::Validate`, `ScannerConfig::set_certificate_check` moves
+it, and `ScannerConfig::set_electrum` puts it back whenever the endpoint
+changes, so reaching a self-signed server is a choice made per server.

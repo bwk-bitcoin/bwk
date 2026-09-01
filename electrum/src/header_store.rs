@@ -30,6 +30,7 @@ use crate::{
     fanout::{Fanout, ListenerId},
     header_validator::{self, expected_genesis, Error as ValidatorError},
     notification::Notification,
+    raw_client::CertificateCheck,
     worker::Worker,
 };
 use bwk_persist::{
@@ -401,6 +402,7 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
         network: Network,
         path: Option<PathBuf>,
         min_height: Option<u32>,
+        certificate_check: CertificateCheck,
     ) -> Result<Arc<Self>, StartError> {
         let store = match path {
             Some(p) => Self::from_file(network, p)?,
@@ -411,7 +413,7 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
         // silently returning a worker-less store: header-sync progress
         // gates wallet `Verified` state, so the caller must know the store
         // is degraded and can re-attempt.
-        store.spawn_worker(&electrum_url, electrum_port, min_height)?;
+        store.spawn_worker(&electrum_url, electrum_port, min_height, certificate_check)?;
         Ok(store)
     }
 
@@ -431,9 +433,10 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
         network: Network,
         path: Option<PathBuf>,
         min_height: Option<u32>,
+        certificate_check: CertificateCheck,
     ) -> Result<Arc<Self>, StartError> {
         if let (Some(url), Some(port)) = (url, port) {
-            return Self::start(url, port, network, path, min_height);
+            return Self::start(url, port, network, path, min_height, certificate_check);
         }
         Ok(match path {
             Some(p) => Self::from_file(network, p)?,
@@ -441,19 +444,28 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
         })
     }
 
-    /// Reconnect both connections to `url:port` after the previous ones died.
-    /// Closes the previous pair, clears the stop flag and bumps the writer
-    /// token so the superseded worker self-exits and its in-flight mutations
-    /// become no-ops, then spawns a fresh worker (the sole writer under the new
-    /// token) reusing the backfill floor remembered at [`start`](Self::start).
-    pub fn restart(self: &Arc<Self>, url: String, port: u16) -> Result<(), StartError> {
+    /// Reconnect the background worker to `url:port` after the previous
+    /// connection died. Clears the stop flag and bumps the writer token so the
+    /// superseded worker self-exits and its in-flight mutations become no-ops,
+    /// then spawns a fresh worker (the sole writer under the new token) reusing
+    /// the backfill floor remembered at [`start`](Self::start).
+    ///
+    /// `certificate_check` is the caller's, not remembered: a store that opened
+    /// idle never held one, and reconnecting under the default would strand a
+    /// consumer who configured a self-signed server.
+    pub fn restart(
+        self: &Arc<Self>,
+        url: String,
+        port: u16,
+        certificate_check: CertificateCheck,
+    ) -> Result<(), StartError> {
         let min_height = self.remembered_min_height();
         // Close the previous pair rather than leaving its sockets open until
         // the superseded worker times out and drops its request sender.
         self.stop();
         self.stopped.store(false, Ordering::SeqCst);
         self.writer_token.fetch_add(1, Ordering::SeqCst);
-        self.spawn_worker(&url, port, min_height)
+        self.spawn_worker(&url, port, min_height, certificate_check)
     }
 
     /// Connect a fresh worker pair to `url:port` and record the backfill floor
@@ -465,12 +477,13 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
         url: &str,
         port: u16,
         min_height: Option<u32>,
+        certificate_check: CertificateCheck,
     ) -> Result<(), StartError> {
-        let client = connect(url, port)?;
+        let client = connect(url, port, certificate_check)?;
         // A second connection on purpose: the header worker's loop is a strict
         // sequence of header fetches that blocks on each answer, so proof
         // traffic multiplexed into it would stall sync behind every proof.
-        let merkle = connect(url, port)?;
+        let merkle = connect(url, port, certificate_check)?;
         let (req_tx, resp_rx) = client.listen_headers::<HeaderRequest, HeaderResponse>();
         let token = self.writer_token.load(Ordering::SeqCst);
         *self.worker.lock().expect("poisoned") = Some(BackfillFloor { min_height });
@@ -553,8 +566,12 @@ fn forward_merkle_proofs<S>(
 }
 
 /// Open an electrum connection, tagging a failure as [`StartError::Connect`].
-fn connect(url: &str, port: u16) -> Result<Client, StartError> {
-    Client::new(url, port).map_err(|e| {
+fn connect(
+    url: &str,
+    port: u16,
+    certificate_check: CertificateCheck,
+) -> Result<Client, StartError> {
+    Client::new(url, port, certificate_check).map_err(|e| {
         log::warn!("HeaderStore: fail to create electrum client {url}:{port}: {e}");
         StartError::Connect(e)
     })

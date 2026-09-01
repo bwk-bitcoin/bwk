@@ -8,7 +8,9 @@
 
 use std::{sync::mpsc, time::Duration};
 
-use bwk_electrum::{config::HEADERS_FILENAME, header_store::HeaderStore};
+use bwk_electrum::{
+    config::HEADERS_FILENAME, header_store::HeaderStore, raw_client::CertificateCheck,
+};
 use bwk_utils::test::regtest::{
     bootstrap_electrs, generate, get_block_hash_str, get_block_height, invalidate_block, wait_until,
 };
@@ -35,8 +37,15 @@ fn header_store_follows_tip_and_resolves_reorg() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join(HEADERS_FILENAME);
 
-    let store =
-        HeaderStore::start(url, port, Network::Regtest, Some(path), Some(base_height)).unwrap();
+    let store = HeaderStore::start(
+        url,
+        port,
+        Network::Regtest,
+        Some(path),
+        Some(base_height),
+        CertificateCheck::Validate,
+    )
+    .unwrap();
     let rx = store.register_chain_tick();
 
     // Wait for the worker to backfill up to the current tip.

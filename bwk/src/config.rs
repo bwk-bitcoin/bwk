@@ -171,12 +171,15 @@ impl Config {
         matches!(self.scanner.persistence, Some(PersistenceKind::Sqlite))
     }
 
-    /// Sets the Electrum url.
+    /// Sets the Electrum url. A different url resets the certificate policy,
+    /// see [`ScannerConfig::set_electrum`](bwk_electrum::config::ScannerConfig::set_electrum).
     pub fn set_electrum_url(&mut self, url: String) {
         let port = self.scanner.endpoint().port();
         self.scanner.set_electrum(Some(url), port);
     }
-    /// Sets the Electrum port from a string.
+    /// Sets the Electrum port from a string. A different port resets the
+    /// certificate policy, see
+    /// [`ScannerConfig::set_electrum`](bwk_electrum::config::ScannerConfig::set_electrum).
     pub fn set_electrum_port(&mut self, port: String) {
         let url = self.scanner.endpoint().url().map(str::to_string);
         self.scanner.set_electrum(url, port.parse::<u16>().ok());
@@ -282,6 +285,7 @@ pub mod tests {
   "account": "alice",
   "electrum_url": "electrum.pythcoiner.dev",
   "electrum_port": 50002,
+  "certificate_check": "validate",
   "stay_offline": false,
   "network": "regtest",
   "look_ahead": 20,

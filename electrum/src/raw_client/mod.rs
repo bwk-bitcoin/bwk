@@ -9,6 +9,8 @@ use std::{
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
+
 use crate::electrum::{
     self,
     request::Request,
@@ -102,6 +104,20 @@ pub fn read_line<R: ElectrumRead>(stream: &mut R, buf: &mut Vec<u8>) -> Result<S
             Err(e) => return Err(Error::TcpStream(e)),
         }
     }
+}
+
+/// Whether the TLS certificate a server presents is checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CertificateCheck {
+    /// Check the chain of trust, the expiry and the hostname.
+    #[default]
+    Validate,
+    /// Accept any certificate: the chain of trust, the expiry and the hostname
+    /// are all skipped, so any party on the network path can impersonate the
+    /// server. It exists to reach a self-signed or onion server, and is unsafe
+    /// against anything else.
+    DangerAcceptInvalid,
 }
 
 #[derive(Debug)]
@@ -214,18 +230,23 @@ impl Client {
         }
     }
 
-    pub fn verif_certificate(mut self, verif: bool) -> Self {
-        let connected = self.is_connected();
-        if let (
-            Self::Ssl(SslClient {
-                verif_certificate, ..
-            }),
-            false,
-        ) = (&mut self, connected)
-        {
-            *verif_certificate = verif;
+    /// Set the certificate policy the next connection handshakes under.
+    ///
+    /// Errors on a connected client: the handshake is already behind us, so
+    /// keeping the old policy would leave the caller believing they had
+    /// reached their self-signed server, and on an unconfigured one, which has
+    /// no endpoint to apply it to. A plain TCP endpoint presents no certificate
+    /// at all, so there the policy is dropped without complaint.
+    pub fn certificate_check(mut self, check: CertificateCheck) -> Result<Self, Error> {
+        if self.is_connected() {
+            return Err(Error::AlreadyConnected);
         }
-        self
+        match &mut self {
+            Client::None => return Err(Error::NotConfigured),
+            Client::Tcp(_) => {}
+            Client::Ssl(c) => c.certificate_check = check,
+        }
+        Ok(self)
     }
 
     pub fn is_connected(&self) -> bool {

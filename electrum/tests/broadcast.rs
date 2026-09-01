@@ -1,4 +1,7 @@
-use bwk_electrum::client::{Client, Error};
+use bwk_electrum::{
+    client::{Client, Error},
+    raw_client::CertificateCheck,
+};
 use bwk_utils::test::regtest::bootstrap_electrs;
 use miniscript::bitcoin::{
     self, absolute, transaction, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
@@ -10,7 +13,7 @@ use miniscript::bitcoin::{
 #[test]
 fn broadcast_tx_rejection_is_typed() {
     let (url, port, _electrs, _bitcoind) = bootstrap_electrs();
-    let mut client = Client::new(&url, port).expect("connect");
+    let mut client = Client::new(&url, port, CertificateCheck::Validate).expect("connect");
 
     // Random outpoint guaranteed not to exist on regtest.
     let bogus = Transaction {

@@ -10,7 +10,7 @@ use crate::{
         },
         types::ScriptHash,
     },
-    raw_client::{self, Client as RawClient},
+    raw_client::{self, CertificateCheck, Client as RawClient},
 };
 use bwk_utils::short_string;
 use header_listener::listen_headers;
@@ -308,31 +308,23 @@ impl Client {
     /// # Arguments
     /// * `address` - url/ip of the electrum server as String
     /// * `port` - port of the electrum server
-    pub fn new(address: &str, port: u16) -> Result<Self, Error> {
+    /// * `certificate_check` - [`CertificateCheck::DangerAcceptInvalid`] drops
+    ///   certificate verification entirely: the chain of trust, the expiry and
+    ///   the hostname are all skipped, so any party on the network path can
+    ///   impersonate the server. It is what a self-signed LAN host or an onion
+    ///   address needs, and it must not be used against a clearnet server.
+    ///   Ignored unless `address` is `ssl://`, a plain endpoint presenting no
+    ///   certificate to check.
+    pub fn new(
+        address: &str,
+        port: u16,
+        certificate_check: CertificateCheck,
+    ) -> Result<Self, Error> {
         let ssl = address.starts_with("ssl://");
         let address = address.to_string().replace("ssl://", "");
-        let mut inner = RawClient::new_ssl_maybe(&address, port, ssl);
+        let mut inner =
+            RawClient::new_ssl_maybe(&address, port, ssl).certificate_check(certificate_check)?;
         inner.try_connect(Some(CONNECT_TIMEOUT))?;
-        Ok(Client {
-            inner,
-            index: HashMap::new(),
-            last_id: 0,
-            url: address,
-            port,
-        })
-    }
-
-    /// Create a new local electrum client: SSL certificate validation is disabled in
-    ///   order to be used with self-signed certificates.
-    ///
-    /// # Arguments
-    /// * `address` - url/ip of the electrum server as String
-    /// * `port` - port of the electrum server
-    pub fn new_local(address: &str, port: u16) -> Result<Self, Error> {
-        let ssl = address.starts_with("ssl://");
-        let address = address.to_string().replace("ssl://", "");
-        let mut inner = RawClient::new_ssl_maybe(&address, port, ssl).verif_certificate(false);
-        inner.try_connect(None)?;
         Ok(Client {
             inner,
             index: HashMap::new(),

@@ -45,6 +45,7 @@ use {
             label_store::{LabelKey, LabelStore},
             notification::{Notification, SpNotification},
             profile::{DefaultBackend, RamProfile},
+            raw_client::CertificateCheck,
             reconcile::Reconciler,
             scanner::ElectrumScanner,
         },
@@ -156,6 +157,7 @@ struct BroadcastWorker<P: crate::profile::SpStorageProfile> {
     tx: bitcoin::Transaction,
     url: String,
     port: u16,
+    certificate_check: CertificateCheck,
     sp_receiver: SpReceiver,
     coin_store: Arc<Mutex<SpCoinStore<P>>>,
     tx_store: Arc<Mutex<SpTxStore<P>>>,
@@ -206,7 +208,8 @@ impl<P: crate::profile::SpStorageProfile> BroadcastWorker<P> {
             &self.sub_accounts,
             &self.tx,
         )?;
-        let mut client = bwk::bwk_electrum::client::Client::new(&self.url, self.port)?;
+        let mut client =
+            bwk::bwk_electrum::client::Client::new(&self.url, self.port, self.certificate_check)?;
         client.broadcast_tx(&self.tx)?;
         Ok(apply_unconfirmed_spend(
             &self.coin_store,
@@ -572,8 +575,12 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
                 config.network,
                 config.persistence,
             );
-            scanner_config.set_stay_offline(sub_cfg.endpoint.url().is_none());
-            scanner_config.set_endpoint(sub_cfg.endpoint.clone());
+            // The account's certificate policy only reaches a sub-account
+            // pointed at the same server as the account itself.
+            let mut endpoint = sub_cfg.endpoint.clone();
+            endpoint.adopt_certificate_check(config.endpoint());
+            scanner_config.set_stay_offline(endpoint.url().is_none());
+            scanner_config.set_endpoint(endpoint);
             scanners.push(ElectrumScanner::try_new_with_sender(
                 scanner_config,
                 sender.clone(),
@@ -1017,12 +1024,11 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     }
 
     /// Point every sub-account and the header validator at `url:port`, and
-    /// persist it. The account's own endpoint moves with them: it is what the
-    /// header validator follows and what a spend broadcasts through, so
-    /// leaving it behind splits the account across two servers. The
-    /// sub-account configs move too: the constructor rebuilds each scanner
-    /// from its own endpoint, so a reopen would otherwise bring them back up
-    /// on the previous server.
+    /// persist it. Moves the account's own endpoint with them, so the
+    /// certificate policy the validator connects under is reset by the same
+    /// rule that resets the scanners'. The sub-account configs move too: the
+    /// constructor rebuilds each scanner from its own endpoint, so a reopen
+    /// would otherwise bring them back up on the previous server.
     pub fn set_electrum_settings(&mut self, url: Option<String>, port: Option<u16>) {
         for sub in &mut self.sub_accounts {
             sub.scanner.set_electrum(url.clone(), port);
@@ -1372,10 +1378,12 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
             return;
         };
 
+        let certificate_check = self.config.endpoint().certificate_check();
         let worker = BroadcastWorker {
             tx,
             url: url.to_string(),
             port,
+            certificate_check,
             sp_receiver: self.sp_receiver.clone(),
             coin_store: self.coin_store.clone(),
             tx_store: self.tx_store.clone(),
@@ -1598,7 +1606,8 @@ fn reconcilers(
 }
 
 #[cfg(feature = "mnemonic")]
-/// The endpoint the header validator should follow.
+/// The endpoint the header validator should follow, with the certificate policy
+/// of whichever config supplied it.
 ///
 /// The account's own endpoint wins; a sub-account's is the fallback for a
 /// config that broadcasts nowhere but still watches descriptors.
@@ -1790,6 +1799,7 @@ mod tests {
     use super::*;
     use crate::receiver::OwnedOutput;
     use bitcoin::{absolute::Height, hashes::hash160, secp256k1::Parity};
+    use bwk::bwk_electrum::raw_client::CertificateCheck;
     use std::path::PathBuf;
 
     fn test_config() -> Config {
@@ -2113,7 +2123,11 @@ mod tests {
 
     // with_header_store: shares one HeaderStore across sub-accounts
 
-    fn offline_sub_account_config(mnemonic: &str, network: Network) -> config::SubAccountConfig {
+    fn sub_account_config(
+        mnemonic: &str,
+        network: Network,
+        endpoint: Endpoint,
+    ) -> config::SubAccountConfig {
         use bwk_sign::{bwk_descriptor, HotSigner};
         use miniscript::bitcoin::bip32::ChildNumber;
 
@@ -2127,8 +2141,59 @@ mod tests {
         config::SubAccountConfig {
             descriptor,
             mnemonic: None,
-            endpoint: Endpoint::default(),
+            endpoint,
         }
+    }
+
+    fn endpoint_at(url: &str, port: u16, check: CertificateCheck) -> Endpoint {
+        let mut endpoint = Endpoint::default();
+        endpoint.set(Some(url.to_string()), Some(port));
+        endpoint.set_certificate_check(check);
+        endpoint
+    }
+
+    /// A policy the consumer picked to reach this account's own self-signed
+    /// server must not disable validation against a sub-account watching
+    /// another one.
+    #[test]
+    fn the_account_certificate_policy_stops_at_sub_accounts_on_another_server() {
+        let mut config = test_config();
+        let mnemonic = config
+            .mnemonic
+            .clone()
+            .expect("test_config carries a mnemonic");
+        // A closed local port: the scanners start, fail to connect and stop,
+        // without a name to resolve.
+        config.set_electrum_endpoint("127.0.0.1".to_string(), 50002);
+        config.set_certificate_check(CertificateCheck::DangerAcceptInvalid);
+        config.descriptors = vec![
+            sub_account_config(
+                &mnemonic,
+                config.network,
+                endpoint_at("127.0.0.1", 50002, CertificateCheck::Validate),
+            ),
+            sub_account_config(
+                &mnemonic,
+                config.network,
+                endpoint_at("127.0.0.1", 50003, CertificateCheck::Validate),
+            ),
+        ];
+
+        let shared = bwk::bwk_electrum::header_store::HeaderStore::new_in_memory(config.network);
+        let mut account = Account::with_header_store(config, shared).expect("with_header_store");
+        account.stop_electrum();
+
+        let checks: Vec<_> = account
+            .scanners()
+            .map(|scanner| scanner.config().endpoint().certificate_check())
+            .collect();
+        assert_eq!(
+            checks,
+            vec![
+                CertificateCheck::DangerAcceptInvalid,
+                CertificateCheck::Validate
+            ]
+        );
     }
 
     #[test]
@@ -2139,8 +2204,8 @@ mod tests {
             .clone()
             .expect("test_config carries a mnemonic");
         config.descriptors = vec![
-            offline_sub_account_config(&mnemonic, config.network),
-            offline_sub_account_config(&mnemonic, config.network),
+            sub_account_config(&mnemonic, config.network, Endpoint::default()),
+            sub_account_config(&mnemonic, config.network, Endpoint::default()),
         ];
 
         let shared = bwk::bwk_electrum::header_store::HeaderStore::new_in_memory(config.network);
@@ -2170,8 +2235,8 @@ mod tests {
             .clone()
             .expect("test_config carries a mnemonic");
         config.descriptors = vec![
-            offline_sub_account_config(&mnemonic, config.network),
-            offline_sub_account_config(&mnemonic, config.network),
+            sub_account_config(&mnemonic, config.network, Endpoint::default()),
+            sub_account_config(&mnemonic, config.network, Endpoint::default()),
         ];
 
         let saved: Arc<Mutex<Option<Config>>> = Arc::new(Mutex::new(None));
@@ -2238,7 +2303,7 @@ mod tests {
         let descriptor = bwk_descriptor::SpkDerivator::new_wpkh(xpub, network)
             .unwrap()
             .descriptor();
-        let mut scanner_config = ScannerConfig::new(
+        let mut config = ScannerConfig::new(
             descriptor,
             std::path::PathBuf::new(),
             String::new(),
@@ -2246,10 +2311,75 @@ mod tests {
             network,
             None,
         );
-        scanner_config.set_stay_offline(true);
-        scanner_config.look_ahead = 5;
-        let scanner = ElectrumScanner::try_new(scanner_config).unwrap();
+        config.stay_offline = true;
+        config.look_ahead = 5;
+        let scanner = ElectrumScanner::try_new(config).unwrap();
         (scanner, mnemo.to_string())
+    }
+
+    /// An offline scanner already pointed at `url:port` under `check`, built
+    /// that way rather than mutated: `set_electrum` deliberately resets the
+    /// policy on an endpoint change.
+    fn offline_scanner_at(
+        url: &str,
+        port: u16,
+        check: CertificateCheck,
+    ) -> ElectrumScanner<RamProfile<DefaultBackend>> {
+        use bip39::Mnemonic;
+        use bwk_sign::{bwk_descriptor, HotSigner};
+        use miniscript::bitcoin::bip32::ChildNumber;
+
+        let network = bitcoin::Network::Regtest;
+        let mnemo = Mnemonic::generate(12).unwrap();
+        let signer = HotSigner::new_from_mnemonics(network, &mnemo.to_string()).unwrap();
+        let path =
+            bwk_descriptor::wpkh_path(network, ChildNumber::from_hardened_idx(0).unwrap()).unwrap();
+        let xpub = signer.xpub(&path);
+        let descriptor = bwk_descriptor::SpkDerivator::new_wpkh(xpub, network)
+            .unwrap()
+            .descriptor();
+        let mut config = ScannerConfig::new(
+            descriptor,
+            std::path::PathBuf::new(),
+            String::new(),
+            "target-sub".to_string(),
+            network,
+            None,
+        );
+        config.stay_offline = true;
+        config.look_ahead = 5;
+        config.set_endpoint(endpoint_at(url, port, check));
+        ElectrumScanner::try_new(config).unwrap()
+    }
+
+    /// The validator's endpoint and its certificate policy must always come
+    /// from one config. Pairing the account's endpoint with a sub-account's
+    /// policy, or the reverse, would let a policy chosen for one server decide
+    /// the connection to another.
+    #[test]
+    fn the_header_store_target_takes_both_halves_from_one_config() {
+        let scanners = [offline_scanner_at(
+            "sub.lan",
+            50001,
+            CertificateCheck::DangerAcceptInvalid,
+        )];
+
+        // The account's own endpoint wins, and brings its own policy with it.
+        let mut config = test_config();
+        config.set_electrum_endpoint("account.example.com".to_string(), 50002);
+        let target = header_store_target(&config, &scanners).expect("target");
+        assert_eq!(target.url(), Some("account.example.com"));
+        assert_eq!(target.certificate_check(), CertificateCheck::Validate);
+
+        // With no endpoint of its own it falls back to the sub-account, and
+        // takes that sub-account's policy rather than its own.
+        config.clear_electrum_endpoint();
+        let target = header_store_target(&config, &scanners).expect("target");
+        assert_eq!(target.url(), Some("sub.lan"));
+        assert_eq!(
+            target.certificate_check(),
+            CertificateCheck::DangerAcceptInvalid
+        );
     }
 
     /// Build a syntactically valid p2tr scriptPubKey from a fixed

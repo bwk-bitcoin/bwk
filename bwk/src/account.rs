@@ -642,6 +642,7 @@ mod integration_tests {
         client::Client,
         coin_store::Payment,
         notification::{Notification, TxListenerNotif},
+        raw_client::CertificateCheck,
         tx_store::Inclusion,
     };
     use bwk_persist::PersistenceKind;
@@ -685,7 +686,7 @@ mod integration_tests {
     #[allow(unused)]
     pub fn tcp_client() -> (Client, ElectrsD, TestBitcoinD) {
         let (url, port, e, b) = bootstrap_electrs();
-        let client = Client::new(&url, port).unwrap();
+        let client = Client::new(&url, port, CertificateCheck::Validate).unwrap();
 
         (client, e, b)
     }

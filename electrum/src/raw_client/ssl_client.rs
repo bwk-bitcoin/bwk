@@ -1,4 +1,4 @@
-use super::{read_line, try_read_line, Error};
+use crate::raw_client::{read_line, try_read_line, CertificateCheck, Error};
 use std::{
     io::Write,
     net::{self, ToSocketAddrs},
@@ -32,7 +32,7 @@ pub struct SslClient {
     pub(crate) stream: Option<SslStream>,
     pub(crate) read_timeout: Option<Duration>,
     pub(crate) write_timeout: Option<Duration>,
-    pub(crate) verif_certificate: bool,
+    pub certificate_check: CertificateCheck,
 }
 
 impl Clone for SslClient {
@@ -43,7 +43,7 @@ impl Clone for SslClient {
             stream: self.stream.clone(),
             read_timeout: self.read_timeout,
             write_timeout: self.write_timeout,
-            verif_certificate: self.verif_certificate,
+            certificate_check: self.certificate_check,
         }
     }
 }
@@ -62,7 +62,7 @@ impl Default for SslClient {
             stream: None,
             read_timeout: None,
             write_timeout: None,
-            verif_certificate: true,
+            certificate_check: CertificateCheck::default(),
         }
     }
 }
@@ -104,8 +104,11 @@ impl SslClient {
             }
         }
 
-        // do not verify for self-signed certs
-        if !self.verif_certificate {
+        if self.certificate_check == CertificateCheck::DangerAcceptInvalid {
+            log::warn!(
+                "certificate verification is disabled for {}, this connection can be impersonated",
+                self.url
+            );
             builder.danger_accept_invalid_certs(true);
             builder.danger_accept_invalid_hostnames(true);
         }

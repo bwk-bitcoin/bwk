@@ -21,7 +21,9 @@
 
 use std::time::Duration;
 
-use bwk_electrum::{config::HEADERS_FILENAME, header_store::HeaderStore};
+use bwk_electrum::{
+    config::HEADERS_FILENAME, header_store::HeaderStore, raw_client::CertificateCheck,
+};
 use bwk_utils::test::regtest::{
     bootstrap_electrs, generate, get_block_hash_str, get_block_height, init_logger,
     invalidate_block, wait_until,
@@ -46,6 +48,7 @@ fn restart_from_cache_skips_full_validation() {
             Network::Regtest,
             Some(persist_path.clone()),
             Some(0),
+            CertificateCheck::Validate,
         )
         .unwrap();
 
@@ -118,6 +121,7 @@ fn restart_from_cache_skips_full_validation() {
                 Network::Regtest,
                 Some(persist_path.clone()),
                 Some(0),
+                CertificateCheck::Validate,
             ) {
                 Ok(store) => break store,
                 Err(e) if std::time::Instant::now() < deadline => {
@@ -156,8 +160,15 @@ fn deep_reorg_below_anchor_resyncs() {
     let chain_tip = get_block_height(&bitcoind);
     let anchor = chain_tip - 2;
 
-    let store =
-        HeaderStore::start(url.clone(), port, Network::Regtest, None, Some(anchor)).unwrap();
+    let store = HeaderStore::start(
+        url.clone(),
+        port,
+        Network::Regtest,
+        None,
+        Some(anchor),
+        CertificateCheck::Validate,
+    )
+    .unwrap();
     assert!(
         wait_until(Duration::from_secs(60), || store
             .tip()

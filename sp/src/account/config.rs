@@ -10,7 +10,7 @@ use std::{
 
 use bitcoin::{bip32::ChildNumber, Network};
 use bwk::{
-    bwk_electrum::config::Endpoint,
+    bwk_electrum::{config::Endpoint, raw_client::CertificateCheck},
     miniscript::{Descriptor, DescriptorPublicKey},
 };
 use bwk_sign::{bwk_descriptor, HotSigner};
@@ -43,9 +43,9 @@ pub struct Config {
     // Backend
     /// Blindbit server URL for chain data
     pub blindbit_url: String,
-    /// Electrum server used to broadcast spends (blindbit is read-only).
-    /// Private so [`Endpoint`] stays the only way to move it, see
-    /// [`Endpoint::set`].
+    /// Electrum server used to broadcast spends (blindbit is read-only), and
+    /// the certificate policy to reach it under. Private so [`Endpoint`] stays
+    /// the only way to move it, see [`Endpoint::set`].
     #[serde(flatten)]
     endpoint: Endpoint,
 
@@ -84,7 +84,9 @@ pub struct SubAccountConfig {
     /// mnemonics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mnemonic: Option<String>,
-    /// Electrum server this sub-account watches, offline while unset.
+    /// Electrum server this sub-account watches (offline while unset), and the
+    /// certificate policy to reach it under. Its own: a policy the SP account
+    /// picked for its server says nothing about this one.
     #[serde(flatten)]
     pub endpoint: Endpoint,
 }
@@ -216,13 +218,14 @@ impl Config {
         self.blindbit_url = url;
     }
 
-    /// The Electrum server this account broadcasts through.
+    /// The Electrum server this account broadcasts through, with the
+    /// certificate policy it connects under.
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
     }
 
     /// Set the Electrum server endpoint used to broadcast spends, see
-    /// [`Endpoint::set`].
+    /// [`Endpoint::set`] for what that does to the certificate policy.
     pub fn set_electrum_endpoint(&mut self, url: String, port: u16) {
         self.endpoint.set(Some(url), Some(port));
     }
@@ -230,6 +233,11 @@ impl Config {
     /// Forget the Electrum endpoint, see [`Endpoint::clear`].
     pub fn clear_electrum_endpoint(&mut self) {
         self.endpoint.clear();
+    }
+
+    /// Connect under `check`, see [`Endpoint::set_certificate_check`].
+    pub fn set_certificate_check(&mut self, check: CertificateCheck) {
+        self.endpoint.set_certificate_check(check);
     }
 
     /// Set the dust limit in satoshis.
@@ -454,6 +462,21 @@ mod tests {
         config.set_electrum_endpoint("electrum.pythcoiner.dev".to_string(), 50001);
 
         assert_eq!(config.endpoint().url(), Some("electrum.pythcoiner.dev"));
+    }
+
+    #[test]
+    fn clearing_the_endpoint_puts_the_certificate_choice_back() {
+        let mut config = test_config();
+        config.set_electrum_endpoint("self.signed.lan".to_string(), 50002);
+        config.set_certificate_check(CertificateCheck::DangerAcceptInvalid);
+
+        config.clear_electrum_endpoint();
+
+        assert!(config.endpoint().server().is_none());
+        assert_eq!(
+            config.endpoint().certificate_check(),
+            CertificateCheck::Validate
+        );
     }
 
     #[test]
