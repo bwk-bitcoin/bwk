@@ -93,6 +93,13 @@ impl<P: ScanProfile> Reconciler<P> {
         self.pass.stop();
     }
 
+    /// Test-only accessor for the chain this pass promotes against, used to
+    /// assert store identity (`Arc::ptr_eq`) across wallets sharing one.
+    #[cfg(any(test, feature = "test"))]
+    pub fn header_store(&self) -> &Arc<HeaderStore<P::HeaderStore>> {
+        &self.header_store
+    }
+
     /// Re-queue a merkle fetch for every `ConfirmedUnverified` entry when the
     /// merkle client is (re)connected, covering entries stranded while it was
     /// down; it bypasses the in-flight guard, so a fetch that died with the old
