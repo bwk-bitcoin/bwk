@@ -1,8 +1,8 @@
 //! Unified views of coins and spendable totals across the SP account and its
 //! BIP32 sub-accounts.
 //!
-//! The SP [`Account`](crate::Account) embeds zero or more
-//! [`bwk::Account`] sub-accounts (segwit, taproot, ...). These helpers fold all
+//! The SP [`Account`](crate::Account) embeds zero or more scanner
+//! sub-accounts (segwit, taproot, ...). These helpers fold all
 //! of them into one structure keyed by outpoint so callers (including FFI
 //! bindings) do not have to stitch them together themselves.
 
@@ -14,7 +14,7 @@ pub enum CoinOrigin {
     /// The Silent Payments main account.
     Sp,
     /// An embedded BIP32 sub-account, addressed by its index in
-    /// [`Account::sub_accounts`](crate::Account::sub_accounts).
+    /// [`Account::scanners`](crate::Account::scanners).
     SubAccount(usize),
 }
 

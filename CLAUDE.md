@@ -100,7 +100,11 @@ Account (sp/src/account/mod.rs)
 ├── Blindbit transport - blockchain data via Blindbit oracle
 ├── SpCoinStore, SpTxStore, ScanState (bwk-sp's own)
 ├── LabelStore (from bwk-electrum)
-└── Scanner thread (background block scanning)
+├── SP scanner thread (background block scanning)
+├── ElectrumScanner per sub-account descriptor (bwk-electrum)
+├── HeaderStore (validated header chain, shared by every scanner)
+├── Reconciler per scanner (promotes its scan against the header chain)
+└── SigningManager (hot signers for the sub-account descriptors)
 ```
 
 ### Transaction Building (`bwk-tx`)

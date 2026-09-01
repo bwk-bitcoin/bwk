@@ -79,7 +79,11 @@ fn test_bip32_only_sp_change_bookkeeping(env: &mut TestEnv) {
     env.add_segwit_sub_account(&mut account);
     let coin = env.create_taproot_coin(0.1);
     let funding_tx = bwk_utils::test::get_tx(&mut env.bitcoind.client, coin.outpoint.txid).unwrap();
-    account.sub_accounts()[0].record_unconfirmed_spend(&funding_tx);
+    account
+        .scanners()
+        .next()
+        .unwrap()
+        .record_unconfirmed_spend(&funding_tx);
     let input_value = coin.txout.value;
 
     let external_signer =
@@ -108,7 +112,10 @@ fn test_bip32_only_sp_change_bookkeeping(env: &mut TestEnv) {
         .unwrap();
     assert_eq!(entry.change, change);
     assert_eq!(entry.tx.unwrap(), tx);
-    assert!(!account.sub_accounts()[1]
+    assert!(!account
+        .scanners()
+        .nth(1)
+        .unwrap()
         .tx_history()
         .iter()
         .any(|entry| entry.txid() == txid));
@@ -156,7 +163,11 @@ fn test_standard_output_ownership_is_counted_once(env: &mut TestEnv) {
     env.add_segwit_sub_account(&mut account);
     let coin = env.create_taproot_coin(0.1);
     let funding_tx = bwk_utils::test::get_tx(&mut env.bitcoind.client, coin.outpoint.txid).unwrap();
-    account.sub_accounts()[0].record_unconfirmed_spend(&funding_tx);
+    account
+        .scanners()
+        .next()
+        .unwrap()
+        .record_unconfirmed_spend(&funding_tx);
     let input_value = coin.txout.value.to_sat();
     let standard_output = env.segwit_addr(0);
 
@@ -181,11 +192,17 @@ fn test_standard_output_ownership_is_counted_once(env: &mut TestEnv) {
         .find(|entry| entry.txid == txid)
         .unwrap();
     assert_eq!(entry.change, change);
-    assert!(account.sub_accounts()[0]
+    assert!(account
+        .scanners()
+        .next()
+        .unwrap()
         .tx_history()
         .iter()
         .any(|entry| entry.txid() == txid));
-    assert!(account.sub_accounts()[1]
+    assert!(account
+        .scanners()
+        .nth(1)
+        .unwrap()
         .tx_history()
         .iter()
         .any(|entry| entry.txid() == txid));

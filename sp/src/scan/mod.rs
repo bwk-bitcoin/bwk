@@ -1530,7 +1530,7 @@ impl<P: SpStorageProfile> crate::account::Account<P> {
         let sender = self.sender.clone();
         let stop = self.scanner_stop.clone();
         let min_birthday = self.config.min_birthday_height();
-        let header_store = self.header_store.clone();
+        let header_store = self.header_store().clone();
         let runtime = self.scan_runtime;
 
         let handle = thread::spawn(move || {
@@ -1640,7 +1640,7 @@ impl<P: SpStorageProfile> crate::account::Account<P> {
         let sender = self.sender.clone();
         let stop = self.scanner_stop.clone();
         let mut first_start = start.map(|h| h.max(self.config.min_birthday_height()));
-        let header_store = self.header_store.clone();
+        let header_store = self.header_store().clone();
         let runtime = self.scan_runtime;
 
         let handle = thread::spawn(move || {
@@ -1847,7 +1847,7 @@ impl<P: SpStorageProfile> crate::account::Account<P> {
             tx_store: self.tx_store.clone(),
             scan_state: self.scan_state.clone(),
             sender: self.sender.clone(),
-            header_store: self.header_store.clone(),
+            header_store: self.header_store().clone(),
         };
 
         scan_blocks(

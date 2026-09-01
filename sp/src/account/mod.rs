@@ -38,13 +38,20 @@ use {
     },
     bwk::{
         bwk_electrum::{
-            config::ScannerConfig,
+            coin_store::SpendRecorder,
+            config::{Endpoint, ScannerConfig},
+            header_follower::HeaderFollower,
+            header_store::HeaderStore,
             label_store::{LabelKey, LabelStore},
             notification::{Notification, SpNotification},
+            profile::{DefaultBackend, RamProfile},
+            reconcile::Reconciler,
+            scanner::ElectrumScanner,
         },
         persist::{ConfigStore, NoopConfigStore},
     },
-    miniscript::psbt::PsbtExt,
+    bwk_sign::signing_manager::SigningManager,
+    miniscript::{psbt::PsbtExt, Descriptor, DescriptorPublicKey, ForEachKey},
     std::{
         collections::{BTreeMap, BTreeSet},
         str::FromStr,
@@ -76,6 +83,8 @@ pub enum AccountError {
     MissingBlindbitUrl,
     #[error("invalid mnemonic: {0}")]
     InvalidMnemonic(bip39::Error),
+    #[error("invalid sub-account mnemonic: {0}")]
+    SubAccountMnemonic(bwk_sign::Error),
     #[error("invalid scan_sk hex: {0}")]
     ScanSkHex(hex::FromHexError),
     #[error("invalid scan_sk: {0}")]
@@ -415,16 +424,25 @@ pub struct Account<
     pub(crate) scanner_handle: Option<JoinHandle<()>>,
     pub(crate) broadcast_handle: Option<JoinHandle<()>>,
     pub(crate) scanner_stop: Arc<AtomicBool>,
-    // Sub-accounts use the default bwk RAM profile, independent of sp's P.
-    sub_accounts: Vec<bwk::Account>,
-    /// Shared HeaderStore handle every BIP32 sub-account's chain-tip-advance
-    /// pass reads from.
-    pub header_store: Arc<bwk::bwk_electrum::header_store::HeaderStore>,
-    /// Electrum endpoint the shared HeaderStore currently follows, if any
-    /// (the first sub-account descriptor carrying one). Used by
-    /// `start_electrum` and `set_electrum_settings` to decide whether to
-    /// restart it; cleared by `stop_electrum`.
-    header_store_endpoint: Option<(String, u16)>,
+    /// Sub-accounts use the default bwk RAM profile, independent of sp's P.
+    sub_accounts: Vec<SubAccount>,
+    /// Hot signers for the BIP32 sub-accounts. The scanners only watch
+    /// descriptors, so the wallet keeps the signing side here, once for the
+    /// whole account.
+    signing_manager: SigningManager,
+    /// The validated header chain this account promotes its scanners against,
+    /// and the endpoint it follows.
+    headers: HeaderFollower<RamProfile<DefaultBackend>>,
+}
+
+#[cfg(feature = "mnemonic")]
+/// One watched sub-account descriptor: the scanner recording what the server
+/// reports, and the pass promoting that against this account's header chain.
+struct SubAccount {
+    scanner: ElectrumScanner<RamProfile<DefaultBackend>>,
+    /// Held for its `Drop`, which joins the reconcile thread. Declared after
+    /// `scanner` so the scanner stops its listener first.
+    reconciler: Reconciler<RamProfile<DefaultBackend>>,
 }
 
 // Constructors are tied to the default SpRamProfile because they open
@@ -478,8 +496,7 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
         config_store: Arc<dyn ConfigStore<Config>>,
         scan_runtime: ScanRuntimeConfig,
     ) -> Result<Self, AccountError> {
-        let header_store = Self::build_header_store(&config)?;
-        Self::with_config_store_and_header_store(config, config_store, header_store, scan_runtime)
+        Self::with_config_store_and_header_store(config, config_store, None, scan_runtime)
     }
 
     /// Like [`Account::with_config_store`] but sharing an existing
@@ -504,15 +521,17 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
         Self::with_config_store_and_header_store(
             config,
             Arc::new(NoopConfigStore::<Config>::default()),
-            header_store,
+            Some(header_store),
             scan_runtime,
         )
     }
 
+    /// `header_store == None` opens this account its own store, which it then
+    /// owns and may idle from [`Account::stop_electrum`].
     fn with_config_store_and_header_store(
         config: Config,
         config_store: Arc<dyn ConfigStore<Config>>,
-        header_store: Arc<bwk::bwk_electrum::header_store::HeaderStore>,
+        header_store: Option<Arc<HeaderStore>>,
         scan_runtime: ScanRuntimeConfig,
     ) -> Result<Self, AccountError> {
         // Validate config
@@ -537,42 +556,76 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
         // Create/load stores
         let (coin_store, label_store, tx_store, scan_state) = Self::create_or_load_stores(&config)?;
 
+        // One scanner per configured sub-account descriptor, all reporting on
+        // this account's channel, plus the signers they cannot hold themselves.
+        // In memory: every sub-signer is re-derivable from a mnemonic the
+        // persisted config already carries.
+        let mut signing_manager = SigningManager::new();
+        let mut scanners = Vec::with_capacity(config.descriptors.len());
+        for (i, sub_cfg) in config.descriptors.iter().enumerate() {
+            let name = format!("{}-sub-{}", config.account_name, i);
+            let mut scanner_config = ScannerConfig::new(
+                sub_cfg.descriptor.clone(),
+                config.account_dir(),
+                name.clone(),
+                name,
+                config.network,
+                config.persistence,
+            );
+            scanner_config.set_stay_offline(sub_cfg.endpoint.url().is_none());
+            scanner_config.set_endpoint(sub_cfg.endpoint.clone());
+            scanners.push(ElectrumScanner::try_new_with_sender(
+                scanner_config,
+                sender.clone(),
+            )?);
+            if let Some(mnemonic) = sub_cfg.mnemonic.clone().or_else(|| config.mnemonic.clone()) {
+                register_sub_signer(
+                    &mut signing_manager,
+                    config.network,
+                    &mnemonic,
+                    sub_cfg.descriptor.clone(),
+                )?;
+            }
+        }
+
+        // Opened against the same target the scanners are followed at, so an
+        // account with no endpoint of its own still validates against the one
+        // its sub-accounts watch.
+        let headers = match header_store {
+            Some(store) => HeaderFollower::borrowed(store, sender.clone()),
+            None => HeaderFollower::open(
+                header_store_target(&config, &scanners),
+                config.network,
+                config.persistence,
+                config.account_dir(),
+                // Backfill from the birthday so the worker covers the scan
+                // range, whose confirmation block times the scanner reads here.
+                Some(config.min_birthday_height()),
+                sender.clone(),
+            )?,
+        };
         // Once per account, not per reconciler: every sub-account shares this
         // header store, so registering per reconciler would report the same
         // event to this channel as many times as there are sub-accounts.
-        header_store.register_notifications(sender.clone());
+        headers.store().register_notifications(sender.clone());
+        forward_header_progress(headers.store(), sender.clone());
 
-        let header_store_endpoint = Self::header_store_endpoint(&config);
-        forward_header_progress(&header_store, sender.clone());
-
-        // Create sub-accounts from config descriptors
-        let sub_accounts = config
-            .descriptors
-            .iter()
-            .enumerate()
-            .map(|(i, sub_cfg)| {
-                let name = format!("{}-sub-{}", config.account_name, i);
-                let mut scanner = ScannerConfig::new(
-                    sub_cfg.descriptor.clone(),
-                    config.account_dir(),
-                    name.clone(),
-                    name,
-                    config.network,
-                    config.persistence,
-                );
-                scanner.set_stay_offline(sub_cfg.endpoint.url().is_none());
-                scanner.set_endpoint(sub_cfg.endpoint.clone());
-                let bwk_config = bwk::Config {
+        let sub_accounts: Vec<SubAccount> = scanners
+            .into_iter()
+            .map(|mut scanner| {
+                // Spawned first: the reconciler registers for the scan ticks, so
+                // a scan started before it would fire them at nobody.
+                let reconciler =
+                    Reconciler::spawn(&scanner, headers.store().clone(), sender.clone());
+                if !scanner.config().stay_offline() {
+                    scanner.start();
+                }
+                SubAccount {
                     scanner,
-                    mnemonic: sub_cfg.mnemonic.clone().or_else(|| config.mnemonic.clone()),
-                };
-                bwk::Account::try_new_with_sender_and_header_store(
-                    bwk_config,
-                    header_store.clone(),
-                    sender.clone(),
-                )
+                    reconciler,
+                }
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect();
 
         Ok(Account {
             sp_receiver,
@@ -590,8 +643,8 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
             broadcast_handle: None,
             scanner_stop: Arc::new(AtomicBool::new(false)),
             sub_accounts,
-            header_store,
-            header_store_endpoint,
+            signing_manager,
+            headers,
         })
     }
 
@@ -703,40 +756,6 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
             Arc::new(Mutex::new(scan_state)),
         ))
     }
-
-    /// The electrum endpoint that drives the shared HeaderStore: the first
-    /// configured sub-account descriptor carrying one.
-    fn header_store_endpoint(config: &Config) -> Option<(String, u16)> {
-        config
-            .endpoint()
-            .server()
-            .map(|(url, port)| (url.to_string(), port))
-    }
-
-    /// Build the shared HeaderStore for this account's BIP32 sub-accounts:
-    /// online against [`Self::header_store_endpoint`] when one is
-    /// configured, file-backed/in-memory (idle) otherwise. Fails loud if a
-    /// configured endpoint cannot be reached rather than silently opening a
-    /// worker-less store.
-    fn build_header_store(
-        config: &Config,
-    ) -> Result<Arc<bwk::bwk_electrum::header_store::HeaderStore>, AccountError> {
-        let path = config.persistence.is_some().then(|| {
-            config
-                .account_dir()
-                .join(bwk::bwk_electrum::config::HEADERS_FILENAME)
-        });
-        let (url, port) = Self::header_store_endpoint(config).unzip();
-        // Backfill from the birthday so the worker covers the scan range, whose
-        // confirmation block times the scanner reads from this store.
-        Ok(bwk::bwk_electrum::header_store::HeaderStore::start_or_open(
-            url,
-            port,
-            config.network,
-            path,
-            Some(config.min_birthday_height()),
-        )?)
-    }
 }
 
 // Generic accessors and operations, available for any `P: SpStorageProfile`.
@@ -832,7 +851,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         let mut sources: Vec<&dyn bwk::bwk_electrum::history::AccountHistory> =
             vec![self as &dyn bwk::bwk_electrum::history::AccountHistory];
         for sub in &self.sub_accounts {
-            sources.push(sub as &dyn bwk::bwk_electrum::history::AccountHistory);
+            sources.push(&sub.scanner as &dyn bwk::bwk_electrum::history::AccountHistory);
         }
         bwk::bwk_electrum::history::aggregate_payments(sources)
     } // Labels
@@ -898,19 +917,63 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
 
     // Sub-accounts
 
-    /// Add a standard wallet sub-account (segwit, taproot, etc.).
-    pub fn add_sub_account(&mut self, account: bwk::Account) {
-        self.sub_accounts.push(account);
+    /// Watch one more standard descriptor (segwit, taproot, etc.) as a
+    /// sub-account, reconciled against this account's header chain.
+    ///
+    /// `mnemonic` is the key that signs for it; pass `None` for a
+    /// watch-only sub-account.
+    pub fn add_sub_account(
+        &mut self,
+        mut scanner: ElectrumScanner<RamProfile<DefaultBackend>>,
+        mnemonic: Option<String>,
+    ) -> Result<(), AccountError> {
+        if let Some(mnemonic) = mnemonic {
+            register_sub_signer(
+                &mut self.signing_manager,
+                self.config.network,
+                &mnemonic,
+                scanner.descriptor(),
+            )?;
+        }
+        // Spawned first: the reconciler registers for the scan ticks, so a
+        // scan started before it would fire them at nobody.
+        let reconciler =
+            Reconciler::spawn(&scanner, self.headers.store().clone(), self.sender.clone());
+        // `start` is a no-op without an endpoint to reach.
+        if !scanner.config().stay_offline() {
+            scanner.start();
+        }
+        self.sub_accounts.push(SubAccount {
+            scanner,
+            reconciler,
+        });
+        // The first sub-account carrying an endpoint is what an account with
+        // none of its own follows, so recompute rather than leave it idle.
+        let target = self.header_target();
+        self.headers.follow(target, reconcilers(&self.sub_accounts));
+        Ok(())
     }
 
-    /// Returns a reference to the embedded sub-accounts.
-    pub fn sub_accounts(&self) -> &[bwk::Account] {
-        &self.sub_accounts
+    /// The sub-account scanners.
+    pub fn scanners(&self) -> impl Iterator<Item = &ElectrumScanner<RamProfile<DefaultBackend>>> {
+        self.sub_accounts.iter().map(|sub| &sub.scanner)
     }
 
-    /// Returns a mutable reference to the embedded sub-accounts.
-    pub fn sub_accounts_mut(&mut self) -> &mut [bwk::Account] {
-        &mut self.sub_accounts
+    /// The sub-account scanners, mutably.
+    pub fn scanners_mut(
+        &mut self,
+    ) -> impl Iterator<Item = &mut ElectrumScanner<RamProfile<DefaultBackend>>> {
+        self.sub_accounts.iter_mut().map(|sub| &mut sub.scanner)
+    }
+
+    /// Every BIP32 master xpriv this wallet can sign with: the silent-payments
+    /// key plus every sub-account hot signer.
+    pub fn master_xprivs(&self) -> BTreeMap<bitcoin::bip32::Fingerprint, bitcoin::bip32::Xpriv> {
+        let mut xprivs = self.signing_manager.master_xprivs();
+        if let Some((fg, xpriv)) = self.sp_master_xpriv() {
+            xprivs.insert(fg, xpriv);
+        }
+        xprivs
     }
 
     /// Derive the BIP32 master xpriv from this account's mnemonic, if available.
@@ -926,68 +989,64 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         Some((fg, xpriv))
     }
 
-    /// Stop electrum on all sub-accounts. Every sub-account is now offline,
-    /// so idle the shared `HeaderStore` too instead of leaving its worker
-    /// running against a connection none of them use anymore. Clears the
-    /// tracked endpoint so a later `start_electrum`/`set_electrum_settings`
-    /// call restarts the store even against the same endpoint as before.
+    /// Stop every sub-account scan, its reconcile pass, and the header
+    /// validator. The validator is only idled when this account opened it: one
+    /// handed in through [`Account::with_header_store`] is the sharer's to
+    /// stop.
     pub fn stop_electrum(&mut self) {
         for sub in &mut self.sub_accounts {
-            sub.stop_electrum();
+            sub.scanner.stop();
         }
-        self.header_store.stop();
-        self.header_store_endpoint = None;
+        self.headers.stop();
+        for sub in &mut self.sub_accounts {
+            sub.reconciler.stop();
+        }
     }
 
-    /// Start electrum on all sub-accounts, restarting the shared
-    /// `HeaderStore` against the first sub-account endpoint if it isn't
-    /// already following it (e.g. after a prior `stop_electrum`).
+    /// Start every sub-account scan and its reconcile pass, and point the
+    /// header validator at the first endpoint they carry.
     pub fn start_electrum(&mut self) {
         for sub in &mut self.sub_accounts {
-            sub.start_electrum();
+            sub.scanner.start();
         }
-        let endpoint = self.sub_accounts.iter().find_map(|a| {
-            let config = a.get_config();
-            config
-                .scanner
-                .endpoint()
-                .server()
-                .map(|(url, port)| (url.to_string(), port))
-        });
-        self.follow_header_store_endpoint(endpoint);
+        let target = self.header_target();
+        self.headers.follow(target, reconcilers(&self.sub_accounts));
+        for sub in &mut self.sub_accounts {
+            sub.reconciler.start();
+        }
     }
 
-    /// Set electrum URL and port on all sub-accounts without writing to file.
+    /// Point every sub-account and the header validator at `url:port`, and
+    /// persist it. The sub-account configs move too: the constructor rebuilds
+    /// each scanner from its own endpoint, so a reopen would otherwise bring
+    /// them back up on the previous server.
     pub fn set_electrum_settings(&mut self, url: Option<String>, port: Option<u16>) {
         for sub in &mut self.sub_accounts {
-            sub.set_electrum_config(url.clone(), port);
+            sub.scanner.set_electrum(url.clone(), port);
         }
-        self.follow_header_store_endpoint(url.zip(port));
+        for sub_cfg in &mut self.config.descriptors {
+            sub_cfg.endpoint.set(url.clone(), port);
+        }
+        let target = self.header_target();
+        self.headers.follow(target, reconcilers(&self.sub_accounts));
+        self.persist_config();
     }
 
-    /// Point the shared `HeaderStore` at `endpoint`: restart its worker
-    /// against a new endpoint, or idle it when every sub-account went
-    /// offline. No-op when already following `endpoint`.
-    fn follow_header_store_endpoint(&mut self, endpoint: Option<(String, u16)>) {
-        if endpoint == self.header_store_endpoint {
-            return;
-        }
-        match endpoint.clone() {
-            Some((url, port)) => match self.header_store.restart(url, port) {
-                Ok(()) => self.header_store_endpoint = endpoint,
-                Err(e) => log::warn!("sp::Account: header store restart failed: {e}"),
-            },
-            None => {
-                self.header_store.stop();
-                self.header_store_endpoint = endpoint;
-            }
-        }
+    /// The validated header chain this account's scanners promote against.
+    pub fn header_store(&self) -> &Arc<HeaderStore> {
+        self.headers.store()
+    }
+
+    /// The endpoint the header validator should follow, given what this
+    /// account and its sub-accounts currently point at.
+    fn header_target(&self) -> Option<Endpoint> {
+        header_store_target(&self.config, self.scanners())
     }
 
     /// Total balance across SP and all sub-accounts.
     pub fn total_balance(&self) -> u64 {
         let sp_balance = self.balance();
-        let bip32_balance: u64 = self.sub_accounts.iter().map(|a| a.balance().0).sum();
+        let bip32_balance: u64 = self.scanners().map(|s| s.balance().0).sum();
         sp_balance + bip32_balance
     }
 
@@ -1014,8 +1073,8 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
             );
         }
 
-        for (sub_idx, sub) in self.sub_accounts.iter().enumerate() {
-            for (outpoint, entry) in sub.coins() {
+        for (sub_idx, scanner) in self.scanners().enumerate() {
+            for (outpoint, entry) in scanner.coins() {
                 let spendable = !matches!(
                     entry.status(),
                     bwk_coin::CoinStatus::Spent | bwk_coin::CoinStatus::BeingSpend,
@@ -1105,8 +1164,8 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
                     continue;
                 }
                 let mut found = false;
-                for sub in self.sub_accounts() {
-                    if let Some(entry) = sub.coins().get(outpoint) {
+                for scanner in self.scanners() {
+                    if let Some(entry) = scanner.coins().get(outpoint) {
                         if matches!(
                             entry.status(),
                             bwk_coin::CoinStatus::Spent | bwk_coin::CoinStatus::BeingSpend
@@ -1184,8 +1243,8 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
             unconfirmed_count: sp.unconfirmed_coins as u64,
             unconfirmed_balance: Amount::from_sat(sp.unconfirmed_balance),
         };
-        for sub in &self.sub_accounts {
-            let s = sub.spendable_coins();
+        for scanner in self.scanners() {
+            let s = scanner.spendable_coins();
             summary.confirmed_count += s.confirmed_coins as u64;
             summary.confirmed_balance += Amount::from_sat(s.confirmed_balance);
             summary.unconfirmed_count += s.unconfirmed_coins as u64;
@@ -1222,14 +1281,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
 
         let sp_source = SpCoinSource::new(self.coin_store.clone());
 
-        // Collect master xprivs from SP account and all sub-accounts for BIP32 key derivation
-        let mut all_xprivs = std::collections::BTreeMap::new();
-        if let Some((fg, xpriv)) = self.sp_master_xpriv() {
-            all_xprivs.insert(fg, xpriv);
-        }
-        for sub in &self.sub_accounts {
-            all_xprivs.extend(sub.master_xprivs());
-        }
+        let all_xprivs = self.master_xprivs();
 
         let sp_provider = Box::new(SpSecretProvider::new(
             self.coin_store.clone(),
@@ -1238,14 +1290,14 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         ));
 
         // Merge coin sources from all sub-accounts, enriching BIP32 coins
-        // with their secret keys for SP partial secret computation.
+        // with their secret keys for SP partial secret computation. Each
+        // scanner only gets the keys its own descriptor is derived from.
         let bip32_sources: Vec<Box<dyn bwk_coin::CoinSource>> = self
-            .sub_accounts
-            .iter()
-            .map(|a| {
+            .scanners()
+            .map(|scanner| {
                 Box::new(KeyedBip32Source::new(
-                    Box::new(a.coin_source()),
-                    a.master_xprivs(),
+                    Box::new(scanner.coin_source()),
+                    descriptor_xprivs(&scanner.descriptor(), &all_xprivs),
                 )) as Box<dyn bwk_coin::CoinSource>
             })
             .collect();
@@ -1259,7 +1311,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     /// Sign all inputs in a PSBT, both SP and BIP32 (segwit/taproot).
     ///
     /// 1. Signs SP inputs using `b_spend + tweak` (no taproot tweak).
-    /// 2. Signs BIP32 inputs via sub-account SigningManagers.
+    /// 2. Signs BIP32 inputs with the wallet's hot signers.
     ///
     /// # Errors
     /// * `AccountError::NoKeys` if this account has no spend secret key
@@ -1270,10 +1322,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
             self.sign_sp_inputs(psbt)?;
         }
 
-        // Sign BIP32 inputs via sub-account SigningManagers
-        for sub in &self.sub_accounts {
-            sub.sign_psbt(psbt);
-        }
+        self.signing_manager.sign_psbt(psbt);
 
         Ok(())
     }
@@ -1281,7 +1330,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     /// Sign all inputs and finalize the PSBT into a broadcast-ready transaction.
     ///
     /// 1. Signs SP inputs (`b_spend + tweak`).
-    /// 2. Signs BIP32 inputs via sub-account SigningManagers.
+    /// 2. Signs BIP32 inputs with the wallet's hot signers.
     /// 3. Finalizes all inputs (builds witnesses) and extracts the transaction.
     pub fn sign_and_finalize(
         &self,
@@ -1351,10 +1400,9 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     }
 
     fn sub_account_spend_recorders(&self) -> Vec<SubAccountSpendRecorder> {
-        self.sub_accounts
-            .iter()
-            .map(|account| {
-                let recorder = account.spend_recorder();
+        self.scanners()
+            .map(|scanner| {
+                let recorder = SpendRecorder::new(scanner.coin_store().clone());
                 SubAccountSpendRecorder {
                     scripts: recorder.address_scripts(),
                     recorder,
@@ -1470,9 +1518,9 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     pub fn owned_addresses(&self) -> Vec<OwnedAddress> {
         let mut out: Vec<OwnedAddress> = Vec::new();
 
-        for sub in &self.sub_accounts {
-            let name = sub.name();
-            for e in sub.address_entries() {
+        for scanner in self.scanners() {
+            let name = scanner.name();
+            for e in scanner.address_entries() {
                 out.push(OwnedAddress {
                     address: e.value(),
                     account_name: name.clone(),
@@ -1532,6 +1580,78 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
 }
 
 #[cfg(feature = "mnemonic")]
+/// The reconcile passes of `sub_accounts`, one per sub-account.
+///
+/// Free rather than a method on [`Account`]: every caller hands it to the
+/// header follower it is mutably borrowing, which a whole-`self` borrow blocks.
+fn reconcilers(
+    sub_accounts: &[SubAccount],
+) -> impl Iterator<Item = &Reconciler<RamProfile<DefaultBackend>>> {
+    sub_accounts.iter().map(|sub| &sub.reconciler)
+}
+
+#[cfg(feature = "mnemonic")]
+/// The endpoint the header validator should follow.
+///
+/// The account's own endpoint wins; a sub-account's is the fallback for a
+/// config that broadcasts nowhere but still watches descriptors.
+///
+/// Free rather than a method on [`Account`]: the constructor computes the
+/// target the store opens on before the account exists.
+fn header_store_target<'a>(
+    config: &'a Config,
+    scanners: impl IntoIterator<Item = &'a ElectrumScanner<RamProfile<DefaultBackend>>>,
+) -> Option<Endpoint> {
+    config
+        .endpoint()
+        .configured()
+        .or_else(|| {
+            scanners
+                .into_iter()
+                .find_map(|scanner| scanner.config().endpoint().configured())
+        })
+        .cloned()
+}
+
+#[cfg(feature = "mnemonic")]
+/// Seed a hot signer from `mnemonic` and let it sign for `descriptor`.
+///
+/// A fingerprint already registered is left as is: re-seeding it would replace
+/// the signer and drop the descriptors registered on it so far.
+fn register_sub_signer(
+    signing_manager: &mut SigningManager,
+    network: Network,
+    mnemonic: &str,
+    descriptor: Descriptor<DescriptorPublicKey>,
+) -> Result<(), AccountError> {
+    let signer = bwk_sign::HotSigner::new_from_mnemonics(network, mnemonic)
+        .map_err(AccountError::SubAccountMnemonic)?;
+    if !signing_manager.has_bip32_signer(&signer.fingerprint()) {
+        signing_manager.add_bip32_signer(signer);
+    }
+    signing_manager.register_bip32_descriptor(descriptor);
+    Ok(())
+}
+
+#[cfg(feature = "mnemonic")]
+/// The subset of `xprivs` that `descriptor` is derived from, keyed by
+/// fingerprint: the only keys able to sign for it.
+fn descriptor_xprivs(
+    descriptor: &Descriptor<DescriptorPublicKey>,
+    xprivs: &BTreeMap<bitcoin::bip32::Fingerprint, bitcoin::bip32::Xpriv>,
+) -> BTreeMap<bitcoin::bip32::Fingerprint, bitcoin::bip32::Xpriv> {
+    let mut out = BTreeMap::new();
+    descriptor.for_each_key(|key| {
+        let fingerprint = key.master_fingerprint();
+        if let Some(xpriv) = xprivs.get(&fingerprint) {
+            out.insert(fingerprint, *xpriv);
+        }
+        true
+    });
+    out
+}
+
+#[cfg(feature = "mnemonic")]
 /// Provenance of an [`OwnedAddress`].
 ///
 /// SP-derived spks have exactly one funding tx by protocol design
@@ -1550,7 +1670,7 @@ pub enum AddressSource {
 #[cfg(feature = "mnemonic")]
 /// One address the wallet owns, aggregated across sub-accounts
 /// (BIP32) and the SP wallet. `account_name` identifies the
-/// originating keychain, see [`bwk::Account::name`] /
+/// originating keychain, see [`ElectrumScanner::name`] /
 /// [`crate::Account::name`]. `source` carries the per-spk provenance
 /// (see [`AddressSource`]).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1663,7 +1783,6 @@ mod tests {
     use super::*;
     use crate::receiver::OwnedOutput;
     use bitcoin::{absolute::Height, hashes::hash160, secp256k1::Parity};
-    use bwk::bwk_electrum::config::Endpoint;
     use std::path::PathBuf;
 
     fn test_config() -> Config {
@@ -2021,16 +2140,84 @@ mod tests {
         let account =
             Account::with_header_store(config, shared.clone()).expect("with_header_store");
 
-        assert!(Arc::ptr_eq(&account.header_store, &shared));
-        assert_eq!(account.sub_accounts().len(), 2);
-        for sub in account.sub_accounts() {
-            assert!(Arc::ptr_eq(sub.header_store(), &shared));
+        assert!(Arc::ptr_eq(account.header_store(), &shared));
+        assert_eq!(account.scanners().count(), 2);
+        // What sharing is for: every sub-account promotes against that one
+        // chain, not a per-scanner copy.
+        assert_eq!(reconcilers(&account.sub_accounts).count(), 2);
+        for reconciler in reconcilers(&account.sub_accounts) {
+            assert!(Arc::ptr_eq(reconciler.header_store(), &shared));
         }
+    }
+
+    /// The constructor rebuilds each sub-account scanner from its own
+    /// endpoint, so a config whose sub-accounts stayed behind reopens them on
+    /// the previous server while the account half points at the new one.
+    #[test]
+    fn set_electrum_settings_moves_the_sub_account_endpoints_too() {
+        use bwk::persist::CallbackConfigStore;
+
+        let mut config = test_config();
+        let mnemonic = config
+            .mnemonic
+            .clone()
+            .expect("test_config carries a mnemonic");
+        config.descriptors = vec![
+            offline_sub_account_config(&mnemonic, config.network),
+            offline_sub_account_config(&mnemonic, config.network),
+        ];
+
+        let saved: Arc<Mutex<Option<Config>>> = Arc::new(Mutex::new(None));
+        let sink = saved.clone();
+        let source = saved.clone();
+        let store = CallbackConfigStore::new(
+            move |config: &Config| {
+                *sink.lock().expect("poisoned") = Some(config.clone());
+                Ok(())
+            },
+            move || Ok(source.lock().expect("poisoned").clone()),
+        );
+
+        let mut account =
+            Account::with_config_store(config, Arc::new(store)).expect("with_config_store");
+        // A closed local port: the header restart and the reopened scanners
+        // fail to connect, without a name to resolve.
+        account.set_electrum_settings(Some("127.0.0.1".to_string()), Some(50001));
+        drop(account);
+
+        let saved = saved
+            .lock()
+            .expect("poisoned")
+            .clone()
+            .expect("set_electrum_settings persisted the config");
+        let shared = bwk::bwk_electrum::header_store::HeaderStore::new_in_memory(saved.network);
+        let mut reopened = Account::with_header_store(saved, shared).expect("with_header_store");
+        reopened.stop_electrum();
+
+        let servers: Vec<_> = reopened
+            .scanners()
+            .map(|scanner| {
+                scanner
+                    .config()
+                    .endpoint()
+                    .server()
+                    .map(|(url, port)| (url.to_string(), port))
+            })
+            .collect();
+        assert_eq!(
+            servers,
+            vec![
+                Some(("127.0.0.1".to_string(), 50001)),
+                Some(("127.0.0.1".to_string(), 50001)),
+            ]
+        );
     }
 
     // owned_addresses: aggregate view across BIP32 subs + SP
 
-    fn build_offline_segwit_sub(name: &str) -> bwk::Account {
+    fn build_offline_segwit_sub(
+        name: &str,
+    ) -> (ElectrumScanner<RamProfile<DefaultBackend>>, String) {
         use bip39::Mnemonic;
         use bwk_sign::{bwk_descriptor, HotSigner};
         use miniscript::bitcoin::bip32::ChildNumber;
@@ -2044,7 +2231,7 @@ mod tests {
         let descriptor = bwk_descriptor::SpkDerivator::new_wpkh(xpub, network)
             .unwrap()
             .descriptor();
-        let mut scanner = ScannerConfig::new(
+        let mut scanner_config = ScannerConfig::new(
             descriptor,
             std::path::PathBuf::new(),
             String::new(),
@@ -2052,12 +2239,10 @@ mod tests {
             network,
             None,
         );
-        scanner.stay_offline = true;
-        scanner.look_ahead = 5;
-        bwk::Account::new(bwk::Config {
-            scanner,
-            mnemonic: Some(mnemo.to_string()),
-        })
+        scanner_config.set_stay_offline(true);
+        scanner_config.look_ahead = 5;
+        let scanner = ElectrumScanner::try_new(scanner_config).unwrap();
+        (scanner, mnemo.to_string())
     }
 
     /// Build a syntactically valid p2tr scriptPubKey from a fixed
@@ -2094,7 +2279,10 @@ mod tests {
     fn owned_addresses_includes_bip32_sub_accounts() {
         let mut account = Account::new(test_config()).expect("Account::new");
         let sub_name = "sub-segwit-0".to_string();
-        account.add_sub_account(build_offline_segwit_sub(&sub_name));
+        let (sub, mnemonic) = build_offline_segwit_sub(&sub_name);
+        account
+            .add_sub_account(sub, Some(mnemonic))
+            .expect("add_sub_account");
 
         let owned = account.owned_addresses();
         // Sub-accounts populate look_ahead receive + look_ahead change
@@ -2164,7 +2352,10 @@ mod tests {
     #[test]
     fn lookup_returns_none_for_unknown_address() {
         let mut account = Account::new(test_config()).expect("Account::new");
-        account.add_sub_account(build_offline_segwit_sub("sub-segwit-0"));
+        let (sub, mnemonic) = build_offline_segwit_sub("sub-segwit-0");
+        account
+            .add_sub_account(sub, Some(mnemonic))
+            .expect("add_sub_account");
         // A signet bech32 address that the wallet definitely doesn't own.
         let unknown = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
         assert!(account.lookup_owned_address(unknown).is_none());
@@ -2173,13 +2364,15 @@ mod tests {
     #[test]
     fn lookup_returns_entry_for_owned_bip32_address() {
         let mut account = Account::new(test_config()).expect("Account::new");
-        account.add_sub_account(build_offline_segwit_sub("sub-segwit-0"));
+        let (sub, mnemonic) = build_offline_segwit_sub("sub-segwit-0");
+        account
+            .add_sub_account(sub, Some(mnemonic))
+            .expect("add_sub_account");
 
         // Pick any address the sub generated at construction time,
         // look it up by canonical string, and check we get it back.
         let sample = account
-            .sub_accounts()
-            .iter()
+            .scanners()
             .flat_map(|s| s.address_entries())
             .next()
             .expect("sub-account has entries");

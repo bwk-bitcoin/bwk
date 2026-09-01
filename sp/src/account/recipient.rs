@@ -600,14 +600,7 @@ fn derive_bip32_key(
     let secp = crate::receiver::bitcoin::secp256k1::Secp256k1::new();
     let psbt_input = coin.to_psbt_input().ok()?;
 
-    // Collect xprivs from SP account and all sub-accounts
-    let mut xprivs = std::collections::BTreeMap::new();
-    if let Some((fg, xpriv)) = account.sp_master_xpriv() {
-        xprivs.insert(fg, xpriv);
-    }
-    for sub in account.sub_accounts() {
-        xprivs.extend(sub.master_xprivs());
-    }
+    let xprivs = account.master_xprivs();
 
     if !psbt_input.bip32_derivation.is_empty() {
         psbt_input.bip32_derivation.values().find_map(|(fg, path)| {
