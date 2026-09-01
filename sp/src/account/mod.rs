@@ -1017,15 +1017,22 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     }
 
     /// Point every sub-account and the header validator at `url:port`, and
-    /// persist it. The sub-account configs move too: the constructor rebuilds
-    /// each scanner from its own endpoint, so a reopen would otherwise bring
-    /// them back up on the previous server.
+    /// persist it. The account's own endpoint moves with them: it is what the
+    /// header validator follows and what a spend broadcasts through, so
+    /// leaving it behind splits the account across two servers. The
+    /// sub-account configs move too: the constructor rebuilds each scanner
+    /// from its own endpoint, so a reopen would otherwise bring them back up
+    /// on the previous server.
     pub fn set_electrum_settings(&mut self, url: Option<String>, port: Option<u16>) {
         for sub in &mut self.sub_accounts {
             sub.scanner.set_electrum(url.clone(), port);
         }
         for sub_cfg in &mut self.config.descriptors {
             sub_cfg.endpoint.set(url.clone(), port);
+        }
+        match url.clone().zip(port) {
+            Some((url, port)) => self.config.set_electrum_endpoint(url, port),
+            None => self.config.clear_electrum_endpoint(),
         }
         let target = self.header_target();
         self.headers.follow(target, reconcilers(&self.sub_accounts));
