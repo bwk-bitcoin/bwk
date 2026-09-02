@@ -1,0 +1,25 @@
+[package]
+name = "bwk-qr"
+version = "0.0.1"
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+keywords.workspace = true
+readme.workspace = true
+
+[dependencies]
+bbqr = { workspace = true, optional = true }
+bwk-qr-protocol = { workspace = true, features = ["bitcoin"], optional = true }
+qrcodegen = { workspace = true, optional = true }
+quircs = { workspace = true, optional = true }
+thiserror.workspace = true
+
+[dev-dependencies]
+bitcoin = { workspace = true }
+
+[features]
+default = ["gen", "scan", "protocol"]
+gen = ["dep:qrcodegen"]
+scan = ["dep:quircs"]
+protocol = ["gen", "scan", "dep:bbqr", "dep:bwk-qr-protocol"]

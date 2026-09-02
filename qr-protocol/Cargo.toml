@@ -1,0 +1,21 @@
+[package]
+name = "bwk-qr-protocol"
+version = "0.0.1"
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+keywords.workspace = true
+readme.workspace = true
+
+[dependencies]
+# The codec is `no_std` and dependency-free so a bare-metal signer can vendor it.
+# `bitcoin` is only the adapter layer for callers that already run on `std`.
+bitcoin = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[features]
+default = []
+bitcoin = ["dep:bitcoin"]
