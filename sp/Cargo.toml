@@ -134,3 +134,4 @@ bwk-utils = { workspace = true, features = ["test"] }
 bwk-sign = { workspace = true, features = ["test"] }
 bip39 = { workspace = true }
 libc = { workspace = true }
+base64ct = { workspace = true, features = ["alloc"] }

@@ -10,7 +10,8 @@ use bitcoin::{key::TapTweak, Script, ScriptBuf};
 use crate::{
     account::AccountError,
     core::{
-        secp256k1::{PublicKey, Scalar, Secp256k1},
+        dleq::{self, DleqProof},
+        secp256k1::{constants::ONE, PublicKey, Scalar, Secp256k1, SecretKey},
         utils::hash::calculate_input_hash,
     },
 };
@@ -337,34 +338,284 @@ pub fn fill_output_scripts(
     Ok(())
 }
 
+/// The secp256k1 base point `G`. BIP375 fixes the DLEQ generator to `G`, so
+/// this is the only place a `SecretKey` appears outside the test module, and
+/// it is a public constant, not key material.
+pub fn generator() -> PublicKey {
+    let one = SecretKey::from_slice(&ONE).expect("one is a valid secret key");
+    PublicKey::from_secret_key(&Secp256k1::new(), &one)
+}
+
+pub fn verify_proof(
+    public: PublicKey,
+    scan_key: PublicKey,
+    share: PublicKey,
+    proof: [u8; 64],
+) -> Result<(), AccountError> {
+    if dleq::verify_proof(
+        public,
+        scan_key,
+        share,
+        DleqProof::from(proof),
+        generator(),
+        None,
+    ) {
+        Ok(())
+    } else {
+        Err(AccountError::PsbtV2)
+    }
+}
+
+/// Rejects a share with no matching proof, or a proof with no matching
+/// share, at both the global and per-input scopes. An unpaired share is a
+/// claim nobody backed; an unpaired proof is either a mistake or an attempt
+/// to make the map counts look right.
+pub fn validate_share_maps(psbt: &bwk_psbt::PsbtV2) -> Result<(), AccountError> {
+    let shares = bwk_psbt::sp::sp_global_ecdh_shares_v2(psbt).map_err(|_| AccountError::PsbtV2)?;
+    let proofs = bwk_psbt::sp::sp_global_dleqs_v2(psbt).map_err(|_| AccountError::PsbtV2)?;
+    for share in &shares {
+        bwk_psbt::sp::sp_global_dleq_v2(psbt, share.scan_key)
+            .map_err(|_| AccountError::PsbtV2)?
+            .ok_or(AccountError::PsbtV2)?;
+    }
+    for proof in &proofs {
+        bwk_psbt::sp::sp_global_ecdh_share_v2(psbt, proof.scan_key)
+            .map_err(|_| AccountError::PsbtV2)?
+            .ok_or(AccountError::PsbtV2)?;
+    }
+    for input in &psbt.inputs {
+        bwk_psbt::sp::sp_input_ecdh_shares(&input.psbt).map_err(|_| AccountError::PsbtV2)?;
+        bwk_psbt::sp::sp_input_dleqs(&input.psbt).map_err(|_| AccountError::PsbtV2)?;
+    }
+    Ok(())
+}
+
+/// A share or proof on an input claims that input contributes to the sum, so
+/// that input must be eligible and have a recoverable public key. A share on
+/// an ineligible input is skipped, not fatal: a sender may attach shares
+/// before knowing which inputs survive selection.
+pub fn validate_input_share_pairs(psbt: &bwk_psbt::PsbtV2) -> Result<(), AccountError> {
+    for input in &psbt.inputs {
+        let shares =
+            bwk_psbt::sp::sp_input_ecdh_shares(&input.psbt).map_err(|_| AccountError::PsbtV2)?;
+        let proofs = bwk_psbt::sp::sp_input_dleqs(&input.psbt).map_err(|_| AccountError::PsbtV2)?;
+        if !shares.is_empty() || !proofs.is_empty() {
+            if !eligible_input_script(input)? {
+                continue;
+            }
+            if !input_script_pubkey(input)?.is_some_and(|script| script.is_p2tr())
+                && input.psbt.bip32_derivation.is_empty()
+            {
+                return Err(AccountError::PsbtV2);
+            }
+            if eligible_input_pubkey(input)?.is_none() {
+                return Err(AccountError::PsbtV2);
+            }
+        }
+        for share in &shares {
+            bwk_psbt::sp::sp_input_dleq(&input.psbt, share.scan_key)
+                .map_err(|_| AccountError::PsbtV2)?
+                .ok_or(AccountError::PsbtV2)?;
+        }
+        for proof in &proofs {
+            bwk_psbt::sp::sp_input_ecdh_share(&input.psbt, proof.scan_key)
+                .map_err(|_| AccountError::PsbtV2)?
+                .ok_or(AccountError::PsbtV2)?;
+        }
+    }
+    Ok(())
+}
+
+/// The global proof is over the sum of eligible input public keys, not any
+/// single key: the global share is the sender's combined ECDH contribution
+/// across every eligible input, so that is what the proof must attest to.
+pub fn validate_global_share(
+    psbt: &bwk_psbt::PsbtV2,
+    scan_key: PublicKey,
+) -> Result<(), AccountError> {
+    let share = bwk_psbt::sp::sp_global_ecdh_share_v2(psbt, scan_key)
+        .map_err(|_| AccountError::PsbtV2)?
+        .ok_or(AccountError::PsbtV2)?;
+    let proof = bwk_psbt::sp::sp_global_dleq_v2(psbt, scan_key)
+        .map_err(|_| AccountError::PsbtV2)?
+        .ok_or(AccountError::PsbtV2)?;
+    verify_proof(eligible_pubkey_sum(psbt)?, scan_key, share, proof)
+}
+
+pub fn validate_input_shares(
+    psbt: &bwk_psbt::PsbtV2,
+    scan_key: PublicKey,
+) -> Result<(), AccountError> {
+    for input in &psbt.inputs {
+        let Some(pubkey) = eligible_input_pubkey(input)? else {
+            continue;
+        };
+        let share = bwk_psbt::sp::sp_input_ecdh_share(&input.psbt, scan_key)
+            .map_err(|_| AccountError::PsbtV2)?
+            .ok_or(AccountError::PsbtV2)?;
+        let proof = bwk_psbt::sp::sp_input_dleq(&input.psbt, scan_key)
+            .map_err(|_| AccountError::PsbtV2)?
+            .ok_or(AccountError::PsbtV2)?;
+        verify_proof(pubkey, scan_key, share, proof)?;
+    }
+    Ok(())
+}
+
+/// A read-only validation of a half-built PSBT must not demand shares that
+/// have not been supplied yet, so the per-input fallback only kicks in once
+/// an output has actually been computed from them.
+pub fn validate_scan_key(psbt: &bwk_psbt::PsbtV2, scan_key: PublicKey) -> Result<(), AccountError> {
+    if bwk_psbt::sp::sp_global_ecdh_share_v2(psbt, scan_key)
+        .map_err(|_| AccountError::PsbtV2)?
+        .is_some()
+    {
+        validate_global_share(psbt, scan_key)
+    } else if has_computed_output(psbt, scan_key)? {
+        validate_input_shares(psbt, scan_key)
+    } else {
+        Ok(())
+    }
+}
+
+/// Completion is about to act on whatever shares exist, so unlike
+/// `validate_scan_key` it always falls back to the per-input shares.
+pub fn validate_scan_key_for_completion(
+    psbt: &bwk_psbt::PsbtV2,
+    scan_key: PublicKey,
+) -> Result<(), AccountError> {
+    if bwk_psbt::sp::sp_global_ecdh_share_v2(psbt, scan_key)
+        .map_err(|_| AccountError::PsbtV2)?
+        .is_some()
+    {
+        validate_global_share(psbt, scan_key)
+    } else {
+        validate_input_shares(psbt, scan_key)
+    }
+}
+
+pub fn has_computed_output(
+    psbt: &bwk_psbt::PsbtV2,
+    scan_key: PublicKey,
+) -> Result<bool, AccountError> {
+    psbt.outputs.iter().try_fold(false, |found, output| {
+        let info = bwk_psbt::sp::sp_v0_output(&output.psbt).map_err(|_| AccountError::PsbtV2)?;
+        Ok(found
+            || info.is_some_and(|info| info.scan_key == scan_key) && output.script_pubkey.is_some())
+    })
+}
+
+pub fn has_any_computed_output(psbt: &bwk_psbt::PsbtV2) -> Result<bool, AccountError> {
+    psbt.outputs.iter().try_fold(false, |found, output| {
+        let info = bwk_psbt::sp::sp_v0_output(&output.psbt).map_err(|_| AccountError::PsbtV2)?;
+        Ok::<bool, AccountError>(found || (info.is_some() && output.script_pubkey.is_some()))
+    })
+}
+
+pub fn has_any_share_for_scan_keys(
+    psbt: &bwk_psbt::PsbtV2,
+    scan_keys: &BTreeSet<PublicKey>,
+) -> Result<bool, AccountError> {
+    for scan_key in scan_keys {
+        if bwk_psbt::sp::sp_global_ecdh_share_v2(psbt, *scan_key)
+            .map_err(|_| AccountError::PsbtV2)?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        for input in &psbt.inputs {
+            if bwk_psbt::sp::sp_input_ecdh_share(&input.psbt, *scan_key)
+                .map_err(|_| AccountError::PsbtV2)?
+                .is_some()
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Recomputes every silent-payment script and rejects any mismatch with what
+/// is already written. This is where a lying signer is caught: it can
+/// publish a valid proof for a share and still write the wrong script.
+/// `require_all` is `false`, since a group with no share yet and no computed
+/// script is incomplete, not invalid.
+pub fn validate_output_scripts(psbt: &bwk_psbt::PsbtV2) -> Result<(), AccountError> {
+    if !has_any_computed_output(psbt)? {
+        return Ok(());
+    }
+    let input_hash = input_hash(psbt)?;
+    for (index, script) in output_scripts(psbt, input_hash, false)? {
+        if psbt.outputs[index]
+            .script_pubkey
+            .as_ref()
+            .is_some_and(|actual| actual != &script)
+        {
+            return Err(AccountError::PsbtV2);
+        }
+    }
+    Ok(())
+}
+
+pub fn validate(psbt: &bwk_psbt::PsbtV2) -> Result<(), AccountError> {
+    let scan_keys = scan_keys(psbt)?;
+    if scan_keys.is_empty() {
+        return Ok(());
+    }
+    validate_share_maps(psbt)?;
+    validate_input_share_pairs(psbt)?;
+    validate_input_eligibility(psbt, true)?;
+    // A PSBT with no computed output and no share for any scan key is simply
+    // an unstarted build, not an invalid one.
+    if !has_any_computed_output(psbt)? && !has_any_share_for_scan_keys(psbt, &scan_keys)? {
+        return Ok(());
+    }
+    for scan_key in scan_keys {
+        validate_scan_key(psbt, scan_key)?;
+    }
+    validate_output_scripts(psbt)
+}
+
 pub fn complete_output_scripts(psbt: &mut bwk_psbt::PsbtV2) -> Result<(), AccountError> {
     let scan_keys = scan_keys(psbt)?;
     if scan_keys.is_empty() {
         return Ok(());
     }
     validate_input_eligibility(psbt, true)?;
+    validate_share_maps(psbt)?;
+    validate_input_share_pairs(psbt)?;
+    for scan_key in scan_keys {
+        validate_scan_key_for_completion(psbt, scan_key)?;
+    }
     let input_hash = input_hash(psbt)?;
-    fill_output_scripts(psbt, input_hash)
+    fill_output_scripts(psbt, input_hash)?;
+    validate_output_scripts(psbt)
 }
 
 #[cfg(test)]
 mod tests {
+    use base64ct::{Base64, Encoding};
     use bitcoin::{
-        absolute, hashes::Hash, key::TapTweak, psbt::PsbtSighashType, secp256k1::Secp256k1,
+        absolute,
+        bip32::{DerivationPath, Fingerprint},
+        hashes::Hash,
+        key::TapTweak,
+        psbt::PsbtSighashType,
+        secp256k1::Secp256k1,
         transaction, Amount, Network, OutPoint, PublicKey as BitcoinPublicKey, ScriptBuf, Sequence,
-        TapSighashType, TxOut,
+        TapSighashType, TxIn, TxOut, Txid, Witness, XOnlyPublicKey,
     };
+    use bwk_psbt::sp::{PSBT_GLOBAL_SP_DLEQ, PSBT_GLOBAL_SP_ECDH_SHARE};
     use secp256k1::{PublicKey, Scalar, SecretKey};
 
     use crate::{
         account::{
             bip375::{
-                complete_output_scripts, eligible_input_pubkey, eligible_script, input_hash,
-                input_script_pubkey, validate_input_eligibility, NUMS_H,
+                complete_output_scripts, eligible_input_pubkey, eligible_script, generator,
+                input_hash, input_script_pubkey, validate, validate_input_eligibility, NUMS_H,
             },
             AccountError,
         },
-        core::utils::hash::calculate_input_hash,
+        core::{dleq, utils::hash::calculate_input_hash},
         receiver::{SpReceiver, SpendKey},
     };
 
@@ -647,7 +898,10 @@ mod tests {
         let share = scan_key
             .mul_tweak(&Secp256k1::new(), &Scalar::from(input_secret))
             .unwrap();
+        let proof =
+            dleq::generate_proof(input_secret, scan_key, [3; 32], generator(), None).unwrap();
         bwk_psbt::sp::set_sp_global_ecdh_share_v2(psbt, scan_key, share);
+        bwk_psbt::sp::set_sp_global_dleq_v2(psbt, scan_key, *proof.as_bytes());
         share
     }
 
@@ -655,7 +909,9 @@ mod tests {
         let share = scan_key
             .mul_tweak(&Secp256k1::new(), &Scalar::from(secret))
             .unwrap();
+        let proof = dleq::generate_proof(secret, scan_key, [3; 32], generator(), None).unwrap();
         bwk_psbt::sp::set_sp_input_ecdh_share(input, scan_key, share);
+        bwk_psbt::sp::set_sp_input_dleq(input, scan_key, *proof.as_bytes());
     }
 
     fn psbt() -> (bwk_psbt::PsbtV2, PublicKey) {
@@ -900,5 +1156,341 @@ mod tests {
         complete_output_scripts(&mut psbt).unwrap();
 
         assert_eq!(psbt.tx_modifiable, before);
+    }
+
+    fn remove_global(psbt: &mut bwk_psbt::PsbtV2, type_value: u8, scan_key: PublicKey) {
+        psbt.unknown.remove(&bitcoin::psbt::raw::Key {
+            type_value,
+            key: scan_key.serialize().to_vec(),
+        });
+    }
+
+    fn spending_tx(script_pubkey: ScriptBuf) -> bitcoin::Transaction {
+        bitcoin::Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(10_000),
+                script_pubkey,
+            }],
+        }
+    }
+
+    #[test]
+    fn rejects_missing_global_dleq() {
+        let (mut psbt, scan_key) = psbt();
+        remove_global(&mut psbt, PSBT_GLOBAL_SP_DLEQ, scan_key);
+
+        let result = complete_output_scripts(&mut psbt);
+
+        assert!(matches!(result, Err(AccountError::PsbtV2)));
+    }
+
+    #[test]
+    fn rejects_orphan_global_dleq() {
+        let (mut psbt, scan_key) = psbt();
+        remove_global(&mut psbt, PSBT_GLOBAL_SP_ECDH_SHARE, scan_key);
+
+        let result = validate(&psbt);
+
+        assert!(matches!(result, Err(AccountError::PsbtV2)));
+    }
+
+    #[test]
+    fn rejects_orphan_input_share() {
+        let (mut psbt, scan_key) = psbt();
+        remove_global(&mut psbt, PSBT_GLOBAL_SP_ECDH_SHARE, scan_key);
+        remove_global(&mut psbt, PSBT_GLOBAL_SP_DLEQ, scan_key);
+        let secp = Secp256k1::new();
+        let share = scan_key
+            .mul_tweak(&secp, &Scalar::from(even_secret(5)))
+            .unwrap();
+        bwk_psbt::sp::set_sp_input_ecdh_share(&mut psbt.inputs[0].psbt, scan_key, share);
+
+        let result = validate(&psbt);
+
+        assert!(matches!(result, Err(AccountError::PsbtV2)));
+    }
+
+    #[test]
+    fn rejects_orphan_input_dleq() {
+        let (mut psbt, scan_key) = psbt();
+        remove_global(&mut psbt, PSBT_GLOBAL_SP_ECDH_SHARE, scan_key);
+        remove_global(&mut psbt, PSBT_GLOBAL_SP_DLEQ, scan_key);
+        let proof =
+            dleq::generate_proof(even_secret(5), scan_key, [3; 32], generator(), None).unwrap();
+        bwk_psbt::sp::set_sp_input_dleq(&mut psbt.inputs[0].psbt, scan_key, *proof.as_bytes());
+
+        let result = validate(&psbt);
+
+        assert!(matches!(result, Err(AccountError::PsbtV2)));
+    }
+
+    #[test]
+    fn rejects_forged_global_share() {
+        let secp = Secp256k1::new();
+        let (mut psbt, scan_key) = psbt();
+        let unrelated_secret = secret(42);
+        let forged_share = scan_key
+            .mul_tweak(&secp, &Scalar::from(unrelated_secret))
+            .unwrap();
+        bwk_psbt::sp::set_sp_global_ecdh_share_v2(&mut psbt, scan_key, forged_share);
+
+        let result = validate(&psbt);
+
+        assert!(matches!(result, Err(AccountError::PsbtV2)));
+    }
+
+    #[test]
+    fn rejects_tampered_output_script() {
+        let secp = Secp256k1::new();
+        let (mut psbt, _) = psbt();
+        complete_output_scripts(&mut psbt).unwrap();
+        let unrelated_key = PublicKey::from_secret_key(&secp, &even_secret(99));
+        let (xonly, _) = unrelated_key.x_only_public_key();
+        psbt.outputs[0].script_pubkey = Some(ScriptBuf::new_p2tr_tweaked(
+            xonly.dangerous_assume_tweaked(),
+        ));
+
+        let result = validate(&psbt);
+
+        assert!(matches!(result, Err(AccountError::PsbtV2)));
+    }
+
+    #[test]
+    fn rejects_non_taproot_input_with_unrelated_bip32_key() {
+        let secp = Secp256k1::new();
+        let input_secret = secret(10);
+        let input_pubkey = PublicKey::from_secret_key(&secp, &input_secret);
+        let scan_secret = secret(12);
+        let scan_key = PublicKey::from_secret_key(&secp, &scan_secret);
+        let spend_secret = secret(13);
+        let spend_key = PublicKey::from_secret_key(&secp, &spend_secret);
+        let input_script =
+            ScriptBuf::new_p2wpkh(&BitcoinPublicKey::new(input_pubkey).wpubkey_hash().unwrap());
+
+        let build_psbt = |share_secret: SecretKey| {
+            let share_pubkey = PublicKey::from_secret_key(&secp, &share_secret);
+            let mut input_psbt = bitcoin::psbt::Input {
+                witness_utxo: Some(TxOut {
+                    value: Amount::from_sat(10_000),
+                    script_pubkey: input_script.clone(),
+                }),
+                ..Default::default()
+            };
+            input_psbt.bip32_derivation.insert(
+                share_pubkey,
+                (Fingerprint::default(), DerivationPath::default()),
+            );
+            set_input_share(&mut input_psbt, scan_key, share_secret);
+
+            let mut psbt = empty_psbt(vec![input_with(input_psbt, OutPoint::null())]);
+            psbt.outputs = vec![sp_output(scan_key, spend_key)];
+            psbt
+        };
+
+        let mut unrelated = build_psbt(secret(11));
+        assert!(matches!(
+            eligible_input_pubkey(&unrelated.inputs[0]),
+            Err(AccountError::PsbtV2)
+        ));
+        assert!(matches!(
+            complete_output_scripts(&mut unrelated),
+            Err(AccountError::PsbtV2)
+        ));
+
+        let mut matching = build_psbt(input_secret);
+        assert_eq!(
+            eligible_input_pubkey(&matching.inputs[0]).unwrap(),
+            Some(input_pubkey)
+        );
+        complete_output_scripts(&mut matching).unwrap();
+        validate(&matching).unwrap();
+
+        let receiver = receiver(scan_secret, spend_secret);
+        assert!(receiver_discovers(&matching, &receiver, &[input_pubkey]));
+    }
+
+    #[test]
+    fn rejects_initial_psbt_with_ineligible_input() {
+        let (mut psbt, scan_key) = psbt();
+        remove_global(&mut psbt, PSBT_GLOBAL_SP_ECDH_SHARE, scan_key);
+        remove_global(&mut psbt, PSBT_GLOBAL_SP_DLEQ, scan_key);
+        psbt.inputs[0]
+            .psbt
+            .witness_utxo
+            .as_mut()
+            .unwrap()
+            .script_pubkey = segwit_v2_script();
+
+        let result = validate(&psbt);
+
+        assert!(matches!(result, Err(AccountError::PsbtV2)));
+    }
+
+    #[test]
+    fn rejects_segwit_v2_from_non_witness_utxo() {
+        let (mut psbt, _) = psbt();
+        psbt.inputs[0].psbt.witness_utxo = None;
+        psbt.inputs[0].psbt.non_witness_utxo = Some(spending_tx(segwit_v2_script()));
+
+        let result = validate(&psbt);
+
+        assert!(matches!(result, Err(AccountError::PsbtV2)));
+    }
+
+    #[test]
+    fn rejects_conflicting_witness_and_non_witness_utxo() {
+        let (mut psbt, _) = psbt();
+        let secp = Secp256k1::new();
+        let real_pubkey = PublicKey::from_secret_key(&secp, &even_secret(8));
+        let (xonly, _) = real_pubkey.x_only_public_key();
+        let non_witness_utxo = spending_tx(ScriptBuf::new_p2tr_tweaked(
+            xonly.dangerous_assume_tweaked(),
+        ));
+        psbt.inputs[0].previous_output = OutPoint {
+            txid: non_witness_utxo.compute_txid(),
+            vout: 0,
+        };
+        psbt.inputs[0].psbt.non_witness_utxo = Some(non_witness_utxo);
+        let receiver = receiver(secret(6), secret(7));
+
+        let result = complete_output_scripts(&mut psbt);
+        if result.is_ok() {
+            assert!(!receiver_discovers(&psbt, &receiver, &[real_pubkey]));
+        }
+        assert!(
+            matches!(result, Err(AccountError::PsbtV2)),
+            "completion returned {result:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_uncommitted_p2sh_redeem_script() {
+        let (mut psbt, _) = psbt();
+        let secp = Secp256k1::new();
+        let input_pubkey = PublicKey::from_secret_key(&secp, &secret(8));
+        let bitcoin_pubkey = BitcoinPublicKey::new(input_pubkey);
+        let real_redeem_script = bitcoin_pubkey
+            .wpubkey_hash()
+            .map(|hash| ScriptBuf::new_p2wpkh(&hash))
+            .unwrap();
+        let script_pubkey = ScriptBuf::new_p2sh(&real_redeem_script.script_hash());
+        let unrelated_pubkey = BitcoinPublicKey::new(PublicKey::from_secret_key(&secp, &secret(9)));
+        let mut input_psbt = bitcoin::psbt::Input {
+            witness_utxo: Some(TxOut {
+                value: Amount::from_sat(10_000),
+                script_pubkey,
+            }),
+            redeem_script: Some(ScriptBuf::new_p2pkh(&unrelated_pubkey.pubkey_hash())),
+            ..Default::default()
+        };
+        input_psbt.bip32_derivation.insert(
+            input_pubkey,
+            (Fingerprint::default(), DerivationPath::default()),
+        );
+        psbt.inputs.push(input_with(
+            input_psbt,
+            OutPoint {
+                txid: Txid::from_byte_array([15; 32]),
+                vout: 0,
+            },
+        ));
+
+        let result = complete_output_scripts(&mut psbt);
+
+        assert!(matches!(result, Err(AccountError::PsbtV2)));
+    }
+
+    #[test]
+    fn rejects_uncommitted_taproot_nums_internal_key() {
+        let (mut psbt, _) = psbt();
+        let secp = Secp256k1::new();
+        let input_pubkey = PublicKey::from_secret_key(&secp, &even_secret(8));
+        let mut input_psbt = p2tr_witness_utxo(input_pubkey);
+        input_psbt.tap_internal_key = Some(XOnlyPublicKey::from_slice(&NUMS_H).unwrap());
+        psbt.inputs.push(input_with(
+            input_psbt,
+            OutPoint {
+                txid: Txid::from_byte_array([16; 32]),
+                vout: 0,
+            },
+        ));
+
+        let result = complete_output_scripts(&mut psbt);
+
+        assert!(matches!(result, Err(AccountError::PsbtV2)));
+    }
+
+    #[test]
+    fn excludes_committed_taproot_nums_input() {
+        let (mut psbt, _) = psbt();
+        let nums = PublicKey::from_slice(&{
+            let mut bytes = [0u8; 33];
+            bytes[0] = 0x02;
+            bytes[1..].copy_from_slice(&NUMS_H);
+            bytes
+        })
+        .unwrap();
+        let mut input_psbt = p2tr_witness_utxo(nums);
+        input_psbt.tap_internal_key = Some(nums.x_only_public_key().0);
+        psbt.inputs.push(input_with(
+            input_psbt,
+            OutPoint {
+                txid: Txid::from_byte_array([17; 32]),
+                vout: 0,
+            },
+        ));
+
+        assert!(matches!(eligible_input_pubkey(&psbt.inputs[1]), Ok(None)));
+        complete_output_scripts(&mut psbt).unwrap();
+        validate(&psbt).unwrap();
+    }
+
+    #[test]
+    fn p2tr_eligible_key_comes_from_script() {
+        let (mut psbt, _) = psbt();
+        let secp = Secp256k1::new();
+        let wrong = PublicKey::from_secret_key(&secp, &secret(9));
+        psbt.inputs[0]
+            .psbt
+            .bip32_derivation
+            .insert(wrong, (Fingerprint::default(), DerivationPath::default()));
+
+        complete_output_scripts(&mut psbt).unwrap();
+        validate(&psbt).unwrap();
+    }
+
+    #[test]
+    fn bip375_vectors() {
+        const VALID: &[&str] = &[
+            "cHNidP8B+wQCAAAAAQIEAgAAAAEEAQEBBQEBAQYBAAABDiBSJ0jrF3ZNKMpJSBXsjUnn0w1SvHNCLHyG63TjlwVylAEPBAAAAAABAFUCAAAAAfTCEtWu0ef2/2M/LOCcZHxXvt2TAxTZjed1A9WOlAszAAAAAAD/////AaCGAQAAAAAAGXapFB4q14ctMpQTpW3wlovjOCIngxY7iKwAAAAAIgICyBe7dSGvw16pbzv7Jw5utQ3f+lVgYnuWH+wA8pllCL9HMEQCIDnBDcvHz0XG2UNW/1DBK42GqVUM8DcXPZzr94cU5nx1AiBxlVpC7SBTJDIHI8TwFCXc6J9CX4NwKEy0J2z9tt6jrAEBAwQBAAAAIgYCyBe7dSGvw16pbzv7Jw5utQ3f+lVgYnuWH+wA8pllCL8IAAAAgAAAAAABEAT+////Ih0Cekh/wZ+3aYd7h0LW6hgRjzxOcrHqjG3mAqetSkHb4GghA+yk/xG3KOLg9gzmIilDpv9VudlfYnv5qZ0IS8hy1QpbIh4Cekh/wZ+3aYd7h0LW6hgRjzxOcrHqjG3mAqetSkHb4GhAihOzmFVF9yvW6JcUrrkJs+NUqEKpu4tWzQ7e0h34oZlZizEiikngvX6VzhBT98WyistUOmhwdgDjzomCLuMgIQABAwgYcwEAAAAAAAEEIlEg4UDSh7RbRs1OqvpDdwYVcLq+g9G4vJUKdKn+oJIz16YBCUICekh/wZ+3aYd7h0LW6hgRjzxOcrHqjG3mAqetSkHb4GgDYeGx6d5eQssgB/fKVLng1X7ROTj61W0/GeV1E6j84DkA",
+        ];
+        const INVALID: &[&str] = &[
+            "cHNidP8B+wQCAAAAAQIEAgAAAAEEAQEBBQEBAQYBAAABDiAYpxdmOwurFLEqGncTI/8eQHndUy5d0T4o6hCBxwCYSgEPBAAAAAABAR+ghgEAAAAAABYAFCKactNKZFvTSWu79Qu7gckGP0+UIgICyBe7dSGvw16pbzv7Jw5utQ3f+lVgYnuWH+wA8pllCL9HMEQCIAkHemqmSsFK56GqT+aMAqziBsnqxyNJBhrnYDkAuSJuAiBvFDKlePjjMK8LkAJWdGvJ9OUqoujMeQKdyOdqPClLBgEBAwQBAAAAIgYCyBe7dSGvw16pbzv7Jw5utQ3f+lVgYnuWH+wA8pllCL8IAAAAgAAAAAABEAT+////Ih0Cekh/wZ+3aYd7h0LW6hgRjzxOcrHqjG3mAqetSkHb4GghA+yk/xG3KOLg9gzmIilDpv9VudlfYnv5qZ0IS8hy1QpbIh4Cekh/wZ+3aYd7h0LW6hgRjzxOcrHqjG3mAqetSkHb4GhAihOzmFVF9yvW6JcUrrkJs+NUqEKpu4tWzQ7e0h34oZlZizEiikngvX6VzhBT98WyistUOmhwdgDjzomCLuMgIQABAwgYcwEAAAAAAAEEIlEgImjPUplZ8wrI96VHHKTGdTalHw5bForwPu1HFe3McuABCgQBAAAAAA==",
+            "cHNidP8B+wQCAAAAAQIEAgAAAAEEAQEBBQEBAQYBAAABDiAYpxdmOwurFLEqGncTI/8eQHndUy5d0T4o6hCBxwCYSgEPBAAAAAABAR+ghgEAAAAAABZSFCKactNKZFvTSWu79Qu7gckGP0+UIgICyBe7dSGvw16pbzv7Jw5utQ3f+lVgYnuWH+wA8pllCL9HMEQCIHLzeIUvuENyYHLyUHbw53Vg7UwuBHFm7mpibHW/2znWAiAhKq5fCVdONB9YhvX/8y9XFuq5AwpKU3nmAWtqTULcJAEBAwQBAAAAIgYCyBe7dSGvw16pbzv7Jw5utQ3f+lVgYnuWH+wA8pllCL8IAAAAgAAAAAABEAT+////Ih0Cekh/wZ+3aYd7h0LW6hgRjzxOcrHqjG3mAqetSkHb4GghA+yk/xG3KOLg9gzmIilDpv9VudlfYnv5qZ0IS8hy1QpbIh4Cekh/wZ+3aYd7h0LW6hgRjzxOcrHqjG3mAqetSkHb4GhAihOzmFVF9yvW6JcUrrkJs+NUqEKpu4tWzQ7e0h34oZlZizEiikngvX6VzhBT98WyistUOmhwdgDjzomCLuMgIQABAwiQXwEAAAAAAAEEIlEgdUe4Fj1bvFSYQL5MwUaq0JUgc2e565RwbeZwjUCPk/kBCUICekh/wZ+3aYd7h0LW6hgRjzxOcrHqjG3mAqetSkHb4GgCi4D5lDNIleEbx2x1q254/iwluzMvIXshHEAXvx9nfYYAAQMIECcAAAAAAAABBCJRIGziw1OV8XDyS20tgNCkDEb0a6S0hD9qsxGpNLMcXYTcAQlCAnpIf8Gft2mHe4dC1uoYEY88TnKx6oxt5gKnrUpB2+BoA6r4Yq7amM+SU5r33DN10dpfsGsSHvCh8DGp9zgv1T27AA==",
+            "cHNidP8B+wQCAAAAAQIEAgAAAAEEAQEBBQECAQYBAAABDiAYpxdmOwurFLEqGncTI/8eQHndUy5d0T4o6hCBxwCYSgEPBAAAAAABAR+ghgEAAAAAABYAFCKactNKZFvTSWu79Qu7gckGP0+UIgICyBe7dSGvw16pbzv7Jw5utQ3f+lVgYnuWH+wA8pllCL9HMEQCID9iBcRocGpGJF8XE6u4uLmjp7/YOsdF98ByDUQxtM38AiBxWKv7gg8r9a1nRfVvwHCcmVzMrP4XCY2KobYfjJ/y/wEBAwQBAAAAIgYCyBe7dSGvw16pbzv7Jw5utQ3f+lVgYnuWH+wA8pllCL8IAAAAgAAAAAABEAT+////Ih0Cekh/wZ+3aYd7h0LW6hgRjzxOcrHqjG3mAqetSkHb4GghA+yk/xG3KOLg9gzmIilDpv9VudlfYnv5qZ0IS8hy1QpbIh4Cekh/wZ+3aYd7h0LW6hgRjzxOcrHqjG3mAqetSkHb4GhAihOzmFVF9yvW6JcUrrkJs+NUqEKpu4tWzQ7e0h34oZlZizEiikngvX6VzhBT98WyistUOmhwdgDjzomCLuMgIQABAwiQXwEAAAAAAAEEIlEgdUe4Fj1bvFSYQL5MwUaq0JUgc2e565RwbeZwjUCPk/kBCUICekh/wZ+3aYd7h0LW6hgRjzxOcrHqjG3mAqetSkHb4GgCi4D5lDNIleEbx2x1q254/iwluzMvIXshHEAXvx9nfYYAAQMIECcAAAAAAAABBCJRIGziw1OV8XDyS20tgNCkDEb0a6S0hD9qsxGpNLMcXYTcAQlCAnpIf8Gft2mHe4dC1uoYEY88TnKx6oxt5gKnrUpB2+BoA6r4Yq7amM+SU5r33DN10dpfsGsSHvCh8DGp9zgv1T27AA==",
+            "cHNidP8B+wQCAAAAAQIEAgAAAAEEAQEBBQEDAQYBAAABDiAYpxdmOwurFLEqGncTI/8eQHndUy5d0T4o6hCBxwCYSgEPBAAAAAABAR+ghgEAAAAAABYAFCKactNKZFvTSWu79Qu7gckGP0+UIgICyBe7dSGvw16pbzv7Jw5utQ3f+lVgYnuWH+wA8pllCL9HMEQCIFg36hg2U7tRrGNQq+bDhHvokGogZdwwSNbSCOp8DkyCAiAQ+0/6sv7Vqmy2KAqTxHnPsE5Gyp7fF6owXNFnSiQsSQEBAwQBAAAAIgYCyBe7dSGvw16pbzv7Jw5utQ3f+lVgYnuWH+wA8pllCL8IAAAAgAAAAAABEAT+////Ih0Cekh/wZ+3aYd7h0LW6hgRjzxOcrHqjG3mAqetSkHb4GghA+yk/xG3KOLg9gzmIilDpv9VudlfYnv5qZ0IS8hy1QpbIh4Cekh/wZ+3aYd7h0LW6hgRjzxOcrHqjG3mAqetSkHb4GhAihOzmFVF9yvW6JcUrrkJs+NUqEKpu4tWzQ7e0h34oZlZizEiikngvX6VzhBT98WyistUOmhwdgDjzomCLuMgIQABAwiQXwEAAAAAAAEEIlEgMm31D+Cge3rLcgcL6ztjLrmtFbppXMHlqmqgB7YUb9gBCUICekh/wZ+3aYd7h0LW6hgRjzxOcrHqjG3mAqetSkHb4GgDYeGx6d5eQssgB/fKVLng1X7ROTj61W0/GeV1E6j84DkAAQMIECcAAAAAAAABBCJRIJcUQsifBHhuCCcorhFu6rgC8/qelf2w03U6aEAgIAbeAQlCAnpIf8Gft2mHe4dC1uoYEY88TnKx6oxt5gKnrUpB2+BoA2HhseneXkLLIAf3ylS54NV+0Tk4+tVtPxnldROo/OA5AAEDCBAnAAAAAAAAAQQiUSA/y66kkIf44D2d79Ory9bejAMrWD+Fpl0FeIHExEPNwAEJQgJ6SH/Bn7dph3uHQtbqGBGPPE5yseqMbeYCp61KQdvgaANh4bHp3l5CyyAH98pUueDVftE5OPrVbT8Z5XUTqPzgOQA=",
+        ];
+
+        for vector in VALID {
+            let bytes = Base64::decode_vec(vector).unwrap();
+            let psbt = bwk_psbt::PsbtV2::deserialize(&bytes).unwrap();
+            validate(&psbt).unwrap();
+        }
+        for vector in INVALID {
+            let bytes = Base64::decode_vec(vector).unwrap();
+            let invalid = bwk_psbt::PsbtV2::deserialize(&bytes)
+                .map_err(|_| ())
+                .and_then(|psbt| validate(&psbt).map_err(|_| ()))
+                .is_err();
+            assert!(invalid);
+        }
     }
 }
