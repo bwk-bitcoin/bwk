@@ -616,7 +616,7 @@ pub mod test {
         let path = tr_path(nw, ChildNumber::from_hardened_idx(0).unwrap()).unwrap();
         let xpub = signer.xpub(&path);
         let derivator = SpkDerivator::new_tr(xpub, nw).unwrap();
-        signer.register_descriptor(derivator.descriptor());
+        signer.register_descriptor(derivator.descriptor().into());
         (signer, derivator)
     }
 
@@ -642,7 +642,7 @@ pub mod test {
         let desccriptor =
             Descriptor::<DescriptorPublicKey>::from_str(&descr_str).expect("hardcoded descriptor");
         let derivator = SpkDerivator::new(desccriptor, nw).unwrap();
-        signer.register_descriptor(derivator.descriptor());
+        signer.register_descriptor(derivator.descriptor().into());
         (signer, derivator)
     }
 
@@ -652,7 +652,7 @@ pub mod test {
         let path = wpkh_path(nw, ChildNumber::from_hardened_idx(0).unwrap()).unwrap();
         let xpub = signer.xpub(&path);
         let derivator = SpkDerivator::new_wpkh(xpub, nw).unwrap();
-        signer.register_descriptor(derivator.descriptor());
+        signer.register_descriptor(derivator.descriptor().into());
         (signer, derivator)
     }
 
