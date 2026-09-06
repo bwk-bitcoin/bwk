@@ -51,7 +51,7 @@ use {
         },
         persist::config_store::{ConfigStore, NoopConfigStore},
     },
-    bwk_sign::signing_manager::HotManager,
+    bwk_sign::{bwk_descriptor, signing_manager::HotManager},
     miniscript::psbt::PsbtExt,
     std::{
         collections::{BTreeMap, BTreeSet},
@@ -78,26 +78,16 @@ type Stores = (
 /// Errors that can occur in Account operations.
 #[derive(Debug, thiserror::Error)]
 pub enum AccountError {
-    #[error("either mnemonic or scan_sk must be provided")]
+    #[error("mnemonic required to sign")]
     MissingKeys,
     #[error("blindbit_url is required")]
     MissingBlindbitUrl,
-    #[error("invalid mnemonic: {0}")]
-    InvalidMnemonic(bip39::Error),
     #[error("invalid sub-account mnemonic: {0}")]
     SubAccountMnemonic(bwk_sign::error::Error),
-    #[error("invalid scan_sk hex: {0}")]
-    ScanSkHex(hex::FromHexError),
-    #[error("invalid scan_sk: {0}")]
-    InvalidScanSk(bitcoin::secp256k1::Error),
-    #[error("invalid spend_key hex: {0}")]
-    SpendKeyHex(hex::FromHexError),
-    #[error("invalid spend_key: {0}")]
-    InvalidSpendKey(bitcoin::secp256k1::Error),
-    #[error("spend_key must be 33 bytes")]
-    SpendKeyLength,
-    #[error("spend_key is required when using scan_sk")]
-    MissingSpendKey,
+    #[error("config error: {0}")]
+    Config(#[from] config::ConfigError),
+    #[error("descriptor error: {0}")]
+    Descriptor(#[from] bwk_descriptor::sp_descriptor::Error),
     #[error("failed to create SpReceiver: {0}")]
     SpReceiver(crate::receiver::error::Error),
     #[error("scan failed: {0}")]
@@ -495,9 +485,7 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
     ///
     /// # Errors
     ///
-    /// Returns a configuration error if:
-    /// - Neither mnemonic nor scan_sk is provided ([`AccountError::MissingKeys`])
-    /// - blindbit_url is empty ([`AccountError::MissingBlindbitUrl`])
+    /// Returns [`AccountError::MissingBlindbitUrl`] if `blindbit_url` is empty.
     pub fn new(config: Config) -> Result<Self, AccountError> {
         Self::with_runtime_config(config, ScanRuntimeConfig::default())
     }
@@ -572,9 +560,6 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
         scan_runtime: ScanRuntimeConfig,
     ) -> Result<Self, AccountError> {
         // Validate config
-        if config.mnemonic.is_none() && config.scan_sk.is_none() {
-            return Err(AccountError::MissingKeys);
-        }
         if config.blindbit_url.is_empty() {
             return Err(AccountError::MissingBlindbitUrl);
         }
@@ -712,7 +697,7 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
             mnemonic.to_string(),
             blindbit_url,
             data_dir,
-        );
+        )?;
         Self::new(config)
     }
 
@@ -727,34 +712,10 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
 
     /// Create SpReceiver from config.
     fn create_sp_receiver(config: &Config) -> Result<SpReceiver, AccountError> {
-        if let Some(ref mnemonic) = config.mnemonic {
-            let mnemonic =
-                bip39::Mnemonic::parse(mnemonic).map_err(AccountError::InvalidMnemonic)?;
-            SpReceiver::new_from_mnemonic(mnemonic, config.network)
-                .map_err(AccountError::SpReceiver)
-        } else if let Some(ref scan_sk_hex) = config.scan_sk {
-            // Create from raw keys
-            let scan_sk_bytes = hex::decode(scan_sk_hex).map_err(AccountError::ScanSkHex)?;
-            let scan_sk = bitcoin::secp256k1::SecretKey::from_slice(&scan_sk_bytes)
-                .map_err(AccountError::InvalidScanSk)?;
-
-            let spend_pk = if let Some(ref spend_key_hex) = config.spend_key {
-                let spend_key_bytes =
-                    hex::decode(spend_key_hex).map_err(AccountError::SpendKeyHex)?;
-
-                if spend_key_bytes.len() != 33 {
-                    return Err(AccountError::SpendKeyLength);
-                }
-                bitcoin::secp256k1::PublicKey::from_slice(&spend_key_bytes)
-                    .map_err(AccountError::InvalidSpendKey)?
-            } else {
-                return Err(AccountError::MissingSpendKey);
-            };
-
-            SpReceiver::new(scan_sk, spend_pk, config.network).map_err(AccountError::SpReceiver)
-        } else {
-            Err(AccountError::MissingKeys)
-        }
+        let secp = Secp256k1::new();
+        let scan_sk = config.descriptor.scan_secret_key(&secp)?;
+        let spend_pk = config.descriptor.spend_public_key(&secp)?;
+        SpReceiver::new(scan_sk, spend_pk, config.network).map_err(AccountError::SpReceiver)
     }
 
     // (see the free `create_backend` helper below for the backend
@@ -940,10 +901,10 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
 
     /// Push the current config to the configured [`ConfigStore`].
     ///
-    /// Under [`bwk::persist::PersistenceKind::Sqlite`] the saved view has
-    /// signer material stripped via [`Config::for_persistence`].
+    /// The mnemonic never reaches this save: it's `#[serde(skip)]` on
+    /// [`Config`], so it can't be serialized regardless of `persistence`.
     fn persist_config(&self) {
-        if let Err(e) = self.config_store.save(&self.config.for_persistence()) {
+        if let Err(e) = self.config_store.save(&self.config) {
             log::warn!("config save failed: {e}");
         }
     }
@@ -1873,7 +1834,9 @@ mod tests {
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string(),
             "https://blindbit.example.com".to_string(),
             PathBuf::from("/tmp/bwk-sp-account-test"),
-        ).with_persistence(None)
+        )
+        .unwrap()
+        .with_persistence(None)
     }
 
     #[test]
@@ -2096,22 +2059,34 @@ mod tests {
     }
 
     #[test]
-    fn test_config_validation_no_keys() {
-        let mut config = test_config();
-        config.mnemonic = None;
-        config.scan_sk = None;
-
-        let result = Account::new(config);
-        assert!(matches!(result, Err(AccountError::MissingKeys)));
-    }
-
-    #[test]
     fn test_config_validation_no_blindbit_url() {
         let mut config = test_config();
         config.blindbit_url = String::new();
 
         let result = Account::new(config);
         assert!(matches!(result, Err(AccountError::MissingBlindbitUrl)));
+    }
+
+    #[test]
+    fn watch_only_account_constructs() {
+        let mnemonic_account = Account::new(test_config()).unwrap();
+
+        let watch_only_config = Config::from_descriptor(
+            "watch-only-account".to_string(),
+            Network::Signet,
+            test_config().descriptor,
+            "https://blindbit.example.com".to_string(),
+            PathBuf::from("/tmp/bwk-sp-account-watch-only-test"),
+        )
+        .with_persistence(None);
+        assert!(watch_only_config.mnemonic.is_none());
+
+        let watch_only_account = Account::new(watch_only_config).unwrap();
+
+        assert_eq!(
+            watch_only_account.sp_address(),
+            mnemonic_account.sp_address()
+        );
     }
 
     #[test]
@@ -2123,7 +2098,10 @@ mod tests {
             "https://blindbit.example.com".to_string(),
             PathBuf::from("/tmp/bwk-sp-test-from-mnemonic"),
         );
-        assert!(matches!(result, Err(AccountError::InvalidMnemonic(_))));
+        assert!(matches!(
+            result,
+            Err(AccountError::Config(config::ConfigError::Signer(_)))
+        ));
     }
 
     #[test]
@@ -2143,9 +2121,9 @@ mod tests {
         mnemonic_probe::assert_no_word_leak(&err, mnemonic_probe::UNKNOWN_MNEMONIC);
         assert_eq!(
             err.to_string(),
-            "invalid mnemonic: mnemonic contains an unknown word (word 0)"
+            "config error: signer error: Fail to create derivator"
         );
-        assert_eq!(format!("{err:?}"), "InvalidMnemonic(UnknownWord(0))");
+        assert_eq!(format!("{err:?}"), "Config(Signer(Derivator))");
     }
 
     #[test]
@@ -2164,9 +2142,9 @@ mod tests {
         mnemonic_probe::assert_no_word_leak(&err, mnemonic_probe::BAD_CHECKSUM_MNEMONIC);
         assert_eq!(
             err.to_string(),
-            "invalid mnemonic: the mnemonic has an invalid checksum"
+            "config error: signer error: Fail to create derivator"
         );
-        assert_eq!(format!("{err:?}"), "InvalidMnemonic(InvalidChecksum)");
+        assert_eq!(format!("{err:?}"), "Config(Signer(Derivator))");
     }
 
     #[test]
