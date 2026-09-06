@@ -1051,7 +1051,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let start = args.start.unwrap_or_else(|| min_birthday_for(args.network));
-    let scan_sk_hex = hex::encode([1u8; 32]);
     // Real mode runs a single scan; the dust *list* is an instrumented-only feature.
     let dust = args.dust_limits[0];
     if args.dust_limits.len() > 1 {
@@ -1060,19 +1059,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Watch-only: from_keys reads the 66-hex spend key as a public key.
+    // Watch-only: build a Packed sp() descriptor from the dummy scan/spend keys.
     // Persist enabled with a fresh per-run temp dir = production conditions (real
     // store + throttled scan-state writes) while still a full rescan each run.
     let data_dir = std::env::temp_dir().join(format!("sp_sync_bench_{}", std::process::id()));
     std::fs::create_dir_all(&data_dir).ok();
-    let mut config = bwk_sp::account::config::Config::from_keys(
+    let scan_sk = bitcoin::secp256k1::SecretKey::from_slice(&[1u8; 32])?;
+    let spend_pk = DUMMY_SPEND_PUBKEY.parse::<bitcoin::secp256k1::PublicKey>()?;
+    let descriptor = bwk_sp::bwk_sign::bwk_descriptor::sp_descriptor::SpDescriptor::Packed {
+        key: bwk_sp::bwk_sign::bwk_descriptor::sp_key::SpKey::Scan(
+            bwk_sp::bwk_sign::bwk_descriptor::sp_key::SpScanKey {
+                scan_key: scan_sk,
+                spend_key: spend_pk,
+                network: bitcoin::NetworkKind::from(args.network),
+            },
+        ),
+        origin: None,
+    };
+    let mut config = bwk_sp::account::config::Config::from_descriptor(
         "sp_sync_bench".to_string(),
         args.network,
-        scan_sk_hex,
-        DUMMY_SPEND_PUBKEY.to_string(),
+        descriptor,
         args.url.clone(),
         data_dir.clone(),
-    )?
+    )
     .with_persistence(Some(bwk::persist::PersistenceKind::Json));
     // Match the instrumented path: 0 means "disabled" (no dust filter).
     config.set_dust_limit(if dust == 0 { None } else { Some(dust) });
