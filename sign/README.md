@@ -8,57 +8,52 @@ Provides a unified interface for managing signers and signing PSBTs. Signers
 communicate via async notifications, making it easy to integrate hardware
 wallets that require user interaction.
 
-**Scope:** Signer trait, HotSigner (in-memory BIP32), the
-`manager::SigningManager` trait every signing back end implements,
-`signing_manager::SigningManager` (multi-signer coordination), PSBT signing
-for segwit/taproot. Does NOT handle key derivation paths (use bwk-keys) or
-descriptor parsing (use bwk-descriptor).
+**Scope:** Signer trait, HotSigner (in-memory BIP32), the `SigningManager`
+trait and the back ends implementing it, PSBT signing for segwit/taproot. Does
+NOT handle key derivation paths (use bwk-keys) or descriptor parsing (use
+bwk-descriptor).
 
 ## Usage
 
 ```rust
-use bwk_sign::{
-    signer::{Signer, SignerNotif},
-    signing_manager::SigningManager,
-};
+use bwk_sign::{manager::SigningManager, protocol::Response, signing_manager::HotManager};
+use crossbeam::channel;
 use miniscript::bitcoin::Network;
-use std::path::PathBuf;
 
-// Create signing manager
-let mut manager = SigningManager::new(data_dir, ".my_wallet");
+// A manager for hot signers, plus the channel its answers arrive on
+let mut manager = HotManager::new();
+let (sender, responses) = channel::unbounded();
+manager.subscribe(sender);
 
-// Create hot signer from mnemonic
+// Create a hot signer from a mnemonic; the manager mints its SignerId
 let mnemonic = "abandon abandon abandon ...";
-manager.new_bip32_signer_from_mnemonic(Network::Regtest, mnemonic.to_string());
+let signer =
+    manager.new_bip32_signer_from_mnemonic(Network::Regtest, mnemonic.to_string());
 
-// Poll for notifications
-while let Some(notif) = manager.poll() {
-    match notif {
-        SignerNotif::Info(fingerprint, info) => {
-            println!("Signer {} ready", fingerprint);
-        }
-        SignerNotif::Signed(fingerprint, psbt) => {
-            println!("PSBT signed by {}", fingerprint);
-        }
+// Queue a signature; the returned id correlates the answer
+let request = manager.sign(&signer, descriptor, psbt_bytes)?;
+
+for response in responses {
+    match response {
+        Response::Signed { signer, psbt, .. } => println!("{signer} signed"),
+        Response::Error { message, .. } => println!("failed: {message}"),
         _ => {}
     }
 }
-
-// Sign a PSBT
-manager.sign(Network::Regtest, psbt_string);
 ```
 
 ## Architecture
 
 ```
-SigningManager
-     │
-     ├──► bip32_signers: BTreeMap<Fingerprint, HotSigner>
-     │
-     └──► channel: mpsc::Sender<SignerNotif>
-              │
-              ▼
-         SignerNotif enum (Info, Xpub, Signed, Error, ...)
+consumer
+   │  SigningManager trait: every call queues work and returns a RequestId
+   ▼
+HotManager ──► bip32_signers: BTreeMap<SignerId, HotSigner>
+   │
+   └──► subscriber: channel::Sender<Response>
+            │
+            ▼
+       Response (Signers, Xpub, Signed, Error, ...)
 ```
 
 ## Signer Trait
@@ -114,7 +109,14 @@ In-memory BIP32 signer from mnemonic. Supports:
 - P2TR key-path (tapkey)
 - P2TR script-path (taptree)
 
-## SigningManager
+## HotManager
 
-Manages multiple signers with unified notification channel. Persists hot signers
-to `.signers` JSON file.
+The hot back end: a set of `HotSigner`s behind the `SigningManager` trait. Hot
+signing is CPU-bound and needs no IO, so every trait method does its work
+inline before returning, with no in-flight request table and no worker thread.
+The `RequestId` and `Response` contract is honored all the same, so a caller
+written against a hardware or remote back end works unmodified against this
+one.
+
+`HotManager::new` keeps everything in memory; `with_backend` persists the
+signers through a `bwk-persist` backend.

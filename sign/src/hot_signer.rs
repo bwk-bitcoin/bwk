@@ -43,7 +43,7 @@ impl Signer for HotSigner {
     }
 
     fn info(&self) {
-        send!(self, Info(serde_json::Value::Null));
+        send!(self, Info(self.info_value()));
     }
 
     fn get_xpub(&self, deriv: DerivationPath, _display: bool) {
@@ -292,6 +292,11 @@ impl HotSigner {
     /// extended public key.
     pub fn xpub(&self, path: &DerivationPath) -> OXpub {
         self.derivator.xpub_at(path)
+    }
+
+    /// The payload [`Signer::info`] reports for this signer.
+    pub fn info_value(&self) -> serde_json::Value {
+        serde_json::Value::Null
     }
 
     /// Retrieves the private key at the specified derivation path from the master_xpriv.
