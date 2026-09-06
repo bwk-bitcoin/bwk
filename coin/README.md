@@ -40,7 +40,8 @@ impl CoinSource for MyStore {
 - `KeyChain`: receive, change, or a custom index.
 
 `Coin` converts to a `TxIn`, and to a PSBT input through `to_psbt_input()`,
-which fills in the descriptor derivation for BIP32 coins.
+which fills in the descriptor derivation for BIP32 coins and the BIP376 tweak
+for silent payment coins.
 
 ## Traits
 
