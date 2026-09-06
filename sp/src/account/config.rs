@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use bitcoin::{bip32::ChildNumber, Network, NetworkKind};
+use bitcoin::{bip32::ChildNumber, secp256k1::Secp256k1, Network, NetworkKind};
 use bwk::bwk_electrum::{config::Endpoint, raw_client::CertificateCheck};
 use bwk_sign::{
     bwk_descriptor::{
@@ -201,7 +201,12 @@ impl Config {
     // Sanitization
 
     /// Sanitize all config values, clamping or fixing invalid fields.
-    pub fn sanitize(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::MnemonicDescriptorMismatch`] if a mnemonic is
+    /// set and it does not derive this config's `sp()` descriptor.
+    pub fn sanitize(&mut self) -> Result<(), ConfigError> {
         // Birthday height
         let min = self.min_birthday_height();
         match self.birthday_height {
@@ -209,6 +214,39 @@ impl Config {
             None => self.birthday_height = Some(min),
             _ => {}
         }
+
+        self.check_mnemonic_matches_descriptor()
+    }
+
+    /// Verify that `self.mnemonic`, when present, derives the same BIP352
+    /// scan and spend keys as `self.descriptor`. Watch-only configs (no
+    /// mnemonic) are always valid.
+    fn check_mnemonic_matches_descriptor(&self) -> Result<(), ConfigError> {
+        let Some(mnemonic) = self.mnemonic.as_deref() else {
+            return Ok(());
+        };
+
+        let signer =
+            HotSigner::new_from_mnemonics(self.network, mnemonic).map_err(ConfigError::Signer)?;
+        let account = ChildNumber::from_hardened_idx(0).expect("hardcoded account index");
+        let secp = Secp256k1::new();
+
+        let derived_scan = signer.private_key_at(&receiver::scan_path(self.network, account));
+        let derived_spend = signer.private_key_at(&receiver::spend_path(self.network, account));
+
+        let expected_scan = self
+            .descriptor
+            .scan_secret_key(&secp)
+            .map_err(ConfigError::Descriptor)?;
+        let expected_spend_pk = self
+            .descriptor
+            .spend_public_key(&secp)
+            .map_err(ConfigError::Descriptor)?;
+
+        if derived_scan != expected_scan || derived_spend.public_key(&secp) != expected_spend_pk {
+            return Err(ConfigError::MnemonicDescriptorMismatch);
+        }
+        Ok(())
     }
 
     /// Returns the minimum valid birthday height for this config's network.
@@ -398,16 +436,23 @@ pub enum ConfigError {
     DescriptorPath(#[source] bwk_descriptor::descriptor::Error),
     #[error("derivator error: {0}")]
     Derivator(#[source] bwk_descriptor::derivator::Error),
+    #[error("descriptor error: {0}")]
+    Descriptor(#[source] bwk_descriptor::sp_descriptor::Error),
+    #[error("mnemonic does not derive the configured sp() descriptor")]
+    MnemonicDescriptorMismatch,
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{path::Path, str::FromStr};
 
     use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 
     use super::*;
     use crate::account::mnemonic_probe;
+
+    const MISMATCHED_MNEMONIC: &str =
+        "legal winner thank year wave sausage worth useful legal winner thank yellow";
 
     const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
         abandon abandon abandon about";
@@ -436,6 +481,102 @@ mod tests {
                 network: NetworkKind::Test,
             }),
         }
+    }
+
+    /// Build the `sp(scan_priv,spend_priv)` split form of the descriptor
+    /// for `mnemonic`, so the spend key is a secret rather than a packed key.
+    fn split_descriptor_from_mnemonic(network: Network, mnemonic: &str) -> SpDescriptor {
+        let signer = HotSigner::new_from_mnemonics(network, mnemonic).unwrap();
+        let account = ChildNumber::from_hardened_idx(0).unwrap();
+        let scan_sk = signer.private_key_at(&receiver::scan_path(network, account));
+        let spend_sk = signer.private_key_at(&receiver::spend_path(network, account));
+        let network_kind = NetworkKind::from(network);
+        let scan_wif = bitcoin::PrivateKey::new(scan_sk, network_kind).to_wif();
+        let spend_wif = bitcoin::PrivateKey::new(spend_sk, network_kind).to_wif();
+        SpDescriptor::from_str(&format!("sp({scan_wif},{spend_wif})")).unwrap()
+    }
+
+    #[test]
+    fn sanitize_accepts_matching_pair() {
+        let mut config = test_config();
+        assert!(config.sanitize().is_ok());
+    }
+
+    #[test]
+    fn sanitize_accepts_watch_only() {
+        let mut config = Config::from_descriptor(
+            "watch".to_string(),
+            Network::Signet,
+            watch_only_descriptor(),
+            "https://blindbit.example.com".to_string(),
+            PathBuf::from("/tmp/bwk-test"),
+        );
+
+        assert!(config.sanitize().is_ok());
+    }
+
+    #[test]
+    fn sanitize_rejects_mismatched_mnemonic() {
+        let mut config = test_config();
+        config.mnemonic = Some(MISMATCHED_MNEMONIC.to_string());
+
+        assert!(matches!(
+            config.sanitize(),
+            Err(ConfigError::MnemonicDescriptorMismatch)
+        ));
+    }
+
+    #[test]
+    fn sanitize_accepts_signer_form_descriptor() {
+        let network = Network::Signet;
+        let descriptor = split_descriptor_from_mnemonic(network, TEST_MNEMONIC);
+        let mut config = Config::from_descriptor(
+            "alice".to_string(),
+            network,
+            descriptor,
+            "https://blindbit.example.com".to_string(),
+            PathBuf::from("/tmp/bwk-test"),
+        );
+        config.mnemonic = Some(TEST_MNEMONIC.to_string());
+
+        assert!(config.sanitize().is_ok());
+    }
+
+    #[test]
+    fn sanitize_rejects_wrong_network_derivation() {
+        let mut config = Config::new(
+            "alice".to_string(),
+            Network::Regtest,
+            TEST_MNEMONIC.to_string(),
+            "https://blindbit.example.com".to_string(),
+            PathBuf::from("/tmp/bwk-test"),
+        )
+        .unwrap();
+        config.network = Network::Bitcoin;
+
+        assert!(matches!(
+            config.sanitize(),
+            Err(ConfigError::MnemonicDescriptorMismatch)
+        ));
+    }
+
+    #[test]
+    fn mismatch_error_hides_mnemonic_words() {
+        let mut config = test_config();
+        config.mnemonic = Some(MISMATCHED_MNEMONIC.to_string());
+        let err = config.sanitize().unwrap_err();
+        mnemonic_probe::assert_no_word_leak(&err, TEST_MNEMONIC);
+        mnemonic_probe::assert_no_word_leak(&err, MISMATCHED_MNEMONIC);
+
+        let mut unknown_config = test_config();
+        unknown_config.mnemonic = Some(mnemonic_probe::UNKNOWN_MNEMONIC.to_string());
+        let err = unknown_config.sanitize().unwrap_err();
+        mnemonic_probe::assert_no_word_leak(&err, mnemonic_probe::UNKNOWN_MNEMONIC);
+
+        let mut checksum_config = test_config();
+        checksum_config.mnemonic = Some(mnemonic_probe::BAD_CHECKSUM_MNEMONIC.to_string());
+        let err = checksum_config.sanitize().unwrap_err();
+        mnemonic_probe::assert_no_word_leak(&err, mnemonic_probe::BAD_CHECKSUM_MNEMONIC);
     }
 
     #[test]

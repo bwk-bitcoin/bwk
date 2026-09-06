@@ -554,11 +554,13 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
     /// `header_store == None` opens this account its own store, which it then
     /// owns and may idle from [`Account::stop_electrum`].
     fn with_config_store_and_header_store(
-        config: Config,
+        mut config: Config,
         config_store: Arc<dyn ConfigStore<Config>>,
         header_store: Option<Arc<HeaderStore>>,
         scan_runtime: ScanRuntimeConfig,
     ) -> Result<Self, AccountError> {
+        config.sanitize()?;
+
         // Validate config
         if config.blindbit_url.is_empty() {
             return Err(AccountError::MissingBlindbitUrl);
@@ -1837,6 +1839,19 @@ mod tests {
         )
         .unwrap()
         .with_persistence(None)
+    }
+
+    #[test]
+    fn account_construction_rejects_mismatch() {
+        let mut config = test_config();
+        config.mnemonic = Some(
+            "legal winner thank year wave sausage worth useful legal winner thank yellow"
+                .to_string(),
+        );
+
+        let result = Account::new(config);
+
+        assert!(matches!(result, Err(AccountError::Config(_))));
     }
 
     #[test]
