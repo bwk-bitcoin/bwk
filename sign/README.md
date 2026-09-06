@@ -49,6 +49,7 @@ consumer
    │  SigningManager trait: every call queues work and returns a RequestId
    ▼
 HotManager ──► bip32_signers: BTreeMap<SignerId, HotSigner>
+HwiManager ──► devices discovered through HwiService
    │
    └──► subscriber: channel::Sender<Response>
             │
@@ -123,3 +124,13 @@ signed as one, anything else is read as a PSBTv0.
 
 Nothing here is persisted: a hot signer is re-seeded from the mnemonic its
 consumer already holds, so the manager keeps no store of its own.
+
+## HwiManager
+
+The hardware back end, behind the `hwi` feature. Devices come from
+`bwk_hwi::service::HwiService`, and every one it finds is listed, including
+the locked and the unsupported ones, so a user learns there is something to
+unlock or fix. A device can move between those states at any time, so each
+request is dispatched onto a freshly read view of it, and the set of
+descriptors registered per signer is tracked by the manager rather than by
+that short-lived view.

@@ -1,9 +1,6 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Mutex,
-    },
+    collections::BTreeMap,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use crossbeam::channel;
@@ -30,50 +27,11 @@ use crate::{
 #[derive(Debug, Clone)]
 pub enum Error {
     ParsePsbt,
-    #[cfg(all(feature = "hwi", not(target_os = "android")))]
-    Hw(String),
-}
-
-pub enum SignerKind {
-    Hot,
-    #[cfg(all(feature = "hwi", not(target_os = "android")))]
-    External(bwk_hwi::DeviceKind),
-}
-
-#[cfg(all(feature = "hwi", not(target_os = "android")))]
-impl Clone for SignerKind {
-    fn clone(&self) -> Self {
-        match self {
-            SignerKind::Hot => SignerKind::Hot,
-            SignerKind::External(k) => SignerKind::External(*k),
-        }
-    }
-}
-
-#[allow(clippy::mutable_key_type)]
-struct ExternalSigner {
-    signer: Box<dyn Signer>,
-    fingerprint: bip32::Fingerprint,
-    descriptors: BTreeSet<Descriptor>,
 }
 
 fn mint_id(counter: &AtomicU64, fingerprint: &bip32::Fingerprint) -> SignerId {
     let n = counter.fetch_add(1, Ordering::Relaxed);
     SignerId::new(format!("hot:{fingerprint}:{n}"))
-}
-
-fn notif_fingerprint(notif: &SignerNotif) -> Option<bip32::Fingerprint> {
-    match notif {
-        SignerNotif::Info(fg, _)
-        | SignerNotif::Xpub(fg, _)
-        | SignerNotif::Descriptor(fg, _)
-        | SignerNotif::DescriptorRegistered(fg, _, _)
-        | SignerNotif::Signed(fg, _)
-        | SignerNotif::Error(fg, _) => Some(*fg),
-        SignerNotif::Manager(_) => None,
-        #[cfg(all(feature = "hwi", not(target_os = "android")))]
-        SignerNotif::DeviceUpdate => None,
-    }
 }
 
 enum ParsedPsbt {
@@ -121,28 +79,15 @@ pub struct HotManager {
     receiver: channel::Receiver<SignerNotif>,
     sender: channel::Sender<SignerNotif>,
     bip32_signers: BTreeMap<SignerId, HotSigner>,
-    signers: BTreeMap<SignerId, ExternalSigner>,
     next_hot: AtomicU64,
     requests: RequestIdSource,
     subscriber: Option<channel::Sender<Response>>,
-    /// Last [`RequestId`] issued per fingerprint, so an external signer's
-    /// asynchronous [`SignerNotif`] (which carries no request id of its own)
-    /// can be correlated back to the call that triggered it once [`pump`]
-    /// forwards it.
-    ///
-    /// [`pump`]: HotManager::pump
-    last_request: Mutex<BTreeMap<bip32::Fingerprint, RequestId>>,
-    #[cfg(all(feature = "hwi", not(target_os = "android")))]
-    hw_service: Option<bwk_hwi::service::HwiService<crate::hwi::HwMessage>>,
-    #[cfg(all(feature = "hwi", not(target_os = "android")))]
-    hw_receiver: Option<channel::Receiver<crate::hwi::HwMessage>>,
 }
 
 impl std::fmt::Debug for HotManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HotManager")
             .field("bip32_signers", &self.bip32_signers)
-            .field("signers_count", &self.signers.len())
             .finish()
     }
 }
@@ -161,15 +106,9 @@ impl HotManager {
             receiver,
             sender,
             bip32_signers: BTreeMap::new(),
-            signers: BTreeMap::new(),
             next_hot: AtomicU64::new(0),
             requests: RequestIdSource::new(),
             subscriber: None,
-            last_request: Mutex::new(BTreeMap::new()),
-            #[cfg(all(feature = "hwi", not(target_os = "android")))]
-            hw_service: None,
-            #[cfg(all(feature = "hwi", not(target_os = "android")))]
-            hw_receiver: None,
         }
     }
 
@@ -179,39 +118,7 @@ impl HotManager {
     /// An `Option<SignerNotif>` which is `Some` if a notification is available,
     /// or `None` if there are no new notifications.
     pub fn poll(&self) -> Option<SignerNotif> {
-        if let Ok(notif) = self.receiver.try_recv() {
-            return Some(notif);
-        }
-        #[cfg(all(feature = "hwi", not(target_os = "android")))]
-        if let Some(ref hw_rx) = self.hw_receiver {
-            if let Ok(hw_msg) = hw_rx.try_recv() {
-                return self.convert_hw_message(hw_msg);
-            }
-        }
-        None
-    }
-
-    #[cfg(all(feature = "hwi", not(target_os = "android")))]
-    fn convert_hw_message(&self, msg: crate::hwi::HwMessage) -> Option<SignerNotif> {
-        use bwk_hwi::service::SigningDeviceMsg;
-        use bwk_keys::keys::OXpub;
-        match msg {
-            crate::hwi::HwMessage::Device(device_msg) => match device_msg {
-                SigningDeviceMsg::Update => Some(SignerNotif::DeviceUpdate),
-                SigningDeviceMsg::TransactionSigned(_, fg, psbt) => {
-                    Some(SignerNotif::Signed(fg, psbt))
-                }
-                SigningDeviceMsg::XPub(_, fg, path, xpub) => {
-                    let oxpub = OXpub {
-                        origin: (fg, path),
-                        xkey: xpub,
-                    };
-                    Some(SignerNotif::Xpub(fg, oxpub))
-                }
-                SigningDeviceMsg::Error(_, msg) => Some(SignerNotif::Manager(Error::Hw(msg))),
-                _ => None,
-            },
-        }
+        self.receiver.try_recv().ok()
     }
 
     fn mint_hot_id(&self, fingerprint: &bip32::Fingerprint) -> SignerId {
@@ -283,125 +190,6 @@ impl HotManager {
     fn require_subscriber(&self) -> Result<channel::Sender<Response>, manager::Error> {
         self.subscriber.clone().ok_or(manager::Error::NoSubscriber)
     }
-
-    fn remember_request(&self, fingerprint: bip32::Fingerprint, request: RequestId) {
-        self.last_request
-            .lock()
-            .expect("poisoned")
-            .insert(fingerprint, request);
-    }
-
-    fn signer_id_for_fingerprint(&self, fingerprint: bip32::Fingerprint) -> Option<SignerId> {
-        if let Some((id, _)) = self
-            .bip32_signers
-            .iter()
-            .find(|(_, hot)| hot.fingerprint() == fingerprint)
-        {
-            return Some(id.clone());
-        }
-        self.signers
-            .iter()
-            .find(|(_, ext)| ext.fingerprint == fingerprint)
-            .map(|(id, _)| id.clone())
-    }
-
-    /// Drains any pending [`SignerNotif`] and forwards it to the subscribed
-    /// channel. Hot-signer calls already answer inline before returning;
-    /// this exists for external signers, which report from their own thread
-    /// and whose result is only recoverable this way.
-    pub fn pump(&self) {
-        let Some(sender) = self.subscriber.as_ref() else {
-            return;
-        };
-        while let Some(notif) = self.poll() {
-            let Some(fingerprint) = notif_fingerprint(&notif) else {
-                continue;
-            };
-            let Some(id) = self.signer_id_for_fingerprint(fingerprint) else {
-                continue;
-            };
-            let request = self
-                .last_request
-                .lock()
-                .expect("poisoned")
-                .remove(&fingerprint);
-            let Some(request) = request else {
-                continue;
-            };
-            let _ = sender.send(protocol::from_signer_notif(notif, request, id));
-        }
-    }
-
-    #[cfg(all(feature = "hwi", not(target_os = "android")))]
-    pub fn start_hw_service(&mut self, network: bitcoin::Network) {
-        let (hw_sender, hw_receiver) = channel::unbounded();
-        let service = bwk_hwi::service::HwiService::new(network);
-        service.start(hw_sender);
-        self.hw_service = Some(service);
-        self.hw_receiver = Some(hw_receiver);
-    }
-
-    #[cfg(all(feature = "hwi", not(target_os = "android")))]
-    pub fn stop_hw_service(&mut self) {
-        if let Some(service) = self.hw_service.as_ref() {
-            service.stop();
-        }
-        self.hw_service = None;
-        self.hw_receiver = None;
-    }
-
-    #[cfg(all(feature = "hwi", not(target_os = "android")))]
-    pub fn hw_devices(
-        &self,
-    ) -> BTreeMap<String, bwk_hwi::service::SigningDevice<crate::hwi::HwMessage>> {
-        if let Some(ref service) = self.hw_service {
-            service.list()
-        } else {
-            BTreeMap::new()
-        }
-    }
-
-    /// Adopts a discovered hardware device as an external signer, minting a
-    /// [`SignerId`] from the device's own stable id.
-    #[cfg(all(feature = "hwi", not(target_os = "android")))]
-    pub fn add_hw_signer(&mut self, device_id: &str) -> Option<SignerId> {
-        let service = self.hw_service.as_ref()?;
-        let devices = service.list();
-        let device = devices.get(device_id)?;
-        if let bwk_hwi::service::SigningDevice::Supported(supported) = device {
-            let fingerprint = *supported.fingerprint();
-            let mut signer = crate::hwi::HwSigner::new(supported.clone(), device_id.to_string());
-            signer.init(self.sender.clone());
-            let id = SignerId::new(format!("hwi:{device_id}"));
-            let ext = ExternalSigner {
-                signer: Box::new(signer),
-                fingerprint,
-                descriptors: BTreeSet::new(),
-            };
-            self.signers.insert(id.clone(), ext);
-            Some(id)
-        } else {
-            None
-        }
-    }
-
-    #[cfg(all(feature = "hwi", not(target_os = "android")))]
-    pub fn remove_hw_signer(&mut self, signer: &SignerId) {
-        self.signers.remove(signer);
-    }
-
-    /// Register a descriptor for a hardware signer identified by its
-    /// [`SignerId`].
-    ///
-    /// This stores the descriptor in the ExternalSigner for use during signing,
-    /// and delegates to the underlying signer (which calls device.register_wallet()).
-    #[cfg(all(feature = "hwi", not(target_os = "android")))]
-    pub fn register_hw_descriptor(&mut self, signer: &SignerId, descriptor: Descriptor) {
-        if let Some(ext) = self.signers.get_mut(signer) {
-            ext.descriptors.insert(descriptor.clone());
-            ext.signer.register_descriptor(descriptor);
-        }
-    }
 }
 
 impl manager::SigningManager for HotManager {
@@ -423,15 +211,6 @@ impl manager::SigningManager for HotManager {
                 )
             })
             .collect();
-        result.extend(self.signers.iter().map(|(id, ext)| {
-            let wallet_name = ext
-                .descriptors
-                .iter()
-                .next()
-                .map(|d| bwk_utils::short_string(d.to_string(), 18))
-                .unwrap_or_else(|| ext.fingerprint.to_string());
-            SignerInfo::new(id.clone(), ext.fingerprint, wallet_name, SignerState::Ready)
-        }));
         result.sort();
         result
     }
@@ -448,8 +227,7 @@ impl manager::SigningManager for HotManager {
     }
 
     fn init(&mut self, signer: &SignerId) -> Result<RequestId, manager::Error> {
-        let exists = self.bip32_signers.contains_key(signer) || self.signers.contains_key(signer);
-        if !exists {
+        if !self.bip32_signers.contains_key(signer) {
             return Err(manager::Error::UnknownSigner(signer.clone()));
         }
         let sender = self.require_subscriber()?;
@@ -462,58 +240,44 @@ impl manager::SigningManager for HotManager {
     }
 
     fn info(&self, signer: &SignerId) -> Result<RequestId, manager::Error> {
-        if let Some(hot) = self.bip32_signers.get(signer) {
-            let sender = self.require_subscriber()?;
-            let request = self.requests.next();
-            // Hot signers answer inline; there is no IO to wait on, so the
-            // response is built straight from `hot` rather than by pushing a
-            // notif and popping it back off the shared SignerNotif channel,
-            // which other signers also write to and which never fully
-            // drains (see HotSigner::init's own Info notif).
-            let _ = sender.send(Response::Info {
-                request,
-                signer: signer.clone(),
-                info: protocol::info_map(hot.info_value()),
-            });
-            return Ok(request);
-        }
-        if let Some(ext) = self.signers.get(signer) {
-            self.require_subscriber()?;
-            let request = self.requests.next();
-            self.remember_request(ext.fingerprint, request);
-            ext.signer.info();
-            return Ok(request);
-        }
-        Err(manager::Error::UnknownSigner(signer.clone()))
+        let Some(hot) = self.bip32_signers.get(signer) else {
+            return Err(manager::Error::UnknownSigner(signer.clone()));
+        };
+        let sender = self.require_subscriber()?;
+        let request = self.requests.next();
+        // Hot signers answer inline; there is no IO to wait on, so the
+        // response is built straight from `hot` rather than by pushing a
+        // notif and popping it back off the shared SignerNotif channel,
+        // which other signers also write to and which never fully drains
+        // (see HotSigner::init's own Info notif).
+        let _ = sender.send(Response::Info {
+            request,
+            signer: signer.clone(),
+            info: protocol::info_map(hot.info_value()),
+        });
+        Ok(request)
     }
 
     fn get_xpub(
         &self,
         signer: &SignerId,
         path: DerivationPath,
-        display: bool,
+        _display: bool,
     ) -> Result<RequestId, manager::Error> {
-        if let Some(hot) = self.bip32_signers.get(signer) {
-            let sender = self.require_subscriber()?;
-            let request = self.requests.next();
-            // Hot signers have no display step and no IO, so the xpub is
-            // read straight off `hot` instead of round-tripping through the
-            // shared SignerNotif channel (see the comment in `info` above).
-            let _ = sender.send(Response::Xpub {
-                request,
-                signer: signer.clone(),
-                xpub: hot.xpub(&path),
-            });
-            return Ok(request);
-        }
-        if let Some(ext) = self.signers.get(signer) {
-            self.require_subscriber()?;
-            let request = self.requests.next();
-            self.remember_request(ext.fingerprint, request);
-            ext.signer.get_xpub(path, display);
-            return Ok(request);
-        }
-        Err(manager::Error::UnknownSigner(signer.clone()))
+        let Some(hot) = self.bip32_signers.get(signer) else {
+            return Err(manager::Error::UnknownSigner(signer.clone()));
+        };
+        let sender = self.require_subscriber()?;
+        let request = self.requests.next();
+        // Hot signers have no display step and no IO, so the xpub is read
+        // straight off `hot` instead of round-tripping through the shared
+        // SignerNotif channel (see the comment in `info` above).
+        let _ = sender.send(Response::Xpub {
+            request,
+            signer: signer.clone(),
+            xpub: hot.xpub(&path),
+        });
+        Ok(request)
     }
 
     fn is_descriptor_registered(
@@ -521,29 +285,18 @@ impl manager::SigningManager for HotManager {
         signer: &SignerId,
         descriptor: Descriptor,
     ) -> Result<RequestId, manager::Error> {
-        if let Some(hot) = self.bip32_signers.get(signer) {
-            let sender = self.require_subscriber()?;
-            let request = self.requests.next();
-            let registered = hot.descriptors().contains(&descriptor);
-            let _ = sender.send(Response::DescriptorIsRegistered {
-                request,
-                signer: signer.clone(),
-                registered,
-            });
-            return Ok(request);
-        }
-        if let Some(ext) = self.signers.get(signer) {
-            let sender = self.require_subscriber()?;
-            let request = self.requests.next();
-            let registered = ext.descriptors.contains(&descriptor);
-            let _ = sender.send(Response::DescriptorIsRegistered {
-                request,
-                signer: signer.clone(),
-                registered,
-            });
-            return Ok(request);
-        }
-        Err(manager::Error::UnknownSigner(signer.clone()))
+        let Some(hot) = self.bip32_signers.get(signer) else {
+            return Err(manager::Error::UnknownSigner(signer.clone()));
+        };
+        let sender = self.require_subscriber()?;
+        let request = self.requests.next();
+        let registered = hot.descriptors().contains(&descriptor);
+        let _ = sender.send(Response::DescriptorIsRegistered {
+            request,
+            signer: signer.clone(),
+            registered,
+        });
+        Ok(request)
     }
 
     fn register_descriptor(
@@ -551,29 +304,19 @@ impl manager::SigningManager for HotManager {
         signer: &SignerId,
         descriptor: Descriptor,
     ) -> Result<RequestId, manager::Error> {
-        if self.bip32_signers.contains_key(signer) {
-            let sender = self.require_subscriber()?;
-            let request = self.requests.next();
-            let hot = self.bip32_signers.get_mut(signer).expect("checked above");
-            hot.inner_register_descriptor(descriptor);
-            let _ = sender.send(Response::DescriptorRegistered {
-                request,
-                signer: signer.clone(),
-                registered: true,
-            });
-            return Ok(request);
+        if !self.bip32_signers.contains_key(signer) {
+            return Err(manager::Error::UnknownSigner(signer.clone()));
         }
-        if self.signers.contains_key(signer) {
-            self.require_subscriber()?;
-            let request = self.requests.next();
-            let fingerprint = self.signers.get(signer).expect("checked above").fingerprint;
-            self.remember_request(fingerprint, request);
-            let ext = self.signers.get_mut(signer).expect("checked above");
-            ext.descriptors.insert(descriptor.clone());
-            ext.signer.register_descriptor(descriptor);
-            return Ok(request);
-        }
-        Err(manager::Error::UnknownSigner(signer.clone()))
+        let sender = self.require_subscriber()?;
+        let request = self.requests.next();
+        let hot = self.bip32_signers.get_mut(signer).expect("checked above");
+        hot.inner_register_descriptor(descriptor);
+        let _ = sender.send(Response::DescriptorRegistered {
+            request,
+            signer: signer.clone(),
+            registered: true,
+        });
+        Ok(request)
     }
 
     fn sign(
@@ -582,47 +325,38 @@ impl manager::SigningManager for HotManager {
         descriptor: Descriptor,
         psbt: Vec<u8>,
     ) -> Result<RequestId, manager::Error> {
-        if let Some(hot) = self.bip32_signers.get(signer) {
-            let sender = self.require_subscriber()?;
-            let parsed = ParsedPsbt::parse(&psbt)?;
-            let request = self.requests.next();
-            match descriptor.as_miniscript() {
-                Some(inner) => match parsed.sign(hot, inner) {
-                    Ok(signed) => {
-                        let _ = sender.send(Response::Signed {
-                            request,
-                            signer: signer.clone(),
-                            psbt: signed,
-                        });
-                    }
-                    Err(e) => {
-                        let _ =
-                            sender.send(Response::error(request, signer.clone(), e.to_string()));
-                    }
-                },
-                None => {
-                    let _ = sender.send(Response::error(
+        let Some(hot) = self.bip32_signers.get(signer) else {
+            return Err(manager::Error::UnknownSigner(signer.clone()));
+        };
+        let sender = self.require_subscriber()?;
+        let parsed = ParsedPsbt::parse(&psbt)?;
+        let request = self.requests.next();
+        match descriptor.as_miniscript() {
+            Some(inner) => match parsed.sign(hot, inner) {
+                Ok(signed) => {
+                    let _ = sender.send(Response::Signed {
                         request,
-                        signer.clone(),
-                        "silent payment descriptors are not signable yet",
-                    ));
+                        signer: signer.clone(),
+                        psbt: signed,
+                    });
                 }
+                Err(e) => {
+                    let _ = sender.send(Response::error(request, signer.clone(), e.to_string()));
+                }
+            },
+            None => {
+                let _ = sender.send(Response::error(
+                    request,
+                    signer.clone(),
+                    "silent payment descriptors are not signable yet",
+                ));
             }
-            return Ok(request);
         }
-        if let Some(ext) = self.signers.get(signer) {
-            self.require_subscriber()?;
-            let parsed = bitcoin::Psbt::deserialize(&psbt).map_err(|_| manager::Error::Psbt)?;
-            let request = self.requests.next();
-            self.remember_request(ext.fingerprint, request);
-            ext.signer.sign_with_descriptor(parsed, descriptor);
-            return Ok(request);
-        }
-        Err(manager::Error::UnknownSigner(signer.clone()))
+        Ok(request)
     }
 
     fn raw(&self, signer: &SignerId, _request: Vec<u8>) -> Result<RequestId, manager::Error> {
-        if self.bip32_signers.contains_key(signer) || self.signers.contains_key(signer) {
+        if self.bip32_signers.contains_key(signer) {
             Err(manager::Error::Unsupported(signer.clone()))
         } else {
             Err(manager::Error::UnknownSigner(signer.clone()))
@@ -632,7 +366,7 @@ impl manager::SigningManager for HotManager {
 
 #[cfg(all(test, feature = "test"))]
 mod tests {
-    use std::str::FromStr;
+    use std::{collections::BTreeSet, str::FromStr};
 
     use bip32::Fingerprint;
     use bwk_descriptor::{derivator::SpkDerivator, descriptor::wpkh, sp_descriptor::SpDescriptor};
