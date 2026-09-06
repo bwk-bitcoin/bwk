@@ -47,9 +47,9 @@ assert_eq!(PsbtV2::deserialize(&bytes)?, psbt);
 `validate` checks what the key-value layout alone cannot: no PSBTv2 keytype
 hiding in an unknown map, each required locktime of the right kind (and a
 height requirement never zero, which BIP370 reserves for "no requirement"),
-every output carrying a script, modifiable flags only on a version 2
-transaction, and per-input locktime requirements that agree on one transaction
-locktime.
+every output carrying a script unless it is a silent payment output (see
+below), modifiable flags only on a version 2 transaction, and per-input
+locktime requirements that agree on one transaction locktime.
 
 ## PSBTv0 bridge
 
@@ -60,3 +60,19 @@ converts by borrowing and substitutes an empty script, which is how a PSBT
 with a still underived output is handed to code that insists on a complete
 transaction. `unsigned_tx` builds the transaction the PSBT describes, at the
 resolved locktime.
+
+## Silent payment fields
+
+The `sp` module holds the BIP375 keytypes rust-bitcoin does not model, under
+their real keytype numbers so the wire bytes stay spec-correct: the ECDH share
+and the DLEQ proof a sender publishes per scan key, and, on an output, the
+scan and spend keys (`SpV0Output`) plus the optional label. The global getters
+and setters come in a PSBTv0 and a PSBTv2 flavour, since a sender may still be
+working on either; the per-output ones take a `bitcoin::psbt::Output`, which
+both versions share.
+
+`validate` reads those fields: an output with silent payment info may have no
+script, a label without that info is refused, and an output whose script has
+already been computed is refused unless the transaction is frozen, because the
+script is derived from the inputs and any remaining modifiable field would
+invalidate it.
