@@ -264,7 +264,9 @@ impl<P: OpenFromBackend> Account<P> {
         let mut signing_manager = SigningManager::from_store(stores.signers);
         if let Some(mnemo) = mnemonic.clone() {
             signing_manager.new_bip32_signer_from_mnemonic(scanner_config.network, mnemo);
-            signing_manager.register_bip32_descriptor(scanner_config.descriptor.clone());
+            signing_manager.register_bip32_descriptor(
+                bwk_descriptor::descriptor::Descriptor::from(scanner_config.descriptor.clone()),
+            );
         }
         let stay_offline = scanner_config.stay_offline();
         let scanner = ElectrumScanner::from_stores(

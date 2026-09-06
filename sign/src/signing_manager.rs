@@ -6,6 +6,7 @@ use std::{
 
 use crossbeam::channel;
 
+use bwk_descriptor::descriptor::Descriptor;
 use bwk_persist::{
     backend::{noop::NoopBackend, PersistenceBackend},
     storage::{ram::RamStore, Store},
@@ -14,7 +15,7 @@ use bwk_persist::{
 
 use miniscript::{
     bitcoin::{self, bip32},
-    Descriptor, DescriptorPublicKey, ForEachKey,
+    DescriptorPublicKey, ForEachKey,
 };
 
 use crate::{
@@ -51,7 +52,7 @@ struct ExternalSigner {
     #[cfg(all(feature = "hwi", not(target_os = "android")))]
     kind: SignerKind,
     id: String,
-    descriptors: BTreeSet<Descriptor<DescriptorPublicKey>>,
+    descriptors: BTreeSet<Descriptor>,
 }
 
 /// Logical store name used by [`PersistenceBackend`] implementations
@@ -262,7 +263,7 @@ where
         self.bip32_signers.contains_key(fingerprint)
     }
 
-    pub fn register_bip32_descriptor(&mut self, descriptor: Descriptor<DescriptorPublicKey>) {
+    pub fn register_bip32_descriptor(&mut self, descriptor: Descriptor) {
         for signer in self.bip32_signers.values_mut() {
             signer.inner_register_descriptor(descriptor.clone());
         }
@@ -431,7 +432,7 @@ where
     pub fn register_hw_descriptor(
         &mut self,
         fingerprint: &bip32::Fingerprint,
-        descriptor: Descriptor<DescriptorPublicKey>,
+        descriptor: Descriptor,
     ) {
         if let Some(ext) = self.signers.get_mut(fingerprint) {
             ext.descriptors.insert(descriptor.clone());
@@ -447,8 +448,8 @@ where
 fn psbt_matching_descriptor(
     psbt: &bitcoin::Psbt,
     fingerprint: bip32::Fingerprint,
-    descriptors: &BTreeSet<Descriptor<DescriptorPublicKey>>,
-) -> Option<Descriptor<DescriptorPublicKey>> {
+    descriptors: &BTreeSet<Descriptor>,
+) -> Option<Descriptor> {
     // Collect all fingerprints referenced in this PSBT for quick lookup
     let mut psbt_fingerprints = BTreeSet::new();
     for input in &psbt.inputs {
@@ -466,7 +467,10 @@ fn psbt_matching_descriptor(
 
     // Find the first registered descriptor that references this fingerprint
     for descriptor in descriptors {
-        let matches = descriptor.for_any_key(|k| match k {
+        let Some(inner) = descriptor.as_miniscript() else {
+            continue;
+        };
+        let matches = inner.for_any_key(|k| match k {
             DescriptorPublicKey::XPub(key) => key
                 .origin
                 .as_ref()
@@ -488,6 +492,11 @@ fn psbt_matching_descriptor(
 #[cfg(test)]
 mod tests {
     use bip32::Fingerprint;
+    use bwk_descriptor::sp_descriptor::SpDescriptor;
+    use miniscript::bitcoin::{
+        absolute::LockTime, hashes::Hash, secp256k1::Secp256k1, transaction::Version, Amount,
+        OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+    };
 
     use super::*;
 
@@ -501,5 +510,73 @@ mod tests {
         } else {
             panic!("expect info");
         }
+    }
+
+    fn psbt_with_fingerprint(fingerprint: Fingerprint) -> bitcoin::Psbt {
+        let txin = TxIn {
+            previous_output: OutPoint {
+                txid: Txid::all_zeros(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ZERO,
+            witness: Witness::new(),
+        };
+        let txout = TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::new(),
+        };
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![txin],
+            output: vec![txout],
+        };
+        let mut psbt = bitcoin::Psbt::from_unsigned_tx(tx).unwrap();
+        let secp = Secp256k1::new();
+        let sk = bitcoin::secp256k1::SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk);
+        psbt.inputs[0].bip32_derivation.insert(
+            pk,
+            (fingerprint, bip32::DerivationPath::from_str("m/0").unwrap()),
+        );
+        psbt
+    }
+
+    fn sp_descriptor(fingerprint: &str) -> Descriptor {
+        let secp = Secp256k1::new();
+        let scan = bip32::Xpriv::new_master(bitcoin::Network::Testnet, &[0x11; 64]).unwrap();
+        let spend_xpriv = bip32::Xpriv::new_master(bitcoin::Network::Testnet, &[0x12; 64]).unwrap();
+        let spend_xpub = bip32::Xpub::from_priv(&secp, &spend_xpriv);
+        let s = format!("sp([{fingerprint}/352h/0h/0h]{scan}/0h,{spend_xpub}/0h)");
+        SpDescriptor::from_str(&s).unwrap().into()
+    }
+
+    #[test]
+    fn psbt_matching_descriptor_skips_sp() {
+        let fingerprint = Fingerprint::from_str("deadbeef").unwrap();
+        let psbt = psbt_with_fingerprint(fingerprint);
+
+        let secp = Secp256k1::new();
+        let xpriv = bip32::Xpriv::new_master(bitcoin::Network::Testnet, &[0x13; 64]).unwrap();
+        let xpub = bip32::Xpub::from_priv(&secp, &xpriv);
+        let miniscript_str = format!("wpkh([{fingerprint}/84h/1h/0h]{xpub}/<0;1>/*)");
+        let miniscript_descriptor = Descriptor::from_str(&miniscript_str).unwrap();
+        let sp = sp_descriptor(&fingerprint.to_string());
+
+        #[allow(clippy::mutable_key_type)]
+        let mut descriptors = BTreeSet::new();
+        descriptors.insert(sp.clone());
+        descriptors.insert(miniscript_descriptor.clone());
+
+        assert_eq!(
+            psbt_matching_descriptor(&psbt, fingerprint, &descriptors),
+            Some(miniscript_descriptor)
+        );
+
+        #[allow(clippy::mutable_key_type)]
+        let mut sp_only = BTreeSet::new();
+        sp_only.insert(sp);
+        assert_eq!(psbt_matching_descriptor(&psbt, fingerprint, &sp_only), None);
     }
 }

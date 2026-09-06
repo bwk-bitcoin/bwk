@@ -1790,7 +1790,7 @@ fn register_sub_signer(
     if !signing_manager.has_bip32_signer(&signer.fingerprint()) {
         signing_manager.add_bip32_signer(signer);
     }
-    signing_manager.register_bip32_descriptor(descriptor);
+    signing_manager.register_bip32_descriptor(descriptor.into());
     Ok(())
 }
 

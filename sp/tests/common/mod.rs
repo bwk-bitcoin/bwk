@@ -905,7 +905,13 @@ impl TestEnv {
         add_offline_sub_account(
             account,
             "sub-tr",
-            signer.descriptors().into_iter().next().unwrap(),
+            signer
+                .descriptors()
+                .into_iter()
+                .next()
+                .unwrap()
+                .into_miniscript()
+                .unwrap(),
         );
     }
 
@@ -918,7 +924,13 @@ impl TestEnv {
         add_offline_sub_account(
             account,
             "sub-sw",
-            signer.descriptors().into_iter().next().unwrap(),
+            signer
+                .descriptors()
+                .into_iter()
+                .next()
+                .unwrap()
+                .into_miniscript()
+                .unwrap(),
         );
     }
 
@@ -943,7 +955,13 @@ impl TestEnv {
             .unwrap();
         let height = bwk_utils::test::get_tx_height(&mut self.bitcoind.client, txid);
 
-        let descriptor = signer.descriptors().into_iter().next().unwrap();
+        let descriptor = signer
+            .descriptors()
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_miniscript()
+            .unwrap();
         Coin {
             txout,
             outpoint: OutPoint {
@@ -970,7 +988,16 @@ impl TestEnv {
         let signer =
             HotSigner::new_wpkh_from_mnemonics(bitcoin::Network::Regtest, bip32_mnemonic())
                 .unwrap();
-        self.create_descriptor_coin(signer.descriptors().into_iter().next().unwrap(), btc)
+        self.create_descriptor_coin(
+            signer
+                .descriptors()
+                .into_iter()
+                .next()
+                .unwrap()
+                .into_miniscript()
+                .unwrap(),
+            btc,
+        )
     }
 
     /// Create a funded coin at receive index 0 of `descriptor` via bitcoind.

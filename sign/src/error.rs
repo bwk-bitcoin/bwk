@@ -24,6 +24,7 @@ pub enum Error {
     InsaneTaptreeInfo,
     MixedSigningInfo,
     PsbtV2,
+    SpDescriptor,
     #[cfg(feature = "sp")]
     SpSigning,
 }
@@ -57,6 +58,7 @@ impl Display for Error {
                 )
             }
             Error::PsbtV2 => write!(f, "PSBTv2 error"),
+            Error::SpDescriptor => write!(f, "silent payment descriptors are not signable yet"),
             #[cfg(feature = "sp")]
             Error::SpSigning => write!(f, "Failed to sign SP input"),
         }
