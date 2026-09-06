@@ -126,6 +126,8 @@ pub enum AccountError {
     SilentPayment(#[from] crate::core::error::Error),
     #[error("psbtv2 error")]
     PsbtV2,
+    #[error("{0}")]
+    Bip375(String),
     #[error("signing manager {0} is already attached")]
     ManagerAlreadyAttached(String),
     #[error("no signer with that id")]
@@ -1025,12 +1027,19 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         let (tx, rx) = channel::unbounded();
         manager.subscribe(tx);
         let stop = Arc::new(AtomicBool::new(false));
+        // Bytes cross untouched from the manager; a deserialization failure is
+        // itself a verification failure, not a panic.
+        let verifier: bwk::account::PsbtVerifier = Arc::new(|bytes: &[u8]| {
+            let psbt = bwk_psbt::PsbtV2::deserialize(bytes).map_err(|e| e.to_string())?;
+            bip375::verify_signed(&psbt).map_err(|e| e.to_string())
+        });
         let pump = bwk::account::spawn_pump(
             name.to_string(),
             rx,
             self.sender.clone(),
             stop.clone(),
             self.signers.clone(),
+            Some(verifier),
         );
         // A synchronous read of what the manager already knows, not a
         // request, so it does not violate the non-blocking rule.
@@ -1934,7 +1943,7 @@ mod tests {
         bip32::{Xpriv, Xpub},
         hashes::hash160,
         key::TweakedPublicKey,
-        secp256k1::{Parity, SecretKey},
+        secp256k1::{Parity, Scalar, SecretKey},
     };
     use bwk::{account::test_support::StubManager, bwk_electrum::raw_client::CertificateCheck};
     use bwk_sign::{identity::SignerState, protocol::Response};
@@ -3143,6 +3152,195 @@ mod tests {
                 Ok(_) => continue,
                 Err(_) => continue,
             }
+        }
+    }
+
+    /// Builds a fully completed, verifiable BIP375 PSBT (one eligible p2tr
+    /// input, one silent-payment output with its script, share and DLEQ
+    /// proof already filled in) and returns its serialized bytes. The scan
+    /// and spend keys are throwaway and unrelated to any account: verifying
+    /// them needs no account state.
+    fn completed_sp_psbt_bytes() -> Vec<u8> {
+        let secp = Secp256k1::new();
+        let even_secret = |byte: u8| -> SecretKey {
+            let secret = SecretKey::from_slice(&[byte; 32]).unwrap();
+            let (_, parity) = secret.x_only_public_key(&secp);
+            if parity == Parity::Odd {
+                secret.negate()
+            } else {
+                secret
+            }
+        };
+        let input_secret = even_secret(5);
+        let input_pubkey = PublicKey::from_secret_key(&secp, &input_secret);
+        let scan_key = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[6; 32]).unwrap());
+        let spend_key =
+            PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[7; 32]).unwrap());
+
+        let mut output = bitcoin::psbt::Output::default();
+        bwk_psbt::sp::set_sp_v0_output(&mut output, scan_key, spend_key, None);
+
+        let (xonly, _) = input_pubkey.x_only_public_key();
+        let input = bwk_psbt::Input {
+            previous_output: OutPoint::null(),
+            sequence: bitcoin::Sequence::MAX,
+            required_time_lock_time: None,
+            required_height_lock_time: None,
+            psbt: bitcoin::psbt::Input {
+                witness_utxo: Some(TxOut {
+                    value: Amount::from_sat(10_000),
+                    script_pubkey: ScriptBuf::new_p2tr_tweaked(
+                        TweakedPublicKey::dangerous_assume_tweaked(xonly),
+                    ),
+                }),
+                ..Default::default()
+            },
+        };
+
+        let mut psbt = bwk_psbt::PsbtV2 {
+            tx_version: bitcoin::transaction::Version::TWO,
+            fallback_lock_time: Some(bitcoin::absolute::LockTime::ZERO),
+            tx_modifiable: None,
+            xpub: Default::default(),
+            proprietary: Default::default(),
+            unknown: Default::default(),
+            inputs: vec![input],
+            outputs: vec![bwk_psbt::Output {
+                amount: Amount::from_sat(1_000),
+                script_pubkey: None,
+                psbt: output,
+            }],
+        };
+
+        let share = scan_key
+            .mul_tweak(&secp, &Scalar::from(input_secret))
+            .unwrap();
+        let proof = crate::core::dleq::generate_proof(
+            input_secret,
+            scan_key,
+            [3; 32],
+            bip375::generator(),
+            None,
+        )
+        .unwrap();
+        bwk_psbt::sp::set_sp_global_ecdh_share_v2(&mut psbt, scan_key, share);
+        bwk_psbt::sp::set_sp_global_dleq_v2(&mut psbt, scan_key, *proof.as_bytes());
+
+        bip375::complete_output_scripts(&mut psbt).unwrap();
+        psbt.serialize().unwrap()
+    }
+
+    fn recv_signer_notification_matching(
+        receiver: &mpsc::Receiver<Notification>,
+        pred: impl Fn(&SignerNotification) -> bool,
+    ) -> SignerNotification {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for a matching signer notification"
+            );
+            match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(Notification::Signer(n)) if pred(&n) => return n,
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    #[test]
+    fn verified_psbt_reaches_the_consumer() {
+        let mut account = Account::new(test_config()).unwrap();
+        let receiver = account.receiver().unwrap();
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), captured_sender.clone());
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+        let sender = captured_sender.lock().unwrap().clone().unwrap();
+
+        let bytes = completed_sp_psbt_bytes();
+        sender
+            .send(Response::Signed {
+                request: RequestId::new(1),
+                signer: SignerId::new("s1"),
+                psbt: bytes.clone(),
+            })
+            .unwrap();
+
+        match recv_signer_notification_matching(&receiver, |n| {
+            matches!(n, SignerNotification::PsbtVerified { .. })
+        }) {
+            SignerNotification::PsbtVerified { psbt, .. } => assert_eq!(psbt, bytes),
+            other => panic!("expected PsbtVerified, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failed_verification_withholds_bytes() {
+        let mut account = Account::new(test_config()).unwrap();
+        let receiver = account.receiver().unwrap();
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), captured_sender.clone());
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+        let sender = captured_sender.lock().unwrap().clone().unwrap();
+
+        let mut psbt = bwk_psbt::PsbtV2::deserialize(&completed_sp_psbt_bytes()).unwrap();
+        let other_key = PublicKey::from_secret_key(
+            &Secp256k1::new(),
+            &SecretKey::from_slice(&[9; 32]).unwrap(),
+        );
+        psbt.outputs[0].script_pubkey = Some(ScriptBuf::new_op_return(
+            other_key.x_only_public_key().0.serialize(),
+        ));
+        let tampered = psbt.serialize().unwrap();
+
+        sender
+            .send(Response::Signed {
+                request: RequestId::new(2),
+                signer: SignerId::new("s1"),
+                psbt: tampered,
+            })
+            .unwrap();
+
+        match recv_signer_notification_matching(&receiver, |n| {
+            matches!(n, SignerNotification::PsbtVerificationFailed { .. })
+        }) {
+            SignerNotification::PsbtVerificationFailed { reason, .. } => {
+                assert!(!reason.is_empty())
+            }
+            other => panic!("expected PsbtVerificationFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn undecodable_bytes_fail_verification() {
+        let mut account = Account::new(test_config()).unwrap();
+        let receiver = account.receiver().unwrap();
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), captured_sender.clone());
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+        let sender = captured_sender.lock().unwrap().clone().unwrap();
+
+        sender
+            .send(Response::Signed {
+                request: RequestId::new(3),
+                signer: SignerId::new("s1"),
+                psbt: vec![0xff; 8],
+            })
+            .unwrap();
+
+        match recv_signer_notification_matching(&receiver, |n| {
+            matches!(n, SignerNotification::PsbtVerificationFailed { .. })
+        }) {
+            SignerNotification::PsbtVerificationFailed { reason, .. } => {
+                assert!(!reason.is_empty())
+            }
+            other => panic!("expected PsbtVerificationFailed, got {other:?}"),
         }
     }
 

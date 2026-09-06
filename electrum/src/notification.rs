@@ -78,11 +78,27 @@ pub enum SignerNotification {
         registered: bool,
     },
     /// The bytes may or may not be fully signed: an updated PSBT is simply
-    /// recorded, not combined or verified here.
+    /// recorded, not combined or verified here. Emitted when no verifier is
+    /// installed on the pump (e.g. `bwk::account::Account`, which has no
+    /// BIP375 validator).
     PsbtUpdated {
         request: RequestId,
         signer: SignerId,
         psbt: Vec<u8>,
+    },
+    /// A signed PSBT that passed the installed verifier.
+    PsbtVerified {
+        request: RequestId,
+        signer: SignerId,
+        psbt: Vec<u8>,
+    },
+    /// A signed PSBT that failed the installed verifier. Deliberately carries
+    /// no PSBT bytes: a signer-tampered PSBT must not be routable into
+    /// finalize by a consumer that missed the reason.
+    PsbtVerificationFailed {
+        request: RequestId,
+        signer: SignerId,
+        reason: String,
     },
     Raw {
         request: RequestId,

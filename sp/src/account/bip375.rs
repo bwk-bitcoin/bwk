@@ -575,6 +575,45 @@ pub fn validate(psbt: &bwk_psbt::PsbtV2) -> Result<(), AccountError> {
     validate_output_scripts(psbt)
 }
 
+/// Verifies a PSBT a signer just handed back. Runs on the returned bytes
+/// alone: no coin store, no key material, no remembered outgoing PSBT, since
+/// the account keeps none. `validate` alone is not enough here, since it
+/// deliberately returns `Ok` on a half-built PSBT; a signer that returned the
+/// PSBT untouched, with silent-payment outputs still lacking scripts, must
+/// fail this check rather than pass it.
+pub fn verify_signed(psbt: &bwk_psbt::PsbtV2) -> Result<(), AccountError> {
+    psbt.validate()
+        .map_err(|_| AccountError::Bip375("psbt failed structural validation".to_string()))?;
+    validate(psbt).map_err(|_| {
+        AccountError::Bip375("output script or DLEQ proof validation failed".to_string())
+    })?;
+
+    let keys = scan_keys(psbt)?;
+    if keys.is_empty() {
+        return Ok(());
+    }
+    for output in &psbt.outputs {
+        if bwk_psbt::sp::sp_v0_output(&output.psbt)
+            .map_err(|_| AccountError::PsbtV2)?
+            .is_some()
+            && output.script_pubkey.is_none()
+        {
+            return Err(AccountError::Bip375("output missing script".to_string()));
+        }
+    }
+    for scan_key in &keys {
+        if !has_any_share_for_scan_keys(psbt, &BTreeSet::from([*scan_key]))? {
+            return Err(AccountError::Bip375(
+                "share missing for scan key".to_string(),
+            ));
+        }
+    }
+    if psbt.tx_modifiable != Some(bwk_psbt::TxModifiable::none()) {
+        return Err(AccountError::Bip375("tx_modifiable not frozen".to_string()));
+    }
+    Ok(())
+}
+
 pub fn complete_output_scripts(psbt: &mut bwk_psbt::PsbtV2) -> Result<(), AccountError> {
     let scan_keys = scan_keys(psbt)?;
     if scan_keys.is_empty() {
@@ -611,7 +650,8 @@ mod tests {
         account::{
             bip375::{
                 complete_output_scripts, eligible_input_pubkey, eligible_script, generator,
-                input_hash, input_script_pubkey, validate, validate_input_eligibility, NUMS_H,
+                input_hash, input_script_pubkey, validate, validate_input_eligibility,
+                verify_signed, NUMS_H,
             },
             AccountError,
         },
@@ -1076,6 +1116,79 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(psbt.outputs[0].script_pubkey, script);
+    }
+
+    #[test]
+    fn verify_signed_accepts_a_completed_psbt() {
+        let (mut psbt, _) = psbt();
+        complete_output_scripts(&mut psbt).unwrap();
+
+        assert!(verify_signed(&psbt).is_ok());
+    }
+
+    #[test]
+    fn verify_signed_rejects_an_untouched_psbt() {
+        let (psbt, _) = psbt();
+
+        let result = verify_signed(&psbt);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_signed_rejects_a_tampered_script() {
+        let secp = Secp256k1::new();
+        let other_key = PublicKey::from_secret_key(&secp, &even_secret(9));
+        let (mut psbt, _) = psbt();
+        complete_output_scripts(&mut psbt).unwrap();
+        psbt.outputs[0].script_pubkey = Some(ScriptBuf::new_p2tr_tweaked(
+            other_key.x_only_public_key().0.dangerous_assume_tweaked(),
+        ));
+
+        let result = verify_signed(&psbt);
+
+        assert!(matches!(result, Err(AccountError::Bip375(_))));
+    }
+
+    #[test]
+    fn verify_signed_rejects_a_bad_proof() {
+        let (mut psbt, scan_key) = psbt();
+        complete_output_scripts(&mut psbt).unwrap();
+        let mut proof = bwk_psbt::sp::sp_global_dleq_v2(&psbt, scan_key)
+            .unwrap()
+            .unwrap();
+        proof[0] ^= 0xff;
+        bwk_psbt::sp::set_sp_global_dleq_v2(&mut psbt, scan_key, proof);
+
+        let result = verify_signed(&psbt);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_signed_rejects_unfrozen_tx() {
+        let (mut psbt, _) = psbt();
+        complete_output_scripts(&mut psbt).unwrap();
+        psbt.tx_modifiable = Some(bwk_psbt::TxModifiable::try_from(1).unwrap());
+
+        let result = verify_signed(&psbt);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_signed_passes_non_sp_psbt() {
+        let secp = Secp256k1::new();
+        let input_pubkey = PublicKey::from_secret_key(&secp, &even_secret(5));
+        let input = input_with(p2tr_witness_utxo(input_pubkey), OutPoint::null());
+        let mut psbt = empty_psbt(vec![input]);
+        psbt.outputs = vec![bwk_psbt::Output {
+            amount: Amount::from_sat(1_000),
+            script_pubkey: Some(ScriptBuf::new_op_return([])),
+            psbt: bitcoin::psbt::Output::default(),
+        }];
+
+        assert!(verify_signed(&psbt).is_ok());
     }
 
     fn two_input_psbt_with_per_input_shares(

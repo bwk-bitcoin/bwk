@@ -231,6 +231,12 @@ impl SigningManager for HotManagerHandle {
     }
 }
 
+/// Checks a signed PSBT's bytes on receipt, returning the failure reason on
+/// rejection. Installed on [`spawn_pump`] by account types that know how to
+/// verify their own signed PSBTs (e.g. `bwk_sp::account::Account`'s BIP375
+/// check); [`Account`] installs none.
+pub type PsbtVerifier = Arc<dyn Fn(&[u8]) -> Result<(), String> + Send + Sync>;
+
 /// Bridges an attached manager's `crossbeam` response channel onto the
 /// account's `std::sync::mpsc` notification sender. Polls on a timeout so a
 /// `stop` request is picked up promptly even when the manager never answers.
@@ -239,12 +245,17 @@ impl SigningManager for HotManagerHandle {
 /// `Response::SignersChanged` both carry a full roster for `manager_name`, so
 /// either one replaces that manager's cached entries wholesale before the
 /// account-wide snapshot is emitted.
+///
+/// `verifier`, when installed, is applied to every `Response::Signed`'s bytes:
+/// `Ok` emits `PsbtVerified`, `Err` emits `PsbtVerificationFailed` and drops
+/// the bytes. With no verifier the plain `PsbtUpdated` is emitted.
 pub fn spawn_pump(
     manager_name: String,
     rx: channel::Receiver<Response>,
     sender: mpsc::Sender<Notification>,
     stop: Arc<AtomicBool>,
     signers: Arc<Mutex<BTreeMap<SignerId, CachedSigner>>>,
+    verifier: Option<PsbtVerifier>,
 ) -> JoinHandle<()> {
     thread::spawn(move || loop {
         if stop.load(Ordering::Relaxed) {
@@ -301,10 +312,26 @@ pub fn spawn_pump(
                         request,
                         signer,
                         psbt,
-                    } => SignerNotification::PsbtUpdated {
-                        request,
-                        signer,
-                        psbt,
+                    } => match &verifier {
+                        None => SignerNotification::PsbtUpdated {
+                            request,
+                            signer,
+                            psbt,
+                        },
+                        Some(verify) => match verify(&psbt) {
+                            Ok(()) => SignerNotification::PsbtVerified {
+                                request,
+                                signer,
+                                psbt,
+                            },
+                            // Bytes are withheld: a tampered PSBT must not be routable
+                            // into finalize by a consumer that missed the reason.
+                            Err(reason) => SignerNotification::PsbtVerificationFailed {
+                                request,
+                                signer,
+                                reason,
+                            },
+                        },
                     },
                     Response::Raw {
                         request,
@@ -815,6 +842,7 @@ impl<P: ScanProfile> Account<P> {
             self.sender.clone(),
             stop.clone(),
             self.signers.clone(),
+            None,
         );
         // A synchronous read of what the manager already knows, not a
         // request, so it does not violate the non-blocking rule.
