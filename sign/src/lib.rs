@@ -7,6 +7,7 @@ pub mod hwi_manager;
 pub mod identity;
 pub mod manager;
 pub mod protocol;
+pub mod remote_manager;
 pub mod signer;
 pub mod signing_manager;
 

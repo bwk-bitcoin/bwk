@@ -2,7 +2,8 @@
 
 **Experimental. Do not use in production or with real coins. API will break.**
 
-PSBT signing infrastructure with support for hot signers and hardware wallets.
+PSBT signing infrastructure with support for hot signers, hardware wallets and
+out-of-tree remote signers.
 
 Provides a unified interface for managing signers and signing PSBTs. Signers
 communicate via async notifications, making it easy to integrate hardware
@@ -50,6 +51,7 @@ consumer
    ▼
 HotManager ──► bip32_signers: BTreeMap<SignerId, HotSigner>
 HwiManager ──► devices discovered through HwiService
+RemoteManager ──► a Request/Response channel pair to an out-of-tree signer
    │
    └──► subscriber: channel::Sender<Response>
             │
@@ -134,3 +136,17 @@ unlock or fix. A device can move between those states at any time, so each
 request is dispatched onto a freshly read view of it, and the set of
 descriptors registered per signer is tracked by the manager rather than by
 that short-lived view.
+
+## RemoteManager
+
+A back end that is nothing but a channel pair: every trait call becomes a
+`Request` on an outbound channel, and every `Response` arriving on the inbound
+channel is forwarded to the subscriber. This is the plugin boundary for an
+out-of-tree signer that cannot implement a Rust trait, such as one reached
+across an FFI boundary.
+
+`RemoteManager::pair()` returns the manager plus the two channel ends its far
+end answers on. The far end reads every `Request` and answers with a
+`Response` carrying the same `RequestId`, pushes `Response::SignersChanged`
+whenever its signer list changes, and uses `Response::unsolicited_error` for
+anything nobody asked for.

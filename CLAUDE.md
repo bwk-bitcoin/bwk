@@ -49,7 +49,7 @@ tests locally. Commit messages must be single-line and follow existing style
 | bwk-psbt        | Native PSBTv2 (BIP370), silent-payment fields (BIP375/376)  |
 | bwk-electrum    | Electrum protocol client (TCP/SSL), ElectrumScanner, and    |
 |                 | the scan stores, the header chain and the reconcile pass    |
-| bwk-sign        | Signers and signing managers for BIP32 and hardware keys    |
+| bwk-sign        | Signers and signing managers: hot, hardware, remote         |
 | bwk-descriptor  | Miniscript and sp() descriptor handling, SpkDerivator       |
 | bwk-keys        | Key derivation utilities (OXpriv, OXpub, KeyDerivator)      |
 | bwk-p2p         | Bitcoin P2P network client, DNS seed resolution             |

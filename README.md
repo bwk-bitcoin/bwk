@@ -49,7 +49,7 @@ Blindbit).
 | bwk-tx          | Transaction building, coin selection, PSBT            |
 | bwk-psbt        | PSBTv2 (BIP370), silent-payment fields (BIP375/376)   |
 | bwk-electrum    | Electrum client, scanner, scan stores, header chain   |
-| bwk-sign        | Signers and signing managers (hot, hardware)          |
+| bwk-sign        | Signers and signing managers (hot, hardware, remote)  |
 | bwk-descriptor  | Miniscript and sp() descriptors, SpkDerivator         |
 | bwk-keys        | Key derivation (OXpriv, OXpub)                        |
 | bwk-p2p         | Bitcoin P2P client                                    |
