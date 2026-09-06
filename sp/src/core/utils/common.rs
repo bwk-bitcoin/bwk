@@ -7,6 +7,7 @@ use crate::core::{
     error::Error,
     secp256k1::{PublicKey, Scalar, SecretKey, SECP256K1},
     utils::hash::SharedSecretHash,
+    SpVersion,
 };
 use bech32::{FromBase32, ToBase32};
 use bitcoin_hashes::Hash;
@@ -66,7 +67,7 @@ impl TryFrom<&str> for Network {
 /// A silent payment address struct that can be used to deserialize a silent payment address string.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct SilentPaymentAddress {
-    version: u8,
+    version: SpVersion,
     scan_pubkey: PublicKey,
     m_pubkey: PublicKey,
     network: Network,
@@ -98,12 +99,8 @@ impl SilentPaymentAddress {
         scan_pubkey: PublicKey,
         m_pubkey: PublicKey,
         network: Network,
-        version: u8,
+        version: SpVersion,
     ) -> Result<Self, Error> {
-        if version != 0 {
-            return Err(Error::UnsupportedVersion(version as u32));
-        }
-
         Ok(SilentPaymentAddress {
             scan_pubkey,
             m_pubkey,
@@ -141,7 +138,7 @@ impl TryFrom<&str> for SilentPaymentAddress {
             return Err(Error::WrongAddressLength(data.len()));
         }
 
-        let version = data[0].to_u8();
+        let version = SpVersion::try_from(data[0].to_u8())?;
 
         let network = match hrp.as_str() {
             "sp" => Network::Mainnet,
@@ -175,7 +172,7 @@ impl From<SilentPaymentAddress> for String {
             Network::Mainnet => "sp",
         };
 
-        let version = bech32::u5::try_from_u8(val.version).unwrap();
+        let version = bech32::u5::try_from_u8(val.version.as_u8()).unwrap();
 
         let B_scan_bytes = val.scan_pubkey.serialize();
         let B_m_bytes = val.m_pubkey.serialize();

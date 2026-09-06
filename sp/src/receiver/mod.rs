@@ -27,7 +27,13 @@ use serde::{Deserialize, Serialize};
 use crate::core::{
     receiving::{Label, Receiver},
     utils::common::{Network as SpNetwork, SilentPaymentAddress},
+    SpVersion,
 };
+
+const SP_PURPOSE: u32 = 352;
+const SP_SPEND_KEY: u32 = 0;
+const SP_SCAN_KEY: u32 = 1;
+const SP_KEY_INDEX: u32 = 0;
 
 // Blockchain data fetched via the blindbit transport.
 
@@ -189,7 +195,7 @@ impl Default for SpReceiver {
             scan_sk: default_sk,
             spend_key: SpendKey::Secret(default_sk),
             receiver: Receiver::new(
-                0,
+                SpVersion::V0,
                 default_pubkey,
                 default_pubkey,
                 Scalar::from_be_bytes(ONE).unwrap().into(),
@@ -223,7 +229,7 @@ impl SpReceiver {
         };
 
         let receiver = Receiver::new(
-            0,
+            SpVersion::V0,
             scan_pubkey,
             (&spend_key).into(),
             change_label,
@@ -267,18 +273,22 @@ impl SpReceiver {
             _ => 1,
         };
         let base_deriv = vec![
-            bip32::ChildNumber::from_hardened_idx(352).expect("352"),
+            bip32::ChildNumber::from_hardened_idx(SP_PURPOSE).expect("valid purpose"),
             bip32::ChildNumber::from_hardened_idx(network_idx).expect("0 or 1"),
             account,
         ];
 
         let mut scan_deriv = base_deriv.clone();
-        scan_deriv.push(bip32::ChildNumber::from_hardened_idx(1).expect("1"));
-        scan_deriv.push(bip32::ChildNumber::from_normal_idx(0).expect("0"));
+        scan_deriv
+            .push(bip32::ChildNumber::from_hardened_idx(SP_SCAN_KEY).expect("valid scan key"));
+        scan_deriv
+            .push(bip32::ChildNumber::from_normal_idx(SP_KEY_INDEX).expect("valid key index"));
 
         let mut spend_deriv = base_deriv;
-        spend_deriv.push(bip32::ChildNumber::from_hardened_idx(0).expect("0"));
-        spend_deriv.push(bip32::ChildNumber::from_normal_idx(0).expect("0"));
+        spend_deriv
+            .push(bip32::ChildNumber::from_hardened_idx(SP_SPEND_KEY).expect("valid spend key"));
+        spend_deriv
+            .push(bip32::ChildNumber::from_normal_idx(SP_KEY_INDEX).expect("valid key index"));
 
         let scan = master_xpriv
             .derive_priv(&secp, &scan_deriv)

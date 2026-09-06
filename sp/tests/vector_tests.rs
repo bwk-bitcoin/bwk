@@ -5,12 +5,14 @@
 mod sp_common;
 #[cfg(test)]
 mod tests {
+    use bitcoin::{OutPoint, Txid};
     use bitcoin_hashes::{hash160, Hash};
     use bwk_sp::core::{
         receiving::Label,
         secp256k1::{Scalar, Secp256k1, SecretKey},
         sending::{calculate_ecdh_shared_secret, calculate_partial_secret},
         utils::common::{Network, SilentPaymentAddress},
+        SpVersion,
     };
     use std::{collections::HashSet, str::FromStr};
 
@@ -50,10 +52,13 @@ mod tests {
         for sendingtest in test_case.sending {
             let given = sendingtest.given;
             let expected = sendingtest.expected;
-            let outpoints: Vec<(String, u32)> = given
+            let outpoints: Vec<OutPoint> = given
                 .vin
                 .iter()
-                .map(|vin| (vin.txid.clone(), vin.vout))
+                .map(|vin| OutPoint {
+                    txid: Txid::from_str(&vin.txid).unwrap(),
+                    vout: vin.vout,
+                })
                 .collect();
             let mut input_priv_keys = Vec::new();
             for input in given.vin {
@@ -103,7 +108,8 @@ mod tests {
             let B_scan = b_scan.public_key(&secp);
 
             let change_label = Label::new(b_scan, 0);
-            let mut sp_receiver = Receiver::new(0, B_scan, B_spend, change_label, NETWORK).unwrap();
+            let mut sp_receiver =
+                Receiver::new(SpVersion::V0, B_scan, B_spend, change_label, NETWORK).unwrap();
 
             let outputs_to_check = decode_outputs_to_check(&given.outputs);
 
@@ -123,10 +129,10 @@ mod tests {
 
             assert!(set1.is_subset(&set2));
 
-            let ecdh_shared_secret = calculate_ecdh_shared_secret(&B_scan, &partial_secrets[0]);
+            let ecdh_shared_secret = calculate_ecdh_shared_secret(&B_scan, partial_secrets[0]);
 
             let scanned_outputs_received = sp_receiver
-                .scan_transaction(&ecdh_shared_secret, outputs_to_check)
+                .scan_transaction(ecdh_shared_secret, &outputs_to_check)
                 .unwrap();
 
             let key_tweaks: Vec<Scalar> = scanned_outputs_received

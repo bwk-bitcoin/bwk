@@ -24,11 +24,12 @@ use crate::core::{
         common::{calculate_P_n, calculate_t_n, Network, SilentPaymentAddress},
         hash::{calculate_input_hash, LabelHash},
     },
+    SharedSecret, SpVersion,
 };
 use bimap::BiMap;
 use bitcoin::{
     hashes::{hash160, Hash},
-    ScriptBuf, TxIn, TxOut,
+    OutPoint, ScriptBuf, TxIn, TxOut,
 };
 use serde::{
     de::{self, SeqAccess, Visitor},
@@ -39,7 +40,7 @@ use serde::{
 /// Calculate a transaction's BIP352 tweak data from its eligible input keys.
 pub fn calculate_tweak_data(
     input_pubkeys: &[&PublicKey],
-    outpoints: &[(String, u32)],
+    outpoints: &[OutPoint],
 ) -> Result<PublicKey, Error> {
     let secp = Secp256k1::verification_only();
     let input_sum = PublicKey::combine_keys(input_pubkeys)?;
@@ -218,7 +219,7 @@ impl<'de> Deserialize<'de> for Label {
 /// Labels can be added with [`add_label`](Receiver::add_label).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Receiver {
-    version: u8,
+    version: SpVersion,
     scan_pubkey: PublicKey,
     spend_pubkey: PublicKey,
     change_label: Label, // To be able to tell which label is the change
@@ -314,7 +315,7 @@ impl Serialize for Receiver {
         S: serde::Serializer,
     {
         let mut state = serializer.serialize_struct("Receiver", 5)?;
-        state.serialize_field("version", &self.version)?;
+        state.serialize_field("version", &self.version.as_u8())?;
         state.serialize_field("network", &self.network)?;
         state.serialize_field(
             "scan_pubkey",
@@ -347,11 +348,12 @@ impl<'de> Deserialize<'de> for Receiver {
     {
         let helper = ReceiverHelper::deserialize(deserializer)?;
         Ok(Receiver {
-            version: helper.version,
+            version: SpVersion::try_from(helper.version).map_err(de::Error::custom)?,
             network: helper.network,
-            scan_pubkey: PublicKey::from_slice(&helper.scan_pubkey.0).unwrap(),
-            spend_pubkey: PublicKey::from_slice(&helper.spend_pubkey.0).unwrap(),
-            change_label: Label::try_from(helper.change_label).unwrap(),
+            scan_pubkey: PublicKey::from_slice(&helper.scan_pubkey.0).map_err(de::Error::custom)?,
+            spend_pubkey: PublicKey::from_slice(&helper.spend_pubkey.0)
+                .map_err(de::Error::custom)?,
+            change_label: Label::try_from(helper.change_label).map_err(de::Error::custom)?,
             labels: helper.labels.0,
         })
     }
@@ -359,7 +361,7 @@ impl<'de> Deserialize<'de> for Receiver {
 
 impl Receiver {
     pub fn new(
-        version: u32,
+        version: SpVersion,
         scan_pubkey: PublicKey,
         spend_pubkey: PublicKey,
         change_label: Label,
@@ -367,13 +369,8 @@ impl Receiver {
     ) -> Result<Self, Error> {
         let labels: BiMap<Label, PublicKey> = BiMap::new();
 
-        // Check version, we just refuse anything other than 0 for now
-        if version != 0 {
-            return Err(Error::UnsupportedVersion(version));
-        }
-
         let mut receiver = Receiver {
-            version: version as u8,
+            version,
             scan_pubkey,
             spend_pubkey,
             change_label: change_label.clone(),
@@ -428,7 +425,7 @@ impl Receiver {
     ///
     /// # Arguments
     ///
-    /// * `ecdh_shared_secret` -  The ECDH shared secret between sender and recipient as a [PublicKey], the result of elliptic-curve multiplication of `(input_hash * sum_inputs_pubkeys) * scan_private_key`.
+    /// * `ecdh_shared_secret` - The ECDH shared secret between sender and recipient.
     /// * `pubkeys_to_check` - A [HashSet] of public keys of all (unspent) taproot output of the transaction.
     ///
     /// # Returns
@@ -443,8 +440,8 @@ impl Receiver {
     /// * An error occurs during elliptic curve computation. This may happen if a sender is being malicious.
     pub fn scan_transaction(
         &self,
-        ecdh_shared_secret: &PublicKey,
-        pubkeys_to_check: Vec<XOnlyPublicKey>,
+        ecdh_shared_secret: SharedSecret,
+        pubkeys_to_check: &[XOnlyPublicKey],
     ) -> Result<HashMap<Option<Label>, HashMap<XOnlyPublicKey, Scalar>>, Error> {
         let secp = crate::core::secp256k1::Secp256k1::new();
 
@@ -452,7 +449,7 @@ impl Receiver {
         let mut n_found: u32 = 0;
         let mut n: u32 = 0;
         while n_found == n {
-            let t_n: SecretKey = calculate_t_n(ecdh_shared_secret, n)?;
+            let t_n: SecretKey = calculate_t_n(ecdh_shared_secret.as_inner(), n)?;
             let P_n: PublicKey = calculate_P_n(&self.spend_pubkey, t_n.into())?;
             let P_n_xonly = P_n.x_only_public_key().0;
             if pubkeys_to_check.iter().any(|p| p.eq(&P_n_xonly)) {
@@ -460,7 +457,7 @@ impl Receiver {
                 found.entry(None).or_default().insert(P_n_xonly, t_n.into());
             } else {
                 // We subtract P_n from each outputs to check and see if match a public key in our label list
-                'outer: for p in &pubkeys_to_check {
+                'outer: for p in pubkeys_to_check {
                     let even_output = p.public_key(Parity::Even);
                     let odd_output = p.public_key(Parity::Odd);
                     let even_diff = even_output.combine(&P_n.negate(&secp))?;
@@ -490,7 +487,7 @@ impl Receiver {
     ///
     /// # Arguments
     ///
-    /// * `ecdh_shared_secret` -  The ECDH shared secret between sender and recipient as a PublicKey, the result of elliptic-curve multiplication of `(input_hash * sum_inputs_pubkeys) * scan_private_key`.
+    /// * `ecdh_shared_secret` - The ECDH shared secret between sender and recipient.
     ///
     /// # Returns
     ///
@@ -503,9 +500,9 @@ impl Receiver {
     /// * An error occurs during elliptic curve computation. This may happen if a sender is being malicious.
     pub fn get_spks_from_shared_secret(
         &self,
-        ecdh_shared_secret: &PublicKey,
+        ecdh_shared_secret: SharedSecret,
     ) -> Result<HashMap<Option<Label>, [u8; 34]>, Error> {
-        let t_0: SecretKey = calculate_t_n(ecdh_shared_secret, 0)?;
+        let t_0: SecretKey = calculate_t_n(ecdh_shared_secret.as_inner(), 0)?;
         let P_0: PublicKey = calculate_P_n(&self.spend_pubkey, t_0.into())?;
         let output_key_bytes = P_0.x_only_public_key().0.serialize();
 
@@ -617,8 +614,8 @@ impl Receiver {
     }
 
     fn get_silent_payment_address(&self, m_pubkey: PublicKey) -> SilentPaymentAddress {
-        SilentPaymentAddress::new(self.scan_pubkey, m_pubkey, self.network, 0)
-            .expect("only fails if version != 0")
+        SilentPaymentAddress::new(self.scan_pubkey, m_pubkey, self.network, SpVersion::V0)
+            .expect("version is supported")
     }
 }
 
@@ -632,7 +629,7 @@ impl Receiver {
 /// # Returns
 ///
 /// This function returns the shared secret of this transaction. This shared secret can be used to scan the transaction of outputs that are for the current user. See [`Receiver::scan_transaction`].
-pub fn calculate_ecdh_shared_secret(tweak_data: &PublicKey, b_scan: &SecretKey) -> PublicKey {
+pub fn calculate_ecdh_shared_secret(tweak_data: &PublicKey, b_scan: &SecretKey) -> SharedSecret {
     let mut ss_bytes = [0u8; 65];
     ss_bytes[0] = 0x04;
 
@@ -642,7 +639,9 @@ pub fn calculate_ecdh_shared_secret(tweak_data: &PublicKey, b_scan: &SecretKey) 
     // recovery path runs only on a filter match, so const time is fine here.
     ss_bytes[1..].copy_from_slice(&shared_secret_point(tweak_data, b_scan));
 
-    PublicKey::from_slice(&ss_bytes).expect("guaranteed to be a point on the curve")
+    PublicKey::from_slice(&ss_bytes)
+        .expect("guaranteed to be a point on the curve")
+        .into()
 }
 
 #[cfg(test)]
@@ -676,6 +675,7 @@ mod tests {
             receiving::Receiver,
             secp256k1::{PublicKey, Secp256k1, SecretKey},
             utils::common::Network,
+            SpVersion,
         };
         use bitcoin_hashes::{sha256, Hash};
 
@@ -692,8 +692,14 @@ mod tests {
         let spend_pubkey = PublicKey::from_secret_key(&secp, &spend_key);
 
         let change_label = Label::new(scan_key, 0);
-        let mut receiver =
-            Receiver::new(0, scan_pubkey, spend_pubkey, change_label, Network::Regtest).unwrap();
+        let mut receiver = Receiver::new(
+            SpVersion::V0,
+            scan_pubkey,
+            spend_pubkey,
+            change_label,
+            Network::Regtest,
+        )
+        .unwrap();
         // Register a couple of extra labels so there is more than one spend point.
         receiver.add_label(Label::new(scan_key, 1)).unwrap();
         receiver.add_label(Label::new(scan_key, 2)).unwrap();

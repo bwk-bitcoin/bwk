@@ -11,12 +11,6 @@ pub enum Error {
     NoInputProvided,
     #[error("no outpoints provided")]
     NoOutpointsProvided,
-    #[error("invalid txid hex representation: {0}")]
-    InvalidTxidHex(#[source] hex::FromHexError),
-    #[error("txid must be 32 bytes, got {0}")]
-    TxidLength(usize),
-    #[error("unexpected empty outpoints vector")]
-    EmptyOutpoints,
     #[error("invalid transaction input: {0}")]
     InvalidInput(String),
     #[error(transparent)]
