@@ -1,7 +1,7 @@
 //! Source: adapted from SPDK's vendored `silentpayments` vector-test helpers,
 //! originally imported from cygnet3/rust-silentpayments. See `sp/NOTICE`.
 
-use std::{fs::File, io::Read, str::FromStr};
+use std::str::FromStr;
 
 use bitcoin_hashes::Hash;
 use bwk_sp::core::{
@@ -13,10 +13,10 @@ use serde_json::from_str;
 use super::structs::{OutputWithSignature, TestData};
 
 pub fn read_file() -> Vec<TestData> {
-    let mut file = File::open("tests/resources/send_and_receive_test_vectors.json").unwrap();
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).unwrap();
-    from_str(&contents).unwrap()
+    from_str(include_str!(
+        "../resources/send_and_receive_test_vectors.json"
+    ))
+    .unwrap()
 }
 
 pub fn decode_outputs_to_check(outputs: &[String]) -> Vec<XOnlyPublicKey> {
