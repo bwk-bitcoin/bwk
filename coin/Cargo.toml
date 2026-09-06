@@ -20,3 +20,4 @@ miniscript = { workspace = true, features = ["serde"] }
 bitcoin = { workspace = true, features = ["rand-std"] }
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
+bwk-psbt.workspace = true

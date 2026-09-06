@@ -17,6 +17,7 @@ rand.workspace = true
 bwk-coin.workspace = true
 thiserror.workspace = true
 bwk-descriptor.workspace = true
+bwk-psbt.workspace = true
 
 # Features dependencies
 bwk-sign.workspace = true

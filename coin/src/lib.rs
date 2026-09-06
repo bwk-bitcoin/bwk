@@ -169,7 +169,7 @@ impl Coin {
                 descriptor,
                 ..
             } => self.spk_to_psbt_input(*coin_path, descriptor),
-            CoinSpendInfo::Sp { .. } => self.sp_to_psbt_input(),
+            CoinSpendInfo::Sp { tweak, .. } => self.sp_to_psbt_input(*tweak),
         }
     }
 
@@ -208,13 +208,13 @@ impl Coin {
         Ok(dummy_psbt.inputs[0].clone())
     }
 
-    fn sp_to_psbt_input(&self) -> Result<psbt::Input, Error> {
-        // For SP coins, we create a basic PSBT input with witness_utxo
-        // The actual signing will be handled by the SP signer which uses the tweak
-        Ok(psbt::Input {
+    fn sp_to_psbt_input(&self, tweak: [u8; 32]) -> Result<psbt::Input, Error> {
+        let mut input = psbt::Input {
             witness_utxo: Some(self.txout.clone()),
             ..Default::default()
-        })
+        };
+        bwk_psbt::sp::set_sp_input_tweak(&mut input, tweak);
+        Ok(input)
     }
 }
 
@@ -350,6 +350,29 @@ mod tests {
         };
 
         assert_eq!(coin.source(), CoinSourceKind::SilentPayment);
+    }
+
+    #[test]
+    fn silent_payment_input_has_tweak() {
+        let coin = Coin {
+            txout: bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::new(),
+            },
+            outpoint: bitcoin::OutPoint::null(),
+            height: Some(1),
+            sequence: bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
+            status: CoinStatus::Confirmed,
+            label: None,
+            satisfaction_size: 0,
+            spend_info: CoinSpendInfo::Sp {
+                derivation: DerivationPath::default(),
+                tweak: [9u8; 32],
+            },
+        };
+
+        let input = coin.to_psbt_input().unwrap();
+        assert_eq!(bwk_psbt::sp::sp_input_tweak(&input), Ok(Some([9u8; 32])));
     }
 
     #[test]

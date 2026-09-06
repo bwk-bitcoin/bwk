@@ -277,12 +277,7 @@ impl TxTemplate {
                 label,
             } = o.psbt_output_info()
             {
-                crate::psbt_sp::set_sp_v0_output(
-                    &mut psbt_output,
-                    scan_pubkey,
-                    spend_pubkey,
-                    label,
-                );
+                bwk_psbt::sp::set_sp_v0_output(&mut psbt_output, scan_pubkey, spend_pubkey, label);
             }
             psbt.outputs.push(psbt_output);
         }
@@ -880,5 +875,87 @@ mod test {
             res.tx_template
                 .finalize(None, false, None, Network::Signet, 10, 100_000, false);
         assert!(result.is_ok());
+    }
+
+    #[derive(Clone)]
+    struct SpTestRecipient {
+        scan: bitcoin::secp256k1::PublicKey,
+        spend: bitcoin::secp256k1::PublicKey,
+        label: Option<u32>,
+        amount: u64,
+    }
+
+    impl RecipientProvider for SpTestRecipient {
+        fn output_weight(&self) -> Weight {
+            Weight::from_wu(0)
+        }
+
+        fn create_script(&mut self, _ctx: &FinalizationContext) -> bitcoin::ScriptBuf {
+            let dummy_key = bitcoin::XOnlyPublicKey::from_slice(&[0x02; 32]).unwrap();
+            bitcoin::ScriptBuf::new_p2tr_tweaked(
+                bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(dummy_key),
+            )
+        }
+
+        fn psbt_output_info(&self) -> PsbtOutputInfo {
+            PsbtOutputInfo::SilentPayment {
+                scan_pubkey: self.scan,
+                spend_pubkey: self.spend,
+                label: self.label,
+            }
+        }
+
+        fn is_silent_payment(&self) -> bool {
+            true
+        }
+
+        fn amount(&self) -> Amount {
+            Amount::Value(self.amount)
+        }
+
+        fn set_amount(&mut self, amount: Amount) {
+            if let Amount::Value(v) = amount {
+                self.amount = v;
+            }
+        }
+
+        fn network(&self) -> Network {
+            Network::Bitcoin
+        }
+    }
+
+    fn sp_key(b: u8) -> bitcoin::secp256k1::PublicKey {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        bitcoin::secp256k1::PublicKey::from_secret_key(
+            &secp,
+            &bitcoin::secp256k1::SecretKey::from_slice(&[b; 32]).unwrap(),
+        )
+    }
+
+    #[test]
+    fn build_psbt_writes_sp_v0_output() {
+        let scan = sp_key(1);
+        let spend = sp_key(2);
+        let recipient = SpTestRecipient {
+            scan,
+            spend,
+            label: Some(7),
+            amount: 1_000,
+        };
+        let ctx = FinalizationContext {
+            inputs: &[],
+            partial_secret: None,
+            network: Network::Bitcoin,
+        };
+
+        let mut outputs: Vec<Box<dyn RecipientProvider>> = vec![Box::new(recipient)];
+        let psbt = TxTemplate::build_psbt(&[], &mut outputs, &ctx).unwrap();
+
+        let info = bwk_psbt::sp::sp_v0_output(&psbt.outputs[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(info.scan_key, scan);
+        assert_eq!(info.spend_key, spend);
+        assert_eq!(info.label, Some(7));
     }
 }
