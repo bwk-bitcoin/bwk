@@ -5,6 +5,7 @@ use crate::core::{
     error::Error,
     secp256k1::{PublicKey, Scalar, SecretKey},
 };
+use bitcoin::{hashes::Hash as BitcoinHash, OutPoint};
 use bitcoin_hashes::{sha256t_hash_newtype, Hash, HashEngine};
 
 sha256t_hash_newtype! {
@@ -31,15 +32,17 @@ sha256t_hash_newtype! {
     /// This hash type is for computing the shared secret.
     #[hash_newtype(forward)]
     pub(crate) struct SharedSecretHash(_);
+
 }
 
 impl InputsHash {
     pub(crate) fn from_outpoint_and_A_sum(
-        smallest_outpoint: &[u8; 36],
+        smallest_outpoint: &OutPoint,
         A_sum: PublicKey,
     ) -> InputsHash {
         let mut eng = InputsHash::engine();
-        eng.input(smallest_outpoint);
+        eng.input(&smallest_outpoint.txid.to_byte_array());
+        eng.input(&smallest_outpoint.vout.to_le_bytes());
         eng.input(&A_sum.serialize());
         InputsHash::from_engine(eng)
     }
@@ -72,41 +75,31 @@ impl SharedSecretHash {
     }
 }
 
-pub fn calculate_input_hash(
-    outpoints_data: &[(String, u32)],
-    A_sum: PublicKey,
-) -> Result<Scalar, Error> {
-    if outpoints_data.is_empty() {
-        return Err(Error::NoOutpointsProvided);
-    }
+pub fn calculate_input_hash(outpoints: &[OutPoint], A_sum: PublicKey) -> Result<Scalar, Error> {
+    let smallest_outpoint = outpoints
+        .iter()
+        .min_by_key(|outpoint| (outpoint.txid.to_byte_array(), outpoint.vout.to_le_bytes()));
+    let smallest_outpoint = smallest_outpoint.ok_or(Error::NoOutpointsProvided)?;
 
-    let mut outpoints: Vec<[u8; 36]> = Vec::with_capacity(outpoints_data.len());
+    Ok(InputsHash::from_outpoint_and_A_sum(smallest_outpoint, A_sum).to_scalar())
+}
 
-    // should probably just use an OutPoints type properly at some point
-    for (txid, vout) in outpoints_data {
-        let mut bytes: Vec<u8> = hex::decode(txid.as_str()).map_err(Error::InvalidTxidHex)?;
+#[cfg(test)]
+mod tests {
+    use crate::core::{
+        error::Error,
+        secp256k1::{Secp256k1, SecretKey},
+        utils::hash::calculate_input_hash,
+    };
 
-        if bytes.len() != 32 {
-            return Err(Error::TxidLength(bytes.len()));
-        }
+    #[test]
+    fn input_hash_rejects_empty_outpoints() {
+        let secret = SecretKey::from_slice(&[1; 32]).unwrap();
+        let sum = secret.public_key(&Secp256k1::new());
 
-        // txid in string format is big endian and we need little endian
-        bytes.reverse();
-
-        let mut buffer = [0u8; 36];
-
-        buffer[..32].copy_from_slice(&bytes);
-        buffer[32..].copy_from_slice(&vout.to_le_bytes());
-        outpoints.push(buffer);
-    }
-
-    // sort outpoints
-    outpoints.sort_unstable();
-
-    if let Some(smallest_outpoint) = outpoints.first() {
-        Ok(InputsHash::from_outpoint_and_A_sum(smallest_outpoint, A_sum).to_scalar())
-    } else {
-        // This should never happen
-        Err(Error::EmptyOutpoints)
+        assert!(matches!(
+            calculate_input_hash(&[], sum),
+            Err(Error::NoOutpointsProvided)
+        ));
     }
 }

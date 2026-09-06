@@ -15,7 +15,10 @@ use bitcoin::{
 };
 use bwk_coin::{Coin, CoinSpendInfo, CoinStatus, TAPROOT_KEYSPEND_SATISFACTION_WU};
 use bwk_sp::{
-    core::utils::common::{Network as SpNetwork, SilentPaymentAddress},
+    core::{
+        utils::common::{Network as SpNetwork, SilentPaymentAddress},
+        SpVersion,
+    },
     receiver::error::Error as ReceiverError,
 };
 use bwk_tx::template::{TxOutputSpec, TxRequest, TxRequestError};
@@ -118,9 +121,14 @@ fn invalid_address_source(acc: &bwk_sp::account::Account, address: &str) -> Rece
 
 fn sp_address(acc: &bwk_sp::account::Account, network: SpNetwork) -> String {
     let own = acc.sp_address();
-    SilentPaymentAddress::new(own.get_scan_key(), own.get_spend_key(), network, 0)
-        .unwrap()
-        .to_string()
+    SilentPaymentAddress::new(
+        own.get_scan_key(),
+        own.get_spend_key(),
+        network,
+        SpVersion::V0,
+    )
+    .unwrap()
+    .to_string()
 }
 
 #[test]

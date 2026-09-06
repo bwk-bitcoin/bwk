@@ -354,23 +354,14 @@ fn sp_owned_outputs(
     if input_pubkeys.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let outpoints: Vec<_> = tx
-        .input
-        .iter()
-        .map(|input| {
-            (
-                input.previous_output.txid.to_string(),
-                input.previous_output.vout,
-            )
-        })
-        .collect();
+    let outpoints: Vec<_> = tx.input.iter().map(|input| input.previous_output).collect();
     let input_refs: Vec<_> = input_pubkeys.iter().collect();
     let tweak = crate::core::receiving::calculate_tweak_data(&input_refs, &outpoints)?;
     let shared_secret =
         crate::core::receiving::calculate_ecdh_shared_secret(&tweak, &sp_receiver.get_scan_key());
     let owned = sp_receiver
         .receiver
-        .scan_transaction(&shared_secret, outputs)?;
+        .scan_transaction(shared_secret, &outputs)?;
     let owned_keys: BTreeMap<XOnlyPublicKey, _> = owned
         .into_iter()
         .flat_map(|(label, outputs)| {
