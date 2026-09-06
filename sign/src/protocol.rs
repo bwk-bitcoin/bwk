@@ -283,10 +283,6 @@ pub fn from_signer_notif(notif: SignerNotif, request: RequestId, signer: SignerI
         SignerNotif::Descriptor(..) => {
             Response::unsolicited_error("SignerNotif::Descriptor has no protocol equivalent")
         }
-        #[cfg(all(feature = "hwi", not(target_os = "android")))]
-        SignerNotif::DeviceUpdate => {
-            Response::unsolicited_error("SignerNotif::DeviceUpdate has no protocol equivalent")
-        }
     }
 }
 

@@ -21,8 +21,6 @@ pub enum SignerNotif {
     Signed(bip32::Fingerprint, Psbt),
     Error(bip32::Fingerprint, Error),
     Manager(signing_manager::Error),
-    #[cfg(all(feature = "hwi", not(target_os = "android")))]
-    DeviceUpdate,
 }
 
 /// This trait implement features that are available when the signer is connected.
