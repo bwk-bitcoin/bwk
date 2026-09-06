@@ -9,10 +9,7 @@
 
 mod common;
 
-use bitcoin::{
-    bip32::DerivationPath, hashes::Hash, Address, Amount, Network, OutPoint, ScriptBuf, Sequence,
-    TxOut,
-};
+use bitcoin::{hashes::Hash, Address, Amount, Network, OutPoint, ScriptBuf, Sequence, TxOut};
 use bwk_coin::{Coin, CoinSpendInfo, CoinStatus, TAPROOT_KEYSPEND_SATISFACTION_WU};
 use bwk_sp::{
     core::{
@@ -226,10 +223,7 @@ fn sp_coin(amount: u64) -> Coin {
         status: CoinStatus::Confirmed,
         label: None,
         satisfaction_size: TAPROOT_KEYSPEND_SATISFACTION_WU,
-        spend_info: CoinSpendInfo::Sp {
-            derivation: DerivationPath::default(),
-            tweak: [0u8; 32],
-        },
+        spend_info: CoinSpendInfo::Sp { tweak: [0u8; 32] },
     }
 }
 
