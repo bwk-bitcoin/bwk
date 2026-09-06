@@ -2,6 +2,7 @@ use std::{fmt, str::FromStr};
 
 use miniscript::{
     bitcoin::{
+        bip32::{DerivationPath, Fingerprint, KeySource},
         secp256k1::{All, PublicKey, Secp256k1, SecretKey},
         NetworkKind,
     },
@@ -40,6 +41,8 @@ pub enum Error {
     Checksum { expected: String, found: String },
     #[error("invalid expression tree: {0}")]
     Tree(String),
+    #[error("malformed key origin: {0}")]
+    Origin(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,7 +54,10 @@ pub enum SpendKey {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpDescriptor {
-    Packed(SpKey),
+    Packed {
+        origin: Option<KeySource>,
+        key: SpKey,
+    },
     Split {
         scan: DescriptorSecretKey,
         spend: SpendKey,
@@ -112,6 +118,30 @@ fn parse_spend_key(name: &str) -> Result<SpendKey, Error> {
     }
 }
 
+fn split_origin(s: &str) -> Result<(Option<KeySource>, &str), Error> {
+    let Some(rest) = s.strip_prefix('[') else {
+        return Ok((None, s));
+    };
+    let end = rest.find(']').ok_or_else(|| Error::Origin(s.to_string()))?;
+    let inner = &rest[..end];
+    let tail = &rest[end + 1..];
+    if inner.len() < 8 {
+        return Err(Error::Origin(s.to_string()));
+    }
+    let fingerprint =
+        Fingerprint::from_str(&inner[..8]).map_err(|_| Error::Origin(s.to_string()))?;
+    let path = match &inner[8..] {
+        "" => DerivationPath::master(),
+        rest => {
+            let rest = rest
+                .strip_prefix('/')
+                .ok_or_else(|| Error::Origin(s.to_string()))?;
+            DerivationPath::from_str(rest).map_err(|_| Error::Origin(s.to_string()))?
+        }
+    };
+    Ok((Some((fingerprint, path)), tail))
+}
+
 fn derive_secret_key(
     secp: &Secp256k1<All>,
     secret: &DescriptorSecretKey,
@@ -156,7 +186,11 @@ impl FromStr for SpDescriptor {
         }
 
         match top.args.len() {
-            1 => Ok(SpDescriptor::Packed(SpKey::from_str(top.args[0].name)?)),
+            1 => {
+                let (origin, tail) = split_origin(top.args[0].name)?;
+                let key = SpKey::from_str(tail)?;
+                Ok(SpDescriptor::Packed { origin, key })
+            }
             2 => {
                 let scan = parse_scan_key(top.args[0].name)?;
                 let spend = parse_spend_key(top.args[1].name)?;
@@ -170,14 +204,14 @@ impl FromStr for SpDescriptor {
 impl SpDescriptor {
     pub fn scan_secret_key(&self, secp: &Secp256k1<All>) -> Result<SecretKey, Error> {
         match self {
-            SpDescriptor::Packed(key) => Ok(key.scan_secret_key()),
+            SpDescriptor::Packed { key, .. } => Ok(key.scan_secret_key()),
             SpDescriptor::Split { scan, .. } => derive_secret_key(secp, scan),
         }
     }
 
     pub fn spend_public_key(&self, secp: &Secp256k1<All>) -> Result<PublicKey, Error> {
         match self {
-            SpDescriptor::Packed(key) => Ok(key.spend_public_key(secp)),
+            SpDescriptor::Packed { key, .. } => Ok(key.spend_public_key(secp)),
             SpDescriptor::Split {
                 spend: SpendKey::Public(dpk),
                 ..
@@ -202,8 +236,11 @@ impl SpDescriptor {
 
     pub fn spend_secret_key(&self, secp: &Secp256k1<All>) -> Result<Option<SecretKey>, Error> {
         match self {
-            SpDescriptor::Packed(SpKey::Scan(_)) => Ok(None),
-            SpDescriptor::Packed(key) => Ok(key.spend_secret_key()),
+            SpDescriptor::Packed {
+                key: SpKey::Scan(_),
+                ..
+            } => Ok(None),
+            SpDescriptor::Packed { key, .. } => Ok(key.spend_secret_key()),
             SpDescriptor::Split {
                 spend: SpendKey::Public(_),
                 ..
@@ -221,7 +258,7 @@ impl SpDescriptor {
 
     pub fn network_kind(&self) -> NetworkKind {
         match self {
-            SpDescriptor::Packed(key) => key.network(),
+            SpDescriptor::Packed { key, .. } => key.network(),
             SpDescriptor::Split { scan, .. } => match scan {
                 DescriptorSecretKey::Single(single) => single.key.network,
                 DescriptorSecretKey::XPrv(xprv) => xprv.xkey.network,
@@ -234,13 +271,38 @@ impl SpDescriptor {
 
     fn fmt_body<W: fmt::Write>(&self, w: &mut W) -> fmt::Result {
         match self {
-            SpDescriptor::Packed(key) => write!(w, "sp({key})"),
+            SpDescriptor::Packed {
+                origin: Some((fg, path)),
+                key,
+            } => {
+                if path.is_empty() {
+                    write!(w, "sp([{fg}]{key})")
+                } else {
+                    write!(w, "sp([{fg}/{path}]{key})")
+                }
+            }
+            SpDescriptor::Packed { origin: None, key } => write!(w, "sp({key})"),
             SpDescriptor::Split { scan, spend } => write!(w, "sp({scan},{spend})"),
         }
     }
 
     pub fn to_string_no_checksum(&self) -> String {
         format!("{self:#}")
+    }
+
+    pub fn origin(&self) -> Option<KeySource> {
+        match self {
+            SpDescriptor::Packed { origin, .. } => origin.clone(),
+            SpDescriptor::Split { scan, .. } => match scan {
+                DescriptorSecretKey::Single(single) => single.origin.clone(),
+                DescriptorSecretKey::XPrv(xprv) => xprv.origin.clone(),
+                DescriptorSecretKey::MultiXPrv(_) => None,
+            },
+        }
+    }
+
+    pub fn fingerprint(&self) -> Option<Fingerprint> {
+        self.origin().map(|(fg, _)| fg)
     }
 }
 
@@ -267,7 +329,7 @@ mod tests {
 
     use miniscript::{
         bitcoin::{
-            bip32::{ChildNumber, DerivationPath, Xpriv},
+            bip32::{ChildNumber, DerivationPath, Fingerprint, Xpriv},
             secp256k1::{All, PublicKey, Secp256k1, SecretKey},
             Network, NetworkKind,
         },
@@ -312,7 +374,10 @@ mod tests {
         let s = format!("sp({})", SpKey::Scan(fixture.clone()));
         let descriptor = SpDescriptor::from_str(&s).unwrap();
         match &descriptor {
-            SpDescriptor::Packed(SpKey::Scan(_)) => {}
+            SpDescriptor::Packed {
+                key: SpKey::Scan(_),
+                ..
+            } => {}
             other => panic!("expected Packed(Scan(_)), got {other:?}"),
         }
         assert!(descriptor.is_watch_only(&secp).unwrap());
@@ -327,7 +392,10 @@ mod tests {
         let s = format!("sp({})", SpKey::Spend(fixture.clone()));
         let descriptor = SpDescriptor::from_str(&s).unwrap();
         match &descriptor {
-            SpDescriptor::Packed(SpKey::Spend(_)) => {}
+            SpDescriptor::Packed {
+                key: SpKey::Spend(_),
+                ..
+            } => {}
             other => panic!("expected Packed(Spend(_)), got {other:?}"),
         }
         assert!(!descriptor.is_watch_only(&secp).unwrap());
@@ -505,7 +573,10 @@ mod tests {
     #[test]
     fn bad_checksum_rejected() {
         let fixture = scan_key_fixture();
-        let d = SpDescriptor::Packed(SpKey::Scan(fixture));
+        let d = SpDescriptor::Packed {
+            origin: None,
+            key: SpKey::Scan(fixture),
+        };
         let s = d.to_string();
         let expected = desc_checksum(&d.to_string_no_checksum()).unwrap();
 
@@ -530,7 +601,10 @@ mod tests {
     #[test]
     fn display_appends_checksum() {
         let fixture = scan_key_fixture();
-        let d = SpDescriptor::Packed(SpKey::Scan(fixture));
+        let d = SpDescriptor::Packed {
+            origin: None,
+            key: SpKey::Scan(fixture),
+        };
         let s = d.to_string();
 
         assert_eq!(s.matches('#').count(), 1);
@@ -542,7 +616,10 @@ mod tests {
     #[test]
     fn alternate_display_omits_checksum() {
         let fixture = scan_key_fixture();
-        let d = SpDescriptor::Packed(SpKey::Scan(fixture));
+        let d = SpDescriptor::Packed {
+            origin: None,
+            key: SpKey::Scan(fixture),
+        };
         let s = format!("{d:#}");
 
         assert!(!s.contains('#'));
@@ -552,7 +629,10 @@ mod tests {
     #[test]
     fn roundtrip_packed_scan() {
         let fixture = scan_key_fixture();
-        let d = SpDescriptor::Packed(SpKey::Scan(fixture));
+        let d = SpDescriptor::Packed {
+            origin: None,
+            key: SpKey::Scan(fixture),
+        };
         let s = d.to_string();
 
         let parsed = SpDescriptor::from_str(&s).unwrap();
@@ -563,7 +643,10 @@ mod tests {
     #[test]
     fn roundtrip_packed_spend() {
         let fixture = spend_key_fixture();
-        let d = SpDescriptor::Packed(SpKey::Spend(fixture));
+        let d = SpDescriptor::Packed {
+            origin: None,
+            key: SpKey::Spend(fixture),
+        };
         let s = d.to_string();
 
         let parsed = SpDescriptor::from_str(&s).unwrap();
@@ -606,7 +689,10 @@ mod tests {
     #[test]
     fn roundtrip_without_checksum() {
         let fixture = scan_key_fixture();
-        let d = SpDescriptor::Packed(SpKey::Scan(fixture));
+        let d = SpDescriptor::Packed {
+            origin: None,
+            key: SpKey::Scan(fixture),
+        };
         let s = format!("{d:#}");
 
         let parsed = SpDescriptor::from_str(&s).unwrap();
@@ -636,5 +722,141 @@ mod tests {
         let fixture = scan_key_fixture();
         let s = format!("sh(sp({}))", SpKey::Scan(fixture));
         assert!(miniscript::Descriptor::<DescriptorPublicKey>::from_str(&s).is_err());
+    }
+
+    #[test]
+    fn packed_origin_parses() {
+        let fixture = scan_key_fixture();
+        let s = format!("sp([deadbeef/352h/0h/0h]{})", SpKey::Scan(fixture));
+        let descriptor = SpDescriptor::from_str(&s).unwrap();
+        let expected_fg = Fingerprint::from_str("deadbeef").unwrap();
+        let expected_path = DerivationPath::from_str("352h/0h/0h").unwrap();
+        match &descriptor {
+            SpDescriptor::Packed {
+                origin: Some((fg, path)),
+                ..
+            } => {
+                assert_eq!(fg, &expected_fg);
+                assert_eq!(path, &expected_path);
+            }
+            other => panic!("expected Packed with origin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn packed_origin_roundtrips() {
+        let fixture = scan_key_fixture();
+        let s = format!("sp([deadbeef/352h/0h/0h]{})", SpKey::Scan(fixture));
+        let d = SpDescriptor::from_str(&s).unwrap();
+        let rendered = d.to_string_no_checksum();
+
+        let parsed = SpDescriptor::from_str(&rendered).unwrap();
+        assert_eq!(parsed, d);
+        assert_eq!(parsed.to_string_no_checksum(), rendered);
+    }
+
+    #[test]
+    fn packed_origin_apostrophe_form() {
+        let fixture = scan_key_fixture();
+        let key = SpKey::Scan(fixture);
+        let s1 = format!("sp([deadbeef/352h/0h/0h]{key})");
+        let s2 = format!("sp([deadbeef/352'/0'/0']{key})");
+        let d1 = SpDescriptor::from_str(&s1).unwrap();
+        let d2 = SpDescriptor::from_str(&s2).unwrap();
+        assert_eq!(d1, d2);
+        assert_eq!(d1.to_string_no_checksum(), d2.to_string_no_checksum());
+    }
+
+    #[test]
+    fn packed_master_origin() {
+        let fixture = scan_key_fixture();
+        let s = format!("sp([deadbeef]{})", SpKey::Scan(fixture));
+        let d = SpDescriptor::from_str(&s).unwrap();
+        match &d {
+            SpDescriptor::Packed {
+                origin: Some((_, path)),
+                ..
+            } => assert!(path.is_empty()),
+            other => panic!("expected Packed with origin, got {other:?}"),
+        }
+
+        let rendered = d.to_string_no_checksum();
+        assert_eq!(rendered, s);
+        assert!(!rendered.contains("]/"));
+        assert!(!s.contains("deadbeef/]"));
+    }
+
+    #[test]
+    fn packed_without_origin_unchanged() {
+        let fixture = scan_key_fixture();
+        let s = format!("sp({})", SpKey::Scan(fixture));
+        let d = SpDescriptor::from_str(&s).unwrap();
+        match &d {
+            SpDescriptor::Packed { origin: None, .. } => {}
+            other => panic!("expected Packed without origin, got {other:?}"),
+        }
+        assert_eq!(d.to_string_no_checksum(), s);
+    }
+
+    #[test]
+    fn malformed_origin_rejected() {
+        let fixture = scan_key_fixture();
+        let key = SpKey::Scan(fixture);
+        let bad_inputs = [
+            format!("sp([deadbee/0h]{key})"),
+            format!("sp([deadbeef/0h{key})"),
+            format!("sp([deadbeefx/0h]{key})"),
+        ];
+        for s in bad_inputs {
+            assert!(
+                matches!(SpDescriptor::from_str(&s), Err(Error::Origin(_))),
+                "{s}"
+            );
+        }
+    }
+
+    #[test]
+    fn origin_accessor_reads_split_form() {
+        let secp = secp();
+        let xprv = xprv_fixture();
+        let fingerprint = xprv.fingerprint(&secp);
+        let xpub = miniscript::bitcoin::bip32::Xpub::from_priv(&secp, &xprv);
+
+        let s = format!("sp([{fingerprint}/352h/0h/0h]{xprv}/0h,{xpub}/0h)");
+        let descriptor = SpDescriptor::from_str(&s).unwrap();
+
+        let (fg, path) = descriptor.origin().unwrap();
+        assert_eq!(fg, fingerprint);
+        assert_eq!(path, DerivationPath::from_str("352h/0h/0h").unwrap());
+        assert_eq!(descriptor.fingerprint(), Some(fingerprint));
+    }
+
+    #[test]
+    fn origin_accessor_none_for_bare_split() {
+        let s = "sp(L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1,\
+                  0260b2003c386519fc9eadf2b5cf124dd8eea4c4e68d5e154050a9346ea98ce600)";
+        let descriptor = SpDescriptor::from_str(s).unwrap();
+        assert_eq!(descriptor.origin(), None);
+    }
+
+    #[test]
+    fn origin_does_not_affect_keys() {
+        let secp = secp();
+        let fixture = scan_key_fixture();
+        let key = SpKey::Scan(fixture);
+        let s1 = format!("sp([deadbeef/352h/0h/0h]{key})");
+        let s2 = format!("sp([cafebabe/352h/0h/0h]{key})");
+        let d1 = SpDescriptor::from_str(&s1).unwrap();
+        let d2 = SpDescriptor::from_str(&s2).unwrap();
+
+        assert_eq!(
+            d1.scan_secret_key(&secp).unwrap(),
+            d2.scan_secret_key(&secp).unwrap()
+        );
+        assert_eq!(
+            d1.spend_public_key(&secp).unwrap(),
+            d2.spend_public_key(&secp).unwrap()
+        );
+        assert_ne!(d1.to_string(), d2.to_string());
     }
 }
