@@ -980,6 +980,13 @@ mod tests {
         Amount, ScriptBuf, TxIn, Witness,
     };
 
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn hot_signer_is_send_and_sync() {
+        assert_send_sync::<HotSigner>();
+    }
+
     #[test]
     fn test_create_hot_signer_from_xpriv() {
         let network = Network::Testnet;

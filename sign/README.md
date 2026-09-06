@@ -8,9 +8,11 @@ Provides a unified interface for managing signers and signing PSBTs. Signers
 communicate via async notifications, making it easy to integrate hardware
 wallets that require user interaction.
 
-**Scope:** Signer trait, HotSigner (in-memory BIP32), SigningManager (multi-
-signer coordination), PSBT signing for segwit/taproot. Does NOT handle key
-derivation paths (use bwk-keys) or descriptor parsing (use bwk-descriptor).
+**Scope:** Signer trait, HotSigner (in-memory BIP32), the
+`manager::SigningManager` trait every signing back end implements,
+`signing_manager::SigningManager` (multi-signer coordination), PSBT signing
+for segwit/taproot. Does NOT handle key derivation paths (use bwk-keys) or
+descriptor parsing (use bwk-descriptor).
 
 ## Usage
 
@@ -66,6 +68,21 @@ All signers implement `Signer` trait with async notification pattern:
 - `get_xpub()`: Request xpub at derivation path, emit `SignerNotif::Xpub`
 - `sign_with_descriptor()`: Sign PSBT, emit `SignerNotif::Signed`
 - `register_descriptor()` / `is_descriptor_registered()`: For hardware wallets
+
+## SigningManager Trait
+
+`manager::SigningManager` is the object-safe, store-free abstraction every
+signing back end implements. Every operation queues work and returns a
+`RequestId` at once: none of them blocks and none of them carries a result.
+The result arrives later as a notification, and the `RequestId` ties it back
+to the call that triggered it. A back end may also report what nobody asked
+for, such as a device being unplugged.
+
+Operations take a `SignerId`, not a fingerprint: a fingerprint identifies a
+seed, and two signers (a hot one and a device) can hold the same seed. Each
+manager mints its own ids. `signers()` lists what the manager knows from a
+local cache and never does IO, and `set_polling` turns device discovery on and
+off for the back ends that have any.
 
 ## send! Macro
 
