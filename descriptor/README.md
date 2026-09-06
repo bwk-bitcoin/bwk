@@ -81,6 +81,18 @@ all three print and parse through `Display` and `FromStr`. Only version 0 is
 accepted; a payload of the wrong length, one that does not decode to a valid
 key, or a non-canonical encoding is refused.
 
+## Silent Payment Descriptors
+
+`sp_descriptor::SpDescriptor` is a BIP392 `sp()` descriptor. It takes either
+one packed key expression, `sp(spspend1...)`, or a split pair,
+`sp(scan_priv,spend_key)`, where the scan side is always a private key and the
+spend side is public for a watch-only wallet and private for a spending one.
+
+Parsing refuses a nested expression, a wildcard or multipath key, and an
+uncompressed or x-only key. `scan_secret_key`, `spend_public_key` and
+`spend_secret_key` resolve the keys, `is_watch_only` reports whether the spend
+secret is missing, and `network_kind` says which network the keys belong to.
+
 ## DescriptorDerivator Trait
 
 Extension trait on `Descriptor<DescriptorPublicKey>` for creating `SpkDerivator`:
