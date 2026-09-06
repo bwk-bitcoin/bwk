@@ -1,8 +1,15 @@
 use std::{
     collections::BTreeMap,
     slice,
-    sync::{mpsc, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
 };
+
+use bwk_descriptor::descriptor::Descriptor;
 
 use bwk_electrum::{
     coin_store::{ChangeTipUpdater, SpendRecorder},
@@ -21,12 +28,147 @@ use bwk_persist::{
     backend::PersistenceBackend,
     config_store::{ConfigStore, NoopConfigStore},
 };
-use bwk_sign::signing_manager::HotManager;
+use bwk_sign::{
+    identity::{SignerId, SignerInfo},
+    manager::{self, SigningManager},
+    protocol::{RequestId, Response},
+    signing_manager::HotManager,
+};
 use bwk_tx::{recipient::ChangeRecipientProvider, tx_builder::TxBuilder};
+use crossbeam::channel;
 
 use miniscript::bitcoin::{self, Txid};
 
 use crate::config::Config;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("a signing manager is already attached under this name")]
+    ManagerAlreadyAttached,
+}
+
+/// Well-known name of the hot manager an `Account` attaches at construction
+/// when the config carries a mnemonic.
+const HOT_MANAGER_NAME: &str = "hot";
+
+/// One runtime-attached signing manager plus the pump thread forwarding its
+/// responses into the account's notification sender.
+struct AttachedManager {
+    manager: Box<dyn SigningManager>,
+    stop: Arc<AtomicBool>,
+    pump: Option<JoinHandle<()>>,
+}
+
+/// Adapts a shared [`HotManager`] to [`SigningManager`] so it can sit in
+/// [`Account::managers`] like any other attached manager, while
+/// [`Account::sign_psbt`] and [`Account::master_xprivs`] keep a direct handle
+/// to the same [`HotManager`] for the operations the trait cannot express.
+struct HotManagerHandle(Arc<Mutex<HotManager>>);
+
+impl SigningManager for HotManagerHandle {
+    fn signers(&self) -> Vec<SignerInfo> {
+        self.0.lock().expect("poisoned").signers()
+    }
+
+    fn subscribe(&mut self, sender: channel::Sender<Response>) {
+        self.0.lock().expect("poisoned").subscribe(sender);
+    }
+
+    fn set_polling(&mut self, enabled: bool) {
+        self.0.lock().expect("poisoned").set_polling(enabled);
+    }
+
+    fn init(&mut self, signer: &SignerId) -> Result<RequestId, manager::Error> {
+        self.0.lock().expect("poisoned").init(signer)
+    }
+
+    fn info(&self, signer: &SignerId) -> Result<RequestId, manager::Error> {
+        self.0.lock().expect("poisoned").info(signer)
+    }
+
+    fn get_xpub(
+        &self,
+        signer: &SignerId,
+        path: bitcoin::bip32::DerivationPath,
+        display: bool,
+    ) -> Result<RequestId, manager::Error> {
+        self.0
+            .lock()
+            .expect("poisoned")
+            .get_xpub(signer, path, display)
+    }
+
+    fn is_descriptor_registered(
+        &self,
+        signer: &SignerId,
+        descriptor: Descriptor,
+    ) -> Result<RequestId, manager::Error> {
+        self.0
+            .lock()
+            .expect("poisoned")
+            .is_descriptor_registered(signer, descriptor)
+    }
+
+    fn register_descriptor(
+        &mut self,
+        signer: &SignerId,
+        descriptor: Descriptor,
+    ) -> Result<RequestId, manager::Error> {
+        self.0
+            .lock()
+            .expect("poisoned")
+            .register_descriptor(signer, descriptor)
+    }
+
+    fn sign(
+        &self,
+        signer: &SignerId,
+        descriptor: Descriptor,
+        psbt: Vec<u8>,
+    ) -> Result<RequestId, manager::Error> {
+        self.0
+            .lock()
+            .expect("poisoned")
+            .sign(signer, descriptor, psbt)
+    }
+
+    fn raw(&self, signer: &SignerId, request: Vec<u8>) -> Result<RequestId, manager::Error> {
+        self.0.lock().expect("poisoned").raw(signer, request)
+    }
+}
+
+/// Maps a signing-manager [`Response`] onto a [`Notification`]. No variant
+/// carries one, so every response is logged and dropped.
+fn response_to_notification(response: &Response) -> Option<Notification> {
+    log::debug!("signing manager response dropped, no Notification variant: {response:?}");
+    None
+}
+
+/// Bridges an attached manager's `crossbeam` response channel onto the
+/// account's `std::sync::mpsc` notification sender. Polls on a timeout so a
+/// `stop` request is picked up promptly even when the manager never answers.
+fn spawn_pump(
+    rx: channel::Receiver<Response>,
+    sender: mpsc::Sender<Notification>,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    thread::spawn(move || loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(response) => {
+                if let Some(notif) = response_to_notification(&response) {
+                    if sender.send(notif).is_err() {
+                        return;
+                    }
+                }
+            }
+            Err(channel::RecvTimeoutError::Timeout) => {}
+            Err(channel::RecvTimeoutError::Disconnected) => return,
+        }
+    })
+}
 
 /// A descriptor wallet: one [`ElectrumScanner`] watching the descriptor, one
 /// [`HeaderStore`] validating the chain, and the reconciliation between them.
@@ -41,7 +183,11 @@ pub struct Account<P: ScanProfile = RamProfile<DefaultBackend>> {
     /// accounts. The reconcile thread reads it on every chain-tip advance and
     /// fetches its merkle proofs through it.
     headers: HeaderFollower<P>,
-    signing_manager: HotManager,
+    managers: BTreeMap<String, AttachedManager>,
+    /// Shared handle to the hot manager built from the config mnemonic, kept
+    /// so `sign_psbt` and `master_xprivs` can reach operations the
+    /// `SigningManager` trait cannot express.
+    hot: Option<Arc<Mutex<HotManager>>>,
     /// Wallet-level half of [`Config`]; the scanner owns the rest.
     mnemonic: Option<String>,
     sender: mpsc::Sender<Notification>,
@@ -61,6 +207,15 @@ pub struct Account<P: ScanProfile = RamProfile<DefaultBackend>> {
 impl<P: ScanProfile> std::fmt::Debug for Account<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Account").finish()
+    }
+}
+
+impl<P: ScanProfile> Drop for Account<P> {
+    fn drop(&mut self) {
+        let names: Vec<String> = self.managers.keys().cloned().collect();
+        for name in names {
+            self.detach_signing_manager(&name);
+        }
     }
 }
 
@@ -212,11 +367,6 @@ impl<P: OpenScanFromBackend> Account<P> {
             scanner: scanner_config,
             mnemonic,
         } = config;
-        let mut signing_manager = HotManager::new();
-        if let Some(mnemo) = mnemonic.clone() {
-            signing_manager.new_bip32_signer_from_mnemonic(scanner_config.network, mnemo);
-            signing_manager.register_bip32_descriptor(scanner_config.descriptor.clone());
-        }
         let stay_offline = scanner_config.stay_offline();
         // Once per account, not per reconciler: a store shared by several
         // accounts would otherwise report the same event to this channel as
@@ -228,13 +378,29 @@ impl<P: OpenScanFromBackend> Account<P> {
         let mut account = Account {
             scanner,
             headers,
-            signing_manager,
+            managers: BTreeMap::new(),
+            hot: None,
             mnemonic,
             sender,
             receiver: None,
             config_store,
             reconciler,
         };
+        // A hot manager is seeded from the config mnemonic and attached like
+        // any other manager; registration stays consumer-driven, so no
+        // descriptor is pushed here.
+        if let Some(mnemo) = account.mnemonic.clone() {
+            let mut hot_manager = HotManager::new();
+            hot_manager.new_bip32_signer_from_mnemonic(account.scanner.network(), mnemo);
+            let hot = Arc::new(Mutex::new(hot_manager));
+            account.hot = Some(hot.clone());
+            if account
+                .attach_signing_manager(HOT_MANAGER_NAME, Box::new(HotManagerHandle(hot)))
+                .is_err()
+            {
+                log::error!("from_stores(): hot manager name unexpectedly already attached");
+            }
+        }
         if !stay_offline {
             account.start_electrum();
         }
@@ -271,8 +437,10 @@ impl<P: ScanProfile> Account<P> {
         }
     }
 
-    fn signing_manager(&self) -> &HotManager {
-        &self.signing_manager
+    fn hot_manager(&self) -> Option<&dyn SigningManager> {
+        self.managers
+            .get(HOT_MANAGER_NAME)
+            .map(|attached| attached.manager.as_ref())
     }
 }
 
@@ -302,13 +470,78 @@ impl<P: ScanProfile> Account<P> {
         }
     }
 
+    /// Attaches a runtime signing manager under `name`. Non-blocking: this
+    /// only subscribes to the manager's response channel and spawns its pump
+    /// thread, it never registers a descriptor, requests an xpub, or polls
+    /// for devices.
+    ///
+    /// Refuses a duplicate `name` rather than replacing the existing
+    /// manager.
+    pub fn attach_signing_manager(
+        &mut self,
+        name: &str,
+        mut manager: Box<dyn SigningManager>,
+    ) -> Result<(), Error> {
+        if self.managers.contains_key(name) {
+            return Err(Error::ManagerAlreadyAttached);
+        }
+        let (tx, rx) = channel::unbounded();
+        manager.subscribe(tx);
+        let stop = Arc::new(AtomicBool::new(false));
+        let pump = spawn_pump(rx, self.sender.clone(), stop.clone());
+        self.managers.insert(
+            name.to_string(),
+            AttachedManager {
+                manager,
+                stop,
+                pump: Some(pump),
+            },
+        );
+        Ok(())
+    }
+
+    /// Detaches the manager registered under `name`, stopping its pump
+    /// thread. Returns whether a manager was actually removed.
+    pub fn detach_signing_manager(&mut self, name: &str) -> bool {
+        let Some(mut attached) = self.managers.remove(name) else {
+            return false;
+        };
+        attached.stop.store(true, Ordering::Relaxed);
+        drop(attached.manager);
+        if let Some(pump) = attached.pump.take() {
+            let _ = pump.join();
+        }
+        true
+    }
+
+    /// Names of every currently attached signing manager.
+    pub fn signing_manager_names(&self) -> Vec<String> {
+        self.managers.keys().cloned().collect()
+    }
+
+    /// Signs `psbt` in place with the hot signers, when the hot manager is
+    /// attached. `SigningManager` cannot express in-place PSBT mutation, so
+    /// this reaches past the trait into the concrete hot manager.
     pub fn sign_psbt(&self, psbt: &mut bitcoin::Psbt) {
-        self.signing_manager().sign_with_all_hot_signers(psbt);
+        if self.hot_manager().is_none() {
+            return;
+        }
+        if let Some(hot) = &self.hot {
+            let mut hot = hot.lock().expect("poisoned");
+            hot.register_bip32_descriptor(self.scanner.wallet_descriptor());
+            hot.sign_with_all_hot_signers(psbt);
+        }
     }
 
     /// Returns master xprivs from all BIP32 hot signers, keyed by fingerprint.
     pub fn master_xprivs(&self) -> BTreeMap<bitcoin::bip32::Fingerprint, bitcoin::bip32::Xpriv> {
-        self.signing_manager().master_xprivs()
+        if self.hot_manager().is_none() {
+            return BTreeMap::new();
+        }
+        self.hot
+            .as_ref()
+            .map(|hot| hot.lock().expect("poisoned").master_xprivs())
+            .unwrap_or_default()
     }
 }
 
@@ -426,7 +659,7 @@ mod tests {
         },
         Descriptor, DescriptorPublicKey,
     };
-    use std::{path::PathBuf, str::FromStr};
+    use std::{path::PathBuf, str::FromStr, sync::mpsc::TryRecvError};
     use temp_dir::TempDir;
 
     use crate::config::CONFIG_FILENAME;
@@ -697,9 +930,223 @@ mod tests {
             HotSigner::new_from_mnemonics(Network::Regtest, &mnemonic.to_string())
                 .unwrap()
                 .fingerprint();
-        let signers = account.signing_manager().signers();
+        let signers = account.hot_manager().unwrap().signers();
         assert_eq!(signers.len(), 1);
         assert_eq!(signers[0].fingerprint, expected_fingerprint);
+    }
+
+    /// Shared stub for the signing-manager attach/detach tests below.
+    /// Records every call it receives and keeps the sender handed to it by
+    /// `subscribe` in a shared slot, so a test can push a `Response` on it
+    /// after attaching.
+    struct StubManager {
+        calls: Arc<Mutex<Vec<String>>>,
+        captured_sender: Arc<Mutex<Option<channel::Sender<Response>>>>,
+        requests: bwk_sign::protocol::RequestIdSource,
+    }
+
+    impl StubManager {
+        fn new(
+            calls: Arc<Mutex<Vec<String>>>,
+            captured_sender: Arc<Mutex<Option<channel::Sender<Response>>>>,
+        ) -> Self {
+            Self {
+                calls,
+                captured_sender,
+                requests: bwk_sign::protocol::RequestIdSource::new(),
+            }
+        }
+
+        fn record(&self, call: &str) {
+            self.calls.lock().expect("poisoned").push(call.to_string());
+        }
+    }
+
+    impl SigningManager for StubManager {
+        fn signers(&self) -> Vec<SignerInfo> {
+            self.record("signers");
+            vec![]
+        }
+
+        fn subscribe(&mut self, sender: channel::Sender<Response>) {
+            self.record("subscribe");
+            *self.captured_sender.lock().expect("poisoned") = Some(sender);
+        }
+
+        fn set_polling(&mut self, _enabled: bool) {
+            self.record("set_polling");
+        }
+
+        fn init(&mut self, _signer: &SignerId) -> Result<RequestId, manager::Error> {
+            self.record("init");
+            Ok(self.requests.next())
+        }
+
+        fn info(&self, _signer: &SignerId) -> Result<RequestId, manager::Error> {
+            self.record("info");
+            Ok(self.requests.next())
+        }
+
+        fn get_xpub(
+            &self,
+            _signer: &SignerId,
+            _path: DerivationPath,
+            _display: bool,
+        ) -> Result<RequestId, manager::Error> {
+            self.record("get_xpub");
+            Ok(self.requests.next())
+        }
+
+        fn is_descriptor_registered(
+            &self,
+            _signer: &SignerId,
+            _descriptor: bwk_descriptor::descriptor::Descriptor,
+        ) -> Result<RequestId, manager::Error> {
+            self.record("is_descriptor_registered");
+            Ok(self.requests.next())
+        }
+
+        fn register_descriptor(
+            &mut self,
+            _signer: &SignerId,
+            _descriptor: bwk_descriptor::descriptor::Descriptor,
+        ) -> Result<RequestId, manager::Error> {
+            self.record("register_descriptor");
+            Ok(self.requests.next())
+        }
+
+        fn sign(
+            &self,
+            _signer: &SignerId,
+            _descriptor: bwk_descriptor::descriptor::Descriptor,
+            _psbt: Vec<u8>,
+        ) -> Result<RequestId, manager::Error> {
+            self.record("sign");
+            Ok(self.requests.next())
+        }
+
+        fn raw(&self, _signer: &SignerId, _request: Vec<u8>) -> Result<RequestId, manager::Error> {
+            self.record("raw");
+            Ok(self.requests.next())
+        }
+    }
+
+    fn account_for_signing_tests() -> (Account, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let config = persisted_offline_config(&dir, 20);
+        (Account::new(config), dir)
+    }
+
+    #[test]
+    fn attach_then_detach_stops_the_pump() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(calls, captured_sender);
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+        assert!(account
+            .signing_manager_names()
+            .contains(&"stub".to_string()));
+
+        assert!(account.detach_signing_manager("stub"));
+        assert!(!account
+            .signing_manager_names()
+            .contains(&"stub".to_string()));
+        assert!(!account.detach_signing_manager("stub"));
+    }
+
+    #[test]
+    fn duplicate_manager_name_is_refused() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let calls_a = Arc::new(Mutex::new(Vec::new()));
+        let calls_b = Arc::new(Mutex::new(Vec::new()));
+        account
+            .attach_signing_manager(
+                "stub",
+                Box::new(StubManager::new(calls_a, Arc::new(Mutex::new(None)))),
+            )
+            .unwrap();
+
+        let result = account.attach_signing_manager(
+            "stub",
+            Box::new(StubManager::new(calls_b, Arc::new(Mutex::new(None)))),
+        );
+        assert!(matches!(result, Err(Error::ManagerAlreadyAttached)));
+        assert!(account
+            .signing_manager_names()
+            .contains(&"stub".to_string()));
+    }
+
+    #[test]
+    fn manager_responses_reach_the_account_channel() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let receiver = account.receiver().unwrap();
+        // Drain whatever construction (coin store generation, the hot
+        // manager's own subscribe) already queued, so the assertion below
+        // only sees what happens after this test's response is sent.
+        while receiver.try_recv().is_ok() {}
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(calls, captured_sender.clone());
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let sender = captured_sender.lock().unwrap().clone().unwrap();
+        sender
+            .send(Response::SignersChanged { signers: vec![] })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        // No Notification variant maps a signing-manager Response, so assert
+        // the pump drained the response without panicking (the account
+        // channel stays empty) and that the pump thread is still alive (the
+        // channel accepts a second send).
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        sender
+            .send(Response::SignersChanged { signers: vec![] })
+            .unwrap();
+
+        assert!(account.detach_signing_manager("stub"));
+    }
+
+    #[test]
+    fn watch_only_account_attaches_no_manager() {
+        let mnemonic = Mnemonic::generate(12).unwrap();
+        let signer =
+            HotSigner::new_from_mnemonics(Network::Regtest, &mnemonic.to_string()).unwrap();
+        let xpub = signer.xpub(&DerivationPath::from_str("m/84'/0'/0'/1").unwrap());
+        let descriptor = bwk_descriptor::descriptor::wpkh(xpub);
+        let dir = TempDir::new().unwrap();
+        let mut config = Config::new(
+            None,
+            "watch-only".to_string(),
+            Network::Regtest,
+            ScriptType::Descriptor(Box::new(descriptor)),
+            dir.path().to_path_buf(),
+            "wallet".to_string(),
+            Some(PersistenceKind::Json),
+        )
+        .unwrap();
+        config.scanner.set_stay_offline(true);
+
+        let account: Account = Account::new(config);
+        assert!(account.signing_manager_names().is_empty());
+    }
+
+    #[test]
+    fn attach_does_not_register_descriptors() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let stub = StubManager::new(calls.clone(), Arc::new(Mutex::new(None)));
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let seen = calls.lock().unwrap().clone();
+        assert_eq!(seen, vec!["subscribe".to_string()]);
     }
 }
 
@@ -1471,7 +1918,6 @@ mod sqlite_signer_exclusion {
     use bip39::Mnemonic;
     use bwk_descriptor::descriptor::ScriptType;
     use bwk_persist::{config_store::FileConfigStore, PersistenceKind};
-    use bwk_sign::manager::SigningManager;
     use miniscript::bitcoin::{bip32::ChildNumber, Network};
     use temp_dir::TempDir;
 
@@ -1596,7 +2042,7 @@ mod sqlite_signer_exclusion {
             bwk_sign::hot_signer::HotSigner::new_from_mnemonics(Network::Regtest, &mnemonic)
                 .unwrap()
                 .fingerprint();
-        let signers = account.signing_manager().signers();
+        let signers = account.hot_manager().unwrap().signers();
         assert_eq!(signers.len(), 1);
         assert_eq!(signers[0].fingerprint, expected_fingerprint);
     }

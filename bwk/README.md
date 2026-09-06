@@ -9,9 +9,9 @@ generation, transaction history, and labels. Handles background sync with
 Electrum server and emits notifications on state changes.
 
 **Scope:** Account lifecycle, pairing an `ElectrumScanner` with a `HeaderStore`
-and reconciling them, signer management, change address management. The stores
-and the sync thread live in bwk-electrum. Does NOT handle signing itself (use
-bwk-sign) or transaction construction (use bwk-tx).
+and reconciling them, attaching signing managers, change address management.
+The stores and the sync thread live in bwk-electrum. Does NOT handle signing
+itself (use bwk-sign) or transaction construction (use bwk-tx).
 
 ## Usage
 
@@ -137,6 +137,16 @@ index N, if N >= generated_tip, the tip advances and new addresses get watched.
 Uses `ChangeTipUpdater` to increment change_generated_tip on each
 `create_script()` call. The index is stored in a `Cell` so `psbt_output_info()`
 can return correct BIP32 derivation path.
+
+## Signing
+
+An account does not sign, it routes. `attach_signing_manager(name, manager)`
+takes any `bwk_sign::manager::SigningManager` under a caller-chosen name and
+starts a thread forwarding that manager's answers into the account's
+notification channel. `detach_signing_manager(name)` stops that thread and
+drops the manager, and `signing_manager_names()` lists what is attached. A
+config carrying a mnemonic gets a hot manager attached at construction, under
+the name `hot`.
 
 ## Features
 

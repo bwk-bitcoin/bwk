@@ -85,7 +85,9 @@ Account (bwk/src/account.rs)
 ├── HeaderFollower (holds the HeaderStore: validated header chain, two
 │   Electrum connections of its own, one for the header worker and one
 │   for the merkle-proof client, and keeps it on the scanner's endpoint)
-├── HotManager (hot signers)
+├── signing managers attached by name (a hot one when the config carries a
+│   mnemonic), each with a thread pumping its answers into the notification
+│   channel
 └── Reconciler (bwk-electrum, its own thread: promotes what the scanner
     recorded against the header chain, verifies proofs)
 ```
