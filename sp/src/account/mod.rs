@@ -94,7 +94,7 @@ pub enum AccountError {
     SpendKeyHex(hex::FromHexError),
     #[error("invalid spend_key: {0}")]
     InvalidSpendKey(bitcoin::secp256k1::Error),
-    #[error("spend_key must be 32 or 33 bytes")]
+    #[error("spend_key must be 33 bytes")]
     SpendKeyLength,
     #[error("spend_key is required when using scan_sk")]
     MissingSpendKey,
@@ -738,28 +738,20 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
             let scan_sk = bitcoin::secp256k1::SecretKey::from_slice(&scan_sk_bytes)
                 .map_err(AccountError::InvalidScanSk)?;
 
-            let spend_key = if let Some(ref spend_key_hex) = config.spend_key {
+            let spend_pk = if let Some(ref spend_key_hex) = config.spend_key {
                 let spend_key_bytes =
                     hex::decode(spend_key_hex).map_err(AccountError::SpendKeyHex)?;
 
-                if spend_key_bytes.len() == 32 {
-                    // Secret key
-                    let sk = bitcoin::secp256k1::SecretKey::from_slice(&spend_key_bytes)
-                        .map_err(AccountError::InvalidSpendKey)?;
-                    crate::receiver::SpendKey::Secret(sk)
-                } else if spend_key_bytes.len() == 33 {
-                    // Public key
-                    let pk = bitcoin::secp256k1::PublicKey::from_slice(&spend_key_bytes)
-                        .map_err(AccountError::InvalidSpendKey)?;
-                    crate::receiver::SpendKey::Public(pk)
-                } else {
+                if spend_key_bytes.len() != 33 {
                     return Err(AccountError::SpendKeyLength);
                 }
+                bitcoin::secp256k1::PublicKey::from_slice(&spend_key_bytes)
+                    .map_err(AccountError::InvalidSpendKey)?
             } else {
                 return Err(AccountError::MissingSpendKey);
             };
 
-            SpReceiver::new(scan_sk, spend_key, config.network).map_err(AccountError::SpReceiver)
+            SpReceiver::new(scan_sk, spend_pk, config.network).map_err(AccountError::SpReceiver)
         } else {
             Err(AccountError::MissingKeys)
         }
@@ -1303,9 +1295,11 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
 
     /// Check if this account can sign transactions.
     ///
-    /// Returns true if we have the spend secret key.
+    /// Returns true only if a mnemonic was supplied at construction time; the
+    /// wallet no longer holds a spend secret key of its own. A later task
+    /// replaces this with a check against a configured signer list.
     pub fn can_sign(&self) -> bool {
-        self.sp_receiver.try_get_secret_spend_key().is_ok()
+        self.config.mnemonic.is_some()
     }
 
     /// Returns a [`TxBuilder`] pre-configured with this account's coin source
@@ -1530,10 +1524,14 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     /// Source: adapted from cygnet3/spdk's silent-payment input signing.
     /// See `sp/NOTICE`.
     fn sign_sp_inputs(&self, psbt: &mut bitcoin::Psbt) -> Result<(), AccountError> {
-        let b_spend = self
-            .sp_receiver
-            .try_get_secret_spend_key()
-            .map_err(AccountError::Signing)?;
+        let mnemonic = self.config.mnemonic.as_ref().ok_or(AccountError::NoKeys)?;
+        let signer = SpSigner::from_mnemonic(
+            mnemonic,
+            self.config.network,
+            bitcoin::bip32::ChildNumber::from_hardened_idx(0).expect("zero"),
+        )
+        .map_err(|_| AccountError::NoKeys)?;
+        let b_spend = signer.b_spend();
 
         let secp = Secp256k1::new();
 

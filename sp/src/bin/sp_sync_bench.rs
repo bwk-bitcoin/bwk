@@ -181,7 +181,6 @@ mod instrumented {
         bitcoin,
         receiver::{
             error::Error as SpError, BlockData, OutputSpendStatus, OwnedOutput, SpReceiver,
-            SpendKey,
         },
         scan::{scan_blocks_with_observer, ScanRuntimeConfig, ScanStores},
     };
@@ -328,7 +327,7 @@ mod instrumented {
         // Fixed dummy watch-only keys: cost is independent of ownership.
         let scan_sk = bitcoin::secp256k1::SecretKey::from_slice(&[1u8; 32])?;
         let spend_pk = DUMMY_SPEND_PUBKEY.parse::<bitcoin::secp256k1::PublicKey>()?;
-        let client = SpReceiver::new(scan_sk, SpendKey::Public(spend_pk), args.network)
+        let client = SpReceiver::new(scan_sk, spend_pk, args.network)
             .map_err(|e| format!("SpReceiver: {e}"))?;
 
         let probe = bwk_sp::blindbit::agent()?;
@@ -1061,7 +1060,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Watch-only: from_keys reads the 66-hex spend key as SpendKey::Public.
+    // Watch-only: from_keys reads the 66-hex spend key as a public key.
     // Persist enabled with a fresh per-run temp dir = production conditions (real
     // store + throttled scan-state writes) while still a full rescan each run.
     let data_dir = std::env::temp_dir().join(format!("sp_sync_bench_{}", std::process::id()));
