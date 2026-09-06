@@ -16,7 +16,7 @@ use bwk_electrum::{
     header_follower::HeaderFollower,
     header_store::HeaderStore,
     history::{AccountHistory, TxContribution},
-    notification::Notification,
+    notification::{Notification, SignerNotification},
     open,
     profile::{
         DefaultBackend, OpenScanFromBackend, RamProfile, ReopenStatuses, ScanProfile, ScanStores,
@@ -92,6 +92,18 @@ fn replace_manager_signers(
             },
         );
     }
+}
+
+/// Every currently cached signer, across every attached manager. Used to
+/// emit `SignerNotification::Signers` with the account-wide list rather than
+/// one manager's slice.
+fn signers_snapshot(cache: &Mutex<BTreeMap<SignerId, CachedSigner>>) -> Vec<SignerInfo> {
+    cache
+        .lock()
+        .expect("poisoned")
+        .values()
+        .map(|cached| cached.info.clone())
+        .collect()
 }
 
 /// Adapts a shared [`HotManager`] to [`SigningManager`] so it can sit in
@@ -170,20 +182,14 @@ impl SigningManager for HotManagerHandle {
     }
 }
 
-/// Maps a signing-manager [`Response`] onto a [`Notification`]. No variant
-/// carries one, so every response is logged and dropped.
-fn response_to_notification(response: &Response) -> Option<Notification> {
-    log::debug!("signing manager response dropped, no Notification variant: {response:?}");
-    None
-}
-
 /// Bridges an attached manager's `crossbeam` response channel onto the
 /// account's `std::sync::mpsc` notification sender. Polls on a timeout so a
 /// `stop` request is picked up promptly even when the manager never answers.
 ///
 /// Also keeps `signers` current: `Response::Signers` and
 /// `Response::SignersChanged` both carry a full roster for `manager_name`, so
-/// either one replaces that manager's cached entries wholesale.
+/// either one replaces that manager's cached entries wholesale before the
+/// account-wide snapshot is emitted.
 fn spawn_pump(
     manager_name: String,
     rx: channel::Receiver<Response>,
@@ -197,15 +203,81 @@ fn spawn_pump(
         }
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(response) => {
-                if let Response::Signers { signers: list, .. }
-                | Response::SignersChanged { signers: list } = &response
-                {
-                    replace_manager_signers(&signers, &manager_name, list.clone());
-                }
-                if let Some(notif) = response_to_notification(&response) {
-                    if sender.send(notif).is_err() {
-                        return;
+                let notif = match response {
+                    Response::Signers { signers: list, .. }
+                    | Response::SignersChanged { signers: list } => {
+                        replace_manager_signers(&signers, &manager_name, list);
+                        SignerNotification::Signers(signers_snapshot(&signers))
                     }
+                    Response::Initialized { request, signer } => {
+                        SignerNotification::Initialized { request, signer }
+                    }
+                    Response::Info {
+                        request,
+                        signer,
+                        info,
+                    } => SignerNotification::Info {
+                        request,
+                        signer,
+                        info,
+                    },
+                    Response::Xpub {
+                        request,
+                        signer,
+                        xpub,
+                    } => SignerNotification::Xpub {
+                        request,
+                        signer,
+                        xpub,
+                    },
+                    Response::DescriptorIsRegistered {
+                        request,
+                        signer,
+                        registered,
+                    } => SignerNotification::DescriptorIsRegistered {
+                        request,
+                        signer,
+                        registered,
+                    },
+                    Response::DescriptorRegistered {
+                        request,
+                        signer,
+                        registered,
+                    } => SignerNotification::DescriptorRegistered {
+                        request,
+                        signer,
+                        registered,
+                    },
+                    Response::Signed {
+                        request,
+                        signer,
+                        psbt,
+                    } => SignerNotification::PsbtUpdated {
+                        request,
+                        signer,
+                        psbt,
+                    },
+                    Response::Raw {
+                        request,
+                        signer,
+                        payload,
+                    } => SignerNotification::Raw {
+                        request,
+                        signer,
+                        payload,
+                    },
+                    Response::Error {
+                        request,
+                        signer,
+                        message,
+                    } => SignerNotification::Error {
+                        request,
+                        signer,
+                        message,
+                    },
+                };
+                if sender.send(notif.into()).is_err() {
+                    log::debug!("signer pump: consumer receiver dropped");
                 }
             }
             Err(channel::RecvTimeoutError::Timeout) => {}
@@ -545,6 +617,15 @@ impl<P: ScanProfile> Account<P> {
                 pump: Some(pump),
             },
         );
+        let _ = self.sender.send(
+            SignerNotification::ManagerAttached {
+                manager: name.to_string(),
+            }
+            .into(),
+        );
+        let _ = self
+            .sender
+            .send(SignerNotification::Signers(signers_snapshot(&self.signers)).into());
         Ok(())
     }
 
@@ -564,6 +645,15 @@ impl<P: ScanProfile> Account<P> {
             .lock()
             .expect("poisoned")
             .retain(|_, entry| entry.manager != name);
+        let _ = self.sender.send(
+            SignerNotification::ManagerDetached {
+                manager: name.to_string(),
+            }
+            .into(),
+        );
+        let _ = self
+            .sender
+            .send(SignerNotification::Signers(signers_snapshot(&self.signers)).into());
         true
     }
 
@@ -831,7 +921,7 @@ mod tests {
         },
         Descriptor, DescriptorPublicKey,
     };
-    use std::{path::PathBuf, str::FromStr, sync::mpsc::TryRecvError};
+    use std::{path::PathBuf, str::FromStr};
     use temp_dir::TempDir;
 
     use crate::config::CONFIG_FILENAME;
@@ -1261,6 +1351,30 @@ mod tests {
         (Account::new(config), dir)
     }
 
+    /// Like [`account_for_signing_tests`] but watch-only: no mnemonic, so no
+    /// hot manager is attached at construction and the signer cache starts
+    /// empty.
+    fn watch_only_account_for_signing_tests() -> (Account, TempDir) {
+        let mnemonic = Mnemonic::generate(12).unwrap();
+        let signer =
+            HotSigner::new_from_mnemonics(Network::Regtest, &mnemonic.to_string()).unwrap();
+        let xpub = signer.xpub(&DerivationPath::from_str("m/84'/0'/0'/1").unwrap());
+        let descriptor = bwk_descriptor::descriptor::wpkh(xpub);
+        let dir = TempDir::new().unwrap();
+        let mut config = Config::new(
+            None,
+            "watch-only".to_string(),
+            Network::Regtest,
+            ScriptType::Descriptor(Box::new(descriptor)),
+            dir.path().to_path_buf(),
+            "wallet".to_string(),
+            Some(PersistenceKind::Json),
+        )
+        .unwrap();
+        config.scanner.set_stay_offline(true);
+        (Account::new(config), dir)
+    }
+
     #[test]
     fn attach_then_detach_stops_the_pump() {
         let (mut account, _dir) = account_for_signing_tests();
@@ -1303,14 +1417,27 @@ mod tests {
             .contains(&"stub".to_string()));
     }
 
+    /// Blocks until a `Notification` matching `pred` arrives, or panics after
+    /// a short timeout. Used by the signer notification tests below, which
+    /// race the pump thread.
+    fn recv_signer_notif_matching(
+        receiver: &mpsc::Receiver<Notification>,
+        mut pred: impl FnMut(&SignerNotification) -> bool,
+    ) -> SignerNotification {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match receiver.recv_timeout(Duration::from_millis(50)) {
+                Ok(Notification::Signer(n)) if pred(&n) => return n,
+                _ => {}
+            }
+        }
+        panic!("expected matching Notification::Signer within timeout");
+    }
+
     #[test]
     fn manager_responses_reach_the_account_channel() {
         let (mut account, _dir) = account_for_signing_tests();
         let receiver = account.receiver().unwrap();
-        // Drain whatever construction (coin store generation, the hot
-        // manager's own subscribe) already queued, so the assertion below
-        // only sees what happens after this test's response is sent.
-        while receiver.try_recv().is_ok() {}
         let calls = Arc::new(Mutex::new(Vec::new()));
         let captured_sender = Arc::new(Mutex::new(None));
         let stub = StubManager::new(calls, captured_sender.clone());
@@ -1322,13 +1449,10 @@ mod tests {
         sender
             .send(Response::SignersChanged { signers: vec![] })
             .unwrap();
-        std::thread::sleep(Duration::from_millis(50));
 
-        // No Notification variant maps a signing-manager Response, so assert
-        // the pump drained the response without panicking (the account
-        // channel stays empty) and that the pump thread is still alive (the
-        // channel accepts a second send).
-        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        recv_signer_notif_matching(&receiver, |n| matches!(n, SignerNotification::Signers(_)));
+
+        // The pump thread is still alive: it accepts a second send.
         sender
             .send(Response::SignersChanged { signers: vec![] })
             .unwrap();
@@ -1337,26 +1461,214 @@ mod tests {
     }
 
     #[test]
-    fn watch_only_account_attaches_no_manager() {
-        let mnemonic = Mnemonic::generate(12).unwrap();
-        let signer =
-            HotSigner::new_from_mnemonics(Network::Regtest, &mnemonic.to_string()).unwrap();
-        let xpub = signer.xpub(&DerivationPath::from_str("m/84'/0'/0'/1").unwrap());
-        let descriptor = bwk_descriptor::descriptor::wpkh(xpub);
-        let dir = TempDir::new().unwrap();
-        let mut config = Config::new(
-            None,
-            "watch-only".to_string(),
-            Network::Regtest,
-            ScriptType::Descriptor(Box::new(descriptor)),
-            dir.path().to_path_buf(),
-            "wallet".to_string(),
-            Some(PersistenceKind::Json),
-        )
-        .unwrap();
-        config.scanner.set_stay_offline(true);
+    fn signed_response_arrives_as_psbt_updated() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let receiver = account.receiver().unwrap();
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), captured_sender.clone());
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+        let sender = captured_sender.lock().unwrap().clone().unwrap();
 
-        let account: Account = Account::new(config);
+        let request = RequestId::new(7);
+        let signer = SignerId::new("s1");
+        sender
+            .send(Response::Signed {
+                request,
+                signer: signer.clone(),
+                psbt: vec![1, 2, 3],
+            })
+            .unwrap();
+
+        let notif = recv_signer_notif_matching(&receiver, |n| {
+            matches!(n, SignerNotification::PsbtUpdated { .. })
+        });
+        match notif {
+            SignerNotification::PsbtUpdated {
+                request: req,
+                signer: sid,
+                psbt,
+            } => {
+                assert_eq!(req, request);
+                assert_eq!(sid, signer);
+                assert_eq!(psbt, vec![1, 2, 3]);
+            }
+            other => panic!("expected PsbtUpdated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_response_keeps_optional_ids() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let receiver = account.receiver().unwrap();
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), captured_sender.clone());
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+        let sender = captured_sender.lock().unwrap().clone().unwrap();
+
+        sender
+            .send(Response::Error {
+                request: None,
+                signer: None,
+                message: "device gone".to_string(),
+            })
+            .unwrap();
+
+        let notif = recv_signer_notif_matching(&receiver, |n| {
+            matches!(n, SignerNotification::Error { .. })
+        });
+        match notif {
+            SignerNotification::Error {
+                request,
+                signer,
+                message,
+            } => {
+                assert!(request.is_none());
+                assert!(signer.is_none());
+                assert_eq!(message, "device gone");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roster_response_emits_full_list() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let receiver = account.receiver().unwrap();
+        let a = signer_info("roster-full-a", [1, 1, 1, 1], SignerState::Ready);
+        let b = signer_info("roster-full-b", [2, 2, 2, 2], SignerState::Ready);
+        let captured_sender_b = Arc::new(Mutex::new(None));
+        let stub_a = StubManager::new(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)))
+            .with_signers(vec![a.clone()]);
+        let stub_b = StubManager::new(Arc::new(Mutex::new(Vec::new())), captured_sender_b.clone())
+            .with_signers(vec![b.clone()]);
+        account
+            .attach_signing_manager("stub-a", Box::new(stub_a))
+            .unwrap();
+        account
+            .attach_signing_manager("stub-b", Box::new(stub_b))
+            .unwrap();
+        let sender_b = captured_sender_b.lock().unwrap().clone().unwrap();
+
+        let b_locked = SignerInfo::new(
+            b.id.clone(),
+            b.fingerprint,
+            b.wallet_name.clone(),
+            SignerState::Locked,
+        )
+        .with_detail("locked");
+        sender_b
+            .send(Response::Signers {
+                request: RequestId::new(1),
+                signers: vec![b_locked.clone()],
+            })
+            .unwrap();
+
+        let notif = recv_signer_notif_matching(&receiver, |n| match n {
+            SignerNotification::Signers(list) => list.contains(&a) && list.contains(&b_locked),
+            _ => false,
+        });
+        match notif {
+            SignerNotification::Signers(list) => {
+                assert!(list.contains(&a));
+                assert!(list.contains(&b_locked));
+                assert!(!list.contains(&b));
+            }
+            other => panic!("expected Signers, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_and_detach_are_announced() {
+        let (mut account, _dir) = watch_only_account_for_signing_tests();
+        let receiver = account.receiver().unwrap();
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)));
+        account
+            .attach_signing_manager("announced", Box::new(stub))
+            .unwrap();
+
+        recv_signer_notif_matching(
+            &receiver,
+            |n| matches!(n, SignerNotification::ManagerAttached { manager } if manager == "announced"),
+        );
+        recv_signer_notif_matching(&receiver, |n| matches!(n, SignerNotification::Signers(_)));
+
+        assert!(account.detach_signing_manager("announced"));
+
+        recv_signer_notif_matching(
+            &receiver,
+            |n| matches!(n, SignerNotification::ManagerDetached { manager } if manager == "announced"),
+        );
+        let notif =
+            recv_signer_notif_matching(&receiver, |n| matches!(n, SignerNotification::Signers(_)));
+        match notif {
+            SignerNotification::Signers(list) => assert!(list.is_empty()),
+            other => panic!("expected Signers, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pump_survives_a_dropped_receiver() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let receiver = account.receiver().unwrap();
+        drop(receiver);
+
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), captured_sender.clone());
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+        let sender = captured_sender.lock().unwrap().clone().unwrap();
+
+        sender
+            .send(Response::Signed {
+                request: RequestId::new(1),
+                signer: SignerId::new("s1"),
+                psbt: vec![1],
+            })
+            .unwrap();
+        sender
+            .send(Response::Error {
+                request: None,
+                signer: None,
+                message: "boom".to_string(),
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        // The pump thread is still alive and joinable: detach completes.
+        assert!(account.detach_signing_manager("stub"));
+    }
+
+    // The account keeps no in-flight PSBT registry, so there is no accessor
+    // returning a stored PSBT to assert against: this only proves a signed
+    // response is consumed and the manager still detaches.
+    #[test]
+    fn account_stores_no_returned_psbt() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), captured_sender.clone());
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+        let sender = captured_sender.lock().unwrap().clone().unwrap();
+        sender
+            .send(Response::Signed {
+                request: RequestId::new(1),
+                signer: SignerId::new("s1"),
+                psbt: vec![1, 2, 3],
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(account.detach_signing_manager("stub"));
+    }
+
+    #[test]
+    fn watch_only_account_attaches_no_manager() {
+        let (account, _dir) = watch_only_account_for_signing_tests();
         assert!(account.signing_manager_names().is_empty());
     }
 

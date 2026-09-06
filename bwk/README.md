@@ -160,6 +160,10 @@ unknown id, or a signer that is not ready, is refused before any manager is
 touched. None of them blocks or returns a result: the answer comes back as a
 notification.
 
+Those answers arrive as `Notification::Signer(SignerNotification)`: a manager
+attached or detached, the account-wide signer list, the result of each request
+tagged with its `RequestId` and `SignerId`, and errors no request asked for.
+
 ## Features
 
 All off by default. `logger` installs `env_logger` as the global logger; leave

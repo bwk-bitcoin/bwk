@@ -131,8 +131,9 @@ Key traits:
 ### Notification Pattern
 
 Both Account types use `mpsc::channel<Notification>` for async events
-(connection status, new coins, scan progress). Call `account.receiver()` to
-take the receiver.
+(connection status, new coins, scan progress, and the answers of every
+attached signing manager under `Notification::Signer`). Call
+`account.receiver()` to take the receiver.
 
 ## Features
 
