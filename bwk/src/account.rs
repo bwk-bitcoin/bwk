@@ -19,7 +19,7 @@ use bwk_persist::{
     backend::PersistenceBackend,
     config_store::{ConfigStore, NoopConfigStore},
 };
-use bwk_sign::signing_manager::SigningManager;
+use bwk_sign::signing_manager::HotManager;
 use bwk_tx::{recipient::ChangeRecipientProvider, tx_builder::TxBuilder};
 
 use miniscript::bitcoin::{self, Txid};
@@ -42,7 +42,7 @@ pub struct Account<P: StorageProfile = RamProfile<DefaultBackend>> {
     /// accounts. The reconcile thread reads it on every chain-tip advance and
     /// fetches its merkle proofs through it.
     headers: HeaderFollower<P>,
-    signing_manager: SigningManager<P::SignerStore>,
+    signing_manager: HotManager<P::SignerStore>,
     /// Wallet-level half of [`Config`]; the scanner owns the rest.
     mnemonic: Option<String>,
     sender: mpsc::Sender<Notification>,
@@ -223,7 +223,7 @@ impl<P: OpenFromBackend> Account<P> {
             scanner: scanner_config,
             mnemonic,
         } = config;
-        let mut signing_manager = SigningManager::from_store(stores.signers);
+        let mut signing_manager = HotManager::from_store(stores.signers);
         if let Some(mnemo) = mnemonic.clone() {
             signing_manager.new_bip32_signer_from_mnemonic(scanner_config.network, mnemo);
             signing_manager.register_bip32_descriptor(scanner_config.descriptor.clone());
@@ -286,7 +286,7 @@ impl<P: StorageProfile> Account<P> {
         }
     }
 
-    fn signing_manager(&self) -> &SigningManager<P::SignerStore> {
+    fn signing_manager(&self) -> &HotManager<P::SignerStore> {
         &self.signing_manager
     }
 }
@@ -317,12 +317,8 @@ impl<P: StorageProfile> Account<P> {
         }
     }
 
-    pub fn sign(&self, psbt: String) {
-        self.signing_manager().sign(psbt);
-    }
-
     pub fn sign_psbt(&self, psbt: &mut bitcoin::Psbt) {
-        self.signing_manager().sign_psbt(psbt);
+        self.signing_manager().sign_with_all_hot_signers(psbt);
     }
 
     /// Returns master xprivs from all BIP32 hot signers, keyed by fingerprint.

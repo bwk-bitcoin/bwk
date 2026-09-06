@@ -53,7 +53,7 @@ use {
         },
         persist::config_store::{ConfigStore, NoopConfigStore},
     },
-    bwk_sign::signing_manager::SigningManager,
+    bwk_sign::signing_manager::HotManager,
     miniscript::{psbt::PsbtExt, Descriptor, DescriptorPublicKey, ForEachKey},
     std::{
         collections::{BTreeMap, BTreeSet},
@@ -427,7 +427,7 @@ pub struct Account<
     /// Hot signers for the BIP32 sub-accounts. The scanners only watch
     /// descriptors, so the wallet keeps the signing side here, once for the
     /// whole account.
-    signing_manager: SigningManager,
+    signing_manager: HotManager,
     /// The validated header chain this account promotes its scanners against,
     /// and the endpoint it follows.
     headers: HeaderFollower<RamProfile<DefaultBackend>>,
@@ -558,7 +558,7 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
         // this account's channel, plus the signers they cannot hold themselves.
         // In memory: every sub-signer is re-derivable from a mnemonic the
         // persisted config already carries.
-        let mut signing_manager = SigningManager::new();
+        let mut signing_manager = HotManager::new();
         let mut scanners = Vec::with_capacity(config.descriptors.len());
         for (i, sub_cfg) in config.descriptors.iter().enumerate() {
             let name = format!("{}-sub-{}", config.account_name, i);
@@ -1330,7 +1330,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
             self.sign_sp_inputs(psbt)?;
         }
 
-        self.signing_manager.sign_psbt(psbt);
+        self.signing_manager.sign_with_all_hot_signers(psbt);
 
         Ok(())
     }
@@ -1627,10 +1627,10 @@ fn header_store_target<'a>(
 #[cfg(feature = "mnemonic")]
 /// Seed a hot signer from `mnemonic` and let it sign for `descriptor`.
 ///
-/// A fingerprint already registered is left as is: re-seeding it would replace
-/// the signer and drop the descriptors registered on it so far.
+/// A fingerprint already registered is left as is: re-seeding it would register
+/// a second signer holding the same seed.
 fn register_sub_signer(
-    signing_manager: &mut SigningManager,
+    signing_manager: &mut HotManager,
     network: Network,
     mnemonic: &str,
     descriptor: bwk_sign::bwk_descriptor::descriptor::Descriptor,

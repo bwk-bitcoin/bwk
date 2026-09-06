@@ -1,7 +1,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     str::FromStr,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use crossbeam::channel;
@@ -13,13 +16,16 @@ use bwk_persist::{
     PersistError,
 };
 
-use miniscript::{
-    bitcoin::{self, bip32},
-    DescriptorPublicKey, ForEachKey,
+use miniscript::bitcoin::{
+    self,
+    bip32::{self, DerivationPath},
 };
 
 use crate::{
     hot_signer::{HotSigner, JsonSigner},
+    identity::{SignerId, SignerInfo, SignerState},
+    manager,
+    protocol::{self, RequestId, RequestIdSource, Response},
     signer::{Signer, SignerNotif},
 };
 
@@ -49,9 +55,7 @@ impl Clone for SignerKind {
 #[allow(clippy::mutable_key_type)]
 struct ExternalSigner {
     signer: Box<dyn Signer>,
-    #[cfg(all(feature = "hwi", not(target_os = "android")))]
-    kind: SignerKind,
-    id: String,
+    fingerprint: bip32::Fingerprint,
     descriptors: BTreeSet<Descriptor>,
 }
 
@@ -74,39 +78,75 @@ pub fn decode_json_signer(bytes: &[u8]) -> Result<JsonSigner, PersistError> {
         .map_err(|e| PersistError::Serde(format!("decode JsonSigner: {e}")))
 }
 
-/// Default backing store for [`SigningManager`]: RAM-cached + write-back
+/// Default backing store for [`HotManager`]: RAM-cached + write-back
 /// over a runtime-dispatched [`PersistenceBackend`].
 pub type DefaultSignerStore = RamStore<Arc<dyn PersistenceBackend>, bip32::Fingerprint, JsonSigner>;
 
-/// A manager for handling hot signers and their notifications.
-pub struct SigningManager<S = DefaultSignerStore>
+fn mint_id(counter: &AtomicU64, fingerprint: &bip32::Fingerprint) -> SignerId {
+    let n = counter.fetch_add(1, Ordering::Relaxed);
+    SignerId::new(format!("hot:{fingerprint}:{n}"))
+}
+
+fn notif_fingerprint(notif: &SignerNotif) -> Option<bip32::Fingerprint> {
+    match notif {
+        SignerNotif::Info(fg, _)
+        | SignerNotif::Xpub(fg, _)
+        | SignerNotif::Descriptor(fg, _)
+        | SignerNotif::DescriptorRegistered(fg, _, _)
+        | SignerNotif::Signed(fg, _)
+        | SignerNotif::Error(fg, _) => Some(*fg),
+        SignerNotif::Manager(_) => None,
+        #[cfg(all(feature = "hwi", not(target_os = "android")))]
+        SignerNotif::DeviceUpdate => None,
+    }
+}
+
+/// A manager for hot (BIP32, in-memory) signers, implementing
+/// [`manager::SigningManager`].
+///
+/// Hot signing is CPU-bound and needs no IO, so every trait method here does
+/// its work inline before returning: there is no in-flight request table and
+/// no worker thread. The `RequestId`/[`Response`] contract is still honored,
+/// though, so a caller written against a truly asynchronous back end (a
+/// hardware device, a remote signer) works unmodified against this one.
+pub struct HotManager<S = DefaultSignerStore>
 where
     S: Store<Key = bip32::Fingerprint, Value = JsonSigner>,
 {
     receiver: channel::Receiver<SignerNotif>,
     sender: channel::Sender<SignerNotif>,
-    bip32_signers: BTreeMap<bip32::Fingerprint, HotSigner>,
-    signers: BTreeMap<bip32::Fingerprint, ExternalSigner>,
+    bip32_signers: BTreeMap<SignerId, HotSigner>,
+    signers: BTreeMap<SignerId, ExternalSigner>,
     store: S,
+    next_hot: AtomicU64,
+    requests: RequestIdSource,
+    subscriber: Option<channel::Sender<Response>>,
+    /// Last [`RequestId`] issued per fingerprint, so an external signer's
+    /// asynchronous [`SignerNotif`] (which carries no request id of its own)
+    /// can be correlated back to the call that triggered it once [`pump`]
+    /// forwards it.
+    ///
+    /// [`pump`]: HotManager::pump
+    last_request: Mutex<BTreeMap<bip32::Fingerprint, RequestId>>,
     #[cfg(all(feature = "hwi", not(target_os = "android")))]
     hw_service: Option<bwk_hwi::service::HwiService<crate::hwi::HwMessage>>,
     #[cfg(all(feature = "hwi", not(target_os = "android")))]
     hw_receiver: Option<channel::Receiver<crate::hwi::HwMessage>>,
 }
 
-impl<S> std::fmt::Debug for SigningManager<S>
+impl<S> std::fmt::Debug for HotManager<S>
 where
     S: Store<Key = bip32::Fingerprint, Value = JsonSigner>,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SigningManager")
+        f.debug_struct("HotManager")
             .field("bip32_signers", &self.bip32_signers)
             .field("signers_count", &self.signers.len())
             .finish()
     }
 }
 
-impl SigningManager<DefaultSignerStore> {
+impl HotManager<DefaultSignerStore> {
     /// In-memory only (no persistence).
     pub fn new() -> Self {
         let backend: Arc<dyn PersistenceBackend> = Arc::new(NoopBackend);
@@ -127,7 +167,7 @@ impl SigningManager<DefaultSignerStore> {
         ) {
             Ok(store) => Self::from_store(store),
             Err(e) => {
-                log::error!("SigningManager::with_backend: {e}");
+                log::error!("HotManager::with_backend: {e}");
                 let noop: Arc<dyn PersistenceBackend> = Arc::new(NoopBackend);
                 let store =
                     RamStore::empty(noop, store_key, encode_fingerprint, encode_json_signer);
@@ -137,13 +177,13 @@ impl SigningManager<DefaultSignerStore> {
     }
 }
 
-impl Default for SigningManager<DefaultSignerStore> {
+impl Default for HotManager<DefaultSignerStore> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<S> SigningManager<S>
+impl<S> HotManager<S>
 where
     S: Store<Key = bip32::Fingerprint, Value = JsonSigner>,
 {
@@ -151,17 +191,19 @@ where
     /// every row already in the store.
     pub fn from_store(store: S) -> Self {
         let (sender, receiver) = channel::unbounded();
-        let mut bip32_signers: BTreeMap<bip32::Fingerprint, HotSigner> = BTreeMap::new();
+        let next_hot = AtomicU64::new(0);
+        let mut bip32_signers: BTreeMap<SignerId, HotSigner> = BTreeMap::new();
         match store.iter() {
             Ok(iter) => {
-                for (fg, json) in iter {
+                for (_, json) in iter {
                     let mut signer = HotSigner::from_json(json);
                     signer.init(sender.clone());
-                    bip32_signers.insert(fg, signer);
+                    let id = mint_id(&next_hot, &signer.fingerprint());
+                    bip32_signers.insert(id, signer);
                 }
             }
             Err(e) => {
-                log::error!("SigningManager::from_store iter: {e}");
+                log::error!("HotManager::from_store iter: {e}");
             }
         }
         Self {
@@ -170,6 +212,10 @@ where
             bip32_signers,
             signers: BTreeMap::new(),
             store,
+            next_hot,
+            requests: RequestIdSource::new(),
+            subscriber: None,
+            last_request: Mutex::new(BTreeMap::new()),
             #[cfg(all(feature = "hwi", not(target_os = "android")))]
             hw_service: None,
             #[cfg(all(feature = "hwi", not(target_os = "android")))]
@@ -180,7 +226,7 @@ where
     /// Persists pending changes through the backend.
     pub fn persist(&mut self) {
         if let Err(e) = self.store.flush() {
-            log::error!("SigningManager::persist() flush: {e}");
+            log::error!("HotManager::persist() flush: {e}");
         }
     }
 
@@ -225,13 +271,41 @@ where
         }
     }
 
+    fn mint_hot_id(&self, fingerprint: &bip32::Fingerprint) -> SignerId {
+        mint_id(&self.next_hot, fingerprint)
+    }
+
+    /// Registers a fully constructed hot signer: initializes its
+    /// notification channel, mints a [`SignerId`], persists the row and
+    /// inserts it. Returns the freshly minted id.
+    pub fn add_bip32_signer(&mut self, mut signer: HotSigner) -> SignerId {
+        signer.init(self.sender.clone());
+        let fg = signer.fingerprint();
+        let id = self.mint_hot_id(&fg);
+        if let Some(json) = signer.to_json() {
+            if let Err(e) = self.store.insert(fg, json) {
+                log::error!("HotManager::add_bip32_signer insert: {e}");
+            }
+        }
+        self.bip32_signers.insert(id.clone(), signer);
+        id
+    }
+
+    /// Returns whether any loaded hot signer holds `fingerprint`. The map is
+    /// keyed by [`SignerId`], not by fingerprint, so this scans the values.
+    pub fn has_bip32_signer(&self, fingerprint: &bip32::Fingerprint) -> bool {
+        self.bip32_signers
+            .values()
+            .any(|s| s.fingerprint() == *fingerprint)
+    }
+
     /// Creates a new hot signer with a generated mnemonic.
     ///
     /// # Parameters
     /// - `network`: The network for which the hot signer is created.
-    pub fn new_bip32_signer(&mut self, network: bitcoin::Network) {
+    pub fn new_bip32_signer(&mut self, network: bitcoin::Network) -> SignerId {
         let mnemomic = bip39::Mnemonic::generate(12).unwrap();
-        self.new_bip32_signer_from_mnemonic(network, mnemomic.to_string());
+        self.new_bip32_signer_from_mnemonic(network, mnemomic.to_string())
     }
 
     /// Creates a new hot signer from a given mnemonic.
@@ -239,28 +313,13 @@ where
     /// # Parameters
     /// - `network`: The network for which the hot signer is created.
     /// - `mnemonic`: The mnemonic used to create the hot signer.
-    pub fn new_bip32_signer_from_mnemonic(&mut self, network: bitcoin::Network, mnemonic: String) {
+    pub fn new_bip32_signer_from_mnemonic(
+        &mut self,
+        network: bitcoin::Network,
+        mnemonic: String,
+    ) -> SignerId {
         let signer = HotSigner::new_from_mnemonics(network, &mnemonic).unwrap();
-        self.add_bip32_signer(signer);
-    }
-
-    /// Take over an already-built hot signer, keyed by its fingerprint. One
-    /// registered under the same fingerprint is replaced, along with the
-    /// descriptors registered on it.
-    pub fn add_bip32_signer(&mut self, mut signer: HotSigner) {
-        signer.init(self.sender.clone());
-        let fg = signer.fingerprint();
-        if let Some(json) = signer.to_json() {
-            if let Err(e) = self.store.insert(fg, json) {
-                log::error!("SigningManager::add_bip32_signer insert: {e}");
-            }
-        }
-        self.bip32_signers.insert(fg, signer);
-    }
-
-    /// Whether a hot signer with this fingerprint is already registered.
-    pub fn has_bip32_signer(&self, fingerprint: &bip32::Fingerprint) -> bool {
-        self.bip32_signers.contains_key(fingerprint)
+        self.add_bip32_signer(signer)
     }
 
     pub fn register_bip32_descriptor(&mut self, descriptor: Descriptor) {
@@ -275,40 +334,13 @@ where
             .collect();
         for (fg, json) in snapshots {
             if let Err(e) = self.store.insert(fg, json) {
-                log::error!("SigningManager::register_bip32_descriptor insert: {e}");
+                log::error!("HotManager::register_bip32_descriptor insert: {e}");
             }
         }
     }
 
-    pub fn sign(&self, psbt: String) {
-        let mut psbt = match bitcoin::Psbt::from_str(&psbt) {
-            Ok(p) => p,
-            Err(_) => {
-                if self
-                    .sender
-                    .send(SignerNotif::Manager(Error::ParsePsbt))
-                    .is_err()
-                {
-                    log::error!("SigningManager::sign() fails to send notif")
-                }
-                return;
-            }
-        };
-
-        self.sign_psbt(&mut psbt);
-
-        let fg = self
-            .bip32_signers
-            .keys()
-            .next()
-            .copied()
-            .unwrap_or_default();
-        if self.sender.send(SignerNotif::Signed(fg, psbt)).is_err() {
-            log::error!("SigningManager::sign() fails to send notif")
-        }
-    }
-
-    pub fn sign_psbt(&self, psbt: &mut bitcoin::Psbt) {
+    /// Signs `psbt` with every loaded hot signer, in place.
+    pub fn sign_with_all_hot_signers(&self, psbt: &mut bitcoin::Psbt) {
         for signer in self.bip32_signers.values() {
             signer.sign(psbt);
         }
@@ -317,53 +349,60 @@ where
     /// Returns master xprivs from all BIP32 hot signers, keyed by fingerprint.
     pub fn master_xprivs(&self) -> BTreeMap<bip32::Fingerprint, bip32::Xpriv> {
         self.bip32_signers
-            .iter()
-            .map(|(fg, signer)| (*fg, signer.master_xpriv()))
+            .values()
+            .map(|signer| (signer.fingerprint(), signer.master_xpriv()))
             .collect()
     }
 
-    pub fn list_signers(&self) -> Vec<(bip32::Fingerprint, SignerKind)> {
-        #[cfg_attr(
-            not(all(feature = "hwi", not(target_os = "android"))),
-            allow(unused_mut)
-        )]
-        let mut result: Vec<_> = self
-            .bip32_signers
-            .keys()
-            .map(|fg| (*fg, SignerKind::Hot))
-            .collect();
-        #[cfg(all(feature = "hwi", not(target_os = "android")))]
-        for (fg, ext) in &self.signers {
-            result.push((*fg, ext.kind.clone()));
-        }
-        result
+    fn require_subscriber(&self) -> Result<channel::Sender<Response>, manager::Error> {
+        self.subscriber.clone().ok_or(manager::Error::NoSubscriber)
     }
 
-    pub fn sign_with(
-        &self,
-        fingerprint: bip32::Fingerprint,
-        id: Option<&str>,
-        psbt: &mut bitcoin::Psbt,
-    ) {
-        // Hot signers: sign in-place synchronously
-        if let Some(signer) = self.bip32_signers.get(&fingerprint) {
-            signer.sign(psbt);
-            return;
+    fn remember_request(&self, fingerprint: bip32::Fingerprint, request: RequestId) {
+        self.last_request
+            .lock()
+            .expect("poisoned")
+            .insert(fingerprint, request);
+    }
+
+    fn signer_id_for_fingerprint(&self, fingerprint: bip32::Fingerprint) -> Option<SignerId> {
+        if let Some((id, _)) = self
+            .bip32_signers
+            .iter()
+            .find(|(_, hot)| hot.fingerprint() == fingerprint)
+        {
+            return Some(id.clone());
         }
-        // External signers: fire-and-forget, result via poll()
-        if let Some(ext) = self.signers.get(&fingerprint) {
-            if let Some(req_id) = id {
-                if ext.id != req_id {
-                    return;
-                }
-            }
-            // Find first registered descriptor and trigger async signing
-            if let Some(descriptor) = psbt_matching_descriptor(psbt, fingerprint, &ext.descriptors)
-            {
-                ext.signer.sign_with_descriptor(psbt.clone(), descriptor);
-            } else {
-                log::warn!("sign_with: no matching descriptor found for fingerprint {fingerprint}");
-            }
+        self.signers
+            .iter()
+            .find(|(_, ext)| ext.fingerprint == fingerprint)
+            .map(|(id, _)| id.clone())
+    }
+
+    /// Drains any pending [`SignerNotif`] and forwards it to the subscribed
+    /// channel. Hot-signer calls already answer inline before returning;
+    /// this exists for external signers, which report from their own thread
+    /// and whose result is only recoverable this way.
+    pub fn pump(&self) {
+        let Some(sender) = self.subscriber.as_ref() else {
+            return;
+        };
+        while let Some(notif) = self.poll() {
+            let Some(fingerprint) = notif_fingerprint(&notif) else {
+                continue;
+            };
+            let Some(id) = self.signer_id_for_fingerprint(fingerprint) else {
+                continue;
+            };
+            let request = self
+                .last_request
+                .lock()
+                .expect("poisoned")
+                .remove(&fingerprint);
+            let Some(request) = request else {
+                continue;
+            };
+            let _ = sender.send(protocol::from_signer_notif(notif, request, id));
         }
     }
 
@@ -396,151 +435,308 @@ where
         }
     }
 
+    /// Adopts a discovered hardware device as an external signer, minting a
+    /// [`SignerId`] from the device's own stable id.
     #[cfg(all(feature = "hwi", not(target_os = "android")))]
-    pub fn add_hw_signer(&mut self, device_id: &str) -> Option<bip32::Fingerprint> {
+    pub fn add_hw_signer(&mut self, device_id: &str) -> Option<SignerId> {
         let service = self.hw_service.as_ref()?;
         let devices = service.list();
         let device = devices.get(device_id)?;
         if let bwk_hwi::service::SigningDevice::Supported(supported) = device {
-            let fg = *supported.fingerprint();
-            let kind = *supported.kind();
+            let fingerprint = *supported.fingerprint();
             let mut signer = crate::hwi::HwSigner::new(supported.clone(), device_id.to_string());
             signer.init(self.sender.clone());
+            let id = SignerId::new(format!("hwi:{device_id}"));
             let ext = ExternalSigner {
                 signer: Box::new(signer),
-                kind: SignerKind::External(kind),
-                id: device_id.to_string(),
+                fingerprint,
                 descriptors: BTreeSet::new(),
             };
-            self.signers.insert(fg, ext);
-            Some(fg)
+            self.signers.insert(id.clone(), ext);
+            Some(id)
         } else {
             None
         }
     }
 
     #[cfg(all(feature = "hwi", not(target_os = "android")))]
-    pub fn remove_hw_signer(&mut self, fingerprint: &bip32::Fingerprint) {
-        self.signers.remove(fingerprint);
+    pub fn remove_hw_signer(&mut self, signer: &SignerId) {
+        self.signers.remove(signer);
     }
 
-    /// Register a descriptor for a hardware signer identified by fingerprint.
+    /// Register a descriptor for a hardware signer identified by its
+    /// [`SignerId`].
     ///
     /// This stores the descriptor in the ExternalSigner for use during signing,
     /// and delegates to the underlying signer (which calls device.register_wallet()).
     #[cfg(all(feature = "hwi", not(target_os = "android")))]
-    pub fn register_hw_descriptor(
-        &mut self,
-        fingerprint: &bip32::Fingerprint,
-        descriptor: Descriptor,
-    ) {
-        if let Some(ext) = self.signers.get_mut(fingerprint) {
+    pub fn register_hw_descriptor(&mut self, signer: &SignerId, descriptor: Descriptor) {
+        if let Some(ext) = self.signers.get_mut(signer) {
             ext.descriptors.insert(descriptor.clone());
             ext.signer.register_descriptor(descriptor);
         }
     }
 }
 
-/// Find a registered descriptor that references the given fingerprint, confirmed by the PSBT.
-/// Iterates the signer's registered descriptors and returns the first one whose key origins
-/// include the given fingerprint.
-#[allow(clippy::mutable_key_type)]
-fn psbt_matching_descriptor(
-    psbt: &bitcoin::Psbt,
-    fingerprint: bip32::Fingerprint,
-    descriptors: &BTreeSet<Descriptor>,
-) -> Option<Descriptor> {
-    // Collect all fingerprints referenced in this PSBT for quick lookup
-    let mut psbt_fingerprints = BTreeSet::new();
-    for input in &psbt.inputs {
-        for (fg, _) in input.bip32_derivation.values() {
-            psbt_fingerprints.insert(*fg);
-        }
-        for (_, (fg, _)) in input.tap_key_origins.values() {
-            psbt_fingerprints.insert(*fg);
-        }
+impl<S> manager::SigningManager for HotManager<S>
+where
+    S: Store<Key = bip32::Fingerprint, Value = JsonSigner> + Send + Sync,
+{
+    fn signers(&self) -> Vec<SignerInfo> {
+        let mut result: Vec<SignerInfo> = self
+            .bip32_signers
+            .iter()
+            .map(|(id, hot)| {
+                let wallet_name = hot
+                    .descriptors()
+                    .first()
+                    .map(|d| bwk_utils::short_string(d.to_string(), 18))
+                    .unwrap_or_else(|| hot.fingerprint().to_string());
+                SignerInfo::new(
+                    id.clone(),
+                    hot.fingerprint(),
+                    wallet_name,
+                    SignerState::Ready,
+                )
+            })
+            .collect();
+        result.extend(self.signers.iter().map(|(id, ext)| {
+            let wallet_name = ext
+                .descriptors
+                .iter()
+                .next()
+                .map(|d| bwk_utils::short_string(d.to_string(), 18))
+                .unwrap_or_else(|| ext.fingerprint.to_string());
+            SignerInfo::new(id.clone(), ext.fingerprint, wallet_name, SignerState::Ready)
+        }));
+        result.sort();
+        result
     }
 
-    if !psbt_fingerprints.contains(&fingerprint) {
-        return None;
+    fn subscribe(&mut self, sender: channel::Sender<Response>) {
+        let list = self.signers();
+        let _ = sender.send(Response::SignersChanged { signers: list });
+        self.subscriber = Some(sender);
     }
 
-    // Find the first registered descriptor that references this fingerprint
-    for descriptor in descriptors {
-        let Some(inner) = descriptor.as_miniscript() else {
-            continue;
-        };
-        let matches = inner.for_any_key(|k| match k {
-            DescriptorPublicKey::XPub(key) => key
-                .origin
-                .as_ref()
-                .is_some_and(|(fg, _)| *fg == fingerprint),
-            DescriptorPublicKey::MultiXPub(key) => key
-                .origin
-                .as_ref()
-                .is_some_and(|(fg, _)| *fg == fingerprint),
-            DescriptorPublicKey::Single(_) => false,
+    fn set_polling(&mut self, _enabled: bool) {
+        // The hot manager has no device discovery, so there is nothing to
+        // turn on or off.
+    }
+
+    fn init(&mut self, signer: &SignerId) -> Result<RequestId, manager::Error> {
+        let exists = self.bip32_signers.contains_key(signer) || self.signers.contains_key(signer);
+        if !exists {
+            return Err(manager::Error::UnknownSigner(signer.clone()));
+        }
+        let sender = self.require_subscriber()?;
+        let request = self.requests.next();
+        let _ = sender.send(Response::Initialized {
+            request,
+            signer: signer.clone(),
         });
-        if matches {
-            return Some(descriptor.clone());
-        }
+        Ok(request)
     }
 
-    None
+    fn info(&self, signer: &SignerId) -> Result<RequestId, manager::Error> {
+        if let Some(hot) = self.bip32_signers.get(signer) {
+            let sender = self.require_subscriber()?;
+            let request = self.requests.next();
+            // Hot signers answer inline; there is no IO to wait on, so the
+            // response is built straight from `hot` rather than by pushing a
+            // notif and popping it back off the shared SignerNotif channel,
+            // which other signers also write to and which never fully
+            // drains (see HotSigner::init's own Info notif).
+            let _ = sender.send(Response::Info {
+                request,
+                signer: signer.clone(),
+                info: protocol::info_map(hot.info_value()),
+            });
+            return Ok(request);
+        }
+        if let Some(ext) = self.signers.get(signer) {
+            self.require_subscriber()?;
+            let request = self.requests.next();
+            self.remember_request(ext.fingerprint, request);
+            ext.signer.info();
+            return Ok(request);
+        }
+        Err(manager::Error::UnknownSigner(signer.clone()))
+    }
+
+    fn get_xpub(
+        &self,
+        signer: &SignerId,
+        path: DerivationPath,
+        display: bool,
+    ) -> Result<RequestId, manager::Error> {
+        if let Some(hot) = self.bip32_signers.get(signer) {
+            let sender = self.require_subscriber()?;
+            let request = self.requests.next();
+            // Hot signers have no display step and no IO, so the xpub is
+            // read straight off `hot` instead of round-tripping through the
+            // shared SignerNotif channel (see the comment in `info` above).
+            let _ = sender.send(Response::Xpub {
+                request,
+                signer: signer.clone(),
+                xpub: hot.xpub(&path),
+            });
+            return Ok(request);
+        }
+        if let Some(ext) = self.signers.get(signer) {
+            self.require_subscriber()?;
+            let request = self.requests.next();
+            self.remember_request(ext.fingerprint, request);
+            ext.signer.get_xpub(path, display);
+            return Ok(request);
+        }
+        Err(manager::Error::UnknownSigner(signer.clone()))
+    }
+
+    fn is_descriptor_registered(
+        &self,
+        signer: &SignerId,
+        descriptor: Descriptor,
+    ) -> Result<RequestId, manager::Error> {
+        if let Some(hot) = self.bip32_signers.get(signer) {
+            let sender = self.require_subscriber()?;
+            let request = self.requests.next();
+            let registered = hot.descriptors().contains(&descriptor);
+            let _ = sender.send(Response::DescriptorIsRegistered {
+                request,
+                signer: signer.clone(),
+                registered,
+            });
+            return Ok(request);
+        }
+        if let Some(ext) = self.signers.get(signer) {
+            let sender = self.require_subscriber()?;
+            let request = self.requests.next();
+            let registered = ext.descriptors.contains(&descriptor);
+            let _ = sender.send(Response::DescriptorIsRegistered {
+                request,
+                signer: signer.clone(),
+                registered,
+            });
+            return Ok(request);
+        }
+        Err(manager::Error::UnknownSigner(signer.clone()))
+    }
+
+    fn register_descriptor(
+        &mut self,
+        signer: &SignerId,
+        descriptor: Descriptor,
+    ) -> Result<RequestId, manager::Error> {
+        if self.bip32_signers.contains_key(signer) {
+            let sender = self.require_subscriber()?;
+            let request = self.requests.next();
+            let hot = self.bip32_signers.get_mut(signer).expect("checked above");
+            hot.inner_register_descriptor(descriptor);
+            if let Some(json) = hot.to_json() {
+                let fingerprint = hot.fingerprint();
+                if let Err(e) = self.store.insert(fingerprint, json) {
+                    log::error!("HotManager::register_descriptor insert: {e}");
+                }
+            }
+            let _ = sender.send(Response::DescriptorRegistered {
+                request,
+                signer: signer.clone(),
+                registered: true,
+            });
+            return Ok(request);
+        }
+        if self.signers.contains_key(signer) {
+            self.require_subscriber()?;
+            let request = self.requests.next();
+            let fingerprint = self.signers.get(signer).expect("checked above").fingerprint;
+            self.remember_request(fingerprint, request);
+            let ext = self.signers.get_mut(signer).expect("checked above");
+            ext.descriptors.insert(descriptor.clone());
+            ext.signer.register_descriptor(descriptor);
+            return Ok(request);
+        }
+        Err(manager::Error::UnknownSigner(signer.clone()))
+    }
+
+    fn sign(
+        &self,
+        signer: &SignerId,
+        descriptor: Descriptor,
+        psbt: Vec<u8>,
+    ) -> Result<RequestId, manager::Error> {
+        if let Some(hot) = self.bip32_signers.get(signer) {
+            let sender = self.require_subscriber()?;
+            let mut parsed = bitcoin::Psbt::deserialize(&psbt).map_err(|_| manager::Error::Psbt)?;
+            let request = self.requests.next();
+            match descriptor.as_miniscript() {
+                Some(inner) => match hot.inner_sign(&mut parsed, inner) {
+                    Ok(()) => {
+                        let _ = sender.send(Response::Signed {
+                            request,
+                            signer: signer.clone(),
+                            psbt: parsed.serialize(),
+                        });
+                    }
+                    Err(e) => {
+                        let _ =
+                            sender.send(Response::error(request, signer.clone(), e.to_string()));
+                    }
+                },
+                None => {
+                    let _ = sender.send(Response::error(
+                        request,
+                        signer.clone(),
+                        "silent payment descriptors are not signable yet",
+                    ));
+                }
+            }
+            return Ok(request);
+        }
+        if let Some(ext) = self.signers.get(signer) {
+            self.require_subscriber()?;
+            let parsed = bitcoin::Psbt::deserialize(&psbt).map_err(|_| manager::Error::Psbt)?;
+            let request = self.requests.next();
+            self.remember_request(ext.fingerprint, request);
+            ext.signer.sign_with_descriptor(parsed, descriptor);
+            return Ok(request);
+        }
+        Err(manager::Error::UnknownSigner(signer.clone()))
+    }
+
+    fn raw(&self, signer: &SignerId, _request: Vec<u8>) -> Result<RequestId, manager::Error> {
+        if self.bip32_signers.contains_key(signer) || self.signers.contains_key(signer) {
+            Err(manager::Error::Unsupported(signer.clone()))
+        } else {
+            Err(manager::Error::UnknownSigner(signer.clone()))
+        }
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test"))]
 mod tests {
     use bip32::Fingerprint;
-    use bwk_descriptor::sp_descriptor::SpDescriptor;
+    use bwk_descriptor::{derivator::SpkDerivator, descriptor::wpkh, sp_descriptor::SpDescriptor};
+    use bwk_utils::test::{random_output, txid};
     use miniscript::bitcoin::{
-        absolute::LockTime, hashes::Hash, secp256k1::Secp256k1, transaction::Version, Amount,
-        OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+        absolute::LockTime, secp256k1::Secp256k1, transaction::Version, Amount, ScriptBuf, TxIn,
+        TxOut,
     };
 
     use super::*;
+    use crate::{hot_signer::deriv_path, manager::SigningManager};
+
+    const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
     #[test]
     fn test_manager_bip32_signer() {
-        let mut manager = SigningManager::new();
-        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string();
-        manager.new_bip32_signer_from_mnemonic(bitcoin::Network::Regtest, mnemonic);
+        let mut manager = HotManager::new();
+        manager.new_bip32_signer_from_mnemonic(bitcoin::Network::Regtest, MNEMONIC.to_string());
         if let SignerNotif::Info(fg, _info) = manager.poll().unwrap() {
             assert_eq!(fg, Fingerprint::from_str("73c5da0a").unwrap());
         } else {
             panic!("expect info");
         }
-    }
-
-    fn psbt_with_fingerprint(fingerprint: Fingerprint) -> bitcoin::Psbt {
-        let txin = TxIn {
-            previous_output: OutPoint {
-                txid: Txid::all_zeros(),
-                vout: 0,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::ZERO,
-            witness: Witness::new(),
-        };
-        let txout = TxOut {
-            value: Amount::from_sat(1_000),
-            script_pubkey: ScriptBuf::new(),
-        };
-        let tx = Transaction {
-            version: Version(2),
-            lock_time: LockTime::ZERO,
-            input: vec![txin],
-            output: vec![txout],
-        };
-        let mut psbt = bitcoin::Psbt::from_unsigned_tx(tx).unwrap();
-        let secp = Secp256k1::new();
-        let sk = bitcoin::secp256k1::SecretKey::from_slice(&[7u8; 32]).unwrap();
-        let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk);
-        psbt.inputs[0].bip32_derivation.insert(
-            pk,
-            (fingerprint, bip32::DerivationPath::from_str("m/0").unwrap()),
-        );
-        psbt
     }
 
     fn sp_descriptor(fingerprint: &str) -> Descriptor {
@@ -552,31 +748,232 @@ mod tests {
         SpDescriptor::from_str(&s).unwrap().into()
     }
 
+    fn base_psbt() -> bitcoin::Psbt {
+        let txin = TxIn {
+            previous_output: bitcoin::OutPoint {
+                txid: txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: bitcoin::Sequence::ZERO,
+            witness: bitcoin::Witness::new(),
+        };
+        let txout = random_output();
+        let tx = bitcoin::Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![txin],
+            output: vec![txout],
+        };
+        bitcoin::Psbt::from_unsigned_tx(tx).unwrap()
+    }
+
     #[test]
-    fn psbt_matching_descriptor_skips_sp() {
-        let fingerprint = Fingerprint::from_str("deadbeef").unwrap();
-        let psbt = psbt_with_fingerprint(fingerprint);
+    fn two_signers_one_fingerprint() {
+        let mut manager = HotManager::new();
+        let signer_a = HotSigner::new_from_mnemonics(bitcoin::Network::Regtest, MNEMONIC).unwrap();
+        let signer_b = HotSigner::new_from_mnemonics(bitcoin::Network::Regtest, MNEMONIC).unwrap();
+        let id_a = manager.add_bip32_signer(signer_a);
+        let id_b = manager.add_bip32_signer(signer_b);
+        assert_ne!(id_a, id_b);
 
-        let secp = Secp256k1::new();
-        let xpriv = bip32::Xpriv::new_master(bitcoin::Network::Testnet, &[0x13; 64]).unwrap();
-        let xpub = bip32::Xpub::from_priv(&secp, &xpriv);
-        let miniscript_str = format!("wpkh([{fingerprint}/84h/1h/0h]{xpub}/<0;1>/*)");
-        let miniscript_descriptor = Descriptor::from_str(&miniscript_str).unwrap();
-        let sp = sp_descriptor(&fingerprint.to_string());
+        let infos = manager.signers();
+        assert_eq!(infos.len(), 2);
+        let fingerprints: BTreeSet<_> = infos.iter().map(|i| i.fingerprint).collect();
+        assert_eq!(fingerprints.len(), 1);
+        let ids: BTreeSet<_> = infos.iter().map(|i| i.id.clone()).collect();
+        assert_eq!(ids.len(), 2);
+    }
 
-        #[allow(clippy::mutable_key_type)]
-        let mut descriptors = BTreeSet::new();
-        descriptors.insert(sp.clone());
-        descriptors.insert(miniscript_descriptor.clone());
+    #[test]
+    fn signers_are_ready() {
+        let mut manager = HotManager::new();
+        manager.new_bip32_signer_from_mnemonic(bitcoin::Network::Regtest, MNEMONIC.to_string());
+        for info in manager.signers() {
+            assert_eq!(info.state, SignerState::Ready);
+            assert_eq!(info.state_detail, "");
+        }
+    }
+
+    #[test]
+    fn subscribe_pushes_the_signer_list() {
+        let mut manager = HotManager::new();
+        manager.new_bip32_signer_from_mnemonic(bitcoin::Network::Regtest, MNEMONIC.to_string());
+        let (tx, rx) = channel::unbounded();
+        manager.subscribe(tx);
+        match rx.recv().unwrap() {
+            Response::SignersChanged { signers } => assert_eq!(signers, manager.signers()),
+            other => panic!("expected SignersChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_signer_id_errors() {
+        let mut manager = HotManager::new();
+        let (tx, _rx) = channel::unbounded();
+        manager.subscribe(tx);
+        let id = SignerId::new("nope");
+        assert_eq!(manager.info(&id), Err(manager::Error::UnknownSigner(id)));
+    }
+
+    #[test]
+    fn no_subscriber_errors() {
+        let mut manager = HotManager::new();
+        let id =
+            manager.new_bip32_signer_from_mnemonic(bitcoin::Network::Regtest, MNEMONIC.to_string());
+        assert_eq!(manager.info(&id), Err(manager::Error::NoSubscriber));
+    }
+
+    #[test]
+    fn sign_produces_a_signed_psbt() {
+        let mut manager = HotManager::new();
+        let id =
+            manager.new_bip32_signer_from_mnemonic(bitcoin::Network::Regtest, MNEMONIC.to_string());
+        let (tx, rx) = channel::unbounded();
+        manager.subscribe(tx);
+        let _ = rx.recv().unwrap(); // SignersChanged
+
+        let account_path = DerivationPath::from_str("m/84'/0'/0'/0").unwrap();
+        let hot = manager.bip32_signers.get(&id).unwrap();
+        let descriptor: Descriptor = wpkh(hot.xpub(&account_path)).into();
+
+        manager
+            .register_descriptor(&id, descriptor.clone())
+            .unwrap();
+        let _ = rx.recv().unwrap(); // DescriptorRegistered
+
+        let deriv = &(false, 0);
+        let deriv_p = deriv_path(deriv).unwrap();
+        let hot = manager.bip32_signers.get(&id).unwrap();
+        let pubkey = hot.public_key_at(&deriv_p);
+        let fingerprint = hot.fingerprint();
+        let derivator = SpkDerivator::new(
+            descriptor.as_miniscript().unwrap().clone(),
+            bitcoin::Network::Regtest,
+        )
+        .unwrap();
+
+        let mut psbt = base_psbt();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: derivator.receive_spk_at(deriv.1),
+        });
+        psbt.inputs[0]
+            .bip32_derivation
+            .insert(pubkey, (fingerprint, deriv_p));
+
+        let request = manager.sign(&id, descriptor, psbt.serialize()).unwrap();
+        match rx.recv().unwrap() {
+            Response::Signed {
+                request: req,
+                signer,
+                psbt,
+            } => {
+                assert_eq!(req, request);
+                assert_eq!(signer, id);
+                let signed = bitcoin::Psbt::deserialize(&psbt).unwrap();
+                assert!(!signed.inputs[0].partial_sigs.is_empty());
+            }
+            other => panic!("expected Signed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sign_rejects_a_bad_psbt() {
+        let mut manager = HotManager::new();
+        let id =
+            manager.new_bip32_signer_from_mnemonic(bitcoin::Network::Regtest, MNEMONIC.to_string());
+        let (tx, _rx) = channel::unbounded();
+        manager.subscribe(tx);
+        let deriv_p = deriv_path(&(false, 0)).unwrap();
+        let hot = manager.bip32_signers.get(&id).unwrap();
+        let descriptor: Descriptor = wpkh(hot.xpub(&deriv_p)).into();
 
         assert_eq!(
-            psbt_matching_descriptor(&psbt, fingerprint, &descriptors),
-            Some(miniscript_descriptor)
+            manager.sign(&id, descriptor, vec![0xff; 8]),
+            Err(manager::Error::Psbt)
         );
+    }
 
-        #[allow(clippy::mutable_key_type)]
-        let mut sp_only = BTreeSet::new();
-        sp_only.insert(sp);
-        assert_eq!(psbt_matching_descriptor(&psbt, fingerprint, &sp_only), None);
+    #[test]
+    fn sign_with_sp_descriptor_reports_an_error() {
+        let mut manager = HotManager::new();
+        let id =
+            manager.new_bip32_signer_from_mnemonic(bitcoin::Network::Regtest, MNEMONIC.to_string());
+        let (tx, rx) = channel::unbounded();
+        manager.subscribe(tx);
+        let _ = rx.recv().unwrap(); // SignersChanged
+
+        let fingerprint = manager.bip32_signers.get(&id).unwrap().fingerprint();
+        let descriptor = sp_descriptor(&fingerprint.to_string());
+        let psbt = base_psbt();
+
+        let request = manager.sign(&id, descriptor, psbt.serialize()).unwrap();
+        match rx.recv().unwrap() {
+            Response::Error {
+                request: req,
+                signer,
+                ..
+            } => {
+                assert_eq!(req, Some(request));
+                assert_eq!(signer, Some(id));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_xpub_does_not_cross_contaminate_between_hot_signers() {
+        const OTHER_MNEMONIC: &str =
+            "legal winner thank year wave sausage worth useful legal winner thank yellow";
+        let mut manager = HotManager::new();
+        let mnemonic_a =
+            manager.new_bip32_signer_from_mnemonic(bitcoin::Network::Regtest, MNEMONIC.to_string());
+        let mnemonic_b = manager
+            .new_bip32_signer_from_mnemonic(bitcoin::Network::Regtest, OTHER_MNEMONIC.to_string());
+        let (tx, rx) = channel::unbounded();
+        manager.subscribe(tx);
+        let _ = rx.recv().unwrap(); // SignersChanged
+
+        let path = DerivationPath::from_str("m/84'/1'/0'").unwrap();
+        let hot_a = manager.bip32_signers.get(&mnemonic_a).unwrap();
+        let expected_a = hot_a.xpub(&path);
+        let hot_b = manager.bip32_signers.get(&mnemonic_b).unwrap();
+        let expected_b = hot_b.xpub(&path);
+        assert_ne!(expected_a, expected_b);
+
+        // Two prior queries against signer A (mirroring one hot signer's
+        // own init() notif plus one info() call) used to leave the shared
+        // SignerNotif channel with a backlog that a later, unrelated call
+        // could pop instead of its own answer.
+        manager.info(&mnemonic_a).unwrap();
+        let _ = rx.recv().unwrap();
+        manager.get_xpub(&mnemonic_a, path.clone(), false).unwrap();
+        let _ = rx.recv().unwrap();
+
+        let request = manager.get_xpub(&mnemonic_b, path, false).unwrap();
+        match rx.recv().unwrap() {
+            Response::Xpub {
+                request: req,
+                signer,
+                xpub,
+            } => {
+                assert_eq!(req, request);
+                assert_eq!(signer, mnemonic_b);
+                assert_eq!(xpub, expected_b);
+            }
+            other => panic!("expected Xpub, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raw_is_unsupported() {
+        let mut manager = HotManager::new();
+        let id =
+            manager.new_bip32_signer_from_mnemonic(bitcoin::Network::Regtest, MNEMONIC.to_string());
+        assert_eq!(
+            manager.raw(&id, vec![]),
+            Err(manager::Error::Unsupported(id))
+        );
     }
 }

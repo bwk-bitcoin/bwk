@@ -290,7 +290,7 @@ pub fn from_signer_notif(notif: SignerNotif, request: RequestId, signer: SignerI
     }
 }
 
-fn info_map(value: serde_json::Value) -> BTreeMap<String, String> {
+pub fn info_map(value: serde_json::Value) -> BTreeMap<String, String> {
     match value {
         serde_json::Value::Object(map) => map
             .into_iter()

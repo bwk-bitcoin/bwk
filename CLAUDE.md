@@ -49,7 +49,7 @@ tests locally. Commit messages must be single-line and follow existing style
 | bwk-psbt        | Native PSBTv2 (BIP370), silent-payment fields (BIP375/376)  |
 | bwk-electrum    | Electrum protocol client (TCP/SSL), ElectrumScanner, and    |
 |                 | the scan stores, the header chain and the reconcile pass    |
-| bwk-sign        | Hot signer, SigningManager for BIP32 key management         |
+| bwk-sign        | Signers and signing managers for BIP32 and hardware keys    |
 | bwk-descriptor  | Miniscript and sp() descriptor handling, SpkDerivator       |
 | bwk-keys        | Key derivation utilities (OXpriv, OXpub, KeyDerivator)      |
 | bwk-p2p         | Bitcoin P2P network client, DNS seed resolution             |
@@ -66,7 +66,7 @@ tests locally. Commit messages must be single-line and follow existing style
 
 See crate READMEs for usage examples:
 - [bwk/README.md](bwk/README.md): Account, stores, address generation
-- [sign/README.md](sign/README.md): SigningManager, Signer trait
+- [sign/README.md](sign/README.md): SigningManager trait, HotManager, Signer trait
 - [descriptor/README.md](descriptor/README.md): SpkDerivator, descriptor helpers
 - [electrum/README.md](electrum/README.md): Electrum client modes
 - [coin/README.md](coin/README.md): coin domain types
@@ -85,7 +85,7 @@ Account (bwk/src/account.rs)
 ├── HeaderFollower (holds the HeaderStore: validated header chain, two
 │   Electrum connections of its own, one for the header worker and one
 │   for the merkle-proof client, and keeps it on the scanner's endpoint)
-├── SigningManager (hot signers)
+├── HotManager (hot signers)
 └── Reconciler (bwk-electrum, its own thread: promotes what the scanner
     recorded against the header chain, verifies proofs)
 ```
@@ -107,7 +107,7 @@ Account (sp/src/account/mod.rs)
 ├── ElectrumScanner per sub-account descriptor (bwk-electrum)
 ├── HeaderStore (validated header chain, shared by every scanner)
 ├── Reconciler per scanner (promotes its scan against the header chain)
-└── SigningManager (hot signers for the sub-account descriptors)
+└── HotManager (hot signers for the sub-account descriptors)
 ```
 
 ### Transaction Building (`bwk-tx`)
