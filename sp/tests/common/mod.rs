@@ -1235,29 +1235,217 @@ impl SigningManager for MockSpManager {
     }
 }
 
+fn build_sp_manager(
+    network: bitcoin::Network,
+    mnemonic: &str,
+    hook: SpSignHook,
+) -> Box<dyn SigningManager> {
+    let (remote, worker) = mock_manager::spawn_with_sp_hook(network, &[mnemonic], hook);
+    Box::new(MockSpManager {
+        remote,
+        _worker: worker,
+    })
+}
+
+/// A single corruption a malicious signer applies to an otherwise honestly
+/// completed and signed PSBT.
+pub enum Tamper {
+    /// The honest control.
+    None,
+    /// Honest shares and proofs, but a silent-payment output's script does
+    /// not match what they derive: the money goes to the signer's own key.
+    OutputScript,
+    /// One byte flipped in the 0x08 global DLEQ proof.
+    GlobalProof,
+    /// One byte flipped in a 0x1e per-input DLEQ proof, forcing the honest
+    /// global share out of the way first so the per-input path is the one
+    /// actually checked.
+    InputProof,
+    /// The 0x07 global share replaced by an unrelated valid public key, the
+    /// proof left alone: the recipient could never find the output.
+    GlobalShare,
+    /// Shares and proofs removed, but the derived output scripts kept: the
+    /// PSBT claims a completion it cannot justify.
+    DropShares,
+}
+
+/// An unrelated P2TR script, standing in for a signer's own key: the target
+/// of the [`Tamper::OutputScript`] attack.
+fn unrelated_p2tr_script() -> ScriptBuf {
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let sk = bitcoin::secp256k1::SecretKey::from_slice(&[0xab; 32]).unwrap();
+    let keypair = bitcoin::secp256k1::Keypair::from_secret_key(&secp, &sk);
+    let (xonly, _) = keypair.x_only_public_key();
+    ScriptBuf::new_p2tr_tweaked(xonly.dangerous_assume_tweaked())
+}
+
+fn tamper_output_script(psbt: &mut bwk_psbt::PsbtV2) {
+    let index = psbt
+        .outputs
+        .iter()
+        .position(|output| {
+            bwk_psbt::sp::sp_v0_output(&output.psbt).unwrap().is_some()
+                && output.script_pubkey.is_some()
+        })
+        .unwrap();
+    psbt.outputs[index].script_pubkey = Some(unrelated_p2tr_script());
+}
+
+fn tamper_global_proof(psbt: &mut bwk_psbt::PsbtV2) {
+    let entry = bwk_psbt::sp::sp_global_dleqs_v2(psbt)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let mut proof = entry.proof;
+    proof[0] ^= 0xff;
+    bwk_psbt::sp::set_sp_global_dleq_v2(psbt, entry.scan_key, proof);
+}
+
+fn tamper_global_share(psbt: &mut bwk_psbt::PsbtV2) {
+    let entry = bwk_psbt::sp::sp_global_ecdh_shares_v2(psbt)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let unrelated_sk = bitcoin::secp256k1::SecretKey::from_slice(&[0xcd; 32]).unwrap();
+    let unrelated_pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &unrelated_sk);
+    bwk_psbt::sp::set_sp_global_ecdh_share_v2(psbt, entry.scan_key, unrelated_pk);
+}
+
+fn tamper_drop_shares(psbt: &mut bwk_psbt::PsbtV2) {
+    psbt.unknown.retain(|key, _| {
+        key.type_value != bwk_psbt::sp::PSBT_GLOBAL_SP_ECDH_SHARE
+            && key.type_value != bwk_psbt::sp::PSBT_GLOBAL_SP_DLEQ
+    });
+    for input in &mut psbt.inputs {
+        input.psbt.unknown.retain(|key, _| {
+            key.type_value != bwk_psbt::sp::PSBT_IN_SP_ECDH_SHARE
+                && key.type_value != bwk_psbt::sp::PSBT_IN_SP_DLEQ
+        });
+    }
+}
+
+/// Moves a scan key's share and proof from the global scope to a corrupted
+/// per-input one, so a verifier that only ever checked the global fields
+/// would wrongly pass this PSBT. `signer` reconstructs the owned input's
+/// secret key the same way [`bwk_sp::signer::SpSigner::sign`] already did
+/// when it wrote the global share this replaces.
+fn tamper_input_proof(psbt: &mut bwk_psbt::PsbtV2, signer: &bwk_sp::signer::SpSigner) {
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let scan_keys = bwk_sp::account::bip375::scan_keys(psbt).unwrap();
+    let index = psbt
+        .inputs
+        .iter()
+        .position(|input| bwk_psbt::sp::sp_input_tweak(&input.psbt).unwrap().is_some())
+        .unwrap();
+    let tweak = bwk_psbt::sp::sp_input_tweak(&psbt.inputs[index].psbt)
+        .unwrap()
+        .unwrap();
+    let tweak = bitcoin::secp256k1::SecretKey::from_slice(&tweak).unwrap();
+    let script = bwk_sp::account::bip375::input_script_pubkey(&psbt.inputs[index])
+        .unwrap()
+        .unwrap();
+    let sk =
+        bwk_sp::signer::reconstruct_signing_key(signer.b_spend(), tweak, &script, &secp).unwrap();
+
+    tamper_drop_shares(psbt);
+    let mut aux_rand = [0u8; 32];
+    getrandom::getrandom(&mut aux_rand).unwrap();
+    bwk_sp::signer::write_input_ecdh_share(
+        &mut psbt.inputs[index].psbt,
+        &scan_keys,
+        sk,
+        aux_rand,
+        &secp,
+    )
+    .unwrap();
+
+    let scan_key = *scan_keys.iter().next().unwrap();
+    let mut proof = bwk_psbt::sp::sp_input_dleq(&psbt.inputs[index].psbt, scan_key)
+        .unwrap()
+        .unwrap();
+    proof[0] ^= 0xff;
+    bwk_psbt::sp::set_sp_input_dleq(&mut psbt.inputs[index].psbt, scan_key, proof);
+}
+
+fn apply_tamper(psbt: &mut bwk_psbt::PsbtV2, signer: &bwk_sp::signer::SpSigner, tamper: &Tamper) {
+    match tamper {
+        Tamper::None => {}
+        Tamper::OutputScript => tamper_output_script(psbt),
+        Tamper::GlobalProof => tamper_global_proof(psbt),
+        Tamper::InputProof => tamper_input_proof(psbt, signer),
+        Tamper::GlobalShare => tamper_global_share(psbt),
+        Tamper::DropShares => tamper_drop_shares(psbt),
+    }
+}
+
+/// Signs `bytes` honestly with an [`bwk_sp::signer::SpSigner`] derived from
+/// `mnemonic`, then applies exactly one corruption named by `tamper`. This is
+/// both the mock manager's signing hook (through
+/// [`mock_sp_manager_tampering`]) and, called directly, the way a test gets
+/// tampered bytes without driving them through an account's signing round
+/// trip at all, to prove `finalize` rejects them regardless of how a
+/// consumer obtained them.
+pub fn sign_and_tamper(
+    mnemonic: &str,
+    network: bitcoin::Network,
+    bytes: Vec<u8>,
+    tamper: &Tamper,
+) -> Result<Vec<u8>, String> {
+    let signer = bwk_sp::signer::SpSigner::from_mnemonic(
+        mnemonic,
+        network,
+        bitcoin::bip32::ChildNumber::from_hardened_idx(0).unwrap(),
+    )
+    .map_err(|e| e.to_string())?;
+    let mut psbt = bwk_psbt::PsbtV2::deserialize(&bytes).map_err(|e| e.to_string())?;
+    signer.sign(&mut psbt).map_err(|e| e.to_string())?;
+    apply_tamper(&mut psbt, &signer, tamper);
+    psbt.serialize().map_err(|e| e.to_string())
+}
+
 /// Builds a mock remote signing manager backed by an [`bwk_sp::signer::SpSigner`]
 /// derived from `mnemonic`: from the account's point of view it is
 /// indistinguishable from an out-of-process signer answering the BIP375
 /// generator and BIP376 signer roles. The only place in a test using this
 /// helper that should ever touch `mnemonic` again is building the matching
 /// watch-only descriptor; the account under test must stay watch-only.
+///
+/// `tamper` names one corruption the mock signer applies to its own honest
+/// work before handing the PSBT back, so a test can drive a lying signer
+/// through the exact same round trip an honest one takes.
+pub fn mock_sp_manager_tampering(
+    mnemonic: &str,
+    network: bitcoin::Network,
+    tamper: Tamper,
+) -> Box<dyn SigningManager> {
+    let owned_mnemonic = mnemonic.to_string();
+    let hook: SpSignHook =
+        Box::new(move |bytes| sign_and_tamper(&owned_mnemonic, network, bytes, &tamper));
+    build_sp_manager(network, mnemonic, hook)
+}
+
+/// Builds a mock remote signing manager backed by an [`bwk_sp::signer::SpSigner`]
+/// derived from `mnemonic`, an honest signer answering the BIP375 generator
+/// and BIP376 signer roles: [`mock_sp_manager_tampering`] with
+/// [`Tamper::None`].
 pub fn mock_sp_manager(mnemonic: &str, network: bitcoin::Network) -> Box<dyn SigningManager> {
-    let signer = bwk_sp::signer::SpSigner::from_mnemonic(
-        mnemonic,
-        network,
-        bitcoin::bip32::ChildNumber::from_hardened_idx(0).unwrap(),
-    )
-    .unwrap();
-    let hook: SpSignHook = Box::new(move |bytes| {
-        let mut psbt = bwk_psbt::PsbtV2::deserialize(&bytes).map_err(|e| e.to_string())?;
-        signer.sign(&mut psbt).map_err(|e| e.to_string())?;
-        psbt.serialize().map_err(|e| e.to_string())
-    });
-    let (remote, worker) = mock_manager::spawn_with_sp_hook(network, &[mnemonic], hook);
-    Box::new(MockSpManager {
-        remote,
-        _worker: worker,
-    })
+    mock_sp_manager_tampering(mnemonic, network, Tamper::None)
+}
+
+/// Builds a mock remote signing manager whose signing hook is `hook` itself,
+/// with no [`bwk_sp::signer::SpSigner`] behind it: for a malicious signer
+/// that does not even attempt the generator role (returning the request
+/// untouched, or returning garbage), where there is nothing honest to start
+/// from and corrupt.
+pub fn mock_sp_manager_with_hook(
+    mnemonic: &str,
+    network: bitcoin::Network,
+    hook: SpSignHook,
+) -> Box<dyn SigningManager> {
+    build_sp_manager(network, mnemonic, hook)
 }
 
 /// Drains notifications until the signer's verdict on a just-signed PSBT
