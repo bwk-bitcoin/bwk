@@ -137,6 +137,7 @@ pub struct PsbtV2 {
 
 impl PsbtV2 {
     pub fn serialize(&self) -> Result<Vec<u8>, Error> {
+        self.validate()?;
         let mut maps = maps_from_v0(&self.v0_bridge()?)?;
         let global = maps.first_mut().ok_or(Error::BitcoinPsbt)?;
         remove_types(global, &GLOBAL_TYPES);
@@ -280,7 +281,7 @@ impl PsbtV2 {
             output.psbt = psbt_output;
         }
 
-        Ok(Self {
+        let psbt = Self {
             tx_version,
             fallback_lock_time,
             tx_modifiable,
@@ -289,13 +290,15 @@ impl PsbtV2 {
             unknown: psbt.unknown,
             inputs,
             outputs,
-        })
+        };
+        psbt.validate()?;
+        Ok(psbt)
     }
 
     fn v0_bridge(&self) -> Result<bitcoin::Psbt, Error> {
         let unsigned_tx = bridge_tx(
             self.tx_version,
-            self.fallback_lock_time.unwrap_or(absolute::LockTime::ZERO),
+            self.lock_time()?,
             &self.inputs,
             &self.outputs,
         );
@@ -312,6 +315,105 @@ impl PsbtV2 {
                 .map(|output| output.psbt.clone())
                 .collect(),
         })
+    }
+
+    fn lock_time(&self) -> Result<absolute::LockTime, Error> {
+        let has_time = self
+            .inputs
+            .iter()
+            .any(|input| input.required_time_lock_time.is_some());
+        let has_height = self
+            .inputs
+            .iter()
+            .any(|input| input.required_height_lock_time.is_some());
+        if !has_time && !has_height {
+            return Ok(self.fallback_lock_time.unwrap_or(absolute::LockTime::ZERO));
+        }
+        // Height wins when an input declares both: an input that accepts
+        // either kind is compatible with whatever the rest of the tx needs.
+        let height_compatible = self.inputs.iter().all(|input| {
+            input.required_height_lock_time.is_some()
+                || (input.required_time_lock_time.is_none()
+                    && input.required_height_lock_time.is_none())
+        });
+        if height_compatible {
+            return Ok(max_lock_time(
+                self.inputs
+                    .iter()
+                    .filter_map(|input| input.required_height_lock_time),
+            ));
+        }
+        let time_compatible = self.inputs.iter().all(|input| {
+            input.required_time_lock_time.is_some()
+                || (input.required_time_lock_time.is_none()
+                    && input.required_height_lock_time.is_none())
+        });
+        if time_compatible {
+            return Ok(max_lock_time(
+                self.inputs
+                    .iter()
+                    .filter_map(|input| input.required_time_lock_time),
+            ));
+        }
+        Err(Error::IncompatibleLockTimes)
+    }
+
+    pub fn validate(&self) -> Result<(), Error> {
+        self.check_reserved_fields()?;
+        for input in &self.inputs {
+            if input
+                .required_time_lock_time
+                .is_some_and(|lock_time| !lock_time.is_block_time())
+                // BIP370 reserves height locktime zero for "no requirement",
+                // so a stored zero is a malformed field, not a no-op.
+                || input.required_height_lock_time.is_some_and(|lock_time| {
+                    lock_time.is_block_time() || lock_time == absolute::LockTime::ZERO
+                })
+            {
+                return Err(Error::InvalidField);
+            }
+        }
+        for output in &self.outputs {
+            if output.script_pubkey.is_none() {
+                return Err(Error::MissingOutputScript);
+            }
+        }
+        if self.tx_modifiable.is_some() && self.tx_version.0 < transaction::Version::TWO.0 {
+            return Err(Error::InvalidField);
+        }
+        self.lock_time()?;
+        Ok(())
+    }
+
+    fn check_reserved_fields(&self) -> Result<(), Error> {
+        if self
+            .unknown
+            .keys()
+            .any(|key| GLOBAL_TYPES.contains(&key.type_value))
+        {
+            return Err(Error::ReservedField);
+        }
+        for input in &self.inputs {
+            if input
+                .psbt
+                .unknown
+                .keys()
+                .any(|key| INPUT_TYPES.contains(&key.type_value))
+            {
+                return Err(Error::ReservedField);
+            }
+        }
+        for output in &self.outputs {
+            if output
+                .psbt
+                .unknown
+                .keys()
+                .any(|key| OUTPUT_TYPES.contains(&key.type_value))
+            {
+                return Err(Error::ReservedField);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -423,6 +525,17 @@ fn v0_from_maps(
     maps.extend_from_slice(input_maps);
     maps.extend_from_slice(output_maps);
     serialize_maps(&maps)
+}
+
+fn max_lock_time(mut lock_times: impl Iterator<Item = absolute::LockTime>) -> absolute::LockTime {
+    let first = lock_times.next().expect("locktime iterator is not empty");
+    lock_times.fold(first, |max, lock_time| {
+        if lock_time.to_consensus_u32() > max.to_consensus_u32() {
+            lock_time
+        } else {
+            max
+        }
+    })
 }
 
 fn bridge_tx(
@@ -689,7 +802,8 @@ mod tests {
 
     use crate::{
         read_map, spec_key_type, Error, Input, Output, PsbtV2, TxModifiable,
-        PSBT_GLOBAL_UNSIGNED_TX, PSBT_GLOBAL_VERSION,
+        PSBT_GLOBAL_TX_VERSION, PSBT_GLOBAL_UNSIGNED_TX, PSBT_GLOBAL_VERSION, PSBT_IN_SEQUENCE,
+        PSBT_OUT_AMOUNT,
     };
 
     #[test]
@@ -831,5 +945,82 @@ mod tests {
             read_map(&mut &[0xfd, 1, 0, 0][..], spec_key_type),
             Err(Error::InvalidCompactSize)
         ));
+    }
+
+    #[test]
+    fn rejects_missing_output_script() {
+        assert_eq!(psbt(None).serialize(), Err(Error::MissingOutputScript));
+    }
+
+    #[test]
+    fn accepts_input_with_both_required_locktimes() {
+        let mut psbt = psbt_with_script();
+        psbt.inputs[0].required_time_lock_time =
+            Some(absolute::LockTime::from_consensus(500_000_000));
+        psbt.inputs[0].required_height_lock_time = Some(absolute::LockTime::from_consensus(100));
+        assert!(psbt.serialize().is_ok());
+        assert_eq!(
+            psbt.lock_time().unwrap(),
+            absolute::LockTime::from_consensus(100)
+        );
+    }
+
+    #[test]
+    fn rejects_incompatible_locktimes() {
+        let mut psbt = psbt_with_script();
+        let second = psbt.inputs[0].clone();
+        psbt.inputs.push(second);
+        psbt.inputs[0].required_time_lock_time =
+            Some(absolute::LockTime::from_consensus(500_000_000));
+        psbt.inputs[1].required_height_lock_time = Some(absolute::LockTime::from_consensus(100));
+        assert_eq!(psbt.lock_time(), Err(Error::IncompatibleLockTimes));
+    }
+
+    #[test]
+    fn rejects_invalid_required_locktime_kind() {
+        let mut psbt = psbt_with_script();
+        psbt.inputs[0].required_time_lock_time = Some(absolute::LockTime::from_consensus(100));
+        assert_eq!(psbt.serialize(), Err(Error::InvalidField));
+    }
+
+    #[test]
+    fn rejects_zero_required_height_locktime() {
+        let mut psbt = psbt_with_script();
+        psbt.inputs[0].required_height_lock_time = Some(absolute::LockTime::ZERO);
+        assert_eq!(psbt.serialize(), Err(Error::InvalidField));
+    }
+
+    #[test]
+    fn rejects_reserved_field_in_unknown_map() {
+        {
+            let mut psbt = psbt_with_script();
+            psbt.unknown
+                .insert(unkeyed(PSBT_GLOBAL_TX_VERSION), Vec::new());
+            assert_eq!(psbt.serialize(), Err(Error::ReservedField));
+        }
+        {
+            let mut psbt = psbt_with_script();
+            psbt.inputs[0]
+                .psbt
+                .unknown
+                .insert(unkeyed(PSBT_IN_SEQUENCE), Vec::new());
+            assert_eq!(psbt.serialize(), Err(Error::ReservedField));
+        }
+        {
+            let mut psbt = psbt_with_script();
+            psbt.outputs[0]
+                .psbt
+                .unknown
+                .insert(unkeyed(PSBT_OUT_AMOUNT), Vec::new());
+            assert_eq!(psbt.serialize(), Err(Error::ReservedField));
+        }
+    }
+
+    #[test]
+    fn rejects_modifiable_flags_on_version_one() {
+        let mut psbt = psbt_with_script();
+        psbt.tx_version = transaction::Version::ONE;
+        psbt.tx_modifiable = Some(TxModifiable::none());
+        assert_eq!(psbt.serialize(), Err(Error::InvalidField));
     }
 }

@@ -41,3 +41,12 @@ use bwk_psbt::PsbtV2;
 let bytes = psbt.serialize()?;
 assert_eq!(PsbtV2::deserialize(&bytes)?, psbt);
 ```
+
+## Validation
+
+`validate` checks what the key-value layout alone cannot: no PSBTv2 keytype
+hiding in an unknown map, each required locktime of the right kind (and a
+height requirement never zero, which BIP370 reserves for "no requirement"),
+every output carrying a script, modifiable flags only on a version 2
+transaction, and per-input locktime requirements that agree on one transaction
+locktime.
