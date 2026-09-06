@@ -16,7 +16,6 @@ doctest = false
 crossbeam.workspace = true
 bwk-keys.workspace = true
 bwk-descriptor.workspace = true
-bwk-persist.workspace = true
 bwk-psbt.workspace = true
 bwk-utils.workspace = true
 bip39 = { workspace = true, features = ["rand"] }

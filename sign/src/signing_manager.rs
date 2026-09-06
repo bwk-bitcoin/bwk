@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    str::FromStr,
     sync::{
         atomic::{AtomicU64, Ordering},
         Mutex,
@@ -10,7 +9,6 @@ use std::{
 use crossbeam::channel;
 
 use bwk_descriptor::descriptor::Descriptor;
-use bwk_persist::PersistError;
 
 use miniscript::{
     bitcoin::{
@@ -22,7 +20,7 @@ use miniscript::{
 
 use crate::{
     error,
-    hot_signer::{HotSigner, JsonSigner},
+    hot_signer::HotSigner,
     identity::{SignerId, SignerInfo, SignerState},
     manager,
     protocol::{self, RequestId, RequestIdSource, Response},
@@ -57,25 +55,6 @@ struct ExternalSigner {
     signer: Box<dyn Signer>,
     fingerprint: bip32::Fingerprint,
     descriptors: BTreeSet<Descriptor>,
-}
-
-/// Logical store name used by [`PersistenceBackend`] implementations
-/// for the BIP32 hot-signer store.
-pub const STORE_KEY: &str = bwk_persist::SIGNERS_STORE_KEY;
-
-pub fn encode_fingerprint(k: &bip32::Fingerprint) -> String {
-    k.to_string()
-}
-pub fn decode_fingerprint(s: &str) -> Result<bip32::Fingerprint, PersistError> {
-    bip32::Fingerprint::from_str(s)
-        .map_err(|e| PersistError::Serde(format!("bad Fingerprint pk {s:?}: {e}")))
-}
-pub fn encode_json_signer(v: &JsonSigner) -> Result<Vec<u8>, PersistError> {
-    serde_json::to_vec(v).map_err(|e| PersistError::Serde(format!("encode JsonSigner: {e}")))
-}
-pub fn decode_json_signer(bytes: &[u8]) -> Result<JsonSigner, PersistError> {
-    serde_json::from_slice(bytes)
-        .map_err(|e| PersistError::Serde(format!("decode JsonSigner: {e}")))
 }
 
 fn mint_id(counter: &AtomicU64, fingerprint: &bip32::Fingerprint) -> SignerId {
@@ -653,6 +632,8 @@ impl manager::SigningManager for HotManager {
 
 #[cfg(all(test, feature = "test"))]
 mod tests {
+    use std::str::FromStr;
+
     use bip32::Fingerprint;
     use bwk_descriptor::{derivator::SpkDerivator, descriptor::wpkh, sp_descriptor::SpDescriptor};
     use bwk_utils::test::{random_output, txid};
