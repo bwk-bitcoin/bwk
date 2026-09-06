@@ -109,7 +109,8 @@ Account (sp/src/account/mod.rs)
 ├── ElectrumScanner per sub-account descriptor (bwk-electrum)
 ├── HeaderStore (validated header chain, shared by every scanner)
 ├── Reconciler per scanner (promotes its scan against the header chain)
-└── HotManager (hot signers for the sub-account descriptors)
+└── signing managers attached by name (a hot one for the sub-account
+    descriptors when the config carries a mnemonic)
 ```
 
 ### Transaction Building (`bwk-tx`)

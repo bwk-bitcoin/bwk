@@ -59,24 +59,24 @@ const HOT_MANAGER_NAME: &str = "hot";
 
 /// One runtime-attached signing manager plus the pump thread forwarding its
 /// responses into the account's notification sender.
-struct AttachedManager {
-    manager: Box<dyn SigningManager>,
-    stop: Arc<AtomicBool>,
-    pump: Option<JoinHandle<()>>,
+pub struct AttachedManager {
+    pub manager: Box<dyn SigningManager>,
+    pub stop: Arc<AtomicBool>,
+    pub pump: Option<JoinHandle<()>>,
 }
 
 /// One cached signer identity plus the name of the manager it came from, so
 /// [`Account::detach_signing_manager`] can drop exactly that manager's
 /// entries.
-struct CachedSigner {
-    manager: String,
-    info: SignerInfo,
+pub struct CachedSigner {
+    pub manager: String,
+    pub info: SignerInfo,
 }
 
 /// Replaces every cached entry owned by `manager` with `list`: a signer whose
 /// state changes is dropped and re-registered rather than mutated, so a roster
 /// update is a wholesale replacement, not a merge.
-fn replace_manager_signers(
+pub fn replace_manager_signers(
     cache: &Mutex<BTreeMap<SignerId, CachedSigner>>,
     manager: &str,
     list: Vec<SignerInfo>,
@@ -97,7 +97,7 @@ fn replace_manager_signers(
 /// Every currently cached signer, across every attached manager. Used to
 /// emit `SignerNotification::Signers` with the account-wide list rather than
 /// one manager's slice.
-fn signers_snapshot(cache: &Mutex<BTreeMap<SignerId, CachedSigner>>) -> Vec<SignerInfo> {
+pub fn signers_snapshot(cache: &Mutex<BTreeMap<SignerId, CachedSigner>>) -> Vec<SignerInfo> {
     cache
         .lock()
         .expect("poisoned")
@@ -108,7 +108,7 @@ fn signers_snapshot(cache: &Mutex<BTreeMap<SignerId, CachedSigner>>) -> Vec<Sign
 
 /// Adapts a shared [`HotManager`] to [`SigningManager`] so it can sit in
 /// [`Account::managers`] like any other attached manager.
-struct HotManagerHandle(Arc<Mutex<HotManager>>);
+pub struct HotManagerHandle(pub Arc<Mutex<HotManager>>);
 
 impl SigningManager for HotManagerHandle {
     fn signers(&self) -> Vec<SignerInfo> {
@@ -190,7 +190,7 @@ impl SigningManager for HotManagerHandle {
 /// `Response::SignersChanged` both carry a full roster for `manager_name`, so
 /// either one replaces that manager's cached entries wholesale before the
 /// account-wide snapshot is emitted.
-fn spawn_pump(
+pub fn spawn_pump(
     manager_name: String,
     rx: channel::Receiver<Response>,
     sender: mpsc::Sender<Notification>,
@@ -284,6 +284,168 @@ fn spawn_pump(
             Err(channel::RecvTimeoutError::Disconnected) => return,
         }
     })
+}
+
+/// Test doubles for the signing-manager machinery, exposed so other account
+/// types (e.g. `bwk_sp::account::Account`) can exercise it in their own tests
+/// without duplicating a stub.
+#[cfg(feature = "test")]
+pub mod test_support {
+    use std::sync::{Arc, Mutex};
+
+    use bwk_descriptor::descriptor::Descriptor;
+    use bwk_sign::{
+        identity::{SignerId, SignerInfo},
+        manager::{self, SigningManager},
+        protocol::{RequestId, RequestIdSource, Response},
+    };
+    use crossbeam::channel;
+    use miniscript::bitcoin::bip32::DerivationPath;
+
+    /// The signer, descriptor and PSBT bytes of the last `sign` call a
+    /// [`StubManager`] received.
+    pub type LastSign = Arc<Mutex<Option<(SignerId, Descriptor, Vec<u8>)>>>;
+
+    /// Shared stub for signing-manager attach/detach tests.
+    /// Records every call it receives and keeps the sender handed to it by
+    /// `subscribe` in a shared slot, so a test can push a `Response` on it
+    /// after attaching.
+    pub struct StubManager {
+        calls: Arc<Mutex<Vec<String>>>,
+        captured_sender: Arc<Mutex<Option<channel::Sender<Response>>>>,
+        requests: RequestIdSource,
+        initial_signers: Vec<SignerInfo>,
+        /// When set, every request method panics instead of recording and
+        /// answering, so a test can assert that a non-blocking call never
+        /// reaches one.
+        panic_on_request: bool,
+        last_sign: LastSign,
+        last_register_descriptor: Arc<Mutex<Option<(SignerId, Descriptor)>>>,
+    }
+
+    impl StubManager {
+        pub fn new(
+            calls: Arc<Mutex<Vec<String>>>,
+            captured_sender: Arc<Mutex<Option<channel::Sender<Response>>>>,
+        ) -> Self {
+            Self {
+                calls,
+                captured_sender,
+                requests: RequestIdSource::new(),
+                initial_signers: Vec::new(),
+                panic_on_request: false,
+                last_sign: Arc::new(Mutex::new(None)),
+                last_register_descriptor: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        pub fn with_signers(mut self, signers: Vec<SignerInfo>) -> Self {
+            self.initial_signers = signers;
+            self
+        }
+
+        pub fn panicking(mut self) -> Self {
+            self.panic_on_request = true;
+            self
+        }
+
+        fn record(&self, call: &str) {
+            self.calls.lock().expect("poisoned").push(call.to_string());
+        }
+
+        fn deny_request(&self, call: &str) {
+            if self.panic_on_request {
+                panic!("request method {call} reached on a non-blocking call");
+            }
+        }
+
+        pub fn last_sign(&self) -> LastSign {
+            self.last_sign.clone()
+        }
+
+        pub fn last_register_descriptor(&self) -> Arc<Mutex<Option<(SignerId, Descriptor)>>> {
+            self.last_register_descriptor.clone()
+        }
+    }
+
+    impl SigningManager for StubManager {
+        fn signers(&self) -> Vec<SignerInfo> {
+            self.record("signers");
+            self.initial_signers.clone()
+        }
+
+        fn subscribe(&mut self, sender: channel::Sender<Response>) {
+            self.record("subscribe");
+            *self.captured_sender.lock().expect("poisoned") = Some(sender);
+        }
+
+        fn set_polling(&mut self, _enabled: bool) {
+            self.record("set_polling");
+        }
+
+        fn init(&mut self, _signer: &SignerId) -> Result<RequestId, manager::Error> {
+            self.deny_request("init");
+            self.record("init");
+            Ok(self.requests.next())
+        }
+
+        fn info(&self, _signer: &SignerId) -> Result<RequestId, manager::Error> {
+            self.deny_request("info");
+            self.record("info");
+            Ok(self.requests.next())
+        }
+
+        fn get_xpub(
+            &self,
+            _signer: &SignerId,
+            _path: DerivationPath,
+            _display: bool,
+        ) -> Result<RequestId, manager::Error> {
+            self.deny_request("get_xpub");
+            self.record("get_xpub");
+            Ok(self.requests.next())
+        }
+
+        fn is_descriptor_registered(
+            &self,
+            _signer: &SignerId,
+            _descriptor: Descriptor,
+        ) -> Result<RequestId, manager::Error> {
+            self.deny_request("is_descriptor_registered");
+            self.record("is_descriptor_registered");
+            Ok(self.requests.next())
+        }
+
+        fn register_descriptor(
+            &mut self,
+            signer: &SignerId,
+            descriptor: Descriptor,
+        ) -> Result<RequestId, manager::Error> {
+            self.deny_request("register_descriptor");
+            self.record("register_descriptor");
+            *self.last_register_descriptor.lock().expect("poisoned") =
+                Some((signer.clone(), descriptor));
+            Ok(self.requests.next())
+        }
+
+        fn sign(
+            &self,
+            signer: &SignerId,
+            descriptor: Descriptor,
+            psbt: Vec<u8>,
+        ) -> Result<RequestId, manager::Error> {
+            self.deny_request("sign");
+            self.record("sign");
+            *self.last_sign.lock().expect("poisoned") = Some((signer.clone(), descriptor, psbt));
+            Ok(self.requests.next())
+        }
+
+        fn raw(&self, _signer: &SignerId, _request: Vec<u8>) -> Result<RequestId, manager::Error> {
+            self.deny_request("raw");
+            self.record("raw");
+            Ok(self.requests.next())
+        }
+    }
 }
 
 /// A descriptor wallet: one [`ElectrumScanner`] watching the descriptor, one
@@ -913,7 +1075,7 @@ mod tests {
     use bip39::Mnemonic;
     use bwk_descriptor::descriptor::ScriptType;
     use bwk_persist::{config_store::FileConfigStore, storage::Store, PersistenceKind};
-    use bwk_sign::{hot_signer::HotSigner, identity::SignerState, manager::SigningManager};
+    use bwk_sign::{hot_signer::HotSigner, identity::SignerState};
     use miniscript::{
         bitcoin::{
             bip32::{self, ChildNumber, DerivationPath},
@@ -924,7 +1086,7 @@ mod tests {
     use std::{path::PathBuf, str::FromStr};
     use temp_dir::TempDir;
 
-    use crate::config::CONFIG_FILENAME;
+    use crate::{account::test_support::StubManager, config::CONFIG_FILENAME};
 
     fn persisted_offline_config(dir: &TempDir, look_ahead: u32) -> Config {
         let mnemonic = Mnemonic::generate(12).unwrap();
@@ -1195,154 +1357,6 @@ mod tests {
         let signers = account.signers();
         assert_eq!(signers.len(), 1);
         assert_eq!(signers[0].fingerprint, expected_fingerprint);
-    }
-
-    /// The signer, descriptor and PSBT bytes of the last `sign` call a
-    /// [`StubManager`] received.
-    type LastSign = Arc<Mutex<Option<(SignerId, bwk_descriptor::descriptor::Descriptor, Vec<u8>)>>>;
-
-    /// Shared stub for the signing-manager attach/detach tests below.
-    /// Records every call it receives and keeps the sender handed to it by
-    /// `subscribe` in a shared slot, so a test can push a `Response` on it
-    /// after attaching.
-    struct StubManager {
-        calls: Arc<Mutex<Vec<String>>>,
-        captured_sender: Arc<Mutex<Option<channel::Sender<Response>>>>,
-        requests: bwk_sign::protocol::RequestIdSource,
-        initial_signers: Vec<SignerInfo>,
-        /// When set, every request method panics instead of recording and
-        /// answering, so a test can assert that a non-blocking call never
-        /// reaches one.
-        panic_on_request: bool,
-        last_sign: LastSign,
-        last_register_descriptor:
-            Arc<Mutex<Option<(SignerId, bwk_descriptor::descriptor::Descriptor)>>>,
-    }
-
-    impl StubManager {
-        fn new(
-            calls: Arc<Mutex<Vec<String>>>,
-            captured_sender: Arc<Mutex<Option<channel::Sender<Response>>>>,
-        ) -> Self {
-            Self {
-                calls,
-                captured_sender,
-                requests: bwk_sign::protocol::RequestIdSource::new(),
-                initial_signers: Vec::new(),
-                panic_on_request: false,
-                last_sign: Arc::new(Mutex::new(None)),
-                last_register_descriptor: Arc::new(Mutex::new(None)),
-            }
-        }
-
-        fn with_signers(mut self, signers: Vec<SignerInfo>) -> Self {
-            self.initial_signers = signers;
-            self
-        }
-
-        fn panicking(mut self) -> Self {
-            self.panic_on_request = true;
-            self
-        }
-
-        fn record(&self, call: &str) {
-            self.calls.lock().expect("poisoned").push(call.to_string());
-        }
-
-        fn deny_request(&self, call: &str) {
-            if self.panic_on_request {
-                panic!("request method {call} reached on a non-blocking call");
-            }
-        }
-
-        fn last_sign(&self) -> LastSign {
-            self.last_sign.clone()
-        }
-
-        fn last_register_descriptor(
-            &self,
-        ) -> Arc<Mutex<Option<(SignerId, bwk_descriptor::descriptor::Descriptor)>>> {
-            self.last_register_descriptor.clone()
-        }
-    }
-
-    impl SigningManager for StubManager {
-        fn signers(&self) -> Vec<SignerInfo> {
-            self.record("signers");
-            self.initial_signers.clone()
-        }
-
-        fn subscribe(&mut self, sender: channel::Sender<Response>) {
-            self.record("subscribe");
-            *self.captured_sender.lock().expect("poisoned") = Some(sender);
-        }
-
-        fn set_polling(&mut self, _enabled: bool) {
-            self.record("set_polling");
-        }
-
-        fn init(&mut self, _signer: &SignerId) -> Result<RequestId, manager::Error> {
-            self.deny_request("init");
-            self.record("init");
-            Ok(self.requests.next())
-        }
-
-        fn info(&self, _signer: &SignerId) -> Result<RequestId, manager::Error> {
-            self.deny_request("info");
-            self.record("info");
-            Ok(self.requests.next())
-        }
-
-        fn get_xpub(
-            &self,
-            _signer: &SignerId,
-            _path: DerivationPath,
-            _display: bool,
-        ) -> Result<RequestId, manager::Error> {
-            self.deny_request("get_xpub");
-            self.record("get_xpub");
-            Ok(self.requests.next())
-        }
-
-        fn is_descriptor_registered(
-            &self,
-            _signer: &SignerId,
-            _descriptor: bwk_descriptor::descriptor::Descriptor,
-        ) -> Result<RequestId, manager::Error> {
-            self.deny_request("is_descriptor_registered");
-            self.record("is_descriptor_registered");
-            Ok(self.requests.next())
-        }
-
-        fn register_descriptor(
-            &mut self,
-            signer: &SignerId,
-            descriptor: bwk_descriptor::descriptor::Descriptor,
-        ) -> Result<RequestId, manager::Error> {
-            self.deny_request("register_descriptor");
-            self.record("register_descriptor");
-            *self.last_register_descriptor.lock().expect("poisoned") =
-                Some((signer.clone(), descriptor));
-            Ok(self.requests.next())
-        }
-
-        fn sign(
-            &self,
-            signer: &SignerId,
-            descriptor: bwk_descriptor::descriptor::Descriptor,
-            psbt: Vec<u8>,
-        ) -> Result<RequestId, manager::Error> {
-            self.deny_request("sign");
-            self.record("sign");
-            *self.last_sign.lock().expect("poisoned") = Some((signer.clone(), descriptor, psbt));
-            Ok(self.requests.next())
-        }
-
-        fn raw(&self, _signer: &SignerId, _request: Vec<u8>) -> Result<RequestId, manager::Error> {
-            self.deny_request("raw");
-            self.record("raw");
-            Ok(self.requests.next())
-        }
     }
 
     fn account_for_signing_tests() -> (Account, TempDir) {

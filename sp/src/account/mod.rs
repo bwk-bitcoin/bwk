@@ -36,13 +36,14 @@ use {
         Amount, Network, OutPoint, ScriptBuf, TxOut, Txid,
     },
     bwk::{
+        account::{AttachedManager, CachedSigner, HotManagerHandle},
         bwk_electrum::{
             coin_store::SpendRecorder,
             config::{Endpoint, ScannerConfig},
             header_follower::HeaderFollower,
             header_store::HeaderStore,
             label_store::{LabelKey, LabelStore},
-            notification::{Notification, SpNotification},
+            notification::{Notification, SignerNotification, SpNotification},
             profile::{DefaultBackend, RamProfile},
             raw_client::CertificateCheck,
             reconcile::Reconciler,
@@ -50,11 +51,20 @@ use {
         },
         persist::config_store::{ConfigStore, NoopConfigStore},
     },
-    bwk_sign::{bwk_descriptor, signing_manager::HotManager},
+    bwk_sign::{
+        bwk_descriptor,
+        identity::{SignerId, SignerInfo},
+        manager::SigningManager,
+        signing_manager::HotManager,
+    },
+    crossbeam::channel,
     miniscript::psbt::PsbtExt,
     std::{
         collections::{BTreeMap, BTreeSet},
-        sync::{atomic::AtomicBool, mpsc, Arc, Mutex},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc, Arc, Mutex,
+        },
         thread::{self, JoinHandle},
     },
 };
@@ -115,7 +125,14 @@ pub enum AccountError {
     SilentPayment(#[from] crate::core::error::Error),
     #[error("psbtv2 error")]
     PsbtV2,
+    #[error("signing manager {0} is already attached")]
+    ManagerAlreadyAttached(String),
 }
+
+/// Well-known name of the hot manager an `Account` attaches for the signers
+/// its mnemonics yield.
+#[cfg(feature = "mnemonic")]
+const HOT_MANAGER_NAME: &str = "hot";
 
 #[cfg(feature = "mnemonic")]
 struct SpendAnalysis {
@@ -398,10 +415,6 @@ pub struct Account<
     pub(crate) scanner_stop: Arc<AtomicBool>,
     /// Sub-accounts use the default bwk RAM profile, independent of sp's P.
     sub_accounts: Vec<SubAccount>,
-    /// Hot signers for the BIP32 sub-accounts. The scanners only watch
-    /// descriptors, so the wallet keeps the signing side here, once for the
-    /// whole account.
-    signing_manager: HotManager,
     /// The validated header chain this account promotes its scanners against,
     /// and the endpoint it follows.
     headers: HeaderFollower<RamProfile<DefaultBackend>>,
@@ -409,6 +422,18 @@ pub struct Account<
     /// if one was supplied. Cached so nothing downstream needs to reach a
     /// master xpriv to learn it.
     mnemonic_fingerprint: Option<bitcoin::bip32::Fingerprint>,
+    /// Signing managers attached to this account, keyed by caller-supplied
+    /// name. See [`Account::attach_signing_manager`].
+    managers: BTreeMap<String, AttachedManager>,
+    /// Cache of every signer reachable through `managers`, keyed by its
+    /// unique [`SignerId`]. Seeded on attach, dropped on detach, kept
+    /// current by each manager's pump thread.
+    signers: Arc<Mutex<BTreeMap<SignerId, CachedSigner>>>,
+    /// Handle to the attached hot manager. The scanners only watch
+    /// descriptors, so the signers their mnemonics yield live here, once for
+    /// the whole account, and a sub-account added later seeds its own: the
+    /// `SigningManager` trait cannot add a signer.
+    hot: Option<Arc<Mutex<HotManager>>>,
 }
 
 #[cfg(feature = "mnemonic")]
@@ -531,9 +556,12 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
 
         // One scanner per configured sub-account descriptor, all reporting on
         // this account's channel, plus the signers they cannot hold themselves.
-        // In memory: every sub-signer is re-derivable from a mnemonic the
+        // In memory: every signer is re-derivable from a mnemonic the
         // persisted config already carries.
-        let mut signing_manager = HotManager::new();
+        let mut hot_manager = HotManager::new();
+        if let Some(mnemonic) = config.mnemonic.clone() {
+            hot_manager.new_bip32_signer_from_mnemonic(config.network, mnemonic);
+        }
         let mut scanners = Vec::with_capacity(config.descriptors.len());
         for (i, sub_cfg) in config.descriptors.iter().enumerate() {
             let name = format!("{}-sub-{}", config.account_name, i);
@@ -557,7 +585,7 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
             )?);
             if let Some(mnemonic) = sub_cfg.mnemonic.clone().or_else(|| config.mnemonic.clone()) {
                 register_sub_signer(
-                    &mut signing_manager,
+                    &mut hot_manager,
                     config.network,
                     &mnemonic,
                     sub_cfg.descriptor.clone(),
@@ -609,7 +637,7 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
             .as_deref()
             .and_then(|mnemonic| crate::receiver::mnemonic_fingerprint(mnemonic, config.network));
 
-        Ok(Account {
+        let mut account = Account {
             sp_receiver,
             agent,
             coin_store,
@@ -625,10 +653,19 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
             broadcast_handle: None,
             scanner_stop: Arc::new(AtomicBool::new(false)),
             sub_accounts,
-            signing_manager,
             headers,
             mnemonic_fingerprint,
-        })
+            managers: BTreeMap::new(),
+            signers: Arc::new(Mutex::new(BTreeMap::new())),
+            hot: None,
+        };
+        // Registration of the account's own descriptor stays consumer-driven,
+        // so none is pushed here. Watch-only construction with no keyed
+        // sub-account attaches nothing.
+        if !hot_manager.signers().is_empty() {
+            account.attach_hot_manager(hot_manager)?;
+        }
+        Ok(account)
     }
 
     /// Create account from mnemonic (convenience constructor).
@@ -879,12 +916,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         mnemonic: Option<String>,
     ) -> Result<(), AccountError> {
         if let Some(mnemonic) = mnemonic {
-            register_sub_signer(
-                &mut self.signing_manager,
-                self.config.network,
-                &mnemonic,
-                scanner.wallet_descriptor(),
-            )?;
+            self.seed_sub_signer(&mnemonic, scanner.wallet_descriptor())?;
         }
         // Spawned first: the reconciler registers for the scan ticks, so a
         // scan started before it would fire them at nobody.
@@ -917,9 +949,162 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         self.sub_accounts.iter_mut().map(|sub| &mut sub.scanner)
     }
 
-    /// Every BIP32 master xpriv the sub-account hot signers hold.
-    pub fn master_xprivs(&self) -> BTreeMap<bitcoin::bip32::Fingerprint, bitcoin::bip32::Xpriv> {
-        self.signing_manager.master_xprivs()
+    /// Seeds a sub-account's hot signer into the hot manager, attaching one
+    /// when a watch-only account has none yet.
+    fn seed_sub_signer(
+        &mut self,
+        mnemonic: &str,
+        descriptor: bwk_sign::bwk_descriptor::descriptor::Descriptor,
+    ) -> Result<(), AccountError> {
+        let Some(hot) = self.hot.clone() else {
+            let mut hot_manager = HotManager::new();
+            register_sub_signer(&mut hot_manager, self.config.network, mnemonic, descriptor)?;
+            return self.attach_hot_manager(hot_manager);
+        };
+        register_sub_signer(
+            &mut hot.lock().expect("poisoned"),
+            self.config.network,
+            mnemonic,
+            descriptor,
+        )?;
+        self.refresh_signers();
+        let _ = self.sender.send(
+            SignerNotification::Signers(bwk::account::signers_snapshot(&self.signers)).into(),
+        );
+        Ok(())
+    }
+
+    // Signing managers
+
+    fn attach_hot_manager(&mut self, hot_manager: HotManager) -> Result<(), AccountError> {
+        let hot = Arc::new(Mutex::new(hot_manager));
+        self.attach_signing_manager(HOT_MANAGER_NAME, Box::new(HotManagerHandle(hot.clone())))?;
+        self.hot = Some(hot);
+        Ok(())
+    }
+
+    /// Attach a manager to this silent-payment account, next to the hot
+    /// manager holding the signers of every sub-account.
+    ///
+    /// Non-blocking: this only subscribes to the manager's response channel
+    /// and spawns its pump thread, it never registers a descriptor, requests
+    /// an xpub, or polls for devices.
+    ///
+    /// Refuses a duplicate `name` rather than replacing the existing
+    /// manager.
+    pub fn attach_signing_manager(
+        &mut self,
+        name: &str,
+        mut manager: Box<dyn SigningManager>,
+    ) -> Result<(), AccountError> {
+        if self.managers.contains_key(name) {
+            return Err(AccountError::ManagerAlreadyAttached(name.to_string()));
+        }
+        let (tx, rx) = channel::unbounded();
+        manager.subscribe(tx);
+        let stop = Arc::new(AtomicBool::new(false));
+        let pump = bwk::account::spawn_pump(
+            name.to_string(),
+            rx,
+            self.sender.clone(),
+            stop.clone(),
+            self.signers.clone(),
+        );
+        // A synchronous read of what the manager already knows, not a
+        // request, so it does not violate the non-blocking rule.
+        let initial = manager.signers();
+        bwk::account::replace_manager_signers(&self.signers, name, initial);
+        self.managers.insert(
+            name.to_string(),
+            AttachedManager {
+                manager,
+                stop,
+                pump: Some(pump),
+            },
+        );
+        let _ = self.sender.send(
+            SignerNotification::ManagerAttached {
+                manager: name.to_string(),
+            }
+            .into(),
+        );
+        let _ = self.sender.send(
+            SignerNotification::Signers(bwk::account::signers_snapshot(&self.signers)).into(),
+        );
+        Ok(())
+    }
+
+    /// Detaches the manager registered under `name`, stopping its pump
+    /// thread and dropping its signers from the cache. Returns whether a
+    /// manager was actually removed.
+    pub fn detach_signing_manager(&mut self, name: &str) -> bool {
+        let Some(mut attached) = self.managers.remove(name) else {
+            return false;
+        };
+        if name == HOT_MANAGER_NAME {
+            self.hot = None;
+        }
+        attached.stop.store(true, Ordering::Relaxed);
+        drop(attached.manager);
+        if let Some(pump) = attached.pump.take() {
+            let _ = pump.join();
+        }
+        self.signers
+            .lock()
+            .expect("poisoned")
+            .retain(|_, entry| entry.manager != name);
+        let _ = self.sender.send(
+            SignerNotification::ManagerDetached {
+                manager: name.to_string(),
+            }
+            .into(),
+        );
+        let _ = self.sender.send(
+            SignerNotification::Signers(bwk::account::signers_snapshot(&self.signers)).into(),
+        );
+        true
+    }
+
+    /// Names of every currently attached signing manager.
+    pub fn signing_manager_names(&self) -> Vec<String> {
+        self.managers.keys().cloned().collect()
+    }
+
+    /// Every signer reachable through an attached manager, from the local
+    /// cache. Synchronous and never touches a device.
+    pub fn signers(&self) -> Vec<SignerInfo> {
+        self.signers
+            .lock()
+            .expect("poisoned")
+            .values()
+            .map(|cached| cached.info.clone())
+            .collect()
+    }
+
+    /// The cached identity of one signer, if it is currently known.
+    pub fn signer(&self, id: &SignerId) -> Option<SignerInfo> {
+        self.signers
+            .lock()
+            .expect("poisoned")
+            .get(id)
+            .map(|cached| cached.info.clone())
+    }
+
+    /// Re-reads `signers()` from every attached manager and refreshes the
+    /// cache. Synchronous and cheap: it only reads what each manager already
+    /// holds, it never sends a request to a device.
+    pub fn refresh_signers(&self) {
+        for (name, attached) in self.managers.iter() {
+            let list = attached.manager.signers();
+            bwk::account::replace_manager_signers(&self.signers, name, list);
+        }
+    }
+
+    /// Turns device discovery on and off on every attached manager.
+    pub fn set_signer_polling(&mut self, enabled: bool) {
+        for attached in self.managers.values_mut() {
+            attached.manager.set_polling(enabled);
+        }
     }
 
     /// The BIP32 master fingerprint derived from this account's
@@ -1531,6 +1716,10 @@ impl<P: crate::profile::SpStorageProfile> Drop for Account<P> {
         if let Some(handle) = self.broadcast_handle.take() {
             let _ = handle.join();
         }
+        let names: Vec<String> = self.managers.keys().cloned().collect();
+        for name in names {
+            self.detach_signing_manager(&name);
+        }
         self.persist();
     }
 }
@@ -1629,7 +1818,8 @@ mod tests {
         key::TweakedPublicKey,
         secp256k1::{Parity, SecretKey},
     };
-    use bwk::bwk_electrum::raw_client::CertificateCheck;
+    use bwk::{account::test_support::StubManager, bwk_electrum::raw_client::CertificateCheck};
+    use bwk_sign::protocol::Response;
     use std::{path::PathBuf, str::FromStr};
 
     fn test_config() -> Config {
@@ -2586,6 +2776,140 @@ mod tests {
         // No signer ever touched this PSBT: the account cannot produce a
         // spendable transaction on its own.
         assert!(account.finalize_psbt_v2(&psbt).is_err());
+    }
+
+    #[test]
+    fn attach_then_detach_stops_the_pump() {
+        let mut account = Account::new(test_config()).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(calls, captured_sender);
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+        assert!(account
+            .signing_manager_names()
+            .contains(&"stub".to_string()));
+
+        assert!(account.detach_signing_manager("stub"));
+        assert!(!account
+            .signing_manager_names()
+            .contains(&"stub".to_string()));
+        assert!(!account.detach_signing_manager("stub"));
+    }
+
+    #[test]
+    fn watch_only_account_attaches_no_manager() {
+        let watch_only_config = Config::from_descriptor(
+            "watch-only-no-manager".to_string(),
+            Network::Signet,
+            test_config().descriptor,
+            "https://blindbit.example.com".to_string(),
+            PathBuf::from("/tmp/bwk-sp-account-watch-only-no-manager-test"),
+        )
+        .with_persistence(None);
+        let account = Account::new(watch_only_config).unwrap();
+
+        assert!(account.signing_manager_names().is_empty());
+    }
+
+    #[test]
+    fn mnemonic_account_attaches_a_hot_manager() {
+        let account = Account::new(test_config()).unwrap();
+
+        assert_eq!(account.signing_manager_names().len(), 1);
+        assert!(!account.signers().is_empty());
+    }
+
+    #[test]
+    fn attach_registers_nothing() {
+        let mut account = Account::new(test_config()).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let stub = StubManager::new(calls.clone(), Arc::new(Mutex::new(None)));
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert!(calls.contains(&"subscribe".to_string()));
+        assert!(calls.contains(&"signers".to_string()));
+        assert!(!calls.contains(&"register_descriptor".to_string()));
+        assert!(!calls.contains(&"get_xpub".to_string()));
+    }
+
+    #[test]
+    fn sub_account_signer_joins_the_hot_manager() {
+        let mut account = Account::new(test_config()).unwrap();
+        let (sub, mnemonic) = build_offline_segwit_sub("sub-segwit-0");
+        let fingerprint = bwk_sign::hot_signer::HotSigner::new_from_mnemonics(
+            bitcoin::Network::Regtest,
+            &mnemonic,
+        )
+        .unwrap()
+        .fingerprint();
+
+        account.add_sub_account(sub, Some(mnemonic)).unwrap();
+
+        assert_eq!(
+            account.signing_manager_names(),
+            vec![HOT_MANAGER_NAME.to_string()]
+        );
+        assert!(account
+            .signers()
+            .iter()
+            .any(|info| info.fingerprint == fingerprint));
+    }
+
+    #[test]
+    fn watch_only_account_attaches_a_sub_account_signer() {
+        let watch_only_config = Config::from_descriptor(
+            "watch-only-sub-signer".to_string(),
+            Network::Signet,
+            test_config().descriptor,
+            "https://blindbit.example.com".to_string(),
+            PathBuf::from("/tmp/bwk-sp-account-watch-only-sub-signer-test"),
+        )
+        .with_persistence(None);
+        let mut account = Account::new(watch_only_config).unwrap();
+        let (sub, mnemonic) = build_offline_segwit_sub("sub-segwit-0");
+
+        account.add_sub_account(sub, Some(mnemonic)).unwrap();
+
+        assert_eq!(
+            account.signing_manager_names(),
+            vec![HOT_MANAGER_NAME.to_string()]
+        );
+        assert_eq!(account.signers().len(), 1);
+    }
+
+    #[test]
+    fn manager_notifications_reach_the_sp_channel() {
+        let mut account = Account::new(test_config()).unwrap();
+        let receiver = account.receiver().unwrap();
+
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), captured_sender.clone());
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let sender = captured_sender.lock().unwrap().clone().unwrap();
+        sender
+            .send(Response::SignersChanged { signers: vec![] })
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for notification"
+            );
+            match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(Notification::Signer(_)) => break,
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
     }
 
     #[test]
