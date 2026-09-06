@@ -25,9 +25,20 @@ use bitcoin::{
 };
 
 use blindbitd::BlindbitD;
-use bwk_utils::test::{corepc_node, temp_dir::TempDir};
+use bwk_utils::{
+    mock_manager::{self, MockRemote, SpSignHook},
+    test::{corepc_node, temp_dir::TempDir},
+};
+use crossbeam::channel;
 
-use bwk_sign::{bwk_descriptor::sp_descriptor::SpDescriptor, hot_signer::HotSigner};
+use bwk_sign::{
+    bwk_descriptor::{descriptor::Descriptor, sp_descriptor::SpDescriptor},
+    hot_signer::HotSigner,
+    identity::{SignerId, SignerInfo},
+    manager::{self, SigningManager},
+    protocol::{RequestId, Response},
+    remote_manager::RemoteManager,
+};
 use bwk_sp::{
     account::config::Config,
     receiver::{OutputSpendStatus, OwnedOutput},
@@ -709,7 +720,11 @@ pub fn swap_to_sp(
 
 // TestEnv: integration test harness
 
-use bwk::bwk_electrum::{config::ScannerConfig, scanner::ElectrumScanner};
+use bwk::bwk_electrum::{
+    config::ScannerConfig,
+    notification::{Notification, SignerNotification},
+    scanner::ElectrumScanner,
+};
 use bwk_coin::{Coin, CoinSpendInfo, CoinStatus, KeyChain};
 
 /// Mnemonic for BIP32 coins (different from SP mnemonics).
@@ -1149,6 +1164,151 @@ pub fn sign_and_finalize_v2(
     }
     *psbt = bwk_psbt::PsbtV2::from_bitcoin_psbt(v0).unwrap();
     account.finalize(&psbt.serialize().unwrap()).unwrap()
+}
+
+/// A [`SigningManager`] bundling a [`RemoteManager`] with the [`MockRemote`]
+/// answering it, so both live and die together: `MockRemote`'s background
+/// responder thread must outlive every call the account makes through the
+/// manager. Every trait method delegates straight to `remote`.
+struct MockSpManager {
+    remote: RemoteManager,
+    _worker: MockRemote,
+}
+
+impl SigningManager for MockSpManager {
+    fn signers(&self) -> Vec<SignerInfo> {
+        self.remote.signers()
+    }
+
+    fn subscribe(&mut self, sender: channel::Sender<Response>) {
+        self.remote.subscribe(sender)
+    }
+
+    fn set_polling(&mut self, enabled: bool) {
+        self.remote.set_polling(enabled)
+    }
+
+    fn init(&mut self, signer: &SignerId) -> Result<RequestId, manager::Error> {
+        self.remote.init(signer)
+    }
+
+    fn info(&self, signer: &SignerId) -> Result<RequestId, manager::Error> {
+        self.remote.info(signer)
+    }
+
+    fn get_xpub(
+        &self,
+        signer: &SignerId,
+        path: bitcoin::bip32::DerivationPath,
+        display: bool,
+    ) -> Result<RequestId, manager::Error> {
+        self.remote.get_xpub(signer, path, display)
+    }
+
+    fn is_descriptor_registered(
+        &self,
+        signer: &SignerId,
+        descriptor: Descriptor,
+    ) -> Result<RequestId, manager::Error> {
+        self.remote.is_descriptor_registered(signer, descriptor)
+    }
+
+    fn register_descriptor(
+        &mut self,
+        signer: &SignerId,
+        descriptor: Descriptor,
+    ) -> Result<RequestId, manager::Error> {
+        self.remote.register_descriptor(signer, descriptor)
+    }
+
+    fn sign(
+        &self,
+        signer: &SignerId,
+        descriptor: Descriptor,
+        psbt: Vec<u8>,
+    ) -> Result<RequestId, manager::Error> {
+        self.remote.sign(signer, descriptor, psbt)
+    }
+
+    fn raw(&self, signer: &SignerId, request: Vec<u8>) -> Result<RequestId, manager::Error> {
+        self.remote.raw(signer, request)
+    }
+}
+
+/// Builds a mock remote signing manager backed by an [`bwk_sp::signer::SpSigner`]
+/// derived from `mnemonic`: from the account's point of view it is
+/// indistinguishable from an out-of-process signer answering the BIP375
+/// generator and BIP376 signer roles. The only place in a test using this
+/// helper that should ever touch `mnemonic` again is building the matching
+/// watch-only descriptor; the account under test must stay watch-only.
+pub fn mock_sp_manager(mnemonic: &str, network: bitcoin::Network) -> Box<dyn SigningManager> {
+    let signer = bwk_sp::signer::SpSigner::from_mnemonic(
+        mnemonic,
+        network,
+        bitcoin::bip32::ChildNumber::from_hardened_idx(0).unwrap(),
+    )
+    .unwrap();
+    let hook: SpSignHook = Box::new(move |bytes| {
+        let mut psbt = bwk_psbt::PsbtV2::deserialize(&bytes).map_err(|e| e.to_string())?;
+        signer.sign(&mut psbt).map_err(|e| e.to_string())?;
+        psbt.serialize().map_err(|e| e.to_string())
+    });
+    let (remote, worker) = mock_manager::spawn_with_sp_hook(network, &[mnemonic], hook);
+    Box::new(MockSpManager {
+        remote,
+        _worker: worker,
+    })
+}
+
+/// Drains notifications until the signer's verdict on a just-signed PSBT
+/// arrives: `Ok` with the verified bytes, or `Err` with the verifier's
+/// rejection reason. Ignores every other notification on the channel (coin
+/// updates, header traffic) rather than failing on them.
+pub fn wait_for_signed_psbt(
+    rx: &std::sync::mpsc::Receiver<Notification>,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("timed out waiting for a signed psbt notification".to_string());
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(Notification::Signer(SignerNotification::PsbtVerified { psbt, .. })) => {
+                return Ok(psbt)
+            }
+            Ok(Notification::Signer(SignerNotification::PsbtVerificationFailed {
+                reason, ..
+            })) => return Err(reason),
+            Ok(_) => continue,
+            Err(_) => return Err("notification channel disconnected".to_string()),
+        }
+    }
+}
+
+/// Drains notifications until the account's cached signer list is non-empty,
+/// or `timeout` elapses. `attach_signing_manager` subscribes to the manager
+/// and reads its cache synchronously before the manager's background
+/// responder has necessarily answered `ListSigners`, so a consumer wanting to
+/// address a freshly attached remote signer must wait for the
+/// `SignerNotification::Signers` update this produces.
+pub fn wait_for_signers(
+    rx: &std::sync::mpsc::Receiver<Notification>,
+    timeout: Duration,
+) -> Vec<SignerInfo> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "timed out waiting for signers");
+        match rx.recv_timeout(remaining) {
+            Ok(Notification::Signer(SignerNotification::Signers(list))) if !list.is_empty() => {
+                return list
+            }
+            Ok(_) => continue,
+            Err(e) => panic!("notification channel error while waiting for signers: {e}"),
+        }
+    }
 }
 
 // Tests for test utilities

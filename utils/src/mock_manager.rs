@@ -54,11 +54,36 @@ impl Drop for MockRemote {
     }
 }
 
+/// Signs an `sp()` descriptor's PSBT bytes, in place of the built-in
+/// `HotSigner` path which only handles miniscript descriptors. `bwk-utils`
+/// cannot depend on `bwk-sp` to build one itself (silent payments are a
+/// `bwk-sp` concept), so a caller supplies this hook, typically backed by an
+/// `SpSigner`, through [`spawn_with_sp_hook`].
+pub type SpSignHook = Box<dyn Fn(Vec<u8>) -> Result<Vec<u8>, String> + Send + Sync>;
+
 /// Spawns a mock far end backed by one real [`HotSigner`] per mnemonic and
 /// returns the [`RemoteManager`] paired with it. Two entries built from the
 /// same mnemonic get distinct [`SignerId`]s sharing one fingerprint, the same
 /// way two hardware devices holding the same seed would.
 pub fn spawn(network: bitcoin::Network, mnemonics: &[&str]) -> (RemoteManager, MockRemote) {
+    spawn_inner(network, mnemonics, None)
+}
+
+/// Like [`spawn`], but routes `sp()` descriptor sign requests through
+/// `sp_sign` instead of answering them with an error.
+pub fn spawn_with_sp_hook(
+    network: bitcoin::Network,
+    mnemonics: &[&str],
+    sp_sign: SpSignHook,
+) -> (RemoteManager, MockRemote) {
+    spawn_inner(network, mnemonics, Some(sp_sign))
+}
+
+fn spawn_inner(
+    network: bitcoin::Network,
+    mnemonics: &[&str],
+    sp_sign: Option<SpSignHook>,
+) -> (RemoteManager, MockRemote) {
     let (manager, requests, responses) = RemoteManager::pair();
 
     let signers: BTreeMap<SignerId, HotSigner> = mnemonics
@@ -77,7 +102,9 @@ pub fn spawn(network: bitcoin::Network, mnemonics: &[&str]) -> (RemoteManager, M
     let handle = {
         let shutdown = shutdown.clone();
         let fail_next = fail_next.clone();
-        thread::spawn(move || responder_loop(signers, requests, responses, shutdown, fail_next))
+        thread::spawn(move || {
+            responder_loop(signers, requests, responses, shutdown, fail_next, sp_sign)
+        })
     };
 
     (
@@ -96,6 +123,7 @@ fn responder_loop(
     responses: channel::Sender<Response>,
     shutdown: Arc<AtomicBool>,
     fail_next: Arc<Mutex<Option<String>>>,
+    sp_sign: Option<SpSignHook>,
 ) {
     while !shutdown.load(Ordering::SeqCst) {
         let request = match requests.recv_timeout(Duration::from_millis(200)) {
@@ -110,7 +138,7 @@ fn responder_loop(
                 signer: request.signer().cloned(),
                 message,
             },
-            None => handle_request(&mut signers, request),
+            None => handle_request(&mut signers, request, sp_sign.as_ref()),
         };
 
         if responses.send(response).is_err() {
@@ -133,7 +161,11 @@ fn signer_infos(signers: &BTreeMap<SignerId, HotSigner>) -> Vec<SignerInfo> {
         .collect()
 }
 
-fn handle_request(signers: &mut BTreeMap<SignerId, HotSigner>, request: Request) -> Response {
+fn handle_request(
+    signers: &mut BTreeMap<SignerId, HotSigner>,
+    request: Request,
+    sp_sign: Option<&SpSignHook>,
+) -> Response {
     match request {
         Request::ListSigners { request } => Response::Signers {
             request,
@@ -214,6 +246,23 @@ fn handle_request(signers: &mut BTreeMap<SignerId, HotSigner>, request: Request)
             let Some(hot) = signers.get(&signer) else {
                 return Response::error(request, signer, "unknown signer");
             };
+            if descriptor.is_sp() {
+                let Some(sp_sign) = sp_sign else {
+                    return Response::error(
+                        request,
+                        signer,
+                        "sp() descriptors are not signable yet",
+                    );
+                };
+                return match sp_sign(psbt) {
+                    Ok(psbt) => Response::Signed {
+                        request,
+                        signer,
+                        psbt,
+                    },
+                    Err(e) => Response::error(request, signer, e),
+                };
+            }
             let Ok(mut psbt) = bitcoin::Psbt::deserialize(&psbt) else {
                 return Response::error(request, signer, "psbt is not deserializable");
             };
@@ -266,7 +315,7 @@ mod tests {
     };
 
     use crate::{
-        mock_manager::spawn,
+        mock_manager::{spawn, spawn_with_sp_hook, SpSignHook},
         test::{funding_tx, random_output},
     };
 
@@ -494,21 +543,78 @@ mod tests {
         let rx = subscribe(&mut manager);
         let id = first_signer(&rx);
 
+        let request = manager.register_descriptor(&id, sp_descriptor()).unwrap();
+        match recv(&rx) {
+            Response::Error { request: req, .. } => assert_eq!(req, Some(request)),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    fn sp_descriptor() -> Descriptor {
         let secp = bitcoin::secp256k1::Secp256k1::new();
         let scan =
             bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Regtest, &[0x09; 64]).unwrap();
         let spend =
             bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Regtest, &[0x0a; 64]).unwrap();
         let spend_xpub = bitcoin::bip32::Xpub::from_priv(&secp, &spend);
-        let descriptor: Descriptor = SpDescriptor::from_str(&format!(
+        SpDescriptor::from_str(&format!(
             "sp([deadbeef/352h/1h/0h]{scan}/0h,{spend_xpub}/0h)"
         ))
         .unwrap()
-        .into();
+        .into()
+    }
 
-        let request = manager.register_descriptor(&id, descriptor).unwrap();
+    #[test]
+    fn sp_sign_without_a_hook_answers_with_an_error() {
+        let (mut manager, _mock) = spawn(bitcoin::Network::Regtest, &[MNEMONIC_A]);
+        let rx = subscribe(&mut manager);
+        let id = first_signer(&rx);
+
+        let request = manager.sign(&id, sp_descriptor(), vec![1, 2, 3]).unwrap();
         match recv(&rx) {
             Response::Error { request: req, .. } => assert_eq!(req, Some(request)),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sp_sign_routes_through_the_hook() {
+        let hook: SpSignHook = Box::new(|psbt| Ok([psbt, vec![0xaa]].concat()));
+        let (mut manager, _mock) =
+            spawn_with_sp_hook(bitcoin::Network::Regtest, &[MNEMONIC_A], hook);
+        let rx = subscribe(&mut manager);
+        let id = first_signer(&rx);
+
+        let request = manager.sign(&id, sp_descriptor(), vec![1, 2, 3]).unwrap();
+        match recv(&rx) {
+            Response::Signed {
+                request: req, psbt, ..
+            } => {
+                assert_eq!(req, request);
+                assert_eq!(psbt, vec![1, 2, 3, 0xaa]);
+            }
+            other => panic!("expected Signed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sp_sign_hook_error_is_forwarded() {
+        let hook: SpSignHook = Box::new(|_psbt| Err("bad sp psbt".to_string()));
+        let (mut manager, _mock) =
+            spawn_with_sp_hook(bitcoin::Network::Regtest, &[MNEMONIC_A], hook);
+        let rx = subscribe(&mut manager);
+        let id = first_signer(&rx);
+
+        let request = manager.sign(&id, sp_descriptor(), vec![1, 2, 3]).unwrap();
+        match recv(&rx) {
+            Response::Error {
+                request: req,
+                message,
+                ..
+            } => {
+                assert_eq!(req, Some(request));
+                assert_eq!(message, "bad sp psbt");
+            }
             other => panic!("expected Error, got {other:?}"),
         }
     }
