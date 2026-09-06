@@ -50,7 +50,7 @@ tests locally. Commit messages must be single-line and follow existing style
 | bwk-electrum    | Electrum protocol client (TCP/SSL), ElectrumScanner, and    |
 |                 | the scan stores, the header chain and the reconcile pass    |
 | bwk-sign        | Hot signer, SigningManager for BIP32 key management         |
-| bwk-descriptor  | Miniscript descriptor handling, SpkDerivator                |
+| bwk-descriptor  | Miniscript and sp() descriptor handling, SpkDerivator       |
 | bwk-keys        | Key derivation utilities (OXpriv, OXpub, KeyDerivator)      |
 | bwk-p2p         | Bitcoin P2P network client, DNS seed resolution             |
 | bwk-coin        | Coin domain types shared by bwk-tx and bwk-electrum         |
