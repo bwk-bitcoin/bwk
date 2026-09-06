@@ -29,6 +29,21 @@ pub enum Error {
     ParsePsbt,
 }
 
+/// Duplicated from `bwk_utils::short_string` rather than depending on
+/// `bwk-utils`, which would create a dependency cycle (`bwk-utils` depends on
+/// `bwk-sign`). Covered by a test asserting the two agree so the duplication
+/// cannot drift silently.
+fn short_string(s: String, len: usize) -> String {
+    assert!(len > 6);
+    let separator = if len % 2 != 0 { "." } else { ".." };
+    let head = (len - 2).div_ceil(2);
+    let tail = head;
+    if s.len() <= head + tail + 2 {
+        return s.to_string();
+    }
+    format!("{}{separator}{}", &s[..head], &s[s.len() - tail..])
+}
+
 fn mint_id(counter: &AtomicU64, fingerprint: &bip32::Fingerprint) -> SignerId {
     let n = counter.fetch_add(1, Ordering::Relaxed);
     SignerId::new(format!("hot:{fingerprint}:{n}"))
@@ -201,7 +216,7 @@ impl manager::SigningManager for HotManager {
                 let wallet_name = hot
                     .descriptors()
                     .first()
-                    .map(|d| bwk_utils::short_string(d.to_string(), 18))
+                    .map(|d| short_string(d.to_string(), 18))
                     .unwrap_or_else(|| hot.fingerprint().to_string());
                 SignerInfo::new(
                     id.clone(),
@@ -390,6 +405,19 @@ mod tests {
         } else {
             panic!("expect info");
         }
+    }
+
+    #[test]
+    fn short_string_matches_bwk_utils() {
+        let xpub = "xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDfVxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz";
+        assert_eq!(
+            short_string(xpub.to_string(), 18),
+            bwk_utils::short_string(xpub.to_string(), 18)
+        );
+        assert_eq!(
+            short_string("abc".to_string(), 18),
+            bwk_utils::short_string("abc".to_string(), 18)
+        );
     }
 
     #[test]

@@ -17,7 +17,6 @@ pub use bwk_descriptor;
 #[cfg(all(feature = "hwi", not(target_os = "android")))]
 pub use bwk_hwi;
 pub use bwk_keys;
-pub use bwk_utils;
 pub use crossbeam;
 pub use miniscript;
 pub use serde;
