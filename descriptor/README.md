@@ -8,7 +8,8 @@ Wraps miniscript descriptors to provide convenient address/scriptPubKey
 derivation for standard wallet patterns. Handles multipath descriptors
 (recv/change) and validates descriptor structure on construction.
 
-**Scope:** Descriptor building (wpkh/tr), SpkDerivator for address derivation,
+**Scope:** Descriptor building (wpkh/tr), the `Descriptor` enum covering both
+miniscript and BIP392 `sp()` descriptors, SpkDerivator for address derivation,
 BIP84/BIP86 path helpers. Does NOT handle raw key operations (use bwk-keys)
 or full miniscript policy (use miniscript directly).
 
@@ -67,6 +68,18 @@ Validates on construction:
 - `wpkh_path(network, account)`: Returns BIP84 derivation path
 - `tr_path(network, account)`: Returns BIP86 derivation path
 
+## Descriptor
+
+`descriptor::Descriptor` is the descriptor bwk passes around: either a
+`Miniscript` one or an `Sp` one. It parses from a string (anything starting
+with `sp(` goes to `SpDescriptor`, everything else to miniscript), prints back
+with or without a checksum, and answers `as_miniscript`, `as_sp`, `is_sp`,
+`into_miniscript` and `fingerprint`.
+
+The name is deliberately the same as `miniscript::Descriptor`. The convention
+across the workspace is to import this one as `Descriptor` and to spell the
+miniscript one out in full as `miniscript::Descriptor<DescriptorPublicKey>`.
+
 ## Silent Payment Keys
 
 `sp_key` encodes a silent payment key pair as one bech32m string, the form
@@ -102,7 +115,8 @@ fails.
 
 ## DescriptorDerivator Trait
 
-Extension trait on `Descriptor<DescriptorPublicKey>` for creating `SpkDerivator`:
+Extension trait on `miniscript::Descriptor<DescriptorPublicKey>` for creating
+`SpkDerivator`:
 ```rust
 use bwk_descriptor::descriptor::DescriptorDerivator;
 
