@@ -148,8 +148,9 @@ take the receiver.
 Integration tests require the `test` feature flag which enables:
 - `bwk-electrum/test`: Test-only store constructors and accessors (synthetic
   header chains, tx-entry and validation-state setters)
-- `bwk-utils/test`: Test helpers (funding_tx, corepc_node utilities, and the
-  shared regtest harness in `utils/src/test/regtest.rs`)
+- `bwk-utils/test`: Test helpers (funding_tx, corepc_node utilities, the
+  shared regtest harness in `utils/src/test/regtest.rs`, and the mock remote
+  signing manager in `utils/src/mock_manager.rs`)
 - `bwk-sign/test`: Test signer constructors
 - `bwk-tx/test`: TxBuilder test methods (fund_with_bitcoind, mark_tx_mined)
 - `bwk-persist/test`: Test-only accessors on the backends (on-disk paths)

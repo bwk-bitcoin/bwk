@@ -22,11 +22,15 @@ ureq = { workspace = true, optional = true }
 corepc-node = { workspace = true, optional = true }
 temp-dir = { workspace = true, optional = true }
 electrsd = { git = "https://github.com/pythcoiner/electrsd.git", branch = "buffered_logs", optional = true }
+bwk-sign = { workspace = true, default-features = false, optional = true }
+crossbeam = { workspace = true, optional = true }
 
 [features]
 default = []
 test = [
+    "dep:bwk-sign",
     "dep:corepc-node",
+    "dep:crossbeam",
     "dep:electrsd",
     "dep:env_logger",
     "dep:temp-dir",

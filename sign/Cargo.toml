@@ -17,7 +17,6 @@ crossbeam.workspace = true
 bwk-keys.workspace = true
 bwk-descriptor.workspace = true
 bwk-psbt.workspace = true
-bwk-utils.workspace = true
 bip39 = { workspace = true, features = ["rand"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -31,9 +30,12 @@ thiserror.workspace = true
 [target.'cfg(not(target_os = "android"))'.dependencies]
 bwk-hwi = { workspace = true, features = ["service"], optional = true }
 
+[dev-dependencies]
+bwk-utils = { workspace = true, features = ["test"] }
+
 [features]
 default = ["hwi", "sp"]
-test = ["bwk-utils/test"]
+test = []
 sp = []
 # Marker feature only. The actual `bwk-hwi` optional dependency is auto-enabled
 # by the `hwi` feature on non-Android targets (see the target table above). It is
