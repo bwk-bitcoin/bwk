@@ -28,3 +28,16 @@ PSBTv0.
 - `TxModifiable`: the inputs / outputs / sighash-single flags, rejecting any
   other bit.
 - `Error`: every way a PSBTv2 can be malformed.
+
+## Serialization
+
+`serialize` writes the BIP370 key-value maps and `deserialize` reads them back.
+Both refuse anything that is not version 2, including a PSBTv0 unsigned
+transaction, a duplicate key or a missing required field.
+
+```rust
+use bwk_psbt::PsbtV2;
+
+let bytes = psbt.serialize()?;
+assert_eq!(PsbtV2::deserialize(&bytes)?, psbt);
+```
