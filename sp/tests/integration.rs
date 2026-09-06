@@ -460,8 +460,8 @@ fn test_full_receive_flow(env: &mut TestEnv) {
     // 9. Verify account is functional
     assert!(account.backend_online(), "Backend should be online");
     assert!(
-        account.can_sign(),
-        "Mnemonic-based account should be able to sign"
+        account.get_config().mnemonic.is_some(),
+        "Mnemonic-based account should be configured with a mnemonic"
     );
 }
 
@@ -2051,7 +2051,6 @@ fn test_scanner_with_concurrent_api_calls(env: &mut TestEnv) {
             let _balance = account.balance();
             let _spendable = account.spendable_coins();
             let _sp_addr = account.sp_address();
-            let _can_sign = account.can_sign();
             let _tx_history = account.tx_history();
             let _payment_history = account.payment_history();
             let _running = account.scanner_running();

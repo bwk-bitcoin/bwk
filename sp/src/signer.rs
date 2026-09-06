@@ -36,10 +36,8 @@ pub enum Error {
 }
 
 /// Reconstructs a taproot signing key by tweaking `b_spend`, negating for
-/// parity, and matching the result against `script_pubkey`. Shared by
-/// [`SpSigner`] (tweak read from the PSBTv2 input) and
-/// [`crate::account::Account::sign_sp_inputs`] (tweak read from the coin
-/// store).
+/// parity, and matching the result against `script_pubkey`. Used by
+/// [`SpSigner`], with the tweak read from the PSBTv2 input.
 pub fn reconstruct_signing_key(
     b_spend: SecretKey,
     tweak: SecretKey,
@@ -61,8 +59,7 @@ pub fn reconstruct_signing_key(
 }
 
 /// Signs a single taproot key-spend input (no taproot tweak: SP outputs use
-/// `dangerous_assume_tweaked()`). Shared by [`SpSigner`] and
-/// [`crate::account::Account::sign_sp_inputs`].
+/// `dangerous_assume_tweaked()`). Used by [`SpSigner`].
 pub fn sign_taproot_key_spend(
     cache: &mut SighashCache<&bitcoin::Transaction>,
     prevouts: &[bitcoin::TxOut],
@@ -86,8 +83,7 @@ pub fn sign_taproot_key_spend(
 }
 
 /// Writes a per-input ECDH share and DLEQ proof for `sk` against every
-/// `scan_key`. Shared by [`SpSigner::write_shares`]'s per-input branch and
-/// [`crate::account::Account::add_bip32_sp_shares`] for BIP32-owned inputs.
+/// `scan_key`. Used by [`SpSigner::write_shares`]'s per-input branch.
 pub fn write_input_ecdh_share(
     input_psbt: &mut bitcoin::psbt::Input,
     scan_keys: &BTreeSet<PublicKey>,

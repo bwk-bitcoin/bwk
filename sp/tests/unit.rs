@@ -205,7 +205,7 @@ fn test_notification_output_events() {
 
 // Signing Config Tests
 
-/// Test that Config with mnemonic should enable signing (via Account.can_sign()).
+/// Test that Config with mnemonic carries a mnemonic through unchanged.
 #[test]
 fn test_config_for_hot_key_signing() {
     let dir = TempDir::new().unwrap();
@@ -450,14 +450,8 @@ fn test_account_error_display() {
     let err = AccountError::Network("test network error".to_string());
     assert!(err.to_string().contains("network error"));
 
-    let err = AccountError::NoKeys;
-    assert!(err.to_string().contains("no keys"));
-
     let err = AccountError::ScannerAlreadyRunning;
     assert!(err.to_string().contains("already running"));
-
-    let err = AccountError::Tweak(bitcoin::secp256k1::Error::InvalidTweak);
-    assert!(err.to_string().contains("tweak"));
 }
 
 /// Test Notification Debug.
