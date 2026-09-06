@@ -203,9 +203,13 @@ impl<P: ScanProfile> ElectrumScanner<P> {
         let look_ahead = config.look_ahead;
         let receive = receive.max(stat_recv.saturating_sub(look_ahead));
         let change = change.max(stat_change.saturating_sub(look_ahead));
+        let descriptor = config
+            .miniscript_descriptor()
+            .cloned()
+            .expect("sp() is rejected by ScannerConfig::validate_descriptor at open time");
         let coin_store = Arc::new(Mutex::new(CoinStore::new(
             config.network,
-            config.descriptor.clone(),
+            descriptor,
             sender.clone(),
             config.account.clone(),
             receive,
@@ -248,6 +252,13 @@ impl<P: ScanProfile> ElectrumScanner<P> {
     }
 
     pub fn descriptor(&self) -> Descriptor<DescriptorPublicKey> {
+        self.config
+            .miniscript_descriptor()
+            .cloned()
+            .expect("sp() is rejected by ScannerConfig::validate_descriptor at open time")
+    }
+
+    pub fn wallet_descriptor(&self) -> bwk_descriptor::descriptor::Descriptor {
         self.config.descriptor.clone()
     }
 
@@ -723,7 +734,7 @@ impl ElectrumScanner<RamProfile<DefaultBackend>> {
             .expect("generated mnemonic");
         let xpub = signer.xpub(&DerivationPath::from_str("m/84'/0'/0'/1").expect("static path"));
         let config = ScannerConfig::new(
-            wpkh(xpub),
+            wpkh(xpub).into(),
             PathBuf::default(),
             String::new(),
             "test".into(),
@@ -766,7 +777,7 @@ mod tests {
         ))
         .unwrap();
         let config = ScannerConfig::new(
-            single_path,
+            single_path.into(),
             PathBuf::default(),
             String::new(),
             "test".into(),

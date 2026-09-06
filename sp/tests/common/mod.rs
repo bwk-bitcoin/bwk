@@ -704,7 +704,7 @@ pub fn add_offline_sub_account(
     descriptor: Descriptor<DescriptorPublicKey>,
 ) {
     let mut config = ScannerConfig::new(
-        descriptor,
+        descriptor.into(),
         std::path::PathBuf::new(),
         String::new(),
         name.to_string(),
