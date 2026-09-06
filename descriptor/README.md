@@ -93,6 +93,9 @@ uncompressed or x-only key. `scan_secret_key`, `spend_public_key` and
 `spend_secret_key` resolve the keys, `is_watch_only` reports whether the spend
 secret is missing, and `network_kind` says which network the keys belong to.
 
+A key expression may carry a `[fingerprint/path]` origin, on the packed key or
+on the scan key of a split pair. `origin` and `fingerprint` return it.
+
 `Display` appends the usual descriptor checksum and `to_string_no_checksum`
 leaves it off. A string that carries a checksum must match it, or parsing
 fails.
