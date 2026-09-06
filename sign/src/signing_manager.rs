@@ -3,18 +3,14 @@ use std::{
     str::FromStr,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Mutex,
     },
 };
 
 use crossbeam::channel;
 
 use bwk_descriptor::descriptor::Descriptor;
-use bwk_persist::{
-    backend::{noop::NoopBackend, PersistenceBackend},
-    storage::{ram::RamStore, Store},
-    PersistError,
-};
+use bwk_persist::PersistError;
 
 use miniscript::{
     bitcoin::{
@@ -82,10 +78,6 @@ pub fn decode_json_signer(bytes: &[u8]) -> Result<JsonSigner, PersistError> {
         .map_err(|e| PersistError::Serde(format!("decode JsonSigner: {e}")))
 }
 
-/// Default backing store for [`HotManager`]: RAM-cached + write-back
-/// over a runtime-dispatched [`PersistenceBackend`].
-pub type DefaultSignerStore = RamStore<Arc<dyn PersistenceBackend>, bip32::Fingerprint, JsonSigner>;
-
 fn mint_id(counter: &AtomicU64, fingerprint: &bip32::Fingerprint) -> SignerId {
     let n = counter.fetch_add(1, Ordering::Relaxed);
     SignerId::new(format!("hot:{fingerprint}:{n}"))
@@ -146,15 +138,11 @@ impl ParsedPsbt {
 /// no worker thread. The `RequestId`/[`Response`] contract is still honored,
 /// though, so a caller written against a truly asynchronous back end (a
 /// hardware device, a remote signer) works unmodified against this one.
-pub struct HotManager<S = DefaultSignerStore>
-where
-    S: Store<Key = bip32::Fingerprint, Value = JsonSigner>,
-{
+pub struct HotManager {
     receiver: channel::Receiver<SignerNotif>,
     sender: channel::Sender<SignerNotif>,
     bip32_signers: BTreeMap<SignerId, HotSigner>,
     signers: BTreeMap<SignerId, ExternalSigner>,
-    store: S,
     next_hot: AtomicU64,
     requests: RequestIdSource,
     subscriber: Option<channel::Sender<Response>>,
@@ -171,10 +159,7 @@ where
     hw_receiver: Option<channel::Receiver<crate::hwi::HwMessage>>,
 }
 
-impl<S> std::fmt::Debug for HotManager<S>
-where
-    S: Store<Key = bip32::Fingerprint, Value = JsonSigner>,
-{
+impl std::fmt::Debug for HotManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HotManager")
             .field("bip32_signers", &self.bip32_signers)
@@ -183,73 +168,22 @@ where
     }
 }
 
-impl HotManager<DefaultSignerStore> {
-    /// In-memory only (no persistence).
-    pub fn new() -> Self {
-        let backend: Arc<dyn PersistenceBackend> = Arc::new(NoopBackend);
-        let store = RamStore::empty(backend, STORE_KEY, encode_fingerprint, encode_json_signer);
-        Self::from_store(store)
-    }
-
-    /// Open the signer store against `backend`, hydrating the in-memory
-    /// signer map from any rows already present.
-    pub fn with_backend(backend: Arc<dyn PersistenceBackend>, store_key: &'static str) -> Self {
-        match RamStore::open(
-            backend.clone(),
-            store_key,
-            encode_fingerprint,
-            decode_fingerprint,
-            encode_json_signer,
-            decode_json_signer,
-        ) {
-            Ok(store) => Self::from_store(store),
-            Err(e) => {
-                log::error!("HotManager::with_backend: {e}");
-                let noop: Arc<dyn PersistenceBackend> = Arc::new(NoopBackend);
-                let store =
-                    RamStore::empty(noop, store_key, encode_fingerprint, encode_json_signer);
-                Self::from_store(store)
-            }
-        }
-    }
-}
-
-impl Default for HotManager<DefaultSignerStore> {
+impl Default for HotManager {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<S> HotManager<S>
-where
-    S: Store<Key = bip32::Fingerprint, Value = JsonSigner>,
-{
-    /// Wrap a pre-opened signer store. Hydrates `bip32_signers` from
-    /// every row already in the store.
-    pub fn from_store(store: S) -> Self {
+impl HotManager {
+    /// In-memory only (no persistence).
+    pub fn new() -> Self {
         let (sender, receiver) = channel::unbounded();
-        let next_hot = AtomicU64::new(0);
-        let mut bip32_signers: BTreeMap<SignerId, HotSigner> = BTreeMap::new();
-        match store.iter() {
-            Ok(iter) => {
-                for (_, json) in iter {
-                    let mut signer = HotSigner::from_json(json);
-                    signer.init(sender.clone());
-                    let id = mint_id(&next_hot, &signer.fingerprint());
-                    bip32_signers.insert(id, signer);
-                }
-            }
-            Err(e) => {
-                log::error!("HotManager::from_store iter: {e}");
-            }
-        }
         Self {
             receiver,
             sender,
-            bip32_signers,
+            bip32_signers: BTreeMap::new(),
             signers: BTreeMap::new(),
-            store,
-            next_hot,
+            next_hot: AtomicU64::new(0),
             requests: RequestIdSource::new(),
             subscriber: None,
             last_request: Mutex::new(BTreeMap::new()),
@@ -257,13 +191,6 @@ where
             hw_service: None,
             #[cfg(all(feature = "hwi", not(target_os = "android")))]
             hw_receiver: None,
-        }
-    }
-
-    /// Persists pending changes through the backend.
-    pub fn persist(&mut self) {
-        if let Err(e) = self.store.flush() {
-            log::error!("HotManager::persist() flush: {e}");
         }
     }
 
@@ -313,17 +240,11 @@ where
     }
 
     /// Registers a fully constructed hot signer: initializes its
-    /// notification channel, mints a [`SignerId`], persists the row and
-    /// inserts it. Returns the freshly minted id.
+    /// notification channel, mints a [`SignerId`] and inserts it. Returns
+    /// the freshly minted id.
     pub fn add_bip32_signer(&mut self, mut signer: HotSigner) -> SignerId {
         signer.init(self.sender.clone());
-        let fg = signer.fingerprint();
-        let id = self.mint_hot_id(&fg);
-        if let Some(json) = signer.to_json() {
-            if let Err(e) = self.store.insert(fg, json) {
-                log::error!("HotManager::add_bip32_signer insert: {e}");
-            }
-        }
+        let id = self.mint_hot_id(&signer.fingerprint());
         self.bip32_signers.insert(id.clone(), signer);
         id
     }
@@ -362,17 +283,6 @@ where
     pub fn register_bip32_descriptor(&mut self, descriptor: Descriptor) {
         for signer in self.bip32_signers.values_mut() {
             signer.inner_register_descriptor(descriptor.clone());
-        }
-        // Re-snapshot so the new descriptor set survives a restart.
-        let snapshots: Vec<(bip32::Fingerprint, JsonSigner)> = self
-            .bip32_signers
-            .values()
-            .filter_map(|s| s.to_json().map(|j| (s.fingerprint(), j)))
-            .collect();
-        for (fg, json) in snapshots {
-            if let Err(e) = self.store.insert(fg, json) {
-                log::error!("HotManager::register_bip32_descriptor insert: {e}");
-            }
         }
     }
 
@@ -515,10 +425,7 @@ where
     }
 }
 
-impl<S> manager::SigningManager for HotManager<S>
-where
-    S: Store<Key = bip32::Fingerprint, Value = JsonSigner> + Send + Sync,
-{
+impl manager::SigningManager for HotManager {
     fn signers(&self) -> Vec<SignerInfo> {
         let mut result: Vec<SignerInfo> = self
             .bip32_signers
@@ -670,12 +577,6 @@ where
             let request = self.requests.next();
             let hot = self.bip32_signers.get_mut(signer).expect("checked above");
             hot.inner_register_descriptor(descriptor);
-            if let Some(json) = hot.to_json() {
-                let fingerprint = hot.fingerprint();
-                if let Err(e) = self.store.insert(fingerprint, json) {
-                    log::error!("HotManager::register_descriptor insert: {e}");
-                }
-            }
             let _ = sender.send(Response::DescriptorRegistered {
                 request,
                 signer: signer.clone(),
@@ -774,6 +675,24 @@ mod tests {
         } else {
             panic!("expect info");
         }
+    }
+
+    #[test]
+    fn manager_is_in_memory_only() {
+        let mut manager = HotManager::new();
+        manager.new_bip32_signer_from_mnemonic(bitcoin::Network::Regtest, MNEMONIC.to_string());
+        assert_eq!(manager.signers().len(), 1);
+        drop(manager);
+
+        let manager = HotManager::new();
+        assert!(manager.signers().is_empty());
+    }
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn manager_is_send_and_sync() {
+        assert_send_sync::<HotManager>();
     }
 
     fn sp_descriptor(fingerprint: &str) -> Descriptor {
