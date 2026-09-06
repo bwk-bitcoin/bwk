@@ -76,3 +76,9 @@ script, a label without that info is refused, and an output whose script has
 already been computed is refused unless the transaction is frozen, because the
 script is derived from the inputs and any remaining modifiable field would
 invalidate it.
+
+The module also carries the BIP376 per-input fields, which describe an input
+that is itself a silent payment: its own ECDH shares and DLEQ proofs, the
+derivation of the spend key it needs, and the tweak `t` such that the input's
+output key is `b_spend + t`, which is how a signer holding `b_spend`
+recognises a silent payment it can spend.

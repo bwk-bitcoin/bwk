@@ -3,7 +3,8 @@
 use std::collections::BTreeMap;
 
 use bitcoin::{
-    psbt::{raw, Output},
+    bip32::{ChildNumber, DerivationPath, Fingerprint, KeySource},
+    psbt::{raw, Input, Output},
     secp256k1::PublicKey,
     Psbt,
 };
@@ -14,9 +15,14 @@ pub const PSBT_GLOBAL_SP_ECDH_SHARE: u8 = 0x07;
 pub const PSBT_GLOBAL_SP_DLEQ: u8 = 0x08;
 pub const PSBT_OUT_SP_V0_INFO: u8 = 0x09;
 pub const PSBT_OUT_SP_V0_LABEL: u8 = 0x0a;
+pub const PSBT_IN_SP_ECDH_SHARE: u8 = 0x1d;
+pub const PSBT_IN_SP_DLEQ: u8 = 0x1e;
+pub const PSBT_IN_SP_SPEND_BIP32_DERIVATION: u8 = 0x1f;
+pub const PSBT_IN_SP_TWEAK: u8 = 0x20;
 const ECDH_SHARE_LEN: usize = 33;
 const SP_V0_INFO_LEN: usize = 66;
 const DLEQ_PROOF_LEN: usize = 64;
+const TWEAK_LEN: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
@@ -64,6 +70,30 @@ fn get_public_key(value: &[u8]) -> Result<PublicKey, Error> {
 
 fn get_fixed<const N: usize>(value: &[u8]) -> Result<[u8; N], Error> {
     value.try_into().map_err(|_| Error::InvalidValue)
+}
+
+fn get_key_source(value: &[u8]) -> Result<KeySource, Error> {
+    if value.len() < 4 || value.len() % 4 != 0 {
+        return Err(Error::InvalidValue);
+    }
+
+    let fingerprint = Fingerprint::from(get_fixed::<4>(&value[..4])?);
+    let path = value[4..]
+        .chunks_exact(4)
+        .map(|chunk| {
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(chunk);
+            ChildNumber::from(u32::from_le_bytes(bytes))
+        })
+        .collect::<Vec<_>>();
+    Ok((fingerprint, DerivationPath::from(path)))
+}
+
+fn set_key_source(value: &mut Vec<u8>, key_source: &KeySource) {
+    value.extend_from_slice(key_source.0.as_bytes());
+    for child in &key_source.1 {
+        value.extend_from_slice(&u32::from(*child).to_le_bytes());
+    }
 }
 
 fn set_ecdh_share(
@@ -226,18 +256,91 @@ pub fn has_sp_v0_label(output: &Output) -> bool {
         .contains_key(&key(PSBT_OUT_SP_V0_LABEL, Vec::new()))
 }
 
+pub fn set_sp_input_ecdh_share(input: &mut Input, scan: PublicKey, share: PublicKey) {
+    set_ecdh_share(&mut input.unknown, PSBT_IN_SP_ECDH_SHARE, scan, share);
+}
+
+pub fn sp_input_ecdh_share(input: &Input, scan: PublicKey) -> Result<Option<PublicKey>, Error> {
+    get_ecdh_share(&input.unknown, PSBT_IN_SP_ECDH_SHARE, scan)
+}
+
+pub fn sp_input_ecdh_shares(input: &Input) -> Result<Vec<SpShare>, Error> {
+    get_ecdh_shares(&input.unknown, PSBT_IN_SP_ECDH_SHARE)
+}
+
+pub fn set_sp_input_dleq(input: &mut Input, scan: PublicKey, proof: [u8; DLEQ_PROOF_LEN]) {
+    set_dleq(&mut input.unknown, PSBT_IN_SP_DLEQ, scan, proof);
+}
+
+pub fn sp_input_dleq(
+    input: &Input,
+    scan: PublicKey,
+) -> Result<Option<[u8; DLEQ_PROOF_LEN]>, Error> {
+    get_dleq(&input.unknown, PSBT_IN_SP_DLEQ, scan)
+}
+
+pub fn sp_input_dleqs(input: &Input) -> Result<Vec<SpProof>, Error> {
+    get_dleqs(&input.unknown, PSBT_IN_SP_DLEQ)
+}
+
+pub fn set_sp_input_spend_bip32_derivation(
+    input: &mut Input,
+    spend: PublicKey,
+    key_source: KeySource,
+) {
+    let mut value = Vec::with_capacity(4 + key_source.1.len() * 4);
+    set_key_source(&mut value, &key_source);
+    input
+        .unknown
+        .insert(scan_key(PSBT_IN_SP_SPEND_BIP32_DERIVATION, spend), value);
+}
+
+pub fn sp_input_spend_bip32_derivation(
+    input: &Input,
+    spend: PublicKey,
+) -> Result<Option<KeySource>, Error> {
+    input
+        .unknown
+        .get(&scan_key(PSBT_IN_SP_SPEND_BIP32_DERIVATION, spend))
+        .map(|value| get_key_source(value))
+        .transpose()
+}
+
+/// The tweak `t` such that the input's output key is `b_spend + t`: a signer
+/// holding `b_spend` derives `b_spend + t` and compares it to the prevout
+/// script to recognise its own silent-payment inputs.
+pub fn set_sp_input_tweak(input: &mut Input, tweak: [u8; TWEAK_LEN]) {
+    input
+        .unknown
+        .insert(key(PSBT_IN_SP_TWEAK, Vec::new()), tweak.to_vec());
+}
+
+pub fn sp_input_tweak(input: &Input) -> Result<Option<[u8; TWEAK_LEN]>, Error> {
+    input
+        .unknown
+        .get(&key(PSBT_IN_SP_TWEAK, Vec::new()))
+        .map(|value| get_fixed(value))
+        .transpose()
+}
+
 #[cfg(test)]
 mod tests {
     use bitcoin::{
-        psbt::Output,
+        bip32::{ChildNumber, DerivationPath, Fingerprint},
+        psbt::{Input, Output},
         secp256k1::{PublicKey, Secp256k1, SecretKey},
         Psbt,
     };
 
     use crate::sp::{
-        key, scan_key, set_sp_global_dleq, set_sp_global_ecdh_share, set_sp_v0_output,
-        sp_global_dleq, sp_global_ecdh_share, sp_v0_output, Error, DLEQ_PROOF_LEN,
-        PSBT_GLOBAL_SP_DLEQ, PSBT_GLOBAL_SP_ECDH_SHARE, PSBT_OUT_SP_V0_INFO, SP_V0_INFO_LEN,
+        key, scan_key, set_sp_global_dleq, set_sp_global_ecdh_share, set_sp_input_dleq,
+        set_sp_input_ecdh_share, set_sp_input_spend_bip32_derivation, set_sp_input_tweak,
+        set_sp_v0_output, sp_global_dleq, sp_global_ecdh_share, sp_input_dleq, sp_input_dleqs,
+        sp_input_ecdh_share, sp_input_ecdh_shares, sp_input_spend_bip32_derivation, sp_input_tweak,
+        sp_v0_output, Error, SpProof, SpShare, DLEQ_PROOF_LEN, PSBT_GLOBAL_SP_DLEQ,
+        PSBT_GLOBAL_SP_ECDH_SHARE, PSBT_IN_SP_DLEQ, PSBT_IN_SP_ECDH_SHARE,
+        PSBT_IN_SP_SPEND_BIP32_DERIVATION, PSBT_IN_SP_TWEAK, PSBT_OUT_SP_V0_INFO, SP_V0_INFO_LEN,
+        TWEAK_LEN,
     };
 
     fn public_key(b: u8) -> PublicKey {
@@ -305,5 +408,147 @@ mod tests {
 
         assert_eq!(sp_global_ecdh_share(&psbt, scan), Err(Error::InvalidValue));
         assert_eq!(sp_global_dleq(&psbt, scan), Err(Error::InvalidValue));
+    }
+
+    fn one_input_psbt() -> Psbt {
+        psbt_spending(vec![bitcoin::TxIn {
+            previous_output: bitcoin::OutPoint::null(),
+            script_sig: bitcoin::ScriptBuf::new(),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::new(),
+        }])
+    }
+
+    #[test]
+    fn sp_fields_round_trip() {
+        let scan = public_key(1);
+        let share = public_key(2);
+        let spend = public_key(3);
+        let proof = [4; DLEQ_PROOF_LEN];
+        let tweak = [5; TWEAK_LEN];
+        let key_source = (
+            Fingerprint::from([6; 4]),
+            DerivationPath::from(vec![ChildNumber::from(7), ChildNumber::from(8)]),
+        );
+        let mut psbt = one_input_psbt();
+
+        set_sp_global_ecdh_share(&mut psbt, scan, share);
+        set_sp_global_dleq(&mut psbt, scan, proof);
+        set_sp_input_ecdh_share(&mut psbt.inputs[0], scan, share);
+        set_sp_input_dleq(&mut psbt.inputs[0], scan, proof);
+        set_sp_input_spend_bip32_derivation(&mut psbt.inputs[0], spend, key_source.clone());
+        set_sp_input_tweak(&mut psbt.inputs[0], tweak);
+        set_sp_v0_output(&mut psbt.outputs[0], scan, spend, Some(9));
+
+        let parsed = Psbt::deserialize(&psbt.serialize()).unwrap();
+        assert_eq!(sp_global_ecdh_share(&parsed, scan), Ok(Some(share)));
+        assert_eq!(sp_global_dleq(&parsed, scan), Ok(Some(proof)));
+        assert_eq!(
+            sp_input_ecdh_share(&parsed.inputs[0], scan),
+            Ok(Some(share))
+        );
+        assert_eq!(sp_input_dleq(&parsed.inputs[0], scan), Ok(Some(proof)));
+        assert_eq!(
+            sp_input_spend_bip32_derivation(&parsed.inputs[0], spend),
+            Ok(Some(key_source))
+        );
+        assert_eq!(sp_input_tweak(&parsed.inputs[0]), Ok(Some(tweak)));
+        let output = sp_v0_output(&parsed.outputs[0]).unwrap().unwrap();
+        assert_eq!(output.scan_key, scan);
+        assert_eq!(output.spend_key, spend);
+        assert_eq!(output.label, Some(9));
+    }
+
+    #[test]
+    fn input_getters_reject_invalid_values() {
+        let scan = public_key(1);
+        let spend = public_key(2);
+        let mut psbt = one_input_psbt();
+
+        psbt.inputs[0]
+            .unknown
+            .insert(scan_key(PSBT_IN_SP_ECDH_SHARE, scan), vec![0; 32]);
+        psbt.inputs[0]
+            .unknown
+            .insert(scan_key(PSBT_IN_SP_DLEQ, scan), vec![0; 63]);
+        psbt.inputs[0]
+            .unknown
+            .insert(key(PSBT_IN_SP_TWEAK, Vec::new()), vec![0; 31]);
+        psbt.inputs[0].unknown.insert(
+            scan_key(PSBT_IN_SP_SPEND_BIP32_DERIVATION, spend),
+            vec![0; 5],
+        );
+
+        assert_eq!(
+            sp_input_ecdh_share(&psbt.inputs[0], scan),
+            Err(Error::InvalidValue)
+        );
+        assert_eq!(
+            sp_input_dleq(&psbt.inputs[0], scan),
+            Err(Error::InvalidValue)
+        );
+        assert_eq!(sp_input_tweak(&psbt.inputs[0]), Err(Error::InvalidValue));
+        assert_eq!(
+            sp_input_spend_bip32_derivation(&psbt.inputs[0], spend),
+            Err(Error::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn sp_input_shares_and_dleqs_list_every_scan_key() {
+        let scan_a = public_key(1);
+        let scan_b = public_key(2);
+        let share_a = public_key(3);
+        let share_b = public_key(4);
+        let proof_a = [5; DLEQ_PROOF_LEN];
+        let proof_b = [6; DLEQ_PROOF_LEN];
+        let mut psbt = one_input_psbt();
+
+        set_sp_input_ecdh_share(&mut psbt.inputs[0], scan_a, share_a);
+        set_sp_input_ecdh_share(&mut psbt.inputs[0], scan_b, share_b);
+        set_sp_input_dleq(&mut psbt.inputs[0], scan_a, proof_a);
+        set_sp_input_dleq(&mut psbt.inputs[0], scan_b, proof_b);
+
+        let shares = sp_input_ecdh_shares(&psbt.inputs[0]).unwrap();
+        assert_eq!(shares.len(), 2);
+        assert!(shares.contains(&SpShare {
+            scan_key: scan_a,
+            share: share_a
+        }));
+        assert!(shares.contains(&SpShare {
+            scan_key: scan_b,
+            share: share_b
+        }));
+
+        let proofs = sp_input_dleqs(&psbt.inputs[0]).unwrap();
+        assert_eq!(proofs.len(), 2);
+        assert!(proofs.contains(&SpProof {
+            scan_key: scan_a,
+            proof: proof_a
+        }));
+        assert!(proofs.contains(&SpProof {
+            scan_key: scan_b,
+            proof: proof_b
+        }));
+    }
+
+    #[test]
+    fn hardened_derivation_path_round_trips() {
+        let spend = public_key(1);
+        let key_source = (
+            Fingerprint::from([9; 4]),
+            DerivationPath::from(vec![
+                ChildNumber::from_hardened_idx(0).unwrap(),
+                ChildNumber::from_normal_idx(1).unwrap(),
+            ]),
+        );
+        let mut input = Input::default();
+
+        set_sp_input_spend_bip32_derivation(&mut input, spend, key_source.clone());
+
+        assert_eq!(
+            sp_input_spend_bip32_derivation(&input, spend),
+            Ok(Some(key_source))
+        );
     }
 }
