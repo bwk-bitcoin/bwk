@@ -121,5 +121,5 @@ one.
 `sign` takes raw bytes and answers in the version it was given: a PSBTv2 is
 signed as one, anything else is read as a PSBTv0.
 
-`HotManager::new` keeps everything in memory; `with_backend` persists the
-signers through a `bwk-persist` backend.
+Nothing here is persisted: a hot signer is re-seeded from the mnemonic its
+consumer already holds, so the manager keeps no store of its own.

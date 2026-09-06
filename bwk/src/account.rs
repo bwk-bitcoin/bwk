@@ -42,7 +42,7 @@ pub struct Account<P: StorageProfile = RamProfile<DefaultBackend>> {
     /// accounts. The reconcile thread reads it on every chain-tip advance and
     /// fetches its merkle proofs through it.
     headers: HeaderFollower<P>,
-    signing_manager: HotManager<P::SignerStore>,
+    signing_manager: HotManager,
     /// Wallet-level half of [`Config`]; the scanner owns the rest.
     mnemonic: Option<String>,
     sender: mpsc::Sender<Notification>,
@@ -223,7 +223,7 @@ impl<P: OpenFromBackend> Account<P> {
             scanner: scanner_config,
             mnemonic,
         } = config;
-        let mut signing_manager = HotManager::from_store(stores.signers);
+        let mut signing_manager = HotManager::new();
         if let Some(mnemo) = mnemonic.clone() {
             signing_manager.new_bip32_signer_from_mnemonic(scanner_config.network, mnemo);
             signing_manager.register_bip32_descriptor(scanner_config.descriptor.clone());
@@ -286,7 +286,7 @@ impl<P: StorageProfile> Account<P> {
         }
     }
 
-    fn signing_manager(&self) -> &HotManager<P::SignerStore> {
+    fn signing_manager(&self) -> &HotManager {
         &self.signing_manager
     }
 }
@@ -432,7 +432,7 @@ mod tests {
     use super::*;
     use bip39::Mnemonic;
     use bwk_descriptor::descriptor::ScriptType;
-    use bwk_persist::{storage::Store, PersistenceKind};
+    use bwk_persist::{config_store::FileConfigStore, storage::Store, PersistenceKind};
     use bwk_sign::hot_signer::HotSigner;
     use miniscript::{
         bitcoin::{
@@ -443,6 +443,8 @@ mod tests {
     };
     use std::{path::PathBuf, str::FromStr};
     use temp_dir::TempDir;
+
+    use crate::config::CONFIG_FILENAME;
 
     fn persisted_offline_config(dir: &TempDir, look_ahead: u32) -> Config {
         let mnemonic = Mnemonic::generate(12).unwrap();
@@ -654,6 +656,36 @@ mod tests {
         assert_eq!(
             wallet_descriptor.to_string(),
             account.scanner().descriptor_str()
+        );
+    }
+
+    #[test]
+    fn no_signer_file_is_written() {
+        let temp = TempDir::new().unwrap();
+        let mnemonic = Mnemonic::generate(12).unwrap().to_string();
+
+        let cfg = Config::new(
+            Some(mnemonic),
+            "alice".to_string(),
+            Network::Regtest,
+            ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
+            temp.path().to_path_buf(),
+            "wallet".to_string(),
+            Some(PersistenceKind::Json),
+        )
+        .unwrap();
+
+        let account_dir = cfg.scanner.account_dir();
+        let config_store: Arc<dyn ConfigStore<Config>> = Arc::new(FileConfigStore::<Config>::new(
+            account_dir.join(CONFIG_FILENAME),
+        ));
+        let account: Account = Account::with_config_store(cfg.clone(), config_store);
+        account.persist_config();
+        drop(account);
+
+        assert!(
+            !account_dir.join("signers.json").exists(),
+            "no signer file should ever be written, hot signers are in-memory only"
         );
     }
 }
