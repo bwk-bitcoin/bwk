@@ -295,6 +295,106 @@ impl PsbtV2 {
         Ok(psbt)
     }
 
+    pub fn unsigned_tx(&self) -> Result<Transaction, Error> {
+        let lock_time = self.lock_time()?;
+        let input = self.inputs.iter().map(Input::txin).collect();
+        let output = self
+            .outputs
+            .iter()
+            .map(|output| {
+                Ok(TxOut {
+                    value: output.amount,
+                    script_pubkey: output
+                        .script_pubkey
+                        .clone()
+                        .ok_or(Error::MissingOutputScript)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok(Transaction {
+            version: self.tx_version,
+            lock_time,
+            input,
+            output,
+        })
+    }
+
+    pub fn into_unsigned_tx(self) -> Result<Transaction, Error> {
+        self.unsigned_tx()
+    }
+
+    pub fn from_bitcoin_psbt(psbt: bitcoin::Psbt) -> Result<Self, Error> {
+        if psbt.version != 0 {
+            return Err(Error::NotPsbtV0);
+        }
+        if psbt.inputs.len() != psbt.unsigned_tx.input.len()
+            || psbt.outputs.len() != psbt.unsigned_tx.output.len()
+            || psbt
+                .unsigned_tx
+                .input
+                .iter()
+                .any(|input| !input.script_sig.is_empty() || !input.witness.is_empty())
+        {
+            return Err(Error::CountMismatch);
+        }
+        let inputs = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .cloned()
+            .zip(psbt.inputs)
+            .map(|(txin, psbt)| Input {
+                previous_output: txin.previous_output,
+                sequence: txin.sequence,
+                required_time_lock_time: None,
+                required_height_lock_time: None,
+                psbt,
+            })
+            .collect();
+        let outputs = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .cloned()
+            .zip(psbt.outputs)
+            .map(|(txout, psbt)| Output {
+                amount: txout.value,
+                script_pubkey: Some(txout.script_pubkey),
+                psbt,
+            })
+            .collect();
+        Ok(Self {
+            tx_version: psbt.unsigned_tx.version,
+            fallback_lock_time: Some(psbt.unsigned_tx.lock_time),
+            tx_modifiable: None,
+            xpub: psbt.xpub,
+            proprietary: psbt.proprietary,
+            unknown: psbt.unknown,
+            inputs,
+            outputs,
+        })
+    }
+
+    pub fn into_bitcoin_psbt(self) -> Result<bitcoin::Psbt, Error> {
+        let unsigned_tx = self.unsigned_tx()?;
+        Ok(bitcoin::Psbt {
+            unsigned_tx,
+            version: 0,
+            xpub: self.xpub,
+            proprietary: self.proprietary,
+            unknown: self.unknown,
+            inputs: self.inputs.into_iter().map(|input| input.psbt).collect(),
+            outputs: self.outputs.into_iter().map(|output| output.psbt).collect(),
+        })
+    }
+
+    pub fn to_bitcoin_psbt_with_empty_sp_outputs(&self) -> Result<bitcoin::Psbt, Error> {
+        self.v0_bridge()
+    }
+
+    // `into_bitcoin_psbt` consumes and refuses on a missing output script,
+    // whereas this bridge clones and substitutes an empty script so a
+    // silent-payment PSBT with an underived output can still serialize.
     fn v0_bridge(&self) -> Result<bitcoin::Psbt, Error> {
         let unsigned_tx = bridge_tx(
             self.tx_version,
@@ -797,7 +897,7 @@ mod tests {
         absolute,
         hashes::Hash,
         psbt::{self, raw::Key},
-        transaction, Amount, OutPoint, ScriptBuf, Sequence, Txid,
+        transaction, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
     };
 
     use crate::{
@@ -859,6 +959,23 @@ mod tests {
         }
     }
 
+    fn v0_tx(lock_time: absolute::LockTime) -> Transaction {
+        Transaction {
+            version: transaction::Version::TWO,
+            lock_time,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(100),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        }
+    }
+
     fn compact_size_key_type_psbt() -> Vec<u8> {
         let mut bytes = vec![
             0x70, 0x73, 0x62, 0x74, 0xff, 0x01, 0x02, 0x04, 0x02, 0x00, 0x00, 0x00, 0x01, 0x03,
@@ -881,6 +998,10 @@ mod tests {
         let bytes = psbt.serialize().unwrap();
         let parsed = PsbtV2::deserialize(&bytes).unwrap();
         assert_eq!(parsed, psbt);
+        assert_eq!(
+            parsed.unsigned_tx().unwrap().output[0].value,
+            Amount::from_sat(42_000)
+        );
     }
 
     #[test]
@@ -973,7 +1094,44 @@ mod tests {
         psbt.inputs[0].required_time_lock_time =
             Some(absolute::LockTime::from_consensus(500_000_000));
         psbt.inputs[1].required_height_lock_time = Some(absolute::LockTime::from_consensus(100));
-        assert_eq!(psbt.lock_time(), Err(Error::IncompatibleLockTimes));
+        assert_eq!(psbt.unsigned_tx(), Err(Error::IncompatibleLockTimes));
+    }
+
+    #[test]
+    fn converts_v0_without_changing_transaction() {
+        let tx = v0_tx(absolute::LockTime::from_consensus(10));
+        let v0 = bitcoin::Psbt::from_unsigned_tx(tx.clone()).unwrap();
+        let v2 = PsbtV2::from_bitcoin_psbt(v0).unwrap();
+        assert_eq!(v2.unsigned_tx().unwrap(), tx);
+        assert_eq!(v2.into_bitcoin_psbt().unwrap().unsigned_tx, tx);
+    }
+
+    #[test]
+    fn rejects_v0_psbt_with_signed_input() {
+        let tx = v0_tx(absolute::LockTime::ZERO);
+        let mut v0 = bitcoin::Psbt::from_unsigned_tx(tx).unwrap();
+        v0.unsigned_tx.input[0].script_sig = ScriptBuf::from_bytes(vec![0x51]);
+        assert_eq!(PsbtV2::from_bitcoin_psbt(v0), Err(Error::CountMismatch));
+    }
+
+    #[test]
+    fn unsigned_tx_requires_every_output_script() {
+        assert_eq!(psbt(None).unsigned_tx(), Err(Error::MissingOutputScript));
+        assert_eq!(
+            psbt(None).into_bitcoin_psbt(),
+            Err(Error::MissingOutputScript)
+        );
+    }
+
+    #[test]
+    fn unsigned_tx_uses_resolved_locktime() {
+        let mut psbt = psbt_with_script();
+        psbt.inputs[0].required_height_lock_time = Some(absolute::LockTime::from_consensus(100));
+        psbt.fallback_lock_time = Some(absolute::LockTime::ZERO);
+        assert_eq!(
+            psbt.unsigned_tx().unwrap().lock_time,
+            absolute::LockTime::from_consensus(100)
+        );
     }
 
     #[test]

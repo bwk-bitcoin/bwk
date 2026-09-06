@@ -50,3 +50,13 @@ height requirement never zero, which BIP370 reserves for "no requirement"),
 every output carrying a script, modifiable flags only on a version 2
 transaction, and per-input locktime requirements that agree on one transaction
 locktime.
+
+## PSBTv0 bridge
+
+`from_bitcoin_psbt` takes an unsigned `bitcoin::Psbt` and `into_bitcoin_psbt`
+goes back, so a PSBTv2 whose outputs all have a script still reaches every
+rust-bitcoin and miniscript routine. `to_bitcoin_psbt_with_empty_sp_outputs`
+converts by borrowing and substitutes an empty script, which is how a PSBT
+with a still underived output is handed to code that insists on a complete
+transaction. `unsigned_tx` builds the transaction the PSBT describes, at the
+resolved locktime.
