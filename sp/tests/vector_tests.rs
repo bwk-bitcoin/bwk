@@ -38,6 +38,11 @@ mod tests {
         }
     }
 
+    #[test]
+    fn vectors_fixture_is_not_empty() {
+        assert!(!utils::read_file().is_empty());
+    }
+
     fn process_test_case(test_case: TestData) {
         if tests_deleted_input_parsing(&test_case.comment) {
             return;
