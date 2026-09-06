@@ -8,6 +8,7 @@ use crate::{
 };
 use bitcoin::Psbt;
 use bwk_coin::{Coin, CoinSource};
+use bwk_psbt::PsbtV2;
 
 #[cfg(feature = "test")]
 use {
@@ -200,8 +201,9 @@ impl TxBuilder {
         )
     }
 
-    /// Generate a signable PSBT from the current TxTemplate
-    pub fn generate(&mut self) -> Result<Psbt, Error> {
+    /// Run `process_transaction` and resolve the change recipient, without
+    /// finalizing. Shared by [`Self::generate`] and [`Self::generate_v2`].
+    fn final_template(&self) -> Result<(TxTemplate, Option<Box<dyn RecipientProvider>>), Error> {
         let res = process_transaction(
             self.tx_template.clone(),
             Some(self.change_provider.as_ref()),
@@ -221,10 +223,33 @@ impl TxBuilder {
                 None
             };
 
-        res.tx_template.finalize(
+        Ok((res.tx_template, change_recip))
+    }
+
+    /// Generate a signable PSBT from the current TxTemplate
+    pub fn generate(&mut self) -> Result<Psbt, Error> {
+        let (template, change_recip) = self.final_template()?;
+
+        template.finalize(
             change_recip,
             true,
             self.sp_provider.as_deref(),
+            self.change_provider.network(),
+            self.max_fee_percent,
+            self.max_fee_amount,
+            false,
+        )
+    }
+
+    /// Generate a native PSBTv2 from the current TxTemplate. No
+    /// `SpPartialSecretProvider` is involved: silent-payment outputs are left
+    /// with no script for a signer to derive.
+    pub fn generate_v2(&mut self) -> Result<PsbtV2, Error> {
+        let (template, change_recip) = self.final_template()?;
+
+        template.finalize_v2(
+            change_recip,
+            true,
             self.change_provider.network(),
             self.max_fee_percent,
             self.max_fee_amount,
@@ -846,6 +871,34 @@ mod tests {
             !res.tx_template.inputs.is_empty(),
             "engine should have auto-selected inputs"
         );
+    }
+
+    fn assert_generate_v2_adds_change(mut builder: TxBuilder, derivator: &SpkDerivator) {
+        builder.receive_coin(test::receive_coin(100_000, derivator, 0));
+        builder.receive_coin(test::receive_coin(200_000, derivator, 1));
+        builder.dummy_external_output(50_000);
+
+        let psbt = builder.generate_v2().unwrap();
+        assert!(!psbt.inputs.is_empty());
+        assert_eq!(psbt.outputs.len(), 2);
+    }
+
+    #[test]
+    fn generate_v2_adds_change_output() {
+        let (_signer, derivator) = wpkh_signer();
+        let builder = test::builder_from_derivator(derivator.clone());
+        assert_generate_v2_adds_change(builder, &derivator);
+    }
+
+    #[test]
+    fn generate_v2_with_change_recipient_provider_does_not_panic() {
+        let (_signer, derivator) = wpkh_signer();
+        let change_provider = Box::new(crate::recipient::ChangeRecipientProvider::new(
+            derivator.descriptor(),
+            Network::Regtest,
+        ));
+        let builder = TxBuilder::new_with_derivator(change_provider, derivator.clone());
+        assert_generate_v2_adds_change(builder, &derivator);
     }
 
     #[test]

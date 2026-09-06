@@ -2,6 +2,7 @@ use miniscript::bitcoin::{self, absolute, Network, Psbt, TxOut, Weight};
 use serde::{Deserialize, Serialize};
 
 use bwk_coin::{shuffle_coins, Coin, CoinSource};
+use bwk_psbt::{Input as PsbtV2Input, Output as PsbtV2Output, PsbtV2};
 
 use crate::{
     coin_selection::CoinSelector,
@@ -47,10 +48,14 @@ pub enum Error {
     NoSpProvider,
     #[error("failed to compute silent payment partial secret")]
     SpPartialSecret,
+    #[error("silent payments do not support segwit v2 or later inputs")]
+    UnsupportedSegwitVersion,
     #[error("change output already added")]
     ChangeAlreadyAdded,
     #[error("pay to anchor is not supported")]
     PayToAnchor,
+    #[error("psbtv2 error")]
+    PsbtV2,
     #[error("recipient passed as change is not a change output")]
     NotChange,
     #[error("missing change output, {excess} sats would be lost to fees")]
@@ -232,6 +237,28 @@ impl TxTemplate {
         Ok(Some(secret))
     }
 
+    // BIP352 only defines input-hash contribution for P2PKH, P2WPKH, P2TR and
+    // P2SH-P2WPKH: a witness program of any other version cannot be reduced to
+    // a public key, so it cannot be summed into the input hash.
+    fn prepare_sp_inputs(
+        inputs: &[Coin],
+        outputs: &[Box<dyn RecipientProvider>],
+    ) -> Result<(), Error> {
+        if !outputs.iter().any(|r| r.is_silent_payment()) {
+            return Ok(());
+        }
+
+        if inputs.iter().any(|input| {
+            input.txout.script_pubkey.is_witness_program()
+                && !input.txout.script_pubkey.is_p2wpkh()
+                && !input.txout.script_pubkey.is_p2tr()
+        }) {
+            return Err(Error::UnsupportedSegwitVersion);
+        }
+
+        Ok(())
+    }
+
     fn build_psbt(
         inputs: &[Coin],
         outputs: &mut [Box<dyn RecipientProvider>],
@@ -285,6 +312,58 @@ impl TxTemplate {
         Ok(psbt)
     }
 
+    fn build_psbt_v2(
+        inputs: &[Coin],
+        outputs: &mut [Box<dyn RecipientProvider>],
+        ctx: &FinalizationContext,
+    ) -> Result<PsbtV2, Error> {
+        let mut psbt_inputs = Vec::with_capacity(inputs.len());
+        for i in inputs {
+            psbt_inputs.push(PsbtV2Input {
+                previous_output: i.outpoint,
+                sequence: i.sequence,
+                required_time_lock_time: None,
+                required_height_lock_time: None,
+                psbt: i.to_psbt_input().map_err(|_| Error::Input)?,
+            });
+        }
+
+        let mut psbt_outputs = Vec::with_capacity(outputs.len());
+        for o in outputs.iter_mut() {
+            // A silent-payment output's script is derived from the ECDH shared
+            // secret and the input hash, which only a signer holding a private
+            // key can compute, so it is left unset here.
+            let script_pubkey = (!o.is_silent_payment()).then(|| o.create_script(ctx));
+            let mut psbt = o.to_psbt_output().map_err(|_| Error::Output)?;
+            if let PsbtOutputInfo::SilentPayment {
+                scan_pubkey,
+                spend_pubkey,
+                label,
+            } = o.psbt_output_info()
+            {
+                bwk_psbt::sp::set_sp_v0_output(&mut psbt, scan_pubkey, spend_pubkey, label);
+            }
+            psbt_outputs.push(PsbtV2Output {
+                amount: output_bitcoin_amount(o.as_ref()),
+                script_pubkey,
+                psbt,
+            });
+        }
+
+        Ok(PsbtV2 {
+            tx_version: bitcoin::transaction::Version::TWO,
+            fallback_lock_time: Some(absolute::LockTime::ZERO),
+            // Nothing has been frozen yet: a signer sets this once it derives
+            // the silent-payment scripts.
+            tx_modifiable: None,
+            xpub: Default::default(),
+            proprietary: Default::default(),
+            unknown: Default::default(),
+            inputs: psbt_inputs,
+            outputs: psbt_outputs,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn finalize(
         &self,
@@ -304,6 +383,8 @@ impl TxTemplate {
             check_disproportionate_fee(&inputs, &outputs, max_fee_percent, max_fee_amount)?;
         }
 
+        Self::prepare_sp_inputs(&inputs, &outputs)?;
+
         let partial_secret = match sp_provider {
             Some(p) => Self::compute_sp_partial_secret(&inputs, &outputs, p)?,
             None => None,
@@ -322,6 +403,40 @@ impl TxTemplate {
         };
 
         Self::build_psbt(&inputs, &mut outputs, &ctx)
+    }
+
+    /// Native PSBTv2 path: no `SpPartialSecretProvider`, no private key. A
+    /// silent-payment output carries no script yet, only the recipient's scan
+    /// and spend keys, for a signer to derive later.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finalize_v2(
+        &self,
+        change: Option<Box<dyn RecipientProvider>>,
+        shuffle: bool,
+        network: Network,
+        max_fee_percent: u8,
+        max_fee_amount: u64,
+        skip_checks: bool,
+    ) -> Result<PsbtV2, Error> {
+        let outputs = self.prepare_outputs(change)?;
+        let (inputs, mut outputs) = self.shuffle_maybe(shuffle, outputs);
+
+        if !skip_checks {
+            check_missing_change(&inputs, &outputs, &self.fees)?;
+            check_disproportionate_fee(&inputs, &outputs, max_fee_percent, max_fee_amount)?;
+        }
+
+        Self::prepare_sp_inputs(&inputs, &outputs)?;
+
+        let ctx = FinalizationContext {
+            inputs: &inputs,
+            partial_secret: None,
+            network,
+        };
+
+        let psbt = Self::build_psbt_v2(&inputs, &mut outputs, &ctx)?;
+        psbt.validate().map_err(|_| Error::PsbtV2)?;
+        Ok(psbt)
     }
 }
 
@@ -957,5 +1072,150 @@ mod test {
         assert_eq!(info.scan_key, scan);
         assert_eq!(info.spend_key, spend);
         assert_eq!(info.label, Some(7));
+    }
+
+    fn sp_output() -> SpTestRecipient {
+        SpTestRecipient {
+            scan: sp_key(3),
+            spend: sp_key(4),
+            label: None,
+            amount: 10_000,
+        }
+    }
+
+    #[test]
+    fn finalize_v2_leaves_silent_payment_output_without_script() {
+        let (_signer, derivator) = tr_signer();
+        let coin = funding_coin(20_000, &derivator, 1);
+        let output = sp_output();
+        let scan = output.scan;
+        let spend = output.spend;
+
+        let template = TxTemplate {
+            inputs: vec![coin],
+            outputs: vec![Box::new(output)],
+            fees: Fees::Sats(10_000),
+        };
+
+        let psbt = template
+            .finalize_v2(None, false, Network::Bitcoin, 10, 2_000_000, true)
+            .unwrap();
+
+        assert_eq!(psbt.outputs.len(), 1);
+        assert_eq!(psbt.outputs[0].script_pubkey, None);
+        let info = bwk_psbt::sp::sp_v0_output(&psbt.outputs[0].psbt)
+            .unwrap()
+            .unwrap();
+        assert_eq!(info.scan_key, scan);
+        assert_eq!(info.spend_key, spend);
+        assert_eq!(psbt.tx_modifiable, None);
+    }
+
+    #[test]
+    fn finalize_v2_sets_scripts_on_ordinary_outputs() {
+        let (_signer, derivator) = tr_signer();
+        let coin = funding_coin(20_000, &derivator, 1);
+        let output = external_recipient(10_000);
+
+        let template = TxTemplate {
+            inputs: vec![coin],
+            outputs: vec![Box::new(output)],
+            fees: Fees::Sats(1_000),
+        };
+
+        let psbt = template
+            .finalize_v2(None, false, Network::Bitcoin, 10, 2_000_000, true)
+            .unwrap();
+
+        assert!(psbt.outputs[0].script_pubkey.is_some());
+        assert_eq!(
+            bwk_psbt::sp::sp_v0_output(&psbt.outputs[0].psbt).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn finalize_v2_carries_the_input_outpoint_and_sequence() {
+        let (_signer, derivator) = tr_signer();
+        let coin = funding_coin(20_000, &derivator, 1);
+        let outpoint = coin.outpoint;
+        let sequence = coin.sequence;
+        let output = external_recipient(10_000);
+
+        let template = TxTemplate {
+            inputs: vec![coin],
+            outputs: vec![Box::new(output)],
+            fees: Fees::Sats(1_000),
+        };
+
+        let psbt = template
+            .finalize_v2(None, false, Network::Bitcoin, 10, 2_000_000, true)
+            .unwrap();
+
+        assert_eq!(psbt.inputs[0].previous_output, outpoint);
+        assert_eq!(psbt.inputs[0].sequence, sequence);
+    }
+
+    #[test]
+    fn finalize_v2_rejects_segwit_v2_input() {
+        let (_signer, derivator) = tr_signer();
+        let mut coin = funding_coin(20_000, &derivator, 1);
+        coin.txout.script_pubkey =
+            bitcoin::ScriptBuf::from_bytes([vec![0x52, 0x20], vec![0; 32]].concat());
+        let output = sp_output();
+
+        let template = TxTemplate {
+            inputs: vec![coin],
+            outputs: vec![Box::new(output)],
+            fees: Fees::Sats(1_000),
+        };
+
+        let result = template.finalize_v2(None, false, Network::Bitcoin, 10, 2_000_000, true);
+        assert!(matches!(result, Err(Error::UnsupportedSegwitVersion)));
+    }
+
+    struct StubSpProvider {
+        called: std::sync::Arc<std::sync::Mutex<bool>>,
+    }
+
+    impl SpPartialSecretProvider for StubSpProvider {
+        fn compute_partial_secret(
+            &self,
+            _inputs: &[Coin],
+        ) -> Result<bitcoin::secp256k1::SecretKey, crate::error::Error> {
+            *self.called.lock().unwrap() = true;
+            Ok(bitcoin::secp256k1::SecretKey::from_slice(&[9; 32]).unwrap())
+        }
+    }
+
+    #[test]
+    fn finalize_rejects_segwit_v2_input() {
+        let (_signer, derivator) = tr_signer();
+        let mut coin = funding_coin(20_000, &derivator, 1);
+        coin.txout.script_pubkey =
+            bitcoin::ScriptBuf::from_bytes([vec![0x52, 0x20], vec![0; 32]].concat());
+        let output = sp_output();
+        let called = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let provider = StubSpProvider {
+            called: called.clone(),
+        };
+
+        let template = TxTemplate {
+            inputs: vec![coin],
+            outputs: vec![Box::new(output)],
+            fees: Fees::Sats(1_000),
+        };
+
+        let result = template.finalize(
+            None,
+            false,
+            Some(&provider),
+            Network::Bitcoin,
+            10,
+            2_000_000,
+            true,
+        );
+        assert!(matches!(result, Err(Error::UnsupportedSegwitVersion)));
+        assert!(!*called.lock().unwrap());
     }
 }
