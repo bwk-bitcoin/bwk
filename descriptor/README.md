@@ -67,6 +67,20 @@ Validates on construction:
 - `wpkh_path(network, account)`: Returns BIP84 derivation path
 - `tr_path(network, account)`: Returns BIP86 derivation path
 
+## Silent Payment Keys
+
+`sp_key` encodes a silent payment key pair as one bech32m string, the form
+BIP392 defines:
+
+- `spscan` (`tspscan` on test networks): the scan secret key plus the spend
+  public key, enough to detect payments but not to spend them.
+- `spspend` (`tspspend`): both secret keys.
+
+`SpKey` is either of the two, `SpScanKey` and `SpSpendKey` hold the keys, and
+all three print and parse through `Display` and `FromStr`. Only version 0 is
+accepted; a payload of the wrong length, one that does not decode to a valid
+key, or a non-canonical encoding is refused.
+
 ## DescriptorDerivator Trait
 
 Extension trait on `Descriptor<DescriptorPublicKey>` for creating `SpkDerivator`:
