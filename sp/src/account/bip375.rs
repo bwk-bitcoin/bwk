@@ -3,14 +3,14 @@
 //! only answers questions about a PSBT, which is what lets the wallet verify
 //! a signer's work without being able to do the signer's job.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use bitcoin::{Script, ScriptBuf};
+use bitcoin::{key::TapTweak, Script, ScriptBuf};
 
 use crate::{
     account::AccountError,
     core::{
-        secp256k1::{PublicKey, Scalar},
+        secp256k1::{PublicKey, Scalar, Secp256k1},
         utils::hash::calculate_input_hash,
     },
 };
@@ -213,24 +213,159 @@ pub fn validate_input_eligibility(
     Ok(())
 }
 
+pub fn scan_keys(psbt: &bwk_psbt::PsbtV2) -> Result<BTreeSet<PublicKey>, AccountError> {
+    psbt.outputs
+        .iter()
+        .try_fold(BTreeSet::new(), |mut keys, output| {
+            if let Some(info) =
+                bwk_psbt::sp::sp_v0_output(&output.psbt).map_err(|_| AccountError::PsbtV2)?
+            {
+                keys.insert(info.scan_key);
+            }
+            Ok(keys)
+        })
+}
+
+/// The sender's combined ECDH share for `scan_key`: the global share if the
+/// sender published one, otherwise the sum of every eligible input's
+/// per-input share. A missing per-input share is an error, not a zero: the
+/// resulting sum would be wrong and the payment undiscoverable.
+pub fn combined_share(
+    psbt: &bwk_psbt::PsbtV2,
+    scan_key: PublicKey,
+) -> Result<PublicKey, AccountError> {
+    if let Some(share) =
+        bwk_psbt::sp::sp_global_ecdh_share_v2(psbt, scan_key).map_err(|_| AccountError::PsbtV2)?
+    {
+        return Ok(share);
+    }
+    let mut combined: Option<PublicKey> = None;
+    for input in &psbt.inputs {
+        if eligible_input_pubkey(input)?.is_none() {
+            continue;
+        }
+        let share = bwk_psbt::sp::sp_input_ecdh_share(&input.psbt, scan_key)
+            .map_err(|_| AccountError::PsbtV2)?
+            .ok_or(AccountError::PsbtV2)?;
+        combined = Some(match combined {
+            Some(current) => current.combine(&share).map_err(|_| AccountError::PsbtV2)?,
+            None => share,
+        });
+    }
+    combined.ok_or(AccountError::PsbtV2)
+}
+
+/// The P2TR script for every silent-payment output the PSBT already has
+/// enough information to derive. When `require_all` is `false`, a group
+/// still missing its share is skipped rather than rejected, as long as none
+/// of its outputs already carry a script: a PSBT with no share yet for one
+/// recipient is incomplete, not invalid.
+pub fn output_scripts(
+    psbt: &bwk_psbt::PsbtV2,
+    input_hash: Scalar,
+    require_all: bool,
+) -> Result<Vec<(usize, ScriptBuf)>, AccountError> {
+    let mut groups: BTreeMap<PublicKey, Vec<(usize, PublicKey)>> = BTreeMap::new();
+    for (index, output) in psbt.outputs.iter().enumerate() {
+        if let Some(info) =
+            bwk_psbt::sp::sp_v0_output(&output.psbt).map_err(|_| AccountError::PsbtV2)?
+        {
+            groups
+                .entry(info.scan_key)
+                .or_default()
+                .push((index, info.spend_key));
+        }
+    }
+
+    let secp = Secp256k1::new();
+    let mut scripts = Vec::new();
+    for (scan_key, mut outputs) in groups {
+        let share = match combined_share(psbt, scan_key) {
+            Ok(share) => share
+                .mul_tweak(&secp, &input_hash)
+                .map_err(|_| AccountError::PsbtV2)?,
+            Err(_)
+                if !require_all
+                    && outputs
+                        .iter()
+                        .all(|(index, _)| psbt.outputs[*index].script_pubkey.is_none()) =>
+            {
+                continue
+            }
+            Err(err) => return Err(err),
+        };
+        // BIP352 assigns k = 0, 1, 2, ... within a scan-key group, and the
+        // sender and receiver must agree on the order regardless of how the
+        // outputs are laid out in the transaction. Sorting on the spend key
+        // first, with the output index as tiebreak, is that agreed order.
+        outputs.sort_by_key(|(index, spend_key)| (*spend_key, *index));
+        for (k, (index, spend_key)) in outputs.into_iter().enumerate() {
+            let tweak = crate::core::utils::common::calculate_t_n(&share, k as u32)
+                .map_err(|_| AccountError::PsbtV2)?;
+            let output_key = crate::core::utils::common::calculate_P_n(&spend_key, tweak.into())
+                .map_err(|_| AccountError::PsbtV2)?;
+            let (xonly, _) = output_key.x_only_public_key();
+            // P_k is already BIP352's final output key; applying the usual
+            // taproot tweak on top of it would produce a script the
+            // recipient can never find.
+            scripts.push((
+                index,
+                ScriptBuf::new_p2tr_tweaked(xonly.dangerous_assume_tweaked()),
+            ));
+        }
+    }
+    Ok(scripts)
+}
+
+pub fn fill_output_scripts(
+    psbt: &mut bwk_psbt::PsbtV2,
+    input_hash: Scalar,
+) -> Result<(), AccountError> {
+    for (index, script) in output_scripts(psbt, input_hash, true)? {
+        match &psbt.outputs[index].script_pubkey {
+            // A signer must never silently overwrite a script another party
+            // already committed to.
+            Some(existing) if existing != &script => return Err(AccountError::PsbtV2),
+            Some(_) => {}
+            None => psbt.outputs[index].script_pubkey = Some(script),
+        }
+    }
+    // Every silent-payment script here depends on the exact input set (via
+    // the input hash) and the exact output set (via k's position within its
+    // group), so completion must freeze both.
+    psbt.tx_modifiable = Some(bwk_psbt::TxModifiable::none());
+    Ok(())
+}
+
+pub fn complete_output_scripts(psbt: &mut bwk_psbt::PsbtV2) -> Result<(), AccountError> {
+    let scan_keys = scan_keys(psbt)?;
+    if scan_keys.is_empty() {
+        return Ok(());
+    }
+    validate_input_eligibility(psbt, true)?;
+    let input_hash = input_hash(psbt)?;
+    fill_output_scripts(psbt, input_hash)
+}
+
 #[cfg(test)]
 mod tests {
     use bitcoin::{
         absolute, hashes::Hash, key::TapTweak, psbt::PsbtSighashType, secp256k1::Secp256k1,
-        transaction, Amount, OutPoint, PublicKey as BitcoinPublicKey, ScriptBuf, Sequence,
+        transaction, Amount, Network, OutPoint, PublicKey as BitcoinPublicKey, ScriptBuf, Sequence,
         TapSighashType, TxOut,
     };
-    use secp256k1::{PublicKey, SecretKey};
+    use secp256k1::{PublicKey, Scalar, SecretKey};
 
     use crate::{
         account::{
             bip375::{
-                eligible_input_pubkey, eligible_script, input_hash, input_script_pubkey,
-                validate_input_eligibility, NUMS_H,
+                complete_output_scripts, eligible_input_pubkey, eligible_script, input_hash,
+                input_script_pubkey, validate_input_eligibility, NUMS_H,
             },
             AccountError,
         },
         core::utils::hash::calculate_input_hash,
+        receiver::{SpReceiver, SpendKey},
     };
 
     fn secret(byte: u8) -> SecretKey {
@@ -492,5 +627,278 @@ mod tests {
         let expected = calculate_input_hash(&[outpoint_a, outpoint_b], key_a).unwrap();
 
         assert_eq!(input_hash(&psbt).unwrap(), expected);
+    }
+
+    fn sp_output(scan_key: PublicKey, spend_key: PublicKey) -> bwk_psbt::Output {
+        let mut psbt = bitcoin::psbt::Output::default();
+        bwk_psbt::sp::set_sp_v0_output(&mut psbt, scan_key, spend_key, None);
+        bwk_psbt::Output {
+            amount: Amount::from_sat(1_000),
+            script_pubkey: None,
+            psbt,
+        }
+    }
+
+    fn set_global_share(
+        psbt: &mut bwk_psbt::PsbtV2,
+        scan_key: PublicKey,
+        input_secret: SecretKey,
+    ) -> PublicKey {
+        let share = scan_key
+            .mul_tweak(&Secp256k1::new(), &Scalar::from(input_secret))
+            .unwrap();
+        bwk_psbt::sp::set_sp_global_ecdh_share_v2(psbt, scan_key, share);
+        share
+    }
+
+    fn set_input_share(input: &mut bitcoin::psbt::Input, scan_key: PublicKey, secret: SecretKey) {
+        let share = scan_key
+            .mul_tweak(&Secp256k1::new(), &Scalar::from(secret))
+            .unwrap();
+        bwk_psbt::sp::set_sp_input_ecdh_share(input, scan_key, share);
+    }
+
+    fn psbt() -> (bwk_psbt::PsbtV2, PublicKey) {
+        let secp = Secp256k1::new();
+        let input_secret = even_secret(5);
+        let input_pubkey = PublicKey::from_secret_key(&secp, &input_secret);
+        let scan_key = PublicKey::from_secret_key(&secp, &secret(6));
+        let spend_key = PublicKey::from_secret_key(&secp, &secret(7));
+
+        let input = input_with(p2tr_witness_utxo(input_pubkey), OutPoint::null());
+
+        let mut psbt = empty_psbt(vec![input]);
+        psbt.outputs = vec![sp_output(scan_key, spend_key)];
+
+        set_global_share(&mut psbt, scan_key, input_secret);
+        (psbt, scan_key)
+    }
+
+    fn receiver(scan: SecretKey, spend: SecretKey) -> SpReceiver {
+        SpReceiver::new(scan, SpendKey::Secret(spend), Network::Regtest).unwrap()
+    }
+
+    fn receiver_discovers(
+        psbt: &bwk_psbt::PsbtV2,
+        receiver: &SpReceiver,
+        eligible_pubkeys: &[PublicKey],
+    ) -> bool {
+        let (first, rest) = eligible_pubkeys.split_first().unwrap();
+        let sum = rest
+            .iter()
+            .try_fold(*first, |sum, key| sum.combine(key))
+            .unwrap();
+        let outpoints = psbt
+            .inputs
+            .iter()
+            .map(|input| input.previous_output)
+            .collect::<Vec<_>>();
+        let input_hash = calculate_input_hash(&outpoints, sum).unwrap();
+        let tweak_data = sum.mul_tweak(&Secp256k1::new(), &input_hash).unwrap();
+        let shared_secret = crate::core::receiving::calculate_ecdh_shared_secret(
+            &tweak_data,
+            &receiver.get_scan_key(),
+        );
+        let output_keys = psbt
+            .outputs
+            .iter()
+            .filter_map(|output| output.script_pubkey.as_ref())
+            .filter(|script| script.is_p2tr())
+            .map(|script| bitcoin::XOnlyPublicKey::from_slice(&script.as_bytes()[2..]).unwrap())
+            .collect::<Vec<_>>();
+        !receiver
+            .receiver
+            .scan_transaction(shared_secret, &output_keys)
+            .unwrap()
+            .is_empty()
+    }
+
+    #[test]
+    fn completes_missing_output_scripts() {
+        let (mut psbt, _) = psbt();
+
+        complete_output_scripts(&mut psbt).unwrap();
+
+        assert!(psbt.outputs[0].script_pubkey.as_ref().unwrap().is_p2tr());
+        assert_eq!(psbt.tx_modifiable.unwrap().bits(), 0);
+    }
+
+    #[test]
+    fn completed_output_is_discoverable_by_the_receiver() {
+        let secp = Secp256k1::new();
+        let input_pubkey = PublicKey::from_secret_key(&secp, &even_secret(5));
+        let (mut psbt, _) = psbt();
+        let receiver = receiver(secret(6), secret(7));
+
+        complete_output_scripts(&mut psbt).unwrap();
+
+        assert!(receiver_discovers(&psbt, &receiver, &[input_pubkey]));
+    }
+
+    #[test]
+    fn k_counter_follows_spend_key_order_within_a_scan_key() {
+        let secp = Secp256k1::new();
+        let input_secret = even_secret(5);
+        let input_pubkey = PublicKey::from_secret_key(&secp, &input_secret);
+        let scan_key = PublicKey::from_secret_key(&secp, &secret(6));
+
+        let spend_a = (secret(7), PublicKey::from_secret_key(&secp, &secret(7)));
+        let spend_b = (secret(8), PublicKey::from_secret_key(&secp, &secret(8)));
+        let (first, second) = if spend_a.1 < spend_b.1 {
+            (spend_a, spend_b)
+        } else {
+            (spend_b, spend_a)
+        };
+
+        let input = input_with(p2tr_witness_utxo(input_pubkey), OutPoint::null());
+        let mut psbt = empty_psbt(vec![input]);
+        // Added in the reverse of sorted order: index 0 carries the
+        // higher-sorting spend key, index 1 the lower.
+        psbt.outputs = vec![sp_output(scan_key, second.1), sp_output(scan_key, first.1)];
+        let share = set_global_share(&mut psbt, scan_key, input_secret);
+
+        complete_output_scripts(&mut psbt).unwrap();
+
+        let computed_input_hash = input_hash(&psbt).unwrap();
+        let shared = share.mul_tweak(&secp, &computed_input_hash).unwrap();
+        let expected_script = |spend_key: PublicKey, k: u32| {
+            let tweak = crate::core::utils::common::calculate_t_n(&shared, k).unwrap();
+            let output_key =
+                crate::core::utils::common::calculate_P_n(&spend_key, tweak.into()).unwrap();
+            ScriptBuf::new_p2tr_tweaked(output_key.x_only_public_key().0.dangerous_assume_tweaked())
+        };
+
+        assert_eq!(
+            psbt.outputs[1].script_pubkey.as_ref().unwrap(),
+            &expected_script(first.1, 0)
+        );
+        assert_eq!(
+            psbt.outputs[0].script_pubkey.as_ref().unwrap(),
+            &expected_script(second.1, 1)
+        );
+
+        let receiver_first = receiver(secret(6), first.0);
+        let mut receiver_second = receiver(secret(6), second.0);
+        // `first` always lands on k=0 (it sorts first), so its own receiver
+        // finds it immediately. `second` lands on k=1, and BIP352 scanning
+        // never skips a gap on its own key alone; registering the label that
+        // reconciles k=0's foreign output lets `second`'s receiver walk past
+        // it and reach its own output at k=1.
+        let label_offset = first.0.add_tweak(&Scalar::from(second.0.negate())).unwrap();
+        receiver_second
+            .receiver
+            .add_label(crate::core::receiving::Label::from(Scalar::from(
+                label_offset,
+            )))
+            .unwrap();
+        assert!(receiver_discovers(&psbt, &receiver_first, &[input_pubkey]));
+        assert!(receiver_discovers(&psbt, &receiver_second, &[input_pubkey]));
+    }
+
+    #[test]
+    fn refuses_to_overwrite_a_conflicting_script() {
+        let secp = Secp256k1::new();
+        let other_key = PublicKey::from_secret_key(&secp, &even_secret(9));
+        let (mut psbt, _) = psbt();
+        psbt.outputs[0].script_pubkey = Some(ScriptBuf::new_p2tr_tweaked(
+            other_key.x_only_public_key().0.dangerous_assume_tweaked(),
+        ));
+
+        let result = complete_output_scripts(&mut psbt);
+
+        assert!(matches!(result, Err(AccountError::PsbtV2)));
+    }
+
+    #[test]
+    fn accepts_a_matching_preset_script() {
+        let (mut psbt, _) = psbt();
+        complete_output_scripts(&mut psbt).unwrap();
+        let script = psbt.outputs[0].script_pubkey.clone();
+        psbt.tx_modifiable = None;
+
+        let result = complete_output_scripts(&mut psbt);
+
+        assert!(result.is_ok());
+        assert_eq!(psbt.outputs[0].script_pubkey, script);
+    }
+
+    fn two_input_psbt_with_per_input_shares(
+        scan_key: PublicKey,
+        set_share_for_second_input: bool,
+    ) -> (bwk_psbt::PsbtV2, PublicKey, PublicKey) {
+        let secp = Secp256k1::new();
+        let secret_a = even_secret(10);
+        let secret_b = even_secret(11);
+        let pubkey_a = PublicKey::from_secret_key(&secp, &secret_a);
+        let pubkey_b = PublicKey::from_secret_key(&secp, &secret_b);
+        let spend_key = PublicKey::from_secret_key(&secp, &secret(7));
+
+        let mut psbt_input_a = p2tr_witness_utxo(pubkey_a);
+        set_input_share(&mut psbt_input_a, scan_key, secret_a);
+
+        let mut psbt_input_b = p2tr_witness_utxo(pubkey_b);
+        if set_share_for_second_input {
+            set_input_share(&mut psbt_input_b, scan_key, secret_b);
+        }
+
+        let input_a = input_with(psbt_input_a, OutPoint::null());
+        let input_b = input_with(
+            psbt_input_b,
+            OutPoint {
+                txid: bitcoin::Txid::from_byte_array([1; 32]),
+                vout: 1,
+            },
+        );
+
+        let mut psbt = empty_psbt(vec![input_a, input_b]);
+        psbt.outputs = vec![sp_output(scan_key, spend_key)];
+
+        (psbt, pubkey_a, pubkey_b)
+    }
+
+    #[test]
+    fn sums_per_input_shares_when_no_global_share() {
+        let secp = Secp256k1::new();
+        let scan_key = PublicKey::from_secret_key(&secp, &secret(6));
+        let (mut psbt, pubkey_a, pubkey_b) = two_input_psbt_with_per_input_shares(scan_key, true);
+
+        complete_output_scripts(&mut psbt).unwrap();
+
+        let receiver = receiver(secret(6), secret(7));
+        assert!(receiver_discovers(&psbt, &receiver, &[pubkey_a, pubkey_b]));
+    }
+
+    #[test]
+    fn rejects_missing_per_input_share() {
+        let secp = Secp256k1::new();
+        let scan_key = PublicKey::from_secret_key(&secp, &secret(6));
+        let (mut psbt, _, _) = two_input_psbt_with_per_input_shares(scan_key, false);
+
+        let result = complete_output_scripts(&mut psbt);
+
+        assert!(matches!(result, Err(AccountError::PsbtV2)));
+    }
+
+    #[test]
+    fn no_silent_payment_output_is_a_no_op() {
+        let secp = Secp256k1::new();
+        let key_a = PublicKey::from_secret_key(&secp, &even_secret(1));
+        let input = input_with(p2tr_witness_utxo(key_a), OutPoint::null());
+        let mut psbt = empty_psbt(vec![input]);
+        let (xonly, _) = key_a.x_only_public_key();
+        psbt.outputs = vec![bwk_psbt::Output {
+            amount: Amount::from_sat(1_000),
+            script_pubkey: Some(ScriptBuf::new_p2tr_tweaked(
+                xonly.dangerous_assume_tweaked(),
+            )),
+            psbt: bitcoin::psbt::Output::default(),
+        }];
+        psbt.tx_modifiable =
+            Some(bwk_psbt::TxModifiable::try_from(bwk_psbt::TxModifiable::INPUTS).unwrap());
+        let before = psbt.tx_modifiable;
+
+        complete_output_scripts(&mut psbt).unwrap();
+
+        assert_eq!(psbt.tx_modifiable, before);
     }
 }
