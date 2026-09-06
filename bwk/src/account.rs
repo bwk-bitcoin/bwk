@@ -106,6 +106,55 @@ pub fn signers_snapshot(cache: &Mutex<BTreeMap<SignerId, CachedSigner>>) -> Vec<
         .collect()
 }
 
+/// Resolves `signer_id` to the name of the manager that owns it, rejecting an
+/// unknown id or a signer that is not [`SignerState::Ready`] before any
+/// manager is touched. Shared by [`dispatch`] and [`dispatch_mut`] so the
+/// lookup exists once in the workspace, not once per account type.
+pub fn resolve_manager(
+    cache: &Mutex<BTreeMap<SignerId, CachedSigner>>,
+    signer_id: &SignerId,
+) -> Result<String, Error> {
+    let cache = cache.lock().expect("poisoned");
+    let entry = cache.get(signer_id).ok_or(Error::UnknownSigner)?;
+    if !matches!(entry.info.state, SignerState::Ready) {
+        return Err(Error::SignerNotReady);
+    }
+    Ok(entry.manager.clone())
+}
+
+/// Routes a `&self` [`SigningManager`] operation to the manager owning
+/// `signer_id`, the id-to-manager resolution every account type shares.
+pub fn dispatch<F>(
+    managers: &BTreeMap<String, AttachedManager>,
+    signers: &Mutex<BTreeMap<SignerId, CachedSigner>>,
+    signer_id: &SignerId,
+    f: F,
+) -> Result<RequestId, Error>
+where
+    F: FnOnce(&dyn SigningManager) -> Result<RequestId, manager::Error>,
+{
+    let name = resolve_manager(signers, signer_id)?;
+    let attached = managers.get(&name).ok_or(Error::UnknownSigner)?;
+    f(attached.manager.as_ref()).map_err(Error::from)
+}
+
+/// Routes a `&mut self` [`SigningManager`] operation (`init`,
+/// `register_descriptor`) to the manager owning `signer_id`. See
+/// [`dispatch`].
+pub fn dispatch_mut<F>(
+    managers: &mut BTreeMap<String, AttachedManager>,
+    signers: &Mutex<BTreeMap<SignerId, CachedSigner>>,
+    signer_id: &SignerId,
+    f: F,
+) -> Result<RequestId, Error>
+where
+    F: FnOnce(&mut dyn SigningManager) -> Result<RequestId, manager::Error>,
+{
+    let name = resolve_manager(signers, signer_id)?;
+    let attached = managers.get_mut(&name).ok_or(Error::UnknownSigner)?;
+    f(attached.manager.as_mut()).map_err(Error::from)
+}
+
 /// Adapts a shared [`HotManager`] to [`SigningManager`] so it can sit in
 /// [`Account::managers`] like any other attached manager.
 pub struct HotManagerHandle(pub Arc<Mutex<HotManager>>);
@@ -863,39 +912,23 @@ impl<P: ScanProfile> Account<P> {
         }
     }
 
-    /// Resolves `signer_id` to the name of the manager that owns it,
-    /// rejecting an unknown id or a signer that is not [`SignerState::Ready`]
-    /// before any manager is touched. Shared by [`Account::dispatch`] and
-    /// [`Account::dispatch_mut`] so the lookup exists once.
-    fn resolve_manager(&self, signer_id: &SignerId) -> Result<String, Error> {
-        let cache = self.signers.lock().expect("poisoned");
-        let entry = cache.get(signer_id).ok_or(Error::UnknownSigner)?;
-        if !matches!(entry.info.state, SignerState::Ready) {
-            return Err(Error::SignerNotReady);
-        }
-        Ok(entry.manager.clone())
-    }
-
     /// Routes a `&self` [`SigningManager`] operation to the manager owning
-    /// `signer_id`.
+    /// `signer_id`, through the free [`dispatch`].
     fn dispatch<F>(&self, signer_id: &SignerId, f: F) -> Result<RequestId, Error>
     where
         F: FnOnce(&dyn SigningManager) -> Result<RequestId, manager::Error>,
     {
-        let name = self.resolve_manager(signer_id)?;
-        let attached = self.managers.get(&name).ok_or(Error::UnknownSigner)?;
-        f(attached.manager.as_ref()).map_err(Error::from)
+        dispatch(&self.managers, &self.signers, signer_id, f)
     }
 
     /// Routes a `&mut self` [`SigningManager`] operation (`init`,
-    /// `register_descriptor`) to the manager owning `signer_id`.
+    /// `register_descriptor`) to the manager owning `signer_id`, through the
+    /// free [`dispatch_mut`].
     fn dispatch_mut<F>(&mut self, signer_id: &SignerId, f: F) -> Result<RequestId, Error>
     where
         F: FnOnce(&mut dyn SigningManager) -> Result<RequestId, manager::Error>,
     {
-        let name = self.resolve_manager(signer_id)?;
-        let attached = self.managers.get_mut(&name).ok_or(Error::UnknownSigner)?;
-        f(attached.manager.as_mut()).map_err(Error::from)
+        dispatch_mut(&mut self.managers, &self.signers, signer_id, f)
     }
 
     /// Initializes the signer, e.g. an unlock or pairing handshake. Returns

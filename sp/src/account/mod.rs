@@ -52,9 +52,10 @@ use {
         persist::config_store::{ConfigStore, NoopConfigStore},
     },
     bwk_sign::{
-        bwk_descriptor,
+        bwk_descriptor::{self, descriptor::Descriptor},
         identity::{SignerId, SignerInfo},
-        manager::SigningManager,
+        manager::{self, SigningManager},
+        protocol::RequestId,
         signing_manager::HotManager,
     },
     crossbeam::channel,
@@ -127,6 +128,12 @@ pub enum AccountError {
     PsbtV2,
     #[error("signing manager {0} is already attached")]
     ManagerAlreadyAttached(String),
+    #[error("no signer with that id")]
+    UnknownSigner,
+    #[error("signer is not ready")]
+    SignerNotReady,
+    #[error("signing error: {0}")]
+    Signing(#[from] manager::Error),
 }
 
 /// Well-known name of the hot manager an `Account` attaches for the signers
@@ -158,6 +165,21 @@ struct BroadcastWorker<P: crate::profile::SpStorageProfile> {
     tx_store: Arc<Mutex<SpTxStore<P>>>,
     sub_accounts: Vec<SubAccountSpendRecorder>,
     sender: mpsc::Sender<Notification>,
+}
+
+/// Maps a [`bwk::account::dispatch`] error onto this crate's
+/// [`AccountError`]. Dispatch only ever produces `UnknownSigner`,
+/// `SignerNotReady` or `Signing`: attaching belongs to another call path.
+#[cfg(feature = "mnemonic")]
+fn dispatch_error(e: bwk::account::Error) -> AccountError {
+    match e {
+        bwk::account::Error::UnknownSigner => AccountError::UnknownSigner,
+        bwk::account::Error::SignerNotReady => AccountError::SignerNotReady,
+        bwk::account::Error::Signing(e) => AccountError::Signing(e),
+        bwk::account::Error::ManagerAlreadyAttached => {
+            unreachable!("signing dispatch never attaches a manager")
+        }
+    }
 }
 
 #[cfg(feature = "mnemonic")]
@@ -1107,6 +1129,102 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         }
     }
 
+    /// Routes a `&self` [`SigningManager`] operation to the manager owning
+    /// `signer_id`, through [`bwk::account::dispatch`].
+    fn dispatch<F>(&self, signer_id: &SignerId, f: F) -> Result<RequestId, AccountError>
+    where
+        F: FnOnce(&dyn SigningManager) -> Result<RequestId, manager::Error>,
+    {
+        bwk::account::dispatch(&self.managers, &self.signers, signer_id, f).map_err(dispatch_error)
+    }
+
+    /// Routes a `&mut self` [`SigningManager`] operation (`init`,
+    /// `register_descriptor`) to the manager owning `signer_id`. See
+    /// [`Account::dispatch`].
+    fn dispatch_mut<F>(&mut self, signer_id: &SignerId, f: F) -> Result<RequestId, AccountError>
+    where
+        F: FnOnce(&mut dyn SigningManager) -> Result<RequestId, manager::Error>,
+    {
+        bwk::account::dispatch_mut(&mut self.managers, &self.signers, signer_id, f)
+            .map_err(dispatch_error)
+    }
+
+    /// Initializes the signer, e.g. an unlock or pairing handshake. Returns
+    /// immediately; the result arrives later as a notification.
+    pub fn init_signer(&mut self, signer_id: &SignerId) -> Result<RequestId, AccountError> {
+        self.dispatch_mut(signer_id, |manager| manager.init(signer_id))
+    }
+
+    /// Requests the signer's info payload. Returns immediately; the result
+    /// arrives later as a notification.
+    pub fn signer_info(&self, signer_id: &SignerId) -> Result<RequestId, AccountError> {
+        self.dispatch(signer_id, |manager| manager.info(signer_id))
+    }
+
+    /// Requests an xpub at `path` from the signer. Returns immediately; the
+    /// result arrives later as a notification. Never asks for an on-device
+    /// display confirmation: bwk-sp has no surface to drive one.
+    pub fn signer_xpub(
+        &self,
+        signer_id: &SignerId,
+        path: bitcoin::bip32::DerivationPath,
+    ) -> Result<RequestId, AccountError> {
+        self.dispatch(signer_id, |manager| {
+            manager.get_xpub(signer_id, path, false)
+        })
+    }
+
+    /// Asks the signer whether `descriptor` is already registered. Returns
+    /// immediately; the result arrives later as a notification.
+    pub fn is_descriptor_registered(
+        &self,
+        signer_id: &SignerId,
+        descriptor: Descriptor,
+    ) -> Result<RequestId, AccountError> {
+        self.dispatch(signer_id, |manager| {
+            manager.is_descriptor_registered(signer_id, descriptor)
+        })
+    }
+
+    /// Registers `descriptor` with the signer. Consumer-driven: nothing in
+    /// `bwk-sp` calls this on the consumer's behalf. Returns immediately; the
+    /// result arrives later as a notification.
+    pub fn register_descriptor(
+        &mut self,
+        signer_id: &SignerId,
+        descriptor: Descriptor,
+    ) -> Result<RequestId, AccountError> {
+        self.dispatch_mut(signer_id, |manager| {
+            manager.register_descriptor(signer_id, descriptor)
+        })
+    }
+
+    /// Asks the signer to sign `psbt` against `descriptor`. Non-blocking: the
+    /// bytes cross untouched, never parsed, never stored, and the result
+    /// arrives later as a notification. A transaction mixing silent-payment
+    /// and BIP32 inputs needs several calls, one descriptor at a time; this
+    /// method never loops over descriptors itself.
+    pub fn sign(
+        &self,
+        signer_id: &SignerId,
+        descriptor: Descriptor,
+        psbt: Vec<u8>,
+    ) -> Result<RequestId, AccountError> {
+        self.dispatch(signer_id, |manager| {
+            manager.sign(signer_id, descriptor, psbt)
+        })
+    }
+
+    /// Sends an opaque, manager-defined request to the signer. Returns
+    /// immediately; the result arrives later as a notification.
+    pub fn signer_raw(
+        &self,
+        signer_id: &SignerId,
+        request: Vec<u8>,
+    ) -> Result<RequestId, AccountError> {
+        self.dispatch(signer_id, |manager| manager.raw(signer_id, request))
+    }
+
     /// The BIP32 master fingerprint derived from this account's
     /// construction-time mnemonic, if one was supplied. Cached at
     /// construction; the account never reaches a master xpriv to answer this.
@@ -1819,7 +1937,7 @@ mod tests {
         secp256k1::{Parity, SecretKey},
     };
     use bwk::{account::test_support::StubManager, bwk_electrum::raw_client::CertificateCheck};
-    use bwk_sign::protocol::Response;
+    use bwk_sign::{identity::SignerState, protocol::Response};
     use std::{path::PathBuf, str::FromStr};
 
     fn test_config() -> Config {
@@ -2880,6 +2998,122 @@ mod tests {
             vec![HOT_MANAGER_NAME.to_string()]
         );
         assert_eq!(account.signers().len(), 1);
+    }
+
+    fn signer_info(id: &str, fingerprint: [u8; 4], state: SignerState) -> SignerInfo {
+        SignerInfo::new(
+            SignerId::new(id),
+            bitcoin::bip32::Fingerprint::from(fingerprint),
+            "wallet".to_string(),
+            state,
+        )
+    }
+
+    #[test]
+    fn sign_forwards_bytes_untouched() {
+        let mut account = Account::new(test_config()).unwrap();
+        let a = signer_info("signer-1", [1, 1, 1, 1], SignerState::Ready);
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)))
+            .with_signers(vec![a.clone()]);
+        let last_sign = stub.last_sign();
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let descriptor: Descriptor = test_config().descriptor.into();
+        account
+            .sign(&a.id, descriptor.clone(), vec![0xde, 0xad, 0xbe, 0xef])
+            .unwrap();
+
+        let (signer, sent_descriptor, bytes) = last_sign.lock().unwrap().clone().unwrap();
+        assert_eq!(signer, a.id);
+        assert_eq!(sent_descriptor, descriptor);
+        assert!(sent_descriptor.is_sp());
+        assert_eq!(bytes, vec![0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn sign_returns_without_waiting() {
+        let mut account = Account::new(test_config()).unwrap();
+        let a = signer_info("signer-1", [1, 1, 1, 1], SignerState::Ready);
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)))
+            .with_signers(vec![a.clone()]);
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        // The stub records the call and never sends a `Response` on its
+        // channel; if `sign` waited for one instead of returning the queued
+        // `RequestId` straight away, this call would hang.
+        let descriptor: Descriptor = test_config().descriptor.into();
+        account.sign(&a.id, descriptor, vec![1, 2, 3]).unwrap();
+    }
+
+    #[test]
+    fn sign_rejects_unknown_signer() {
+        let mut account = Account::new(test_config()).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let stub = StubManager::new(calls.clone(), Arc::new(Mutex::new(None)));
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let unknown = SignerId::new("does-not-exist");
+        let descriptor: Descriptor = test_config().descriptor.into();
+        let result = account.sign(&unknown, descriptor, vec![1]);
+        assert!(matches!(result, Err(AccountError::UnknownSigner)));
+        assert!(!calls.lock().unwrap().contains(&"sign".to_string()));
+    }
+
+    #[test]
+    fn sign_rejects_locked_signer() {
+        let mut account = Account::new(test_config()).unwrap();
+        let locked = signer_info("locked-1", [2, 2, 2, 2], SignerState::Locked);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let stub = StubManager::new(calls.clone(), Arc::new(Mutex::new(None)))
+            .with_signers(vec![locked.clone()]);
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let descriptor: Descriptor = test_config().descriptor.into();
+        let result = account.sign(&locked.id, descriptor, vec![1]);
+        assert!(matches!(result, Err(AccountError::SignerNotReady)));
+        assert!(!calls.lock().unwrap().contains(&"sign".to_string()));
+    }
+
+    #[test]
+    fn register_descriptor_is_consumer_driven() {
+        let mut account = Account::new(test_config()).unwrap();
+        let a = signer_info("signer-1", [3, 3, 3, 3], SignerState::Ready);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let stub = StubManager::new(calls.clone(), Arc::new(Mutex::new(None)))
+            .with_signers(vec![a.clone()]);
+        let last_register = stub.last_register_descriptor();
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        assert!(!calls
+            .lock()
+            .unwrap()
+            .contains(&"register_descriptor".to_string()));
+
+        let descriptor: Descriptor = test_config().descriptor.into();
+        account
+            .register_descriptor(&a.id, descriptor.clone())
+            .unwrap();
+
+        let seen = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| *c == "register_descriptor")
+            .count();
+        assert_eq!(seen, 1);
+        let (signer, sent) = last_register.lock().unwrap().clone().unwrap();
+        assert_eq!(signer, a.id);
+        assert_eq!(sent, descriptor);
     }
 
     #[test]
