@@ -163,7 +163,6 @@ impl Coin {
             CoinSpendInfo::Bip32 {
                 coin_path,
                 descriptor,
-                ..
             } => self.spk_to_psbt_input(*coin_path, descriptor),
             CoinSpendInfo::Sp { tweak, .. } => self.sp_to_psbt_input(*tweak),
         }
@@ -388,5 +387,13 @@ mod tests {
         assert_eq!(bip32_coin(p2wpkh).source(), CoinSourceKind::Segwit);
         assert_eq!(bip32_coin(p2tr).source(), CoinSourceKind::Taproot);
         assert_eq!(bip32_coin(ScriptBuf::new()).source(), CoinSourceKind::Other);
+    }
+
+    #[test]
+    fn bip32_coin_round_trips_through_serde() {
+        let coin = bip32_coin(ScriptBuf::new());
+        let json = serde_json::to_string(&coin).unwrap();
+        let decoded: Coin = serde_json::from_str(&json).unwrap();
+        assert_eq!(coin, decoded);
     }
 }
