@@ -9,9 +9,9 @@ and fee estimation. Supports both standard descriptor outputs and Silent Payment
 recipients through the `RecipientProvider` trait.
 
 **Scope:** Transaction construction, coin selection algorithm, fee calculation,
-PSBT creation. Does NOT handle signing (use bwk-sign), broadcasting or UTXO
-tracking (use bwk-electrum or bwk-sp), and does not define the coin types it
-selects over (they come from bwk-coin).
+PSBTv0 and PSBTv2 creation. Does NOT handle signing (use bwk-sign),
+broadcasting or UTXO tracking (use bwk-electrum or bwk-sp), and does not
+define the coin types it selects over (they come from bwk-coin).
 
 ## Usage
 
@@ -31,6 +31,10 @@ builder.send_to(address, 50_000);
 
 // Build transaction; inputs are selected from the coin source
 let psbt = builder.generate()?;
+
+// Or build a native PSBTv2, which keeps a silent payment output scriptless
+// until a signer derives it
+let psbt_v2 = builder.generate_v2()?;
 ```
 
 ## Key Traits
