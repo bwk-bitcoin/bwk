@@ -13,7 +13,10 @@
 //!
 //! Source: adapted from SPDK's vendored `silentpayments` implementation,
 //! originally imported from cygnet3/rust-silentpayments. See `sp/NOTICE`.
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+};
 
 use crate::core::{
     error::Error,
@@ -26,7 +29,6 @@ use crate::core::{
     },
     SharedSecret, SpVersion,
 };
-use bimap::BiMap;
 use bitcoin::{
     hashes::{hash160, Hash},
     OutPoint, ScriptBuf, TxIn, TxOut,
@@ -223,13 +225,13 @@ pub struct Receiver {
     scan_pubkey: PublicKey,
     spend_pubkey: PublicKey,
     change_label: Label, // To be able to tell which label is the change
-    labels: BiMap<Label, PublicKey>,
+    labels: BTreeMap<PublicKey, Label>,
     pub network: Network,
 }
 
 struct SerializablePubkey([u8; 33]);
 
-struct SerializableBiMap(BiMap<Label, PublicKey>);
+struct SerializableLabels(BTreeMap<PublicKey, Label>);
 
 impl Serialize for SerializablePubkey {
     fn serialize<S>(&self, serializer: S) -> std::prelude::v1::Result<S::Ok, S::Error>
@@ -280,7 +282,7 @@ impl<'de> Deserialize<'de> for SerializablePubkey {
     }
 }
 
-impl Serialize for SerializableBiMap {
+impl Serialize for SerializableLabels {
     fn serialize<S>(&self, serializer: S) -> std::prelude::v1::Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -288,24 +290,25 @@ impl Serialize for SerializableBiMap {
         let pairs: Vec<(Label, SerializablePubkey)> = self
             .0
             .iter()
-            .map(|(label, pubkey)| (label.to_owned(), SerializablePubkey(pubkey.serialize())))
+            .map(|(pubkey, label)| (label.to_owned(), SerializablePubkey(pubkey.serialize())))
             .collect();
         // Now serialize `pairs` as a vector of tuples
         pairs.serialize(serializer)
     }
 }
 
-impl<'de> Deserialize<'de> for SerializableBiMap {
+impl<'de> Deserialize<'de> for SerializableLabels {
     fn deserialize<D>(deserializer: D) -> std::prelude::v1::Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         let pairs: Vec<(Label, SerializablePubkey)> = Deserialize::deserialize(deserializer)?;
-        let mut bimap: BiMap<Label, PublicKey> = BiMap::new();
+        let mut labels: BTreeMap<PublicKey, Label> = BTreeMap::new();
         for (label, ser_pubkey) in pairs {
-            bimap.insert(label, PublicKey::from_slice(&ser_pubkey.0).unwrap());
+            let pubkey = PublicKey::from_slice(&ser_pubkey.0).map_err(de::Error::custom)?;
+            labels.insert(pubkey, label);
         }
-        Ok(SerializableBiMap(bimap))
+        Ok(SerializableLabels(labels))
     }
 }
 
@@ -326,7 +329,7 @@ impl Serialize for Receiver {
             &SerializablePubkey(self.spend_pubkey.serialize()),
         )?;
         state.serialize_field("change_label", &self.change_label)?;
-        state.serialize_field("labels", &SerializableBiMap(self.labels.clone()))?;
+        state.serialize_field("labels", &SerializableLabels(self.labels.clone()))?;
         state.end()
     }
 }
@@ -338,7 +341,7 @@ struct ReceiverHelper {
     scan_pubkey: SerializablePubkey,
     spend_pubkey: SerializablePubkey,
     change_label: String,
-    labels: SerializableBiMap,
+    labels: SerializableLabels,
 }
 
 impl<'de> Deserialize<'de> for Receiver {
@@ -367,7 +370,7 @@ impl Receiver {
         change_label: Label,
         network: Network,
     ) -> Result<Self, Error> {
-        let labels: BiMap<Label, PublicKey> = BiMap::new();
+        let labels = BTreeMap::new();
 
         let mut receiver = Receiver {
             version,
@@ -395,9 +398,9 @@ impl Receiver {
         // check that the combined key with spend_key is valid
         mG.combine(&self.spend_pubkey)?;
 
-        let old = self.labels.insert(label, mG);
+        let old = self.labels.insert(mG, label);
 
-        Ok(!old.did_overwrite())
+        Ok(old.is_none())
     }
 
     /// Get the silent payment change address for this Receiver. This is the
@@ -464,7 +467,7 @@ impl Receiver {
                     let odd_diff = odd_output.combine(&P_n.negate(&secp))?;
 
                     for diff in [even_diff, odd_diff] {
-                        if let Some(label) = self.labels.get_by_right(&diff) {
+                        if let Some(label) = self.labels.get(&diff) {
                             n_found += 1;
                             let t_n_label = t_n.add_tweak(label.as_inner())?;
                             found
@@ -515,7 +518,7 @@ impl Receiver {
 
         res.insert(None, spk);
 
-        for (label, mG) in &self.labels {
+        for (mG, label) in &self.labels {
             let B_m = mG.combine(&self.spend_pubkey)?;
             let P_m0 = calculate_P_n(&B_m, t_0.into())?;
             let output_key_bytes = P_m0.x_only_public_key().0.serialize();
@@ -537,7 +540,7 @@ impl Receiver {
     pub fn candidate_spend_points(&self) -> Result<Vec<PublicKey>, Error> {
         let mut points = Vec::with_capacity(1 + self.labels.len());
         points.push(self.spend_pubkey);
-        for (_, mG) in &self.labels {
+        for mG in self.labels.keys() {
             points.push(mG.combine(&self.spend_pubkey)?);
         }
         Ok(points)
@@ -646,13 +649,44 @@ pub fn calculate_ecdh_shared_secret(tweak_data: &PublicKey, b_scan: &SecretKey) 
 
 #[cfg(test)]
 mod tests {
-    use super::Label;
+    use crate::core::{
+        receiving::{Label, Receiver},
+        secp256k1::{PublicKey, Secp256k1, SecretKey},
+        utils::common::Network,
+        SpVersion,
+    };
 
     #[test]
     fn string_to_label_success() {
         let s: String =
             "8e4bbee712779f746337cadf39e8b1eab8e8869dd40f2e3a7281113e858ffc0b".to_owned();
         Label::try_from(s).unwrap();
+    }
+
+    #[test]
+    fn receiver_serializes_labels_as_pairs() {
+        let secp = Secp256k1::new();
+        let scan_key = SecretKey::from_slice(&[1; 32]).unwrap();
+        let spend_key = SecretKey::from_slice(&[2; 32]).unwrap();
+        let scan_pubkey = PublicKey::from_secret_key(&secp, &scan_key);
+        let spend_pubkey = PublicKey::from_secret_key(&secp, &spend_key);
+
+        let change_label = Label::new(scan_key, 0);
+        let receiver = Receiver::new(
+            SpVersion::V0,
+            scan_pubkey,
+            spend_pubkey,
+            change_label,
+            Network::Regtest,
+        )
+        .unwrap();
+
+        let value = serde_json::to_value(&receiver).unwrap();
+
+        assert_eq!(value["version"], 0);
+        let labels = value["labels"].as_array().unwrap();
+        let first = labels[0].as_array().unwrap();
+        assert_eq!(first.len(), 2);
     }
 
     #[test]
