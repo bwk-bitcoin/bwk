@@ -2,6 +2,7 @@ pub mod error;
 pub mod hot_signer;
 #[cfg(all(feature = "hwi", not(target_os = "android")))]
 pub mod hwi;
+pub mod identity;
 pub mod signer;
 pub mod signing_manager;
 

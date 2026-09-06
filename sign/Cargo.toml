@@ -24,6 +24,7 @@ serde.workspace = true
 serde_json.workspace = true
 miniscript.workspace = true
 log.workspace = true
+thiserror.workspace = true
 
 # `bwk-hwi` pulls in the USB/HID hardware-wallet stack (coldcard -> hidapi ->
 # libudev), which cannot cross-compile to Android. Gate it off Android targets;
