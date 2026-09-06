@@ -128,6 +128,10 @@ impl SpSigner {
         self.network
     }
 
+    pub fn b_spend(&self) -> SecretKey {
+        self.b_spend
+    }
+
     /// Reconstructs the signing key for `input` if `b_spend`, tweaked by its
     /// `PSBT_IN_SP_TWEAK`, reproduces the prevout's taproot output key.
     fn reconstruct(&self, input: &bwk_psbt::Input, secp: &Secp256k1<All>) -> Option<SecretKey> {

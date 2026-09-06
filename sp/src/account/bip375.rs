@@ -616,7 +616,7 @@ mod tests {
             AccountError,
         },
         core::{dleq, utils::hash::calculate_input_hash},
-        receiver::{SpReceiver, SpendKey},
+        receiver::SpReceiver,
     };
 
     fn secret(byte: u8) -> SecretKey {
@@ -930,8 +930,8 @@ mod tests {
         (psbt, scan_key)
     }
 
-    fn receiver(scan: SecretKey, spend: SecretKey) -> SpReceiver {
-        SpReceiver::new(scan, SpendKey::Secret(spend), Network::Regtest).unwrap()
+    fn receiver(scan: SecretKey, spend: PublicKey) -> SpReceiver {
+        SpReceiver::new(scan, spend, Network::Regtest).unwrap()
     }
 
     fn receiver_discovers(
@@ -984,7 +984,7 @@ mod tests {
         let secp = Secp256k1::new();
         let input_pubkey = PublicKey::from_secret_key(&secp, &even_secret(5));
         let (mut psbt, _) = psbt();
-        let receiver = receiver(secret(6), secret(7));
+        let receiver = receiver(secret(6), PublicKey::from_secret_key(&secp, &secret(7)));
 
         complete_output_scripts(&mut psbt).unwrap();
 
@@ -1033,8 +1033,8 @@ mod tests {
             &expected_script(second.1, 1)
         );
 
-        let receiver_first = receiver(secret(6), first.0);
-        let mut receiver_second = receiver(secret(6), second.0);
+        let receiver_first = receiver(secret(6), first.1);
+        let mut receiver_second = receiver(secret(6), second.1);
         // `first` always lands on k=0 (it sorts first), so its own receiver
         // finds it immediately. `second` lands on k=1, and BIP352 scanning
         // never skips a gap on its own key alone; registering the label that
@@ -1120,7 +1120,7 @@ mod tests {
 
         complete_output_scripts(&mut psbt).unwrap();
 
-        let receiver = receiver(secret(6), secret(7));
+        let receiver = receiver(secret(6), PublicKey::from_secret_key(&secp, &secret(7)));
         assert!(receiver_discovers(&psbt, &receiver, &[pubkey_a, pubkey_b]));
     }
 
@@ -1313,7 +1313,7 @@ mod tests {
         complete_output_scripts(&mut matching).unwrap();
         validate(&matching).unwrap();
 
-        let receiver = receiver(scan_secret, spend_secret);
+        let receiver = receiver(scan_secret, spend_key);
         assert!(receiver_discovers(&matching, &receiver, &[input_pubkey]));
     }
 
@@ -1359,7 +1359,7 @@ mod tests {
             vout: 0,
         };
         psbt.inputs[0].psbt.non_witness_utxo = Some(non_witness_utxo);
-        let receiver = receiver(secret(6), secret(7));
+        let receiver = receiver(secret(6), PublicKey::from_secret_key(&secp, &secret(7)));
 
         let result = complete_output_scripts(&mut psbt);
         if result.is_ok() {
