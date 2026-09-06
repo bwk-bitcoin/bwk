@@ -1,9 +1,7 @@
 use miniscript::{
     bitcoin::{
-        self, absolute,
-        address::NetworkUnchecked,
-        secp256k1::{PublicKey, SecretKey},
-        Address, Network, ScriptBuf, TxOut, Weight,
+        self, absolute, address::NetworkUnchecked, secp256k1::PublicKey, Address, Network,
+        ScriptBuf, TxOut, Weight,
     },
     psbt::PsbtExt,
     Descriptor, DescriptorPublicKey,
@@ -19,29 +17,16 @@ use crate::{error::Error, transaction::Amount};
 pub struct FinalizationContext<'a> {
     /// Selected input coins
     pub inputs: &'a [Coin],
-    /// Partial secret for SP outputs (computed by SpPartialSecretProvider if any SP outputs exist)
-    pub partial_secret: Option<SecretKey>,
     /// Bitcoin network
     pub network: Network,
 }
 
-/// Trait for computing SP partial secret from inputs.
-/// Implemented by SpReceiver/Account in bwk-sp.
-pub trait SpPartialSecretProvider {
-    /// Compute the partial secret needed for SP output derivation.
-    /// This combines the spend key with tweaks from all selected inputs.
-    fn compute_partial_secret(&self, inputs: &[Coin]) -> Result<SecretKey, Error>;
-
-    /// Batch-derive scripts for all Silent Payment outputs in a transaction.
-    ///
-    /// BIP352 requires all SP outputs sharing the same scan key to be derived
-    /// together with incrementing `k` values. This method is called during
-    /// `finalize()` after computing `partial_secret` but before `build_psbt()`.
-    fn derive_sp_scripts(
-        &self,
-        _outputs: &mut [Box<dyn RecipientProvider>],
-        _partial_secret: SecretKey,
-    ) {
+/// Trait for updating BIP375 fields on a PSBTv2's silent-payment inputs.
+/// Implemented by signers in bwk-sp; the wallet never needs a private key to
+/// build a template, so the default body is a no-op.
+pub trait SpUpdater {
+    fn update_sp_inputs(&self, _psbt: &mut bwk_psbt::PsbtV2, _coins: &[Coin]) -> Result<(), Error> {
+        Ok(())
     }
 }
 
@@ -53,7 +38,7 @@ pub trait RecipientProvider: RecipientProviderClone {
 
     /// Create output script using finalization context.
     /// - For regular addresses: ignores context
-    /// - For SP: uses partial_secret from context to derive output key
+    /// - For SP: left unset here; a signer derives it from the input hash
     fn create_script(&mut self, ctx: &FinalizationContext) -> ScriptBuf;
 
     /// PSBT output metadata for signers (BIP32 derivation or BIP375 SP info)
@@ -74,9 +59,6 @@ pub trait RecipientProvider: RecipientProviderClone {
 
     /// Set the amount (used for Max output resolution)
     fn set_amount(&mut self, amount: Amount);
-
-    /// Store a pre-computed output script (used by SP batch derivation).
-    fn set_precomputed_script(&mut self, _script: ScriptBuf) {}
 
     /// Convert to PSBT output metadata
     fn to_psbt_output(&self) -> Result<bitcoin::psbt::Output, Error> {

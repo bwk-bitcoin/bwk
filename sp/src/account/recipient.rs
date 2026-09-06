@@ -1,31 +1,21 @@
 //! RecipientProvider implementations for Silent Payment types.
 //!
 //! This module implements bwk-tx's RecipientProvider trait for SP types.
-//! Uses newtype wrappers to satisfy the orphan rule.
+//! Uses newtype wrappers to satisfy the orphan rule. Silent-payment outputs
+//! never get a script here: that derivation needs `b_spend` and every
+//! selected input's tweak, so it happens later, in `bwk_sp::signer::SpSigner`.
 
 use crate::{
-    core::{receiving::NUMS_H, utils::common::SilentPaymentAddress, SpVersion},
+    core::utils::common::SilentPaymentAddress,
     receiver::{
-        bitcoin::{
-            bip32::{Fingerprint, Xpriv},
-            key::TapTweak,
-            script::PushBytesBuf,
-            secp256k1::{All, Keypair, Secp256k1, SecretKey},
-            Network, ScriptBuf, TxOut, Weight,
-        },
-        RecipientAddress, SpReceiver,
+        bitcoin::{script::PushBytesBuf, Network, ScriptBuf, TxOut, Weight},
+        RecipientAddress,
     },
 };
 
-use bwk_coin::{derive_descriptor, Coin, CoinSpendInfo};
 use bwk_tx::{
-    error::Error as TxError,
-    recipient::{FinalizationContext, PsbtOutputInfo, RecipientProvider, SpPartialSecretProvider},
+    recipient::{FinalizationContext, PsbtOutputInfo, RecipientProvider},
     transaction::Amount,
-};
-use miniscript::{
-    descriptor::{ShInner, Tr},
-    DefiniteDescriptorKey, Descriptor, ToPublicKey,
 };
 
 const TR_OUTPUT_WEIGHT: u64 = 172;
@@ -40,8 +30,6 @@ pub struct SpRecipient {
     pub label: Option<u32>,
     /// Network
     pub network: Network,
-    /// Pre-computed output script (set by batch derivation)
-    precomputed_script: Option<ScriptBuf>,
 }
 
 impl SpRecipient {
@@ -52,7 +40,6 @@ impl SpRecipient {
             amount: Amount::Value(amount),
             label: None,
             network,
-            precomputed_script: None,
         }
     }
 
@@ -68,7 +55,6 @@ impl SpRecipient {
             amount: Amount::Value(amount),
             label: Some(label),
             network,
-            precomputed_script: None,
         }
     }
 }
@@ -79,34 +65,10 @@ impl RecipientProvider for SpRecipient {
         Weight::from_wu(TR_OUTPUT_WEIGHT)
     }
 
-    fn create_script(&mut self, ctx: &FinalizationContext) -> ScriptBuf {
-        if let Some(ref script) = self.precomputed_script {
-            return script.clone();
-        }
-
-        let partial_secret = ctx
-            .partial_secret
-            .expect("SP output requires partial_secret in FinalizationContext");
-
-        // Fallback: single-output independent derivation (k=0).
-        // For multi-output transactions, derive_sp_scripts() should have
-        // already set precomputed_script with the correct k value.
-        let pubkeys = crate::core::sending::generate_recipient_pubkeys(
-            vec![self.address],
-            partial_secret.into(),
-        )
-        .expect("failed to generate SP recipient pubkeys");
-
-        let output_pubkeys = pubkeys
-            .get(&self.address)
-            .expect("missing pubkey for SP address");
-
-        let pubkey = output_pubkeys[0];
-        ScriptBuf::new_p2tr_tweaked(pubkey.dangerous_assume_tweaked())
-    }
-
-    fn set_precomputed_script(&mut self, script: ScriptBuf) {
-        self.precomputed_script = Some(script);
+    fn create_script(&mut self, _ctx: &FinalizationContext) -> ScriptBuf {
+        // Left empty: a signer derives this from the input hash and writes it
+        // into the PSBTv2 output once it has both b_spend and the tx's inputs.
+        ScriptBuf::new()
     }
 
     fn psbt_output_info(&self) -> PsbtOutputInfo {
@@ -139,8 +101,6 @@ pub struct SpRecipientAddress {
     pub inner: RecipientAddress,
     pub amount: Amount,
     pub network: Network,
-    /// Pre-computed output script (set by batch derivation)
-    precomputed_script: Option<ScriptBuf>,
 }
 
 impl SpRecipientAddress {
@@ -150,7 +110,6 @@ impl SpRecipientAddress {
             inner: addr,
             amount: Amount::Value(amount),
             network,
-            precomputed_script: None,
         }
     }
 
@@ -160,7 +119,6 @@ impl SpRecipientAddress {
             inner: RecipientAddress::SpAddress(addr),
             amount: Amount::Value(amount),
             network,
-            precomputed_script: None,
         }
     }
 }
@@ -187,28 +145,10 @@ impl RecipientProvider for SpRecipientAddress {
         }
     }
 
-    fn create_script(&mut self, ctx: &FinalizationContext) -> ScriptBuf {
+    fn create_script(&mut self, _ctx: &FinalizationContext) -> ScriptBuf {
         match &self.inner {
-            RecipientAddress::SpAddress(sp) => {
-                if let Some(ref script) = self.precomputed_script {
-                    return script.clone();
-                }
-
-                let partial_secret = ctx
-                    .partial_secret
-                    .expect("SP output requires partial_secret");
-
-                let pubkeys = crate::core::sending::generate_recipient_pubkeys(
-                    vec![*sp],
-                    partial_secret.into(),
-                )
-                .expect("failed to generate SP recipient pubkeys");
-
-                let output_pubkeys = pubkeys.get(sp).expect("missing pubkey for SP address");
-
-                let pubkey = output_pubkeys[0];
-                ScriptBuf::new_p2tr_tweaked(pubkey.dangerous_assume_tweaked())
-            }
+            // Left empty: a signer derives this later, see `SpRecipient::create_script`.
+            RecipientAddress::SpAddress(_) => ScriptBuf::new(),
             RecipientAddress::LegacyAddress(addr) => addr.script_pubkey(),
             RecipientAddress::Data(data) => {
                 let mut op_return = PushBytesBuf::with_capacity(data.len());
@@ -218,10 +158,6 @@ impl RecipientProvider for SpRecipientAddress {
                 ScriptBuf::new_op_return(op_return)
             }
         }
-    }
-
-    fn set_precomputed_script(&mut self, script: ScriptBuf) {
-        self.precomputed_script = Some(script);
     }
 
     fn psbt_output_info(&self) -> PsbtOutputInfo {
@@ -338,10 +274,6 @@ impl RecipientProvider for SpChangeRecipientProvider {
         self.0.create_script(ctx)
     }
 
-    fn set_precomputed_script(&mut self, script: ScriptBuf) {
-        self.0.set_precomputed_script(script);
-    }
-
     fn psbt_output_info(&self) -> PsbtOutputInfo {
         self.0.psbt_output_info()
     }
@@ -367,301 +299,32 @@ impl RecipientProvider for SpChangeRecipientProvider {
     }
 }
 
-// Batch SP script derivation
-
-use std::collections::{BTreeMap, HashMap};
-
-/// Batch-derive output scripts for all SP outputs in a transaction.
-///
-/// Per BIP352, outputs sharing the same scan key must be derived together
-/// with incrementing `k` values. This function:
-/// 1. Collects all SP addresses from outputs via `psbt_output_info()`
-/// 2. Calls `generate_recipient_pubkeys()` once with all SP addresses
-/// 3. Uses per-address counters to assign the correct pubkey to each output
-/// 4. Stores the pre-computed script on each SP output
-///
-/// Source: adapted from cygnet3/spdk's silent-payment transaction finalization.
-/// See `sp/NOTICE`.
-fn batch_derive_sp_scripts(
-    outputs: &mut [Box<dyn RecipientProvider>],
-    partial_secret: crate::receiver::bitcoin::secp256k1::SecretKey,
-) {
-    // Collect SP output indices and reconstruct their addresses
-    let mut sp_indices = Vec::new();
-    let mut sp_addresses = Vec::new();
-
-    for (i, output) in outputs.iter().enumerate() {
-        if !output.is_silent_payment() {
-            continue;
-        }
-        if let PsbtOutputInfo::SilentPayment {
-            scan_pubkey,
-            spend_pubkey,
-            ..
-        } = output.psbt_output_info()
-        {
-            let addr = SilentPaymentAddress::new(
-                scan_pubkey,
-                spend_pubkey,
-                output.network().into(),
-                SpVersion::V0,
-            )
-            .expect("valid SP address from psbt_output_info");
-            sp_addresses.push(addr);
-            sp_indices.push(i);
-        }
-    }
-
-    if sp_addresses.is_empty() {
-        return;
-    }
-
-    // Single call with all addresses: BIP352 k-counter increments per scan-key group
-    let pubkey_map = crate::core::sending::generate_recipient_pubkeys(
-        sp_addresses.clone(),
-        partial_secret.into(),
-    )
-    .expect("failed to generate SP recipient pubkeys");
-
-    // Assign the correct pubkey to each output using per-address counters
-    let mut counters: HashMap<SilentPaymentAddress, usize> = HashMap::new();
-
-    for (sp_idx, &output_idx) in sp_indices.iter().enumerate() {
-        let addr = &sp_addresses[sp_idx];
-        let pubkeys = pubkey_map.get(addr).expect("missing pubkey for SP address");
-        let k = counters.entry(*addr).or_insert(0);
-        let pubkey = pubkeys[*k];
-        *k += 1;
-
-        let script = ScriptBuf::new_p2tr_tweaked(pubkey.dangerous_assume_tweaked());
-        outputs[output_idx].set_precomputed_script(script);
-    }
-}
-
-// BIP352 input keys
-
-/// Sum the BIP352 input keys of `inputs` into the partial secret. The input
-/// hash still covers every outpoint, eligible or not.
-///
-/// Source: adapted from cygnet3/spdk's selected-input partial-secret logic.
-/// See `sp/NOTICE`.
-fn partial_secret(
-    inputs: &[Coin],
-    b_spend: &SecretKey,
-    xprivs: &BTreeMap<Fingerprint, Xpriv>,
-    secp: &Secp256k1<All>,
-) -> Result<SecretKey, TxError> {
-    let mut input_keys = Vec::with_capacity(inputs.len());
-    let mut outpoints = Vec::with_capacity(inputs.len());
-
-    for coin in inputs {
-        outpoints.push(coin.outpoint);
-        if let Some(key) = bip352_input_key(coin, b_spend, xprivs, secp)? {
-            input_keys.push(key);
-        }
-    }
-
-    crate::core::sending::calculate_partial_secret(&input_keys, &outpoints)
-        .map(|partial_secret| *partial_secret.as_inner())
-        .map_err(|_| TxError::SpPartialSecret)
-}
-
-/// The secret key `coin` adds to the BIP352 input sum, and whether it is a
-/// taproot key.
-///
-/// `None` for an input BIP352 receivers leave out of the sum. An error when
-/// the input counts but we cannot produce its key: the SP outputs would then
-/// pay to a key the receiver never finds. A descriptor we cannot derive at the
-/// coin's path errors with [`TxError::Coin`].
-fn bip352_input_key(
-    coin: &Coin,
-    b_spend: &SecretKey,
-    xprivs: &BTreeMap<Fingerprint, Xpriv>,
-    secp: &Secp256k1<All>,
-) -> Result<Option<(SecretKey, bool)>, TxError> {
-    match &coin.spend_info {
-        CoinSpendInfo::Sp { tweak, .. } => sp_input_key(b_spend, tweak).map(Some),
-        CoinSpendInfo::Bip32 {
-            coin_path: (keychain, index),
-            descriptor,
-        } => {
-            let descriptor = derive_descriptor(descriptor, *keychain, *index)?;
-            if descriptor.script_pubkey() != coin.txout.script_pubkey {
-                return Err(TxError::SpPartialSecret);
-            }
-            match &descriptor {
-                Descriptor::Pkh(pkh) => single_key_input_key(pkh.as_inner(), xprivs, secp),
-                Descriptor::Wpkh(wpkh) => single_key_input_key(wpkh.as_inner(), xprivs, secp),
-                Descriptor::Sh(sh) => match sh.as_inner() {
-                    ShInner::Wpkh(wpkh) => single_key_input_key(wpkh.as_inner(), xprivs, secp),
-                    ShInner::Wsh(_) | ShInner::SortedMulti(_) | ShInner::Ms(_) => Ok(None),
-                },
-                Descriptor::Tr(tr) => taproot_input_key(tr, xprivs, secp),
-                Descriptor::Bare(_) | Descriptor::Wsh(_) => Ok(None),
-            }
-        }
-    }
-}
-
-fn sp_input_key(b_spend: &SecretKey, tweak: &[u8; 32]) -> Result<(SecretKey, bool), TxError> {
-    let tweak = SecretKey::from_slice(tweak).map_err(|_| TxError::SpPartialSecret)?;
-    let key = b_spend
-        .add_tweak(&tweak.into())
-        .map_err(|_| TxError::SpPartialSecret)?;
-    Ok((key, true))
-}
-
-/// BIP352 skips an uncompressed key.
-fn single_key_input_key(
-    key: &DefiniteDescriptorKey,
-    xprivs: &BTreeMap<Fingerprint, Xpriv>,
-    secp: &Secp256k1<All>,
-) -> Result<Option<(SecretKey, bool)>, TxError> {
-    let pubkey = key.to_public_key();
-    if !pubkey.compressed {
-        return Ok(None);
-    }
-    let secret = held_secret(key, xprivs, secp)?;
-    if secret.public_key(secp) != pubkey.inner {
-        return Err(TxError::SpPartialSecret);
-    }
-    Ok(Some((secret, false)))
-}
-
-/// The output key is the internal key tweaked with the tap tree, whatever
-/// path the input will be spent with.
-fn taproot_input_key(
-    tr: &Tr<DefiniteDescriptorKey>,
-    xprivs: &BTreeMap<Fingerprint, Xpriv>,
-    secp: &Secp256k1<All>,
-) -> Result<Option<(SecretKey, bool)>, TxError> {
-    let internal_key = tr.internal_key();
-    if internal_key.to_x_only_pubkey().serialize() == NUMS_H {
-        return Ok(None);
-    }
-    let secret = held_secret(internal_key, xprivs, secp)?;
-    let spend_info = tr.spend_info();
-    let tweaked = Keypair::from_secret_key(secp, &secret)
-        .tap_tweak(secp, spend_info.merkle_root())
-        .to_keypair();
-    if tweaked.x_only_public_key().0 != spend_info.output_key().to_x_only_public_key() {
-        return Err(TxError::SpPartialSecret);
-    }
-    Ok(Some((tweaked.secret_key(), true)))
-}
-
-fn held_secret(
-    key: &DefiniteDescriptorKey,
-    xprivs: &BTreeMap<Fingerprint, Xpriv>,
-    secp: &Secp256k1<All>,
-) -> Result<SecretKey, TxError> {
-    let xpriv = xprivs
-        .get(&key.master_fingerprint())
-        .ok_or(TxError::SpPartialSecret)?;
-    let path = key.full_derivation_path().ok_or(TxError::SpPartialSecret)?;
-    xpriv
-        .derive_priv(secp, &path)
-        .map(|xpriv| xpriv.private_key)
-        .map_err(|_| TxError::SpPartialSecret)
-}
-
-// SpSecretProvider
-
-/// Standalone [`SpPartialSecretProvider`] that can be boxed into a
-/// [`TxBuilder`](bwk_tx::tx_builder::TxBuilder).
-///
-/// Holds a cloned [`SpReceiver`] for the spend key, and the master xprivs of
-/// the sub-accounts to derive the BIP32 input keys.
-pub struct SpSecretProvider {
-    client: SpReceiver,
-    xprivs: std::collections::BTreeMap<
-        crate::receiver::bitcoin::bip32::Fingerprint,
-        crate::receiver::bitcoin::bip32::Xpriv,
-    >,
-    secp: crate::receiver::bitcoin::secp256k1::Secp256k1<crate::receiver::bitcoin::secp256k1::All>,
-}
-
-impl SpSecretProvider {
-    pub fn new(
-        client: SpReceiver,
-        xprivs: std::collections::BTreeMap<
-            crate::receiver::bitcoin::bip32::Fingerprint,
-            crate::receiver::bitcoin::bip32::Xpriv,
-        >,
-    ) -> Self {
-        Self {
-            client,
-            xprivs,
-            secp: crate::receiver::bitcoin::secp256k1::Secp256k1::new(),
-        }
-    }
-}
-
-impl SpPartialSecretProvider for SpSecretProvider {
-    fn compute_partial_secret(&self, inputs: &[Coin]) -> Result<SecretKey, TxError> {
-        let b_spend = self
-            .client
-            .try_get_secret_spend_key()
-            .map_err(|_| TxError::SpPartialSecret)?;
-
-        partial_secret(inputs, &b_spend, &self.xprivs, &self.secp)
-    }
-
-    fn derive_sp_scripts(
-        &self,
-        outputs: &mut [Box<dyn RecipientProvider>],
-        partial_secret: crate::receiver::bitcoin::secp256k1::SecretKey,
-    ) {
-        batch_derive_sp_scripts(outputs, partial_secret);
-    }
-}
-
-// SpPartialSecretProvider for Account.
-
-#[cfg(feature = "mnemonic")]
-use crate::account::Account;
-
-#[cfg(feature = "mnemonic")]
-impl SpPartialSecretProvider for Account {
-    fn compute_partial_secret(&self, inputs: &[Coin]) -> Result<SecretKey, TxError> {
-        let b_spend = self
-            .sp_receiver()
-            .try_get_secret_spend_key()
-            .map_err(|_| TxError::SpPartialSecret)?;
-
-        partial_secret(inputs, &b_spend, &self.master_xprivs(), &Secp256k1::new())
-    }
-
-    fn derive_sp_scripts(
-        &self,
-        outputs: &mut [Box<dyn RecipientProvider>],
-        partial_secret: crate::receiver::bitcoin::secp256k1::SecretKey,
-    ) {
-        batch_derive_sp_scripts(outputs, partial_secret);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        core::utils::common::Network as SpNetwork,
-        receiver::bitcoin::{
-            bip32::{DerivationPath, Fingerprint, Xpriv, Xpub},
-            secp256k1::{PublicKey, Secp256k1, SecretKey, XOnlyPublicKey},
-            Amount as BtcAmount, OutPoint, Sequence, TxOut, Txid,
-        },
+        core::{utils::common::Network as SpNetwork, SpVersion},
+        receiver::bitcoin::secp256k1::PublicKey,
     };
-    use bwk_coin::{derive_descriptor, Coin, CoinSpendInfo, CoinStatus, KeyChain};
-    use bwk_tx::error::Error as TxError;
-    use miniscript::{Descriptor, DescriptorPublicKey};
-    use std::{collections::BTreeMap, str::FromStr};
 
-    /// Build a SilentPaymentAddress for `network` from deterministic keys.
+    /// Compressed encoding of the secp256k1 generator point `G`.
+    const SCAN_PUBKEY_BYTES: [u8; 33] = [
+        0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87,
+        0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16,
+        0xf8, 0x17, 0x98,
+    ];
+
+    /// Compressed encoding of `2G`.
+    const SPEND_PUBKEY_BYTES: [u8; 33] = [
+        0x02, 0xc6, 0x04, 0x7f, 0x94, 0x41, 0xed, 0x7d, 0x6d, 0x30, 0x45, 0x40, 0x6e, 0x95, 0xc0,
+        0x7c, 0xd8, 0x5c, 0x77, 0x8e, 0x4b, 0x8c, 0xef, 0x3c, 0xa7, 0xab, 0xac, 0x09, 0xb9, 0x5c,
+        0x70, 0x9e, 0xe5,
+    ];
+
+    /// Build a SilentPaymentAddress for `network` from fixed dummy keys.
     fn sp_address(network: SpNetwork) -> SilentPaymentAddress {
-        let secp = Secp256k1::new();
-        let scan = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[1u8; 32]).unwrap());
-        let spend = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[2u8; 32]).unwrap());
+        let scan = PublicKey::from_slice(&SCAN_PUBKEY_BYTES).unwrap();
+        let spend = PublicKey::from_slice(&SPEND_PUBKEY_BYTES).unwrap();
         SilentPaymentAddress::new(scan, spend, network, SpVersion::V0).unwrap()
     }
 
@@ -712,228 +375,5 @@ mod tests {
         let addr = sp_address(SpNetwork::Regtest);
         assert!(b.try_send_to_sp(addr, 10_000).is_ok());
         assert_eq!(b.tx_template.outputs.len(), 1);
-    }
-
-    fn xpriv(seed: u8) -> Xpriv {
-        Xpriv::new_master(Network::Regtest, &[seed; 32]).unwrap()
-    }
-
-    fn xpub(seed: u8) -> Xpub {
-        Xpub::from_priv(&Secp256k1::new(), &xpriv(seed))
-    }
-
-    fn held(seeds: &[u8]) -> BTreeMap<Fingerprint, Xpriv> {
-        let secp = Secp256k1::new();
-        seeds
-            .iter()
-            .map(|seed| (xpriv(*seed).fingerprint(&secp), xpriv(*seed)))
-            .collect()
-    }
-
-    /// A receive coin at index 0 of `descriptor`, paying to its scriptPubKey.
-    fn bip32_coin(descriptor: &str) -> Coin {
-        let descriptor = Descriptor::<DescriptorPublicKey>::from_str(descriptor).unwrap();
-        let script_pubkey = derive_descriptor(&descriptor, KeyChain::Receive, 0)
-            .unwrap()
-            .script_pubkey();
-        Coin {
-            txout: TxOut {
-                value: BtcAmount::from_sat(10_000),
-                script_pubkey,
-            },
-            outpoint: OutPoint::null(),
-            height: Some(1),
-            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-            status: CoinStatus::Confirmed,
-            label: None,
-            satisfaction_size: 0,
-            spend_info: CoinSpendInfo::Bip32 {
-                coin_path: (KeyChain::Receive, 0),
-                descriptor,
-            },
-        }
-    }
-
-    fn input_key(coin: &Coin, seeds: &[u8]) -> Result<Option<(SecretKey, bool)>, TxError> {
-        let b_spend = SecretKey::from_slice(&[3u8; 32]).unwrap();
-        bip352_input_key(coin, &b_spend, &held(seeds), &Secp256k1::new())
-    }
-
-    /// The secret at `path` under the master key of `seed`.
-    fn derived_secret(seed: u8, path: &str) -> SecretKey {
-        let path = DerivationPath::from_str(path).unwrap();
-        xpriv(seed)
-            .derive_priv(&Secp256k1::new(), &path)
-            .unwrap()
-            .private_key
-    }
-
-    fn output_key(coin: &Coin) -> XOnlyPublicKey {
-        XOnlyPublicKey::from_slice(&coin.txout.script_pubkey.as_bytes()[2..34]).unwrap()
-    }
-
-    fn assert_single_key(descriptor: &str) {
-        let coin = bip32_coin(descriptor);
-        let (key, is_taproot) = input_key(&coin, &[1]).unwrap().unwrap();
-        assert_eq!(key, derived_secret(1, "m/0/0"));
-        assert!(!is_taproot);
-    }
-
-    fn assert_taproot_key(descriptor: &str) {
-        let coin = bip32_coin(descriptor);
-        let (key, is_taproot) = input_key(&coin, &[1, 2]).unwrap().unwrap();
-        assert!(is_taproot);
-        assert_eq!(
-            key.x_only_public_key(&Secp256k1::new()).0,
-            output_key(&coin)
-        );
-    }
-
-    fn assert_not_eligible(descriptor: &str) {
-        let coin = bip32_coin(descriptor);
-        assert!(matches!(input_key(&coin, &[1, 2]), Ok(None)));
-    }
-
-    #[test]
-    fn bip352_input_key_wpkh() {
-        assert_single_key(&format!("wpkh({}/<0;1>/*)", xpub(1)));
-    }
-
-    #[test]
-    fn bip352_input_key_sh_wpkh() {
-        assert_single_key(&format!("sh(wpkh({}/<0;1>/*))", xpub(1)));
-    }
-
-    #[test]
-    fn bip352_input_key_pkh() {
-        assert_single_key(&format!("pkh({}/<0;1>/*)", xpub(1)));
-    }
-
-    #[test]
-    fn bip352_input_key_skips_wsh() {
-        assert_not_eligible(&format!("wsh(pk({}/<0;1>/*))", xpub(1)));
-    }
-
-    #[test]
-    fn bip352_input_key_skips_sh_wsh() {
-        assert_not_eligible(&format!("sh(wsh(pk({}/<0;1>/*)))", xpub(1)));
-    }
-
-    #[test]
-    fn bip352_input_key_tr_key_only() {
-        assert_taproot_key(&format!("tr({}/<0;1>/*)", xpub(1)));
-    }
-
-    #[test]
-    fn bip352_input_key_tr_with_tree() {
-        assert_taproot_key(&format!("tr({}/<0;1>/*,pk({}/<0;1>/*))", xpub(1), xpub(2)));
-    }
-
-    #[test]
-    fn bip352_input_key_tr_with_tree_differs_from_key_only() {
-        let key_only = bip32_coin(&format!("tr({}/<0;1>/*)", xpub(1)));
-        let with_tree = bip32_coin(&format!("tr({}/<0;1>/*,pk({}/<0;1>/*))", xpub(1), xpub(2)));
-        let (key_only, _) = input_key(&key_only, &[1, 2]).unwrap().unwrap();
-        let (with_tree, _) = input_key(&with_tree, &[1, 2]).unwrap().unwrap();
-        assert_ne!(key_only, with_tree);
-    }
-
-    #[test]
-    fn bip352_input_key_skips_tr_nums_internal_key() {
-        assert_not_eligible(&format!(
-            "tr({},pk({}/<0;1>/*))",
-            hex::encode(NUMS_H),
-            xpub(2)
-        ));
-    }
-
-    #[test]
-    fn bip352_input_key_tr_holding_only_leaf_key_errors() {
-        let coin = bip32_coin(&format!("tr({}/<0;1>/*,pk({}/<0;1>/*))", xpub(1), xpub(2)));
-        assert!(matches!(
-            input_key(&coin, &[2]),
-            Err(TxError::SpPartialSecret)
-        ));
-    }
-
-    #[test]
-    fn bip352_input_key_wpkh_not_held_errors() {
-        let coin = bip32_coin(&format!("wpkh({}/<0;1>/*)", xpub(1)));
-        assert!(matches!(
-            input_key(&coin, &[2]),
-            Err(TxError::SpPartialSecret)
-        ));
-    }
-
-    #[test]
-    fn bip352_input_key_spk_mismatch_errors() {
-        let mut coin = bip32_coin(&format!("wpkh({}/<0;1>/*)", xpub(1)));
-        coin.txout.script_pubkey = bip32_coin(&format!("wpkh({}/<0;1>/*)", xpub(2)))
-            .txout
-            .script_pubkey;
-        assert!(matches!(
-            input_key(&coin, &[1, 2]),
-            Err(TxError::SpPartialSecret)
-        ));
-    }
-
-    /// `coin` spent from an outpoint whose txid is `txid_byte` repeated.
-    fn at(mut coin: Coin, txid_byte: u8) -> Coin {
-        coin.outpoint = OutPoint::new(
-            Txid::from_str(&format!("{txid_byte:02x}").repeat(32)).unwrap(),
-            0,
-        );
-        coin
-    }
-
-    fn partial_secret_of(inputs: &[Coin]) -> Result<SecretKey, TxError> {
-        let b_spend = SecretKey::from_slice(&[3u8; 32]).unwrap();
-        partial_secret(inputs, &b_spend, &held(&[1]), &Secp256k1::new())
-    }
-
-    #[test]
-    fn partial_secret_hashes_the_outpoint_of_an_ineligible_input() {
-        let eligible = at(bip32_coin(&format!("wpkh({}/<0;1>/*)", xpub(1))), 0x11);
-        let ineligible = bip32_coin(&format!("wsh(pk({}/<0;1>/*))", xpub(1)));
-
-        let smallest = partial_secret_of(&[eligible.clone(), at(ineligible.clone(), 0x00)]);
-        let largest = partial_secret_of(&[eligible, at(ineligible.clone(), 0x22)]);
-        assert_ne!(smallest.unwrap(), largest.unwrap());
-
-        assert!(matches!(
-            partial_secret_of(&[ineligible]),
-            Err(TxError::SpPartialSecret)
-        ));
-    }
-
-    const ACCOUNT_PATH: &str = "84'/1'/0'";
-
-    /// The account xpub of `key_seed`, behind the origin of `origin_seed`.
-    fn with_origin(origin_seed: u8, key_seed: u8) -> String {
-        let secp = Secp256k1::new();
-        let path = DerivationPath::from_str(&format!("m/{ACCOUNT_PATH}")).unwrap();
-        let account = xpriv(key_seed).derive_priv(&secp, &path).unwrap();
-        format!(
-            "[{}/{ACCOUNT_PATH}]{}",
-            xpriv(origin_seed).fingerprint(&secp),
-            Xpub::from_priv(&secp, &account)
-        )
-    }
-
-    #[test]
-    fn bip352_input_key_wpkh_with_origin() {
-        let coin = bip32_coin(&format!("wpkh({}/<0;1>/*)", with_origin(1, 1)));
-        let (key, is_taproot) = input_key(&coin, &[1]).unwrap().unwrap();
-        assert_eq!(key, derived_secret(1, &format!("m/{ACCOUNT_PATH}/0/0")));
-        assert!(!is_taproot);
-    }
-
-    #[test]
-    fn bip352_input_key_lying_origin_errors() {
-        let coin = bip32_coin(&format!("wpkh({}/<0;1>/*)", with_origin(1, 2)));
-        assert!(matches!(
-            input_key(&coin, &[1, 2]),
-            Err(TxError::SpPartialSecret)
-        ));
     }
 }

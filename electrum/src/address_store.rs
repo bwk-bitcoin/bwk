@@ -675,7 +675,6 @@ mod tests {
         // Create a dummy finalization context
         let ctx = FinalizationContext {
             inputs: &[],
-            partial_secret: None,
             network,
         };
 

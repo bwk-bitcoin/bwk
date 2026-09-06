@@ -20,20 +20,21 @@ use {
         account::{
             coin_store::{CoinState, MergedCoinSource, SpCoinEntry, SpCoinSource, SpCoinStore},
             config::Config,
-            recipient::{SpChangeRecipientProvider, SpSecretProvider},
+            recipient::SpChangeRecipientProvider,
             tx_store::{header_time, SpTxEntry, SpTxStore},
         },
         blindbit::{self, InfoResponse},
         core::utils::common::SilentPaymentAddress,
         receiver::{bip39, SpReceiver},
         scan::{state::ScanState, ScanRuntimeConfig, ScanRuntimeConfigError},
+        signer::{self, SpSigner},
     },
     bitcoin::{
         hashes::Hash,
-        secp256k1::{Keypair, Message, PublicKey, Secp256k1, SecretKey, XOnlyPublicKey},
-        sighash::{Prevouts, SighashCache},
-        taproot::Signature,
-        Amount, Network, OutPoint, ScriptBuf, TapSighashType, TxOut, Txid,
+        key::TapTweak,
+        secp256k1::{Keypair, Parity, PublicKey, Secp256k1, SecretKey, XOnlyPublicKey},
+        sighash::SighashCache,
+        Amount, Network, OutPoint, ScriptBuf, TxOut, Txid,
     },
     bwk::{
         bwk_electrum::{
@@ -188,6 +189,46 @@ fn p2tr_output_key(script: &ScriptBuf) -> Option<XOnlyPublicKey> {
         .is_p2tr()
         .then(|| XOnlyPublicKey::from_slice(&script.as_bytes()[2..34]).ok())
         .flatten()
+}
+
+/// Derives a BIP32 input's key from `xprivs` as BIP352 sums it: for a P2TR
+/// prevout the internal key tweaked with the tap tree, whatever path the input
+/// will be spent with, negated to its even point (the scanner's tweak is
+/// always taken against the tweaked output key, so the SP share must be
+/// computed from the same key); the derived key otherwise. Only kept when it
+/// reproduces `eligible`, the input's BIP352 public key.
+#[cfg(feature = "mnemonic")]
+fn bip32_secret_key(
+    input: &bitcoin::psbt::Input,
+    eligible: PublicKey,
+    xprivs: &BTreeMap<bitcoin::bip32::Fingerprint, bitcoin::bip32::Xpriv>,
+    secp: &Secp256k1<bitcoin::secp256k1::All>,
+) -> Option<SecretKey> {
+    let held = |(fingerprint, path): &bitcoin::bip32::KeySource| {
+        xprivs
+            .get(fingerprint)?
+            .derive_priv(secp, path)
+            .ok()
+            .map(|k| k.private_key)
+    };
+    let key = match input.tap_internal_key {
+        Some(internal_key) => {
+            let (_, origin) = input.tap_key_origins.get(&internal_key)?;
+            let tweaked = Keypair::from_secret_key(secp, &held(origin)?)
+                .tap_tweak(secp, input.tap_merkle_root)
+                .to_keypair();
+            match tweaked.x_only_public_key().1 {
+                Parity::Odd => tweaked.secret_key().negate(),
+                Parity::Even => tweaked.secret_key(),
+            }
+        }
+        None => input
+            .bip32_derivation
+            .values()
+            .filter_map(held)
+            .find(|key| key.public_key(secp) == eligible)?,
+    };
+    (key.public_key(secp) == eligible).then_some(key)
 }
 
 #[cfg(feature = "mnemonic")]
@@ -1404,16 +1445,18 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         self.sp_receiver.try_get_secret_spend_key().is_ok()
     }
 
-    /// Returns a [`TxBuilder`] pre-configured with this account's coin source,
-    /// change provider, and SP partial secret provider.
+    /// Returns a [`TxBuilder`] pre-configured with this account's coin source
+    /// and change provider. Building never needs a private key: a
+    /// silent-payment output is left unscripted for a signer (see
+    /// [`crate::signer::SpSigner`]) to complete.
     ///
     /// Usage mirrors [`bwk::account::Account::tx_builder()`]:
     /// ```ignore
     /// let mut builder = account.tx_builder();
     /// builder.add_output(SpRecipient::new(sp_addr, 50_000, network));
     /// builder.feerate(1000);
-    /// let mut psbt = builder.generate()?;
-    /// account.sign_psbt(&mut psbt)?;
+    /// let mut psbt = builder.generate_v2()?;
+    /// account.sign_and_finalize_v2(&mut psbt)?;
     /// ```
     pub fn tx_builder(&self) -> bwk_tx::tx_builder::TxBuilder {
         let change_addr = self.sp_receiver.receiver.get_change_address();
@@ -1424,20 +1467,13 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
 
         let sp_source = SpCoinSource::new(self.coin_store.clone());
 
-        let sp_provider = Box::new(SpSecretProvider::new(
-            self.sp_receiver.clone(),
-            self.master_xprivs(),
-        ));
-
         let bip32_sources: Vec<Box<dyn bwk_coin::CoinSource>> = self
             .scanners()
             .map(|scanner| Box::new(scanner.coin_source()) as Box<dyn bwk_coin::CoinSource>)
             .collect();
         let merged_source = Box::new(MergedCoinSource::new(sp_source, bip32_sources));
 
-        bwk_tx::tx_builder::TxBuilder::new(change_provider)
-            .coin_source(merged_source)
-            .sp_provider(sp_provider)
+        bwk_tx::tx_builder::TxBuilder::new(change_provider).coin_source(merged_source)
     }
 
     /// Sign all inputs in a PSBT, both SP and BIP32 (segwit/taproot).
@@ -1473,6 +1509,76 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     ) -> Result<bitcoin::Transaction, AccountError> {
         self.sign_psbt(psbt)?;
         Self::finalize(psbt)
+    }
+
+    /// Signs and finalizes a native PSBTv2 into a broadcast-ready
+    /// transaction, bridging this account's mnemonic-derived keys into
+    /// [`SpSigner`] for the silent-payment side. Temporary: once signing
+    /// fully moves behind the BIP375 signer role, this collapses into
+    /// [`SpSigner::sign`] plus the existing BIP32 signing loop.
+    pub fn sign_and_finalize_v2(
+        &self,
+        psbt: &mut bwk_psbt::PsbtV2,
+    ) -> Result<bitcoin::Transaction, AccountError> {
+        let mnemonic = self
+            .config
+            .mnemonic
+            .as_ref()
+            .ok_or(AccountError::MissingKeys)?;
+
+        self.add_bip32_sp_shares(psbt)?;
+
+        let signer = SpSigner::from_mnemonic(
+            mnemonic,
+            self.config.network,
+            bitcoin::bip32::ChildNumber::from_hardened_idx(0).expect("zero"),
+        )
+        .map_err(|_| AccountError::NoKeys)?;
+        signer.sign(psbt).map_err(|_| AccountError::PsbtV2)?;
+
+        let mut bitcoin_psbt = psbt
+            .clone()
+            .into_bitcoin_psbt()
+            .map_err(|_| AccountError::PsbtV2)?;
+        self.signing_manager
+            .sign_with_all_hot_signers(&mut bitcoin_psbt);
+        Self::finalize(&mut bitcoin_psbt)
+    }
+
+    /// Writes per-input BIP375 ECDH shares/proofs for eligible BIP32 inputs
+    /// the sub-accounts control, using their own xprivs.
+    ///
+    /// [`SpSigner`] only holds `b_spend`, so a transaction mixing BIP32 and
+    /// silent-payment inputs needs this too: `combined_share` requires every
+    /// eligible input's contribution, and the BIP32 ones are outside
+    /// `SpSigner`'s reach.
+    fn add_bip32_sp_shares(&self, psbt: &mut bwk_psbt::PsbtV2) -> Result<(), AccountError> {
+        let scan_keys = bip375::scan_keys(psbt)?;
+        if scan_keys.is_empty() {
+            return Ok(());
+        }
+        let xprivs = self.signing_manager.master_xprivs();
+        let secp = Secp256k1::new();
+        let mut aux_rand = [0u8; 32];
+        getrandom::getrandom(&mut aux_rand).map_err(AccountError::AuxRand)?;
+
+        for input in &mut psbt.inputs {
+            if bwk_psbt::sp::sp_input_tweak(&input.psbt)
+                .map_err(|_| AccountError::PsbtV2)?
+                .is_some()
+            {
+                continue; // an SP-owned input: SpSigner handles it
+            }
+            let Some(eligible) = bip375::eligible_input_pubkey(input)? else {
+                continue;
+            };
+            let Some(sk) = bip32_secret_key(&input.psbt, eligible, &xprivs, &secp) else {
+                continue;
+            };
+            signer::write_input_ecdh_share(&mut input.psbt, &scan_keys, sk, aux_rand, &secp)
+                .ok_or(AccountError::PsbtV2)?;
+        }
+        Ok(())
     }
 
     /// Broadcast a signed spend in the background. Completion is reported via
@@ -1585,7 +1691,6 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
             .map_err(AccountError::Signing)?;
 
         let secp = Secp256k1::new();
-        let hash_ty = TapSighashType::Default;
 
         // `Prevouts::All` needs the spent output of every input, not only the SP ones.
         let prevouts = psbt
@@ -1606,25 +1711,17 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         getrandom::getrandom(&mut aux_rand).map_err(AccountError::AuxRand)?;
 
         for (i, entry) in sp_inputs {
-            let sighash = cache
-                .taproot_key_spend_signature_hash(i, &Prevouts::All(&prevouts), hash_ty)
-                .map_err(AccountError::Sighash)?;
-
-            let msg = Message::from_digest(sighash.to_byte_array());
             let tweak = SecretKey::from_slice(entry.tweak()).map_err(AccountError::Tweak)?;
-            let sk = b_spend
-                .add_tweak(&tweak.into())
-                .map_err(AccountError::Tweak)?;
+            let Some(sk) =
+                signer::reconstruct_signing_key(b_spend, tweak, &prevouts[i].script_pubkey, &secp)
+            else {
+                continue;
+            };
 
-            let keypair = Keypair::from_secret_key(&secp, &sk);
-            // SP outputs use dangerous_assume_tweaked(): no taproot tweak on the
-            // output key, so sign with the untweaked keypair directly.
-            let sig = secp.sign_schnorr_with_aux_rand(&msg, &keypair, &aux_rand);
-
-            psbt.inputs[i].tap_key_sig = Some(Signature {
-                signature: sig,
-                sighash_type: hash_ty,
-            });
+            let signature =
+                signer::sign_taproot_key_spend(&mut cache, &prevouts, i, &sk, &secp, &aux_rand)
+                    .map_err(AccountError::Sighash)?;
+            psbt.inputs[i].tap_key_sig = Some(signature);
         }
 
         Ok(())

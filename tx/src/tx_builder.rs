@@ -1,6 +1,6 @@
 use crate::{
     coin_selection::{CoinSelector, DefaultCoinSelector},
-    recipient::{Recipient, RecipientProvider, SpPartialSecretProvider},
+    recipient::{Recipient, RecipientProvider, SpUpdater},
     transaction::{
         process_transaction, tx_estimated_weight, Amount, Error, Fees, TransactionResult,
         TxTemplate,
@@ -41,7 +41,7 @@ pub struct TxBuilder {
     change_provider: Box<dyn RecipientProvider>,
     pub tx_template: TxTemplate,
     coin_source: Option<Box<dyn CoinSource>>,
-    sp_provider: Option<Box<dyn SpPartialSecretProvider>>,
+    sp_updater: Option<Box<dyn SpUpdater>>,
     coin_selector: Box<dyn CoinSelector>,
     max_fee_percent: u8,
     max_fee_amount: u64,
@@ -60,7 +60,7 @@ impl TxBuilder {
                 dust_threshold: DUST_AMOUNT,
             },
             coin_source: None,
-            sp_provider: None,
+            sp_updater: None,
             coin_selector: Box::new(DefaultCoinSelector::default()),
             max_fee_percent: 10,
             max_fee_amount: 2_000_000,
@@ -83,7 +83,7 @@ impl TxBuilder {
                 dust_threshold: DUST_AMOUNT,
             },
             coin_source: Some(Box::new(BTreeMap::new())),
-            sp_provider: None,
+            sp_updater: None,
             coin_selector: Box::new(DefaultCoinSelector::default()),
             max_fee_percent: 10,
             max_fee_amount: 2_000_000,
@@ -97,8 +97,8 @@ impl TxBuilder {
         self.coin_source = Some(coin_source);
         self
     }
-    pub fn sp_provider(mut self, provider: Box<dyn SpPartialSecretProvider>) -> Self {
-        self.sp_provider = Some(provider);
+    pub fn sp_updater(mut self, updater: Box<dyn SpUpdater>) -> Self {
+        self.sp_updater = Some(updater);
         self
     }
     pub fn coin_selector(mut self, coin_selector: Box<dyn CoinSelector>) -> Self {
@@ -235,14 +235,15 @@ impl TxBuilder {
         Ok((res.tx_template, change_recip))
     }
 
-    /// Generate a signable PSBT from the current TxTemplate
+    /// Generate a signable PSBT from the current TxTemplate. Fails if any
+    /// output is a silent payment: a v0 PSBT has no field to carry the scan
+    /// and spend keys a signer would need, use [`Self::generate_v2`] instead.
     pub fn generate(&mut self) -> Result<Psbt, Error> {
         let (template, change_recip) = self.final_template()?;
 
         template.finalize(
             change_recip,
             true,
-            self.sp_provider.as_deref(),
             self.change_provider.network(),
             self.max_fee_percent,
             self.max_fee_amount,
@@ -250,15 +251,16 @@ impl TxBuilder {
         )
     }
 
-    /// Generate a native PSBTv2 from the current TxTemplate. No
-    /// `SpPartialSecretProvider` is involved: silent-payment outputs are left
-    /// with no script for a signer to derive.
+    /// Generate a native PSBTv2 from the current TxTemplate. No private key
+    /// is involved: silent-payment outputs are left with no script for a
+    /// signer to derive, unless a registered [`SpUpdater`] fills them in.
     pub fn generate_v2(&mut self) -> Result<PsbtV2, Error> {
         let (template, change_recip) = self.final_template()?;
 
         template.finalize_v2(
             change_recip,
             true,
+            self.sp_updater.as_deref(),
             self.change_provider.network(),
             self.max_fee_percent,
             self.max_fee_amount,
@@ -425,7 +427,6 @@ impl TxBuilder {
                             value,
                             script_pubkey: recipient.create_script(&FinalizationContext {
                                 inputs: &self.tx_template.inputs,
-                                partial_secret: None,
                                 network: bitcoin::Network::Bitcoin,
                             }),
                         };
