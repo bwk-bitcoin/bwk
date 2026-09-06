@@ -10,6 +10,7 @@
 
 use std::{
     process::Command,
+    str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
@@ -26,6 +27,7 @@ use bitcoin::{
 use blindbitd::BlindbitD;
 use bwk_utils::test::{corepc_node, temp_dir::TempDir};
 
+use bwk_sign::{bwk_descriptor::sp_descriptor::SpDescriptor, hot_signer::HotSigner};
 use bwk_sp::{
     account::config::Config,
     receiver::{OutputSpendStatus, OwnedOutput},
@@ -349,6 +351,37 @@ pub fn test_account_with_mnemonic(
     .unwrap()
     .with_persistence(None);
     bwk_sp::account::Account::new(config).expect("create test account")
+}
+
+/// Derives the BIP352 scan secret key and spend public key from `mnemonic`
+/// and builds the watch-only `sp(scan_priv,spend_pub)` form of the descriptor:
+/// every key an account needs to receive and build with, no spend secret.
+pub fn watch_only_descriptor(mnemonic: &str, network: bitcoin::Network) -> SpDescriptor {
+    let signer = HotSigner::new_from_mnemonics(network, mnemonic).unwrap();
+    let account = bitcoin::bip32::ChildNumber::from_hardened_idx(0).unwrap();
+    let scan_sk = signer.private_key_at(&bwk_sp::receiver::scan_path(network, account));
+    let spend_sk = signer.private_key_at(&bwk_sp::receiver::spend_path(network, account));
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let spend_pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &spend_sk);
+    let scan_wif = bitcoin::PrivateKey::new(scan_sk, bitcoin::NetworkKind::from(network)).to_wif();
+    SpDescriptor::from_str(&format!("sp({scan_wif},{spend_pk})")).unwrap()
+}
+
+/// Builds a watch-only Account from `sp(scan_priv,spend_pub)`: no mnemonic in
+/// its config and no hot signer attached, yet it derives the exact same
+/// silent-payment address as a hot account built from `mnemonic`.
+pub fn watch_only_account(name: &str, mnemonic: &str, url: &str) -> bwk_sp::account::Account {
+    let network = bitcoin::Network::Regtest;
+    let descriptor = watch_only_descriptor(mnemonic, network);
+    let config = Config::from_descriptor(
+        name.to_string(),
+        network,
+        descriptor,
+        url.to_string(),
+        std::path::PathBuf::from("/unused"),
+    )
+    .with_persistence(None);
+    bwk_sp::account::Account::new(config).unwrap()
 }
 
 /// Creates a test Account with persistence enabled.
@@ -678,7 +711,6 @@ pub fn swap_to_sp(
 
 use bwk::bwk_electrum::{config::ScannerConfig, scanner::ElectrumScanner};
 use bwk_coin::{Coin, CoinSpendInfo, CoinStatus, KeyChain};
-use bwk_sign::hot_signer::HotSigner;
 
 /// Mnemonic for BIP32 coins (different from SP mnemonics).
 #[allow(dead_code)]
