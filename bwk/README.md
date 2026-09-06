@@ -153,6 +153,13 @@ the name `hot`.
 roster, and `set_signer_polling(enabled)` turns device discovery on and off on
 all of them at once.
 
+`init_signer`, `signer_info`, `signer_xpub`, `is_descriptor_registered`,
+`register_descriptor`, `sign` and `signer_raw` each take a `SignerId`, resolve
+which manager owns it and return the `RequestId` that manager minted. An
+unknown id, or a signer that is not ready, is refused before any manager is
+touched. None of them blocks or returns a result: the answer comes back as a
+notification.
+
 ## Features
 
 All off by default. `logger` installs `env_logger` as the global logger; leave
