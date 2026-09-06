@@ -1,5 +1,7 @@
 //! Native BIP370 PSBTv2 support.
 
+pub mod sp;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use bitcoin::{
@@ -474,12 +476,29 @@ impl PsbtV2 {
             }
         }
         for output in &self.outputs {
-            if output.script_pubkey.is_none() {
+            // A silent-payment output legitimately has no script until a
+            // signer derives one from the input hash.
+            if output.script_pubkey.is_none() && !sp_output_info(output)? {
                 return Err(Error::MissingOutputScript);
             }
         }
         if self.tx_modifiable.is_some() && self.tx_version.0 < transaction::Version::TWO.0 {
             return Err(Error::InvalidField);
+        }
+        for output in &self.outputs {
+            let sp_info = sp::sp_v0_output(&output.psbt).map_err(|_| Error::InvalidField)?;
+            if sp::has_sp_v0_label(&output.psbt) && sp_info.is_none() {
+                return Err(Error::InvalidField);
+            }
+            // Once a silent-payment output's script has been computed, it is
+            // derived from the input hash, so the transaction must already be
+            // frozen: any still-modifiable field would invalidate it.
+            if output.script_pubkey.is_some()
+                && sp_info.is_some()
+                && self.tx_modifiable.map(TxModifiable::bits) != Some(0)
+            {
+                return Err(Error::InvalidField);
+            }
         }
         self.lock_time()?;
         Ok(())
@@ -549,6 +568,12 @@ pub enum Error {
     NotPsbtV0,
     #[error("PSBTv2 reserved field is present in an unknown map")]
     ReservedField,
+}
+
+fn sp_output_info(output: &Output) -> Result<bool, Error> {
+    sp::sp_v0_output(&output.psbt)
+        .map(|info| info.is_some())
+        .map_err(|_| Error::InvalidField)
 }
 
 fn parse_input(mut map: Vec<RawPair>) -> Result<(Input, Vec<RawPair>), Error> {
@@ -897,11 +922,12 @@ mod tests {
         absolute,
         hashes::Hash,
         psbt::{self, raw::Key},
+        secp256k1::{PublicKey, Secp256k1, SecretKey},
         transaction, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
     };
 
     use crate::{
-        read_map, spec_key_type, Error, Input, Output, PsbtV2, TxModifiable,
+        read_map, sp, spec_key_type, Error, Input, Output, PsbtV2, TxModifiable,
         PSBT_GLOBAL_TX_VERSION, PSBT_GLOBAL_UNSIGNED_TX, PSBT_GLOBAL_VERSION, PSBT_IN_SEQUENCE,
         PSBT_OUT_AMOUNT,
     };
@@ -957,6 +983,11 @@ mod tests {
             type_value,
             key: Vec::new(),
         }
+    }
+
+    fn public_key(b: u8) -> PublicKey {
+        let secp = Secp256k1::new();
+        PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[b; 32]).unwrap())
     }
 
     fn v0_tx(lock_time: absolute::LockTime) -> Transaction {
@@ -1071,6 +1102,59 @@ mod tests {
     #[test]
     fn rejects_missing_output_script() {
         assert_eq!(psbt(None).serialize(), Err(Error::MissingOutputScript));
+    }
+
+    #[test]
+    fn accepts_missing_silent_payment_output_script() {
+        let scan = public_key(1);
+        let spend = public_key(2);
+        let mut psbt = psbt(None);
+        sp::set_sp_v0_output(&mut psbt.outputs[0].psbt, scan, spend, None);
+
+        let bytes = psbt.serialize().unwrap();
+        let parsed = PsbtV2::deserialize(&bytes).unwrap();
+        assert_eq!(parsed.outputs[0].script_pubkey, None);
+        assert_eq!(
+            sp::sp_v0_output(&parsed.outputs[0].psbt)
+                .unwrap()
+                .unwrap()
+                .scan_key,
+            scan
+        );
+        assert_eq!(parsed.unsigned_tx(), Err(Error::MissingOutputScript));
+    }
+
+    #[test]
+    fn rejects_silent_payment_label_without_info() {
+        let mut psbt = psbt_with_script();
+        psbt.outputs[0].psbt.unknown.insert(
+            unkeyed(sp::PSBT_OUT_SP_V0_LABEL),
+            0u32.to_le_bytes().to_vec(),
+        );
+        assert_eq!(psbt.serialize(), Err(Error::InvalidField));
+    }
+
+    #[test]
+    fn rejects_malformed_silent_payment_output_info() {
+        let mut psbt = psbt_with_script();
+        psbt.outputs[0]
+            .psbt
+            .unknown
+            .insert(unkeyed(sp::PSBT_OUT_SP_V0_INFO), vec![0; 65]);
+        assert_eq!(psbt.serialize(), Err(Error::InvalidField));
+    }
+
+    #[test]
+    fn rejects_computed_silent_payment_output_without_frozen_flags() {
+        let scan = public_key(1);
+        let spend = public_key(2);
+        let mut psbt = psbt_with_script();
+        sp::set_sp_v0_output(&mut psbt.outputs[0].psbt, scan, spend, None);
+
+        assert_eq!(psbt.serialize(), Err(Error::InvalidField));
+
+        psbt.tx_modifiable = Some(TxModifiable::none());
+        assert!(psbt.serialize().is_ok());
     }
 
     #[test]

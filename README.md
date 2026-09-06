@@ -47,7 +47,7 @@ Blindbit).
 | bwk            | Account for descriptor wallets (Electrum backend)     |
 | bwk-sp         | Silent Payments account (BIP352, Blindbit backend)    |
 | bwk-tx         | Transaction building, coin selection, PSBT            |
-| bwk-psbt       | Native PSBTv2 (BIP370)                                |
+| bwk-psbt       | PSBTv2 (BIP370), silent-payment fields (BIP375/376)   |
 | bwk-electrum   | Electrum client, scanner, scan stores, header chain   |
 | bwk-sign       | Hot signer, SigningManager                            |
 | bwk-descriptor | Descriptor construction, SpkDerivator                 |
