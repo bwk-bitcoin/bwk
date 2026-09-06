@@ -6,7 +6,7 @@ use bwk_psbt::{Input as PsbtV2Input, Output as PsbtV2Output, PsbtV2};
 
 use crate::{
     coin_selection::CoinSelector,
-    recipient::{FinalizationContext, PsbtOutputInfo, RecipientProvider, SpPartialSecretProvider},
+    recipient::{FinalizationContext, PsbtOutputInfo, RecipientProvider, SpUpdater},
     DUST_AMOUNT,
 };
 
@@ -44,10 +44,8 @@ pub enum Error {
     // the fee is absolute (`Fees::Sats`); selection needs a per-vB feerate.
     #[error("auto coin selection requires a per-vB feerate")]
     CoinSelectionRequiresFeerate,
-    #[error("no silent payment provider")]
-    NoSpProvider,
-    #[error("failed to compute silent payment partial secret")]
-    SpPartialSecret,
+    #[error("silent payment outputs require psbt v2")]
+    SpRequiresPsbtV2,
     #[error("silent payments do not support segwit v2 or later inputs")]
     UnsupportedSegwitVersion,
     #[error("change output already added")]
@@ -163,7 +161,6 @@ impl TxTemplate {
                 } else {
                     r.create_script(&FinalizationContext {
                         inputs: &[],
-                        partial_secret: None,
                         network: Network::Bitcoin,
                     })
                 };
@@ -221,26 +218,10 @@ impl TxTemplate {
         (inputs, outputs)
     }
 
-    fn compute_sp_partial_secret(
-        inputs: &[Coin],
-        outputs: &[Box<dyn RecipientProvider>],
-        sp_provider: &dyn SpPartialSecretProvider,
-    ) -> Result<Option<bitcoin::secp256k1::SecretKey>, Error> {
-        let needs_sp = outputs.iter().any(|r| r.is_silent_payment());
-        if !needs_sp {
-            return Ok(None);
-        }
-
-        let secret = sp_provider
-            .compute_partial_secret(inputs)
-            .map_err(|_| Error::SpPartialSecret)?;
-        Ok(Some(secret))
-    }
-
     // BIP352 only defines input-hash contribution for P2PKH, P2WPKH, P2TR and
     // P2SH-P2WPKH: a witness program of any other version cannot be reduced to
     // a public key, so it cannot be summed into the input hash.
-    fn prepare_sp_inputs(
+    fn check_sp_input_versions(
         inputs: &[Coin],
         outputs: &[Box<dyn RecipientProvider>],
     ) -> Result<(), Error> {
@@ -364,12 +345,13 @@ impl TxTemplate {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Builds a v0 PSBT. Refuses any silent-payment output: a v0 PSBT has no
+    /// field to carry the scan/spend keys a signer would need to derive its
+    /// script, so such a template must go through [`Self::finalize_v2`].
     pub fn finalize(
         &self,
         change: Option<Box<dyn RecipientProvider>>,
         shuffle: bool,
-        sp_provider: Option<&dyn SpPartialSecretProvider>,
         network: Network,
         max_fee_percent: u8,
         max_fee_amount: u64,
@@ -383,36 +365,29 @@ impl TxTemplate {
             check_disproportionate_fee(&inputs, &outputs, max_fee_percent, max_fee_amount)?;
         }
 
-        Self::prepare_sp_inputs(&inputs, &outputs)?;
-
-        let partial_secret = match sp_provider {
-            Some(p) => Self::compute_sp_partial_secret(&inputs, &outputs, p)?,
-            None => None,
-        };
-
-        // Batch-derive SP output scripts so the k-counter is correct
-        // across all outputs sharing the same scan key (BIP352).
-        if let (Some(p), Some(secret)) = (sp_provider, partial_secret) {
-            p.derive_sp_scripts(&mut outputs, secret);
+        if outputs.iter().any(|r| r.is_silent_payment()) {
+            return Err(Error::SpRequiresPsbtV2);
         }
+
+        Self::check_sp_input_versions(&inputs, &outputs)?;
 
         let ctx = FinalizationContext {
             inputs: &inputs,
-            partial_secret,
             network,
         };
 
         Self::build_psbt(&inputs, &mut outputs, &ctx)
     }
 
-    /// Native PSBTv2 path: no `SpPartialSecretProvider`, no private key. A
-    /// silent-payment output carries no script yet, only the recipient's scan
-    /// and spend keys, for a signer to derive later.
+    /// Native PSBTv2 path: no private key involved. A silent-payment output
+    /// carries no script yet, only the recipient's scan and spend keys, for a
+    /// signer to derive later.
     #[allow(clippy::too_many_arguments)]
     pub fn finalize_v2(
         &self,
         change: Option<Box<dyn RecipientProvider>>,
         shuffle: bool,
+        sp_updater: Option<&dyn SpUpdater>,
         network: Network,
         max_fee_percent: u8,
         max_fee_amount: u64,
@@ -426,15 +401,19 @@ impl TxTemplate {
             check_disproportionate_fee(&inputs, &outputs, max_fee_percent, max_fee_amount)?;
         }
 
-        Self::prepare_sp_inputs(&inputs, &outputs)?;
+        Self::check_sp_input_versions(&inputs, &outputs)?;
 
         let ctx = FinalizationContext {
             inputs: &inputs,
-            partial_secret: None,
             network,
         };
 
-        let psbt = Self::build_psbt_v2(&inputs, &mut outputs, &ctx)?;
+        let mut psbt = Self::build_psbt_v2(&inputs, &mut outputs, &ctx)?;
+        if let Some(updater) = sp_updater {
+            updater
+                .update_sp_inputs(&mut psbt, &inputs)
+                .map_err(|_| Error::PsbtV2)?;
+        }
         psbt.validate().map_err(|_| Error::PsbtV2)?;
         Ok(psbt)
     }
@@ -896,9 +875,9 @@ mod test {
         assert_eq!(res.fees, Some(bitcoin::Amount::from_sat(212)));
 
         // Test finalize without change - should fail with MissingChange
-        let result =
-            res.tx_template
-                .finalize(None, false, None, Network::Signet, 10, 2_000_000, false);
+        let result = res
+            .tx_template
+            .finalize(None, false, Network::Signet, 10, 2_000_000, false);
         assert!(matches!(result, Err(Error::MissingChange { .. })));
 
         // Test finalize with change
@@ -926,7 +905,6 @@ mod test {
             .finalize(
                 Some(Box::new(change_recip.clone())),
                 false,
-                None,
                 Network::Signet,
                 10,
                 2_000_000,
@@ -944,7 +922,6 @@ mod test {
         let result = template_with_existing_change.finalize(
             Some(Box::new(change_recip)),
             false,
-            None,
             Network::Signet,
             10,
             2_000_000,
@@ -971,9 +948,9 @@ mod test {
         assert!(res.error.is_none());
 
         // Should fail: actual fee (90k) > 10% of paid_outputs (1k) AND > max_amount (50k)
-        let result =
-            res.tx_template
-                .finalize(None, false, None, Network::Signet, 10, 50_000, false);
+        let result = res
+            .tx_template
+            .finalize(None, false, Network::Signet, 10, 50_000, false);
         assert!(matches!(
             result,
             Err(Error::DisproportionateFees { fee: 90000, .. })
@@ -982,13 +959,13 @@ mod test {
         // Should succeed with skip_checks
         let result = res
             .tx_template
-            .finalize(None, false, None, Network::Signet, 10, 50_000, true);
+            .finalize(None, false, Network::Signet, 10, 50_000, true);
         assert!(result.is_ok());
 
         // Should succeed if only one threshold is exceeded
-        let result =
-            res.tx_template
-                .finalize(None, false, None, Network::Signet, 10, 100_000, false);
+        let result = res
+            .tx_template
+            .finalize(None, false, Network::Signet, 10, 100_000, false);
         assert!(result.is_ok());
     }
 
@@ -1059,7 +1036,6 @@ mod test {
         };
         let ctx = FinalizationContext {
             inputs: &[],
-            partial_secret: None,
             network: Network::Bitcoin,
         };
 
@@ -1084,7 +1060,7 @@ mod test {
     }
 
     #[test]
-    fn finalize_v2_leaves_silent_payment_output_without_script() {
+    fn finalize_v2_leaves_sp_output_unscripted() {
         let (_signer, derivator) = tr_signer();
         let coin = funding_coin(20_000, &derivator, 1);
         let output = sp_output();
@@ -1098,7 +1074,7 @@ mod test {
         };
 
         let psbt = template
-            .finalize_v2(None, false, Network::Bitcoin, 10, 2_000_000, true)
+            .finalize_v2(None, false, None, Network::Bitcoin, 10, 2_000_000, true)
             .unwrap();
 
         assert_eq!(psbt.outputs.len(), 1);
@@ -1109,6 +1085,24 @@ mod test {
         assert_eq!(info.scan_key, scan);
         assert_eq!(info.spend_key, spend);
         assert_eq!(psbt.tx_modifiable, None);
+        psbt.validate().unwrap();
+    }
+
+    #[test]
+    fn finalize_v2_needs_no_secret() {
+        let (_signer, derivator) = tr_signer();
+        let coin = funding_coin(20_000, &derivator, 1);
+        let output = sp_output();
+
+        let template = TxTemplate {
+            inputs: vec![coin],
+            outputs: vec![Box::new(output)],
+            fees: Fees::Sats(10_000),
+        };
+
+        let result = template.finalize_v2(None, false, None, Network::Bitcoin, 10, 2_000_000, true);
+
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -1124,7 +1118,7 @@ mod test {
         };
 
         let psbt = template
-            .finalize_v2(None, false, Network::Bitcoin, 10, 2_000_000, true)
+            .finalize_v2(None, false, None, Network::Bitcoin, 10, 2_000_000, true)
             .unwrap();
 
         assert!(psbt.outputs[0].script_pubkey.is_some());
@@ -1149,7 +1143,7 @@ mod test {
         };
 
         let psbt = template
-            .finalize_v2(None, false, Network::Bitcoin, 10, 2_000_000, true)
+            .finalize_v2(None, false, None, Network::Bitcoin, 10, 2_000_000, true)
             .unwrap();
 
         assert_eq!(psbt.inputs[0].previous_output, outpoint);
@@ -1170,35 +1164,15 @@ mod test {
             fees: Fees::Sats(1_000),
         };
 
-        let result = template.finalize_v2(None, false, Network::Bitcoin, 10, 2_000_000, true);
+        let result = template.finalize_v2(None, false, None, Network::Bitcoin, 10, 2_000_000, true);
         assert!(matches!(result, Err(Error::UnsupportedSegwitVersion)));
     }
 
-    struct StubSpProvider {
-        called: std::sync::Arc<std::sync::Mutex<bool>>,
-    }
-
-    impl SpPartialSecretProvider for StubSpProvider {
-        fn compute_partial_secret(
-            &self,
-            _inputs: &[Coin],
-        ) -> Result<bitcoin::secp256k1::SecretKey, crate::error::Error> {
-            *self.called.lock().unwrap() = true;
-            Ok(bitcoin::secp256k1::SecretKey::from_slice(&[9; 32]).unwrap())
-        }
-    }
-
     #[test]
-    fn finalize_rejects_segwit_v2_input() {
+    fn finalize_rejects_sp_output() {
         let (_signer, derivator) = tr_signer();
-        let mut coin = funding_coin(20_000, &derivator, 1);
-        coin.txout.script_pubkey =
-            bitcoin::ScriptBuf::from_bytes([vec![0x52, 0x20], vec![0; 32]].concat());
+        let coin = funding_coin(20_000, &derivator, 1);
         let output = sp_output();
-        let called = std::sync::Arc::new(std::sync::Mutex::new(false));
-        let provider = StubSpProvider {
-            called: called.clone(),
-        };
 
         let template = TxTemplate {
             inputs: vec![coin],
@@ -1206,16 +1180,7 @@ mod test {
             fees: Fees::Sats(1_000),
         };
 
-        let result = template.finalize(
-            None,
-            false,
-            Some(&provider),
-            Network::Bitcoin,
-            10,
-            2_000_000,
-            true,
-        );
-        assert!(matches!(result, Err(Error::UnsupportedSegwitVersion)));
-        assert!(!*called.lock().unwrap());
+        let result = template.finalize(None, false, Network::Bitcoin, 10, 2_000_000, true);
+        assert!(matches!(result, Err(Error::SpRequiresPsbtV2)));
     }
 }

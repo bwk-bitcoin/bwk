@@ -1,20 +1,20 @@
 //! RecipientProvider implementations for Silent Payment types.
 //!
 //! This module implements bwk-tx's RecipientProvider trait for SP types.
-//! Uses newtype wrappers to satisfy the orphan rule.
+//! Uses newtype wrappers to satisfy the orphan rule. Silent-payment outputs
+//! never get a script here: that derivation needs `b_spend` and every
+//! selected input's tweak, so it happens later, in `bwk_sp::signer::SpSigner`.
 
 use crate::{
-    core::{utils::common::SilentPaymentAddress, SpVersion},
+    core::utils::common::SilentPaymentAddress,
     receiver::{
-        bitcoin::{key::TapTweak, script::PushBytesBuf, ScriptBuf, TxOut, Weight},
+        bitcoin::{script::PushBytesBuf, ScriptBuf, TxOut, Weight},
         RecipientAddress,
     },
 };
 
-use bwk_coin::{Coin, CoinSpendInfo};
 use bwk_tx::{
-    error::Error as TxError,
-    recipient::{FinalizationContext, PsbtOutputInfo, RecipientProvider, SpPartialSecretProvider},
+    recipient::{FinalizationContext, PsbtOutputInfo, RecipientProvider},
     transaction::Amount,
 };
 
@@ -32,8 +32,6 @@ pub struct SpRecipient {
     pub label: Option<u32>,
     /// Network
     pub network: Network,
-    /// Pre-computed output script (set by batch derivation)
-    precomputed_script: Option<ScriptBuf>,
 }
 
 impl SpRecipient {
@@ -44,7 +42,6 @@ impl SpRecipient {
             amount: Amount::Value(amount),
             label: None,
             network,
-            precomputed_script: None,
         }
     }
 
@@ -60,7 +57,6 @@ impl SpRecipient {
             amount: Amount::Value(amount),
             label: Some(label),
             network,
-            precomputed_script: None,
         }
     }
 }
@@ -71,34 +67,10 @@ impl RecipientProvider for SpRecipient {
         Weight::from_wu(TR_OUTPUT_WEIGHT)
     }
 
-    fn create_script(&mut self, ctx: &FinalizationContext) -> ScriptBuf {
-        if let Some(ref script) = self.precomputed_script {
-            return script.clone();
-        }
-
-        let partial_secret = ctx
-            .partial_secret
-            .expect("SP output requires partial_secret in FinalizationContext");
-
-        // Fallback: single-output independent derivation (k=0).
-        // For multi-output transactions, derive_sp_scripts() should have
-        // already set precomputed_script with the correct k value.
-        let pubkeys = crate::core::sending::generate_recipient_pubkeys(
-            vec![self.address],
-            partial_secret.into(),
-        )
-        .expect("failed to generate SP recipient pubkeys");
-
-        let output_pubkeys = pubkeys
-            .get(&self.address)
-            .expect("missing pubkey for SP address");
-
-        let pubkey = output_pubkeys[0];
-        ScriptBuf::new_p2tr_tweaked(pubkey.dangerous_assume_tweaked())
-    }
-
-    fn set_precomputed_script(&mut self, script: ScriptBuf) {
-        self.precomputed_script = Some(script);
+    fn create_script(&mut self, _ctx: &FinalizationContext) -> ScriptBuf {
+        // Left empty: a signer derives this from the input hash and writes it
+        // into the PSBTv2 output once it has both b_spend and the tx's inputs.
+        ScriptBuf::new()
     }
 
     fn psbt_output_info(&self) -> PsbtOutputInfo {
@@ -131,8 +103,6 @@ pub struct SpRecipientAddress {
     pub inner: RecipientAddress,
     pub amount: Amount,
     pub network: Network,
-    /// Pre-computed output script (set by batch derivation)
-    precomputed_script: Option<ScriptBuf>,
 }
 
 impl SpRecipientAddress {
@@ -142,7 +112,6 @@ impl SpRecipientAddress {
             inner: addr,
             amount: Amount::Value(amount),
             network,
-            precomputed_script: None,
         }
     }
 
@@ -152,7 +121,6 @@ impl SpRecipientAddress {
             inner: RecipientAddress::SpAddress(addr),
             amount: Amount::Value(amount),
             network,
-            precomputed_script: None,
         }
     }
 }
@@ -179,28 +147,10 @@ impl RecipientProvider for SpRecipientAddress {
         }
     }
 
-    fn create_script(&mut self, ctx: &FinalizationContext) -> ScriptBuf {
+    fn create_script(&mut self, _ctx: &FinalizationContext) -> ScriptBuf {
         match &self.inner {
-            RecipientAddress::SpAddress(sp) => {
-                if let Some(ref script) = self.precomputed_script {
-                    return script.clone();
-                }
-
-                let partial_secret = ctx
-                    .partial_secret
-                    .expect("SP output requires partial_secret");
-
-                let pubkeys = crate::core::sending::generate_recipient_pubkeys(
-                    vec![*sp],
-                    partial_secret.into(),
-                )
-                .expect("failed to generate SP recipient pubkeys");
-
-                let output_pubkeys = pubkeys.get(sp).expect("missing pubkey for SP address");
-
-                let pubkey = output_pubkeys[0];
-                ScriptBuf::new_p2tr_tweaked(pubkey.dangerous_assume_tweaked())
-            }
+            // Left empty: a signer derives this later, see `SpRecipient::create_script`.
+            RecipientAddress::SpAddress(_) => ScriptBuf::new(),
             RecipientAddress::LegacyAddress(addr) => addr.clone().assume_checked().script_pubkey(),
             RecipientAddress::Data(data) => {
                 let mut op_return = PushBytesBuf::with_capacity(data.len());
@@ -210,10 +160,6 @@ impl RecipientProvider for SpRecipientAddress {
                 ScriptBuf::new_op_return(op_return)
             }
         }
-    }
-
-    fn set_precomputed_script(&mut self, script: ScriptBuf) {
-        self.precomputed_script = Some(script);
     }
 
     fn psbt_output_info(&self) -> PsbtOutputInfo {
@@ -342,10 +288,6 @@ impl RecipientProvider for SpChangeRecipientProvider {
         self.0.create_script(ctx)
     }
 
-    fn set_precomputed_script(&mut self, script: ScriptBuf) {
-        self.0.set_precomputed_script(script);
-    }
-
     fn psbt_output_info(&self) -> PsbtOutputInfo {
         self.0.psbt_output_info()
     }
@@ -371,19 +313,8 @@ impl RecipientProvider for SpChangeRecipientProvider {
     }
 }
 
-// Batch SP script derivation
-
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
-
-use crate::receiver::SpReceiver;
-
-use crate::account::coin_store::SpCoinStore;
-
 /// Convert bitcoin::Network to crate::core::utils::common::Network.
-fn to_sp_network(network: Network) -> crate::core::utils::common::Network {
+pub fn to_sp_network(network: Network) -> crate::core::utils::common::Network {
     use crate::core::utils::common::Network as SpNetwork;
     match network {
         Network::Bitcoin => SpNetwork::Mainnet,
@@ -393,311 +324,27 @@ fn to_sp_network(network: Network) -> crate::core::utils::common::Network {
     }
 }
 
-/// Batch-derive output scripts for all SP outputs in a transaction.
-///
-/// Per BIP352, outputs sharing the same scan key must be derived together
-/// with incrementing `k` values. This function:
-/// 1. Collects all SP addresses from outputs via `psbt_output_info()`
-/// 2. Calls `generate_recipient_pubkeys()` once with all SP addresses
-/// 3. Uses per-address counters to assign the correct pubkey to each output
-/// 4. Stores the pre-computed script on each SP output
-///
-/// Source: adapted from cygnet3/spdk's silent-payment transaction finalization.
-/// See `sp/NOTICE`.
-fn batch_derive_sp_scripts(
-    outputs: &mut [Box<dyn RecipientProvider>],
-    partial_secret: crate::receiver::bitcoin::secp256k1::SecretKey,
-) {
-    // Collect SP output indices and reconstruct their addresses
-    let mut sp_indices = Vec::new();
-    let mut sp_addresses = Vec::new();
-
-    for (i, output) in outputs.iter().enumerate() {
-        if !output.is_silent_payment() {
-            continue;
-        }
-        if let PsbtOutputInfo::SilentPayment {
-            scan_pubkey,
-            spend_pubkey,
-            ..
-        } = output.psbt_output_info()
-        {
-            let sp_network = to_sp_network(output.network());
-            let addr =
-                SilentPaymentAddress::new(scan_pubkey, spend_pubkey, sp_network, SpVersion::V0)
-                    .expect("valid SP address from psbt_output_info");
-            sp_addresses.push(addr);
-            sp_indices.push(i);
-        }
-    }
-
-    if sp_addresses.is_empty() {
-        return;
-    }
-
-    // Single call with all addresses: BIP352 k-counter increments per scan-key group
-    let pubkey_map = crate::core::sending::generate_recipient_pubkeys(
-        sp_addresses.clone(),
-        partial_secret.into(),
-    )
-    .expect("failed to generate SP recipient pubkeys");
-
-    // Assign the correct pubkey to each output using per-address counters
-    let mut counters: HashMap<SilentPaymentAddress, usize> = HashMap::new();
-
-    for (sp_idx, &output_idx) in sp_indices.iter().enumerate() {
-        let addr = &sp_addresses[sp_idx];
-        let pubkeys = pubkey_map.get(addr).expect("missing pubkey for SP address");
-        let k = counters.entry(*addr).or_insert(0);
-        let pubkey = pubkeys[*k];
-        *k += 1;
-
-        let script = ScriptBuf::new_p2tr_tweaked(pubkey.dangerous_assume_tweaked());
-        outputs[output_idx].set_precomputed_script(script);
-    }
-}
-
-// SpSecretProvider
-
-/// Standalone [`SpPartialSecretProvider`] that can be boxed into a
-/// [`TxBuilder`](bwk_tx::tx_builder::TxBuilder).
-///
-/// Holds a cloned [`SpReceiver`] and a shared coin store reference to look up
-/// `OwnedOutput` tweaks for selected inputs. Also stores master xprivs from
-/// BIP32 sub-accounts so it can derive secret keys for mixed-input transactions.
-pub struct SpSecretProvider<
-    P: crate::profile::SpStorageProfile = crate::profile::SpRamProfile<
-        bwk::bwk_electrum::profile::DefaultBackend,
-    >,
-> {
-    coin_store: Arc<Mutex<SpCoinStore<P>>>,
-    client: SpReceiver,
-    xprivs: std::collections::BTreeMap<
-        crate::receiver::bitcoin::bip32::Fingerprint,
-        crate::receiver::bitcoin::bip32::Xpriv,
-    >,
-    secp: crate::receiver::bitcoin::secp256k1::Secp256k1<crate::receiver::bitcoin::secp256k1::All>,
-}
-
-impl<P: crate::profile::SpStorageProfile> SpSecretProvider<P> {
-    pub fn new(
-        coin_store: Arc<Mutex<SpCoinStore<P>>>,
-        client: SpReceiver,
-        xprivs: std::collections::BTreeMap<
-            crate::receiver::bitcoin::bip32::Fingerprint,
-            crate::receiver::bitcoin::bip32::Xpriv,
-        >,
-    ) -> Self {
-        Self {
-            coin_store,
-            client,
-            xprivs,
-            secp: crate::receiver::bitcoin::secp256k1::Secp256k1::new(),
-        }
-    }
-
-    /// Derive the secret key for a BIP32 coin if not already set.
-    fn derive_bip32_secret_key(
-        &self,
-        coin: &Coin,
-    ) -> Option<crate::receiver::bitcoin::secp256k1::SecretKey> {
-        let psbt_input = coin.to_psbt_input().ok()?;
-
-        if !psbt_input.bip32_derivation.is_empty() {
-            psbt_input.bip32_derivation.values().find_map(|(fg, path)| {
-                let xpriv = self.xprivs.get(fg)?;
-                xpriv
-                    .derive_priv(&self.secp, path)
-                    .ok()
-                    .map(|k| k.private_key)
-            })
-        } else if !psbt_input.tap_key_origins.is_empty() {
-            psbt_input
-                .tap_key_origins
-                .values()
-                .find_map(|(_, (fg, path))| {
-                    let xpriv = self.xprivs.get(fg)?;
-                    xpriv
-                        .derive_priv(&self.secp, path)
-                        .ok()
-                        .map(|k| k.private_key)
-                })
-        } else {
-            None
-        }
-    }
-}
-
-impl<P: crate::profile::SpStorageProfile + Send + Sync + 'static> SpPartialSecretProvider
-    for SpSecretProvider<P>
-{
-    // Source: adapted from cygnet3/spdk's selected-input partial-secret logic.
-    // See `sp/NOTICE`.
-    fn compute_partial_secret(
-        &self,
-        inputs: &[Coin],
-    ) -> Result<crate::receiver::bitcoin::secp256k1::SecretKey, TxError> {
-        use crate::receiver::bitcoin::secp256k1::SecretKey;
-
-        let b_spend = self
-            .client
-            .try_get_secret_spend_key()
-            .map_err(|_| TxError::SpPartialSecret)?;
-
-        let store = self.coin_store.lock().expect("poisoned");
-        let mut input_keys = Vec::with_capacity(inputs.len());
-        let mut outpoints = Vec::with_capacity(inputs.len());
-
-        for coin in inputs {
-            outpoints.push(coin.outpoint);
-
-            match &coin.spend_info {
-                CoinSpendInfo::Sp { tweak, .. } => {
-                    let sk = SecretKey::from_slice(tweak).map_err(|_| TxError::SpPartialSecret)?;
-                    let signing_key = b_spend
-                        .add_tweak(&sk.into())
-                        .map_err(|_| TxError::SpPartialSecret)?;
-                    input_keys.push((signing_key, true));
-                }
-                CoinSpendInfo::Bip32 { secret_key, .. } => {
-                    let sk = secret_key
-                        .or_else(|| self.derive_bip32_secret_key(coin))
-                        .ok_or(TxError::CoinNotFound)?;
-                    let is_taproot = coin.txout.script_pubkey.is_p2tr();
-                    if is_taproot {
-                        // BIP32 P2TR outputs have a standard BIP341 taproot tweak.
-                        // The scanner extracts the tweaked output key from scriptPubKey,
-                        // so we must use the tweaked private key for partial secret.
-                        let kp = crate::receiver::bitcoin::secp256k1::Keypair::from_secret_key(
-                            &self.secp, &sk,
-                        );
-                        let tweaked = kp.tap_tweak(&self.secp, None).to_keypair();
-                        input_keys.push((tweaked.secret_key(), true));
-                    } else {
-                        input_keys.push((sk, false));
-                    }
-                }
-            }
-        }
-
-        drop(store);
-        crate::core::sending::calculate_partial_secret(&input_keys, &outpoints)
-            .map(|partial_secret| *partial_secret.as_inner())
-            .map_err(|_| TxError::SpPartialSecret)
-    }
-
-    fn derive_sp_scripts(
-        &self,
-        outputs: &mut [Box<dyn RecipientProvider>],
-        partial_secret: crate::receiver::bitcoin::secp256k1::SecretKey,
-    ) {
-        batch_derive_sp_scripts(outputs, partial_secret);
-    }
-}
-
-// SpPartialSecretProvider for Account.
-
-#[cfg(feature = "mnemonic")]
-use crate::account::Account;
-
-/// Derive a BIP32 coin's secret key from the SP account's and sub-accounts' master xprivs.
-#[cfg(feature = "mnemonic")]
-fn derive_bip32_key(
-    coin: &Coin,
-    account: &Account,
-) -> Option<crate::receiver::bitcoin::secp256k1::SecretKey> {
-    let secp = crate::receiver::bitcoin::secp256k1::Secp256k1::new();
-    let psbt_input = coin.to_psbt_input().ok()?;
-
-    let xprivs = account.master_xprivs();
-
-    if !psbt_input.bip32_derivation.is_empty() {
-        psbt_input.bip32_derivation.values().find_map(|(fg, path)| {
-            let xpriv = xprivs.get(fg)?;
-            xpriv.derive_priv(&secp, path).ok().map(|k| k.private_key)
-        })
-    } else if !psbt_input.tap_key_origins.is_empty() {
-        psbt_input
-            .tap_key_origins
-            .values()
-            .find_map(|(_, (fg, path))| {
-                let xpriv = xprivs.get(fg)?;
-                xpriv.derive_priv(&secp, path).ok().map(|k| k.private_key)
-            })
-    } else {
-        None
-    }
-}
-
-#[cfg(feature = "mnemonic")]
-impl SpPartialSecretProvider for Account {
-    // Source: adapted from cygnet3/spdk's selected-input partial-secret logic.
-    // See `sp/NOTICE`.
-    fn compute_partial_secret(
-        &self,
-        inputs: &[Coin],
-    ) -> Result<crate::receiver::bitcoin::secp256k1::SecretKey, TxError> {
-        use crate::receiver::bitcoin::secp256k1::SecretKey;
-
-        let b_spend = self
-            .sp_receiver()
-            .try_get_secret_spend_key()
-            .map_err(|_| TxError::SpPartialSecret)?;
-
-        let mut input_keys = Vec::with_capacity(inputs.len());
-        let mut outpoints = Vec::with_capacity(inputs.len());
-
-        for coin in inputs {
-            outpoints.push(coin.outpoint);
-
-            match &coin.spend_info {
-                CoinSpendInfo::Sp { tweak, .. } => {
-                    let sk = SecretKey::from_slice(tweak).map_err(|_| TxError::SpPartialSecret)?;
-                    let signing_key = b_spend
-                        .add_tweak(&sk.into())
-                        .map_err(|_| TxError::SpPartialSecret)?;
-                    input_keys.push((signing_key, true));
-                }
-                CoinSpendInfo::Bip32 { secret_key, .. } => {
-                    let sk = secret_key
-                        .or_else(|| derive_bip32_key(coin, self))
-                        .ok_or(TxError::CoinNotFound)?;
-                    let is_taproot = coin.txout.script_pubkey.is_p2tr();
-                    if is_taproot {
-                        let secp = crate::receiver::bitcoin::secp256k1::Secp256k1::new();
-                        let kp = crate::receiver::bitcoin::secp256k1::Keypair::from_secret_key(
-                            &secp, &sk,
-                        );
-                        let tweaked = kp.tap_tweak(&secp, None).to_keypair();
-                        input_keys.push((tweaked.secret_key(), true));
-                    } else {
-                        input_keys.push((sk, false));
-                    }
-                }
-            }
-        }
-
-        crate::core::sending::calculate_partial_secret(&input_keys, &outpoints)
-            .map(|partial_secret| *partial_secret.as_inner())
-            .map_err(|_| TxError::SpPartialSecret)
-    }
-
-    fn derive_sp_scripts(
-        &self,
-        outputs: &mut [Box<dyn RecipientProvider>],
-        partial_secret: crate::receiver::bitcoin::secp256k1::SecretKey,
-    ) {
-        batch_derive_sp_scripts(outputs, partial_secret);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        core::utils::common::Network as SpNetwork,
-        receiver::bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey},
+        core::{utils::common::Network as SpNetwork, SpVersion},
+        receiver::bitcoin::secp256k1::PublicKey,
     };
+
+    /// Compressed encoding of the secp256k1 generator point `G`.
+    const SCAN_PUBKEY_BYTES: [u8; 33] = [
+        0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87,
+        0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16,
+        0xf8, 0x17, 0x98,
+    ];
+
+    /// Compressed encoding of `2G`.
+    const SPEND_PUBKEY_BYTES: [u8; 33] = [
+        0x02, 0xc6, 0x04, 0x7f, 0x94, 0x41, 0xed, 0x7d, 0x6d, 0x30, 0x45, 0x40, 0x6e, 0x95, 0xc0,
+        0x7c, 0xd8, 0x5c, 0x77, 0x8e, 0x4b, 0x8c, 0xef, 0x3c, 0xa7, 0xab, 0xac, 0x09, 0xb9, 0x5c,
+        0x70, 0x9e, 0xe5,
+    ];
 
     fn sp_net(n: Network) -> SpNetwork {
         if matches!(n, Network::Bitcoin) {
@@ -707,11 +354,10 @@ mod tests {
         }
     }
 
-    /// Build a SilentPaymentAddress for `network` from deterministic keys.
+    /// Build a SilentPaymentAddress for `network` from fixed dummy keys.
     fn sp_address(network: SpNetwork) -> SilentPaymentAddress {
-        let secp = Secp256k1::new();
-        let scan = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[1u8; 32]).unwrap());
-        let spend = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[2u8; 32]).unwrap());
+        let scan = PublicKey::from_slice(&SCAN_PUBKEY_BYTES).unwrap();
+        let spend = PublicKey::from_slice(&SPEND_PUBKEY_BYTES).unwrap();
         SilentPaymentAddress::new(scan, spend, network, SpVersion::V0).unwrap()
     }
 

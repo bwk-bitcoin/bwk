@@ -1382,8 +1382,8 @@ fn test_spend_only_resume_at_same_tip(env: &mut TestEnv) {
         for coin in builder.select_coins(100_000, 1000) {
             builder.add_input(coin);
         }
-        let mut psbt = builder.generate().expect("build spend tx");
-        account.sign_and_finalize(&mut psbt).expect("sign spend tx")
+        let mut psbt = builder.generate_v2().unwrap();
+        account.sign_and_finalize_v2(&mut psbt).unwrap()
     };
     env.broadcast_and_mine(&tx);
     let c2 = env.height;
@@ -1469,8 +1469,8 @@ fn test_unconfirmed_spend_injection(env: &mut TestEnv) {
         builder.add_input(coin);
     }
     let tx = {
-        let mut psbt = builder.generate().expect("build spend tx");
-        account.sign_and_finalize(&mut psbt).expect("sign spend tx")
+        let mut psbt = builder.generate_v2().unwrap();
+        account.sign_and_finalize_v2(&mut psbt).unwrap()
     };
     let spend_txid = tx.compute_txid();
     let change = tx
@@ -1625,8 +1625,8 @@ fn test_broadcast_requires_electrum_endpoint(env: &mut TestEnv) {
         builder.add_input(coin);
     }
     let tx = {
-        let mut psbt = builder.generate().expect("build spend tx");
-        account.sign_and_finalize(&mut psbt).expect("sign spend tx")
+        let mut psbt = builder.generate_v2().unwrap();
+        account.sign_and_finalize_v2(&mut psbt).unwrap()
     };
     let spend_txid = tx.compute_txid();
 

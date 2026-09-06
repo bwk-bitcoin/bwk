@@ -929,7 +929,6 @@ impl TestEnv {
             spend_info: CoinSpendInfo::Bip32 {
                 coin_path: (KeyChain::Receive, 0),
                 descriptor,
-                secret_key: None,
             },
         }
     }
@@ -986,7 +985,6 @@ impl TestEnv {
             spend_info: CoinSpendInfo::Bip32 {
                 coin_path: (KeyChain::Receive, 0),
                 descriptor,
-                secret_key: None,
             },
         }
     }

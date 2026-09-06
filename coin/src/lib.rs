@@ -79,10 +79,6 @@ pub enum CoinSpendInfo {
     Bip32 {
         coin_path: (KeyChain, u32),
         descriptor: Descriptor<DescriptorPublicKey>,
-        /// Ephemeral secret key for SP partial secret computation.
-        /// Never persisted, only populated at tx-building time.
-        #[serde(skip)]
-        secret_key: Option<bitcoin::secp256k1::SecretKey>,
     },
     /// Silent Payment coin (BIP352)
     Sp {
@@ -325,7 +321,6 @@ mod tests {
             spend_info: CoinSpendInfo::Bip32 {
                 coin_path: (KeyChain::Receive, 0),
                 descriptor: bip32_descriptor(),
-                secret_key: None,
             },
         }
     }

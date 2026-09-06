@@ -13,11 +13,10 @@ pub use bitcoin;
 
 use std::str::FromStr;
 
-#[cfg(feature = "mnemonic")]
-use bitcoin::bip32;
 use bitcoin::{
     absolute::Height,
     address::NetworkUnchecked,
+    bip32,
     hex::{DisplayHex, FromHex},
     secp256k1::{All, PublicKey, Secp256k1, SecretKey},
     Address, Amount, BlockHash, Network, ScriptBuf, Txid,
@@ -34,6 +33,42 @@ const SP_PURPOSE: u32 = 352;
 const SP_SPEND_KEY: u32 = 0;
 const SP_SCAN_KEY: u32 = 1;
 const SP_KEY_INDEX: u32 = 0;
+
+/// The BIP352 `purpose'/coin_type'/account'` prefix shared by the scan and
+/// spend derivation paths.
+pub fn bip352_base_derivation(
+    network: Network,
+    account: bip32::ChildNumber,
+) -> Vec<bip32::ChildNumber> {
+    let network_idx = match network {
+        Network::Bitcoin => 0u32,
+        _ => 1,
+    };
+    vec![
+        bip32::ChildNumber::from_hardened_idx(SP_PURPOSE).expect("valid purpose"),
+        bip32::ChildNumber::from_hardened_idx(network_idx).expect("0 or 1"),
+        account,
+    ]
+}
+
+/// Derive the BIP352 spend secret key (`b_spend`) at
+/// `m/352'/{0,1}'/account'/0'/0`. Shared by [`SpReceiver`] and
+/// `bwk_sp::signer::SpSigner`, the only two owners of this key.
+pub fn derive_spend_key(
+    master_xpriv: &bip32::Xpriv,
+    secp: &Secp256k1<All>,
+    network: Network,
+    account: bip32::ChildNumber,
+) -> Result<SecretKey, Error> {
+    let mut spend_deriv = bip352_base_derivation(network, account);
+    spend_deriv.push(bip32::ChildNumber::from_hardened_idx(SP_SPEND_KEY).expect("valid spend key"));
+    spend_deriv.push(bip32::ChildNumber::from_normal_idx(SP_KEY_INDEX).expect("valid key index"));
+
+    master_xpriv
+        .derive_priv(secp, &spend_deriv)
+        .map_err(|_| Error::KeyDerivation("spend"))
+        .map(|k| k.private_key)
+}
 
 // Blockchain data fetched via the blindbit transport.
 
@@ -268,26 +303,11 @@ impl SpReceiver {
         let seed = mnemonic.to_seed(pp);
         let master_xpriv =
             bip32::Xpriv::new_master(network, &seed).map_err(|_| Error::SeedDerivation)?;
-        let network_idx = match network {
-            Network::Bitcoin => 0u32,
-            _ => 1,
-        };
-        let base_deriv = vec![
-            bip32::ChildNumber::from_hardened_idx(SP_PURPOSE).expect("valid purpose"),
-            bip32::ChildNumber::from_hardened_idx(network_idx).expect("0 or 1"),
-            account,
-        ];
 
-        let mut scan_deriv = base_deriv.clone();
+        let mut scan_deriv = bip352_base_derivation(network, account);
         scan_deriv
             .push(bip32::ChildNumber::from_hardened_idx(SP_SCAN_KEY).expect("valid scan key"));
         scan_deriv
-            .push(bip32::ChildNumber::from_normal_idx(SP_KEY_INDEX).expect("valid key index"));
-
-        let mut spend_deriv = base_deriv;
-        spend_deriv
-            .push(bip32::ChildNumber::from_hardened_idx(SP_SPEND_KEY).expect("valid spend key"));
-        spend_deriv
             .push(bip32::ChildNumber::from_normal_idx(SP_KEY_INDEX).expect("valid key index"));
 
         let scan = master_xpriv
@@ -295,10 +315,7 @@ impl SpReceiver {
             .map_err(|_| Error::KeyDerivation("scan"))?
             .private_key;
 
-        let spend = master_xpriv
-            .derive_priv(&secp, &spend_deriv)
-            .map_err(|_| Error::KeyDerivation("spend"))?
-            .private_key;
+        let spend = derive_spend_key(&master_xpriv, &secp, network, account)?;
 
         Self::new_inner(scan, spend.into(), network, secp)
     }
