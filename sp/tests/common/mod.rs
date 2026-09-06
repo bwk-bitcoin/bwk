@@ -685,13 +685,7 @@ pub fn bip32_mnemonic() -> &'static str {
 /// by the BIP32 mnemonic every sub-account here shares.
 #[allow(dead_code)]
 fn add_offline_sub_account(account: &mut bwk_sp::account::Account, name: &str, signer: &HotSigner) {
-    let descriptor = signer
-        .descriptors()
-        .into_iter()
-        .next()
-        .unwrap()
-        .into_miniscript()
-        .unwrap();
+    let descriptor = signer.descriptors().into_iter().next().unwrap();
     let mut config = ScannerConfig::new(
         descriptor,
         std::path::PathBuf::new(),

@@ -127,7 +127,7 @@ impl Config {
         };
         Some(Config {
             scanner: ScannerConfig::new(
-                descriptor,
+                descriptor.into(),
                 data_dir,
                 dir_name,
                 account,
@@ -357,5 +357,55 @@ pub mod tests {
             serialized.contains(&unique),
             "mnemonic must appear in serialized form under JSON mode (default)"
         );
+    }
+
+    #[test]
+    fn config_serde_is_unchanged_on_disk() {
+        let temp = temp_dir::TempDir::new().unwrap();
+        let path = temp.child("storage");
+        let mnemonic = bip39::Mnemonic::generate(12).unwrap();
+        let cfg = Config::new(
+            Some(mnemonic.to_string()),
+            "my_account".to_string(),
+            bitcoin::Network::Regtest,
+            ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
+            path,
+            "wallet".to_string(),
+            Some(PersistenceKind::Json),
+        )
+        .unwrap();
+
+        let value: serde_json::Value = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(
+            value.get("descriptor").unwrap(),
+            &serde_json::Value::String(cfg.scanner.descriptor.to_string())
+        );
+    }
+
+    #[test]
+    fn config_deserializes_a_pre_change_file() {
+        let temp = temp_dir::TempDir::new().unwrap();
+        let path = temp.child("storage");
+        let mnemonic = bip39::Mnemonic::generate(12).unwrap();
+        let cfg = Config::new(
+            Some(mnemonic.to_string()),
+            "my_account".to_string(),
+            bitcoin::Network::Regtest,
+            ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
+            path,
+            "wallet".to_string(),
+            Some(PersistenceKind::Json),
+        )
+        .unwrap();
+        let descriptor_str = cfg.scanner.descriptor.to_string();
+
+        let json = format!(
+            r#"{{"account":"my_account","certificate_check":"validate","network":"regtest","look_ahead":20,"descriptor":"{descriptor_str}","persistence":null,"mnemonic":null}}"#
+        );
+        let parsed: Config = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed.scanner.descriptor,
+            bwk_descriptor::descriptor::Descriptor::Miniscript(_)
+        ));
     }
 }

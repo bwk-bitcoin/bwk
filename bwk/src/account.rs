@@ -226,9 +226,7 @@ impl<P: OpenFromBackend> Account<P> {
         let mut signing_manager = SigningManager::from_store(stores.signers);
         if let Some(mnemo) = mnemonic.clone() {
             signing_manager.new_bip32_signer_from_mnemonic(scanner_config.network, mnemo);
-            signing_manager.register_bip32_descriptor(
-                bwk_descriptor::descriptor::Descriptor::from(scanner_config.descriptor.clone()),
-            );
+            signing_manager.register_bip32_descriptor(scanner_config.descriptor.clone());
         }
         let stay_offline = scanner_config.stay_offline();
         // Once per account, not per reconciler: a store shared by several
@@ -622,6 +620,45 @@ mod tests {
             "generated tip must not be inflated by the look-ahead on reopen"
         );
         drop(account);
+    }
+
+    #[test]
+    fn account_rejects_sp_descriptor() {
+        let sp_str = "sp(L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1,\
+                       0260b2003c386519fc9eadf2b5cf124dd8eea4c4e68d5e154050a9346ea98ce600)";
+        let dir = TempDir::new().unwrap();
+        let mut config = persisted_offline_config(&dir, 20);
+        config.scanner.descriptor =
+            bwk_descriptor::descriptor::Descriptor::from_str(sp_str).unwrap();
+        let account_dir = config.scanner.account_dir();
+        let header_store = HeaderStore::new_in_memory(config.scanner.network);
+
+        let result: Result<Account, open::Error> =
+            Account::try_new_with_header_store(config, header_store);
+
+        assert!(matches!(result, Err(open::Error::SpDescriptor)));
+        assert!(
+            !account_dir.exists(),
+            "account directory must not be created for a rejected config"
+        );
+    }
+
+    #[test]
+    fn wallet_descriptor_returns_the_enum() {
+        let dir = TempDir::new().unwrap();
+        let config = persisted_offline_config(&dir, 20);
+        let account: Account = Account::new(config);
+
+        let wallet_descriptor = account.scanner().wallet_descriptor();
+
+        assert!(matches!(
+            wallet_descriptor,
+            bwk_descriptor::descriptor::Descriptor::Miniscript(_)
+        ));
+        assert_eq!(
+            wallet_descriptor.to_string(),
+            account.scanner().descriptor_str()
+        );
     }
 }
 

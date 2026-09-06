@@ -6,13 +6,13 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use miniscript::{Descriptor, DescriptorPublicKey};
+use miniscript::DescriptorPublicKey;
 use serde::{Deserialize, Serialize};
 
-use bwk_descriptor::{derivator, descriptor::DescriptorDerivator};
+use bwk_descriptor::descriptor::{Descriptor, DescriptorDerivator};
 use bwk_persist::{backend::PersistenceBackend, PersistError, PersistenceKind};
 
-use crate::raw_client::CertificateCheck;
+use crate::{open, raw_client::CertificateCheck};
 
 /// Filename for the binary header cache under [`ScannerConfig::account_dir`].
 /// Headers are always binary-backed, independent of `persistence`.
@@ -131,7 +131,7 @@ pub struct ScannerConfig {
     pub stay_offline: bool,
     pub network: miniscript::bitcoin::Network,
     pub look_ahead: u32,
-    pub descriptor: Descriptor<DescriptorPublicKey>,
+    pub descriptor: Descriptor,
     /// Which backend keeps this account's data, `None` for in-memory only.
     pub persistence: Option<PersistenceKind>,
 }
@@ -141,7 +141,7 @@ impl ScannerConfig {
     /// caller has no opinion on: online, no server pinned,
     /// [`DEFAULT_LOOK_AHEAD`] addresses of look-ahead.
     pub fn new(
-        descriptor: Descriptor<DescriptorPublicKey>,
+        descriptor: Descriptor,
         data_dir: PathBuf,
         dir_name: String,
         account: String,
@@ -161,12 +161,22 @@ impl ScannerConfig {
         }
     }
 
-    /// Check the descriptor is one the scan can derive from: multipath,
-    /// unhardened, wildcarded and on `network`. Callers run it before opening
-    /// any store, so a descriptor the derivator rejects errors out instead of
-    /// panicking once the coin store is built.
-    pub fn validate_descriptor(&self) -> Result<(), derivator::Error> {
-        self.descriptor.spk_derivator(self.network).map(|_| ())
+    /// The miniscript descriptor, `None` when `descriptor` is `sp()`.
+    pub fn miniscript_descriptor(&self) -> Option<&miniscript::Descriptor<DescriptorPublicKey>> {
+        self.descriptor.as_miniscript()
+    }
+
+    /// Check the descriptor is one the scan can derive from: a miniscript
+    /// descriptor, not `sp()`, multipath, unhardened, wildcarded and on
+    /// `network`. Callers run it before opening any store, so a descriptor the
+    /// derivator rejects errors out instead of panicking once the coin store is
+    /// built.
+    pub fn validate_descriptor(&self) -> Result<(), open::Error> {
+        let descriptor = self
+            .miniscript_descriptor()
+            .ok_or(open::Error::SpDescriptor)?;
+        descriptor.spk_derivator(self.network)?;
+        Ok(())
     }
 
     /// Open the persistence backend this config selects, rooted at
@@ -234,7 +244,7 @@ mod tests {
         let signer = HotSigner::new_from_mnemonics(Network::Regtest, &mnemo.to_string()).unwrap();
         let xpub = signer.xpub(&DerivationPath::from_str("m/84'/0'/0'/1").unwrap());
         ScannerConfig::new(
-            wpkh(xpub),
+            wpkh(xpub).into(),
             PathBuf::default(),
             String::new(),
             "test".into(),
