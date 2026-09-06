@@ -20,8 +20,8 @@ use std::{
 };
 
 use bitcoin::{
-    absolute::Height, bip32::DerivationPath, hashes::Hash, Amount, OutPoint, ScriptBuf, TxOut,
-    Txid, XOnlyPublicKey,
+    absolute::Height, bip32::DerivationPath, hashes::Hash, key::TapTweak, Amount, OutPoint,
+    ScriptBuf, TxOut, Txid, XOnlyPublicKey,
 };
 
 use blindbitd::BlindbitD;
@@ -901,7 +901,7 @@ impl TestEnv {
     }
 
     /// Add a taproot sub-account to an SP account so it can sign BIP32
-    /// taproot inputs via `sign_and_finalize()`.
+    /// taproot inputs via `sign_and_finalize_v2()`.
     pub fn add_taproot_sub_account(&self, account: &mut bwk_sp::account::Account) {
         let signer =
             HotSigner::new_taproot_from_mnemonics(bitcoin::Network::Regtest, bip32_mnemonic())
@@ -920,7 +920,7 @@ impl TestEnv {
     }
 
     /// Add a segwit (P2WPKH) sub-account to an SP account so it can sign
-    /// BIP32 segwit inputs via `sign_and_finalize()`.
+    /// BIP32 segwit inputs via `sign_and_finalize_v2()`.
     pub fn add_segwit_sub_account(&self, account: &mut bwk_sp::account::Account) {
         let signer =
             HotSigner::new_wpkh_from_mnemonics(bitcoin::Network::Regtest, bip32_mnemonic())
@@ -942,7 +942,7 @@ impl TestEnv {
     ///
     /// The coin is built manually with `CoinSpendInfo::Bip32` so it can be
     /// added to a TxBuilder as a BIP32 input. Register a taproot sub-account
-    /// via `add_taproot_sub_account()` so `sign_and_finalize()` can sign it.
+    /// via `add_taproot_sub_account()` so `sign_and_finalize_v2()` can sign it.
     pub fn create_taproot_coin(&mut self, btc: f64) -> Coin {
         let signer =
             HotSigner::new_taproot_from_mnemonics(bitcoin::Network::Regtest, bip32_mnemonic())
@@ -987,7 +987,7 @@ impl TestEnv {
     /// Create a funded segwit (P2WPKH) coin via bitcoind.
     ///
     /// Register a segwit sub-account via `add_segwit_sub_account()` so
-    /// `sign_and_finalize()` can sign it.
+    /// `sign_and_finalize_v2()` can sign it.
     pub fn create_segwit_coin(&mut self, btc: f64) -> Coin {
         let signer =
             HotSigner::new_wpkh_from_mnemonics(bitcoin::Network::Regtest, bip32_mnemonic())
@@ -1056,6 +1056,126 @@ impl TestEnv {
             },
         }
     }
+}
+
+/// Derives a BIP32 input's key from `xprivs` as BIP352 sums it: for a P2TR
+/// prevout the internal key tweaked with the tap tree, whatever path the input
+/// will be spent with, negated to its even point (the scanner's tweak is
+/// always taken against the tweaked output key, so the SP share must be
+/// computed from the same key); the derived key otherwise. Only kept when it
+/// reproduces `eligible`, the input's BIP352 public key.
+fn bip32_secret_key(
+    input: &bitcoin::psbt::Input,
+    eligible: bitcoin::secp256k1::PublicKey,
+    xprivs: &std::collections::BTreeMap<bitcoin::bip32::Fingerprint, bitcoin::bip32::Xpriv>,
+    secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
+) -> Option<bitcoin::secp256k1::SecretKey> {
+    let held = |(fingerprint, path): &bitcoin::bip32::KeySource| {
+        xprivs
+            .get(fingerprint)?
+            .derive_priv(secp, path)
+            .ok()
+            .map(|k| k.private_key)
+    };
+    let key = match input.tap_internal_key {
+        Some(internal_key) => {
+            let (_, origin) = input.tap_key_origins.get(&internal_key)?;
+            let tweaked = bitcoin::secp256k1::Keypair::from_secret_key(secp, &held(origin)?)
+                .tap_tweak(secp, input.tap_merkle_root)
+                .to_keypair();
+            match tweaked.x_only_public_key().1 {
+                bitcoin::secp256k1::Parity::Odd => tweaked.secret_key().negate(),
+                bitcoin::secp256k1::Parity::Even => tweaked.secret_key(),
+            }
+        }
+        None => input
+            .bip32_derivation
+            .values()
+            .filter_map(held)
+            .find(|key| key.public_key(secp) == eligible)?,
+    };
+    (key.public_key(secp) == eligible).then_some(key)
+}
+
+/// The hot signer behind every BIP32 sub-account the harness adds, holding
+/// each sub-account descriptor. `None` for an account with no sub-account.
+fn sub_accounts_signer(account: &bwk_sp::account::Account) -> Option<HotSigner> {
+    let mut signer = None;
+    for scanner in account.scanners() {
+        signer
+            .get_or_insert_with(|| {
+                HotSigner::new_from_mnemonics(bitcoin::Network::Regtest, bip32_mnemonic()).unwrap()
+            })
+            .inner_register_descriptor(scanner.wallet_descriptor());
+    }
+    signer
+}
+
+/// Writes per-input BIP375 ECDH shares/proofs for eligible BIP32 inputs the
+/// sub-accounts control. `SpSigner::sign` only ever writes shares for the
+/// SP-owned inputs it can reconstruct from `b_spend`, so a transaction mixing
+/// a BIP32 input with a silent-payment output needs this too, before
+/// `SpSigner::sign`'s `complete_output_scripts` call requires every eligible
+/// input's contribution.
+fn write_bip32_sp_shares(account: &bwk_sp::account::Account, psbt: &mut bwk_psbt::PsbtV2) {
+    let scan_keys = bwk_sp::account::bip375::scan_keys(psbt).unwrap();
+    if scan_keys.is_empty() {
+        return;
+    }
+    let mut xprivs = std::collections::BTreeMap::new();
+    if let Some(signer) = sub_accounts_signer(account) {
+        xprivs.insert(signer.fingerprint(), signer.master_xpriv());
+    }
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let mut aux_rand = [0u8; 32];
+    getrandom::getrandom(&mut aux_rand).unwrap();
+
+    for input in &mut psbt.inputs {
+        if bwk_psbt::sp::sp_input_tweak(&input.psbt).unwrap().is_some() {
+            // An SP-owned input: SpSigner handles it.
+            continue;
+        }
+        let Some(eligible) = bwk_sp::account::bip375::eligible_input_pubkey(input).unwrap() else {
+            continue;
+        };
+        let Some(sk) = bip32_secret_key(&input.psbt, eligible, &xprivs, &secp) else {
+            continue;
+        };
+        bwk_sp::signer::write_input_ecdh_share(&mut input.psbt, &scan_keys, sk, aux_rand, &secp)
+            .unwrap();
+    }
+}
+
+/// Signs a PSBTv2's silent-payment inputs with a fresh `SpSigner` built from
+/// `mnemonic`. Stands in for a real signer, and is the only place in the test
+/// tree that holds a key.
+pub fn sign_v2(mnemonic: &str, network: bitcoin::Network, psbt: &mut bwk_psbt::PsbtV2) {
+    let signer = bwk_sp::signer::SpSigner::from_mnemonic(
+        mnemonic,
+        network,
+        bitcoin::bip32::ChildNumber::from_hardened_idx(0).unwrap(),
+    )
+    .unwrap();
+    signer.sign(psbt).unwrap();
+}
+
+/// Signs and finalizes a PSBTv2 end to end: BIP32-owned eligible inputs' SP
+/// shares first (so a mixed transaction's silent-payment outputs can be
+/// completed), then silent-payment inputs via `sign_v2`, then BIP32 inputs
+/// with the sub-accounts' hot signer.
+pub fn sign_and_finalize_v2(
+    account: &bwk_sp::account::Account,
+    mnemonic: &str,
+    psbt: &mut bwk_psbt::PsbtV2,
+) -> bitcoin::Transaction {
+    write_bip32_sp_shares(account, psbt);
+    sign_v2(mnemonic, account.network(), psbt);
+    let mut v0 = psbt.clone().into_bitcoin_psbt().unwrap();
+    if let Some(signer) = sub_accounts_signer(account) {
+        signer.sign(&mut v0);
+    }
+    *psbt = bwk_psbt::PsbtV2::from_bitcoin_psbt(v0).unwrap();
+    account.finalize_psbt_v2(psbt).unwrap()
 }
 
 // Tests for test utilities

@@ -10,7 +10,7 @@ use bitcoin::{
     secp256k1::{All, Keypair, Message, Parity, PublicKey, Scalar, Secp256k1, SecretKey},
     sighash::{Prevouts, SighashCache},
     taproot::Signature,
-    Network, TapSighashType,
+    Network, OutPoint, TapSighashType,
 };
 
 use crate::{
@@ -33,13 +33,13 @@ pub enum Error {
     Dleq,
     #[error("sighash computation failed: {0}")]
     Sighash(bitcoin::sighash::TaprootError),
+    #[error("missing witness_utxo for input {0}")]
+    MissingPrevout(OutPoint),
 }
 
 /// Reconstructs a taproot signing key by tweaking `b_spend`, negating for
-/// parity, and matching the result against `script_pubkey`. Shared by
-/// [`SpSigner`] (tweak read from the PSBTv2 input) and
-/// [`crate::account::Account::sign_sp_inputs`] (tweak read from the coin
-/// store).
+/// parity, and matching the result against `script_pubkey`. Used by
+/// [`SpSigner`], with the tweak read from the PSBTv2 input.
 pub fn reconstruct_signing_key(
     b_spend: SecretKey,
     tweak: SecretKey,
@@ -61,8 +61,7 @@ pub fn reconstruct_signing_key(
 }
 
 /// Signs a single taproot key-spend input (no taproot tweak: SP outputs use
-/// `dangerous_assume_tweaked()`). Shared by [`SpSigner`] and
-/// [`crate::account::Account::sign_sp_inputs`].
+/// `dangerous_assume_tweaked()`). Used by [`SpSigner`].
 pub fn sign_taproot_key_spend(
     cache: &mut SighashCache<&bitcoin::Transaction>,
     prevouts: &[bitcoin::TxOut],
@@ -86,8 +85,7 @@ pub fn sign_taproot_key_spend(
 }
 
 /// Writes a per-input ECDH share and DLEQ proof for `sk` against every
-/// `scan_key`. Shared by [`SpSigner::write_shares`]'s per-input branch and
-/// [`crate::account::Account::add_bip32_sp_shares`] for BIP32-owned inputs.
+/// `scan_key`. Used by [`SpSigner::write_shares`]'s per-input branch.
 pub fn write_input_ecdh_share(
     input_psbt: &mut bitcoin::psbt::Input,
     scan_keys: &BTreeSet<PublicKey>,
@@ -222,7 +220,13 @@ impl SpSigner {
         let prevouts: Vec<bitcoin::TxOut> = psbt
             .inputs
             .iter()
-            .map(|input| input.psbt.witness_utxo.clone().ok_or(Error::Derivation))
+            .map(|input| {
+                input
+                    .psbt
+                    .witness_utxo
+                    .clone()
+                    .ok_or(Error::MissingPrevout(input.previous_output))
+            })
             .collect::<Result<_, _>>()?;
         let mut cache = SighashCache::new(&tx);
 
@@ -264,7 +268,10 @@ mod tests {
         transaction, Network, OutPoint, ScriptBuf, Sequence, TxOut, Txid, XOnlyPublicKey,
     };
 
-    use crate::{account::bip375, signer::SpSigner};
+    use crate::{
+        account::bip375,
+        signer::{Error, SpSigner},
+    };
 
     fn signer() -> SpSigner {
         SpSigner {
@@ -397,5 +404,31 @@ mod tests {
             .is_some());
         assert!(psbt.outputs[0].script_pubkey.is_some());
         bip375::validate(&psbt).unwrap();
+    }
+
+    #[test]
+    fn signs_nothing_without_an_owned_input_whatever_the_prevouts() {
+        let signer = signer();
+        let mut foreign = foreign_input(1);
+        foreign.psbt.witness_utxo = None;
+        let mut psbt = empty_psbt(vec![foreign]);
+
+        signer.sign(&mut psbt).unwrap();
+
+        assert!(psbt.inputs[0].psbt.tap_key_sig.is_none());
+    }
+
+    #[test]
+    fn signing_an_owned_input_errors_on_a_missing_prevout() {
+        let signer = signer();
+        let mut foreign = foreign_input(2);
+        foreign.psbt.witness_utxo = None;
+        let foreign_outpoint = foreign.previous_output;
+        let mut psbt = empty_psbt(vec![owned_input(&signer, 1, 1), foreign]);
+
+        let err = signer.sign(&mut psbt).unwrap_err();
+
+        assert!(matches!(err, Error::MissingPrevout(outpoint) if outpoint == foreign_outpoint));
+        assert!(psbt.inputs[0].psbt.tap_key_sig.is_none());
     }
 }

@@ -14,8 +14,8 @@ use bitcoin::OutPoint;
 use bwk_utils::test::{self as bwk_test, temp_dir::TempDir};
 
 use common::{
-    test_account, test_account_named, test_account_persistent, test_account_persistent_named,
-    test_mnemonic, test_outpoint, TestEnv,
+    sign_and_finalize_v2, test_account, test_account_named, test_account_persistent,
+    test_account_persistent_named, test_mnemonic, test_outpoint, TestEnv,
 };
 
 use bwk::{
@@ -1058,7 +1058,7 @@ fn test_label_transaction(env: &mut TestEnv) {
 /// 4. Scan blockchain with Account
 /// 5. Verify correct balance and coin count
 /// 6. Verify spendable_coins() returns correct data
-/// 7. Verify can_sign() returns true for mnemonic-based account
+/// 7. Verify the mnemonic-based account was configured with a mnemonic
 fn test_full_wallet_flow(env: &mut TestEnv) {
     use bwk_sign::{bip39, hot_signer::HotSigner};
     use bwk_sp::receiver::SpReceiver;
@@ -1160,10 +1160,10 @@ fn test_full_wallet_flow(env: &mut TestEnv) {
     // 7. Verify backend connectivity
     assert!(account.backend_online(), "Backend should be online");
 
-    // 8. Verify can_sign() returns true for mnemonic-based account
+    // 8. Verify the account was configured with a mnemonic
     assert!(
-        account.can_sign(),
-        "Account with mnemonic should be able to sign"
+        account.get_config().mnemonic.is_some(),
+        "Account should have been configured with a mnemonic"
     );
 
     // 9. Verify account found all SP outputs
@@ -1219,8 +1219,11 @@ fn test_full_wallet_lifecycle(env: &mut TestEnv) {
             "Coin label should be set"
         );
 
-        // Verify can_sign before persist
-        assert!(account.can_sign(), "Should be able to sign before persist");
+        // Verify the mnemonic is configured before persist
+        assert!(
+            account.get_config().mnemonic.is_some(),
+            "Should be configured with a mnemonic before persist"
+        );
 
         // Record state before drop
         let balance_before = account.balance();
@@ -1243,10 +1246,10 @@ fn test_full_wallet_lifecycle(env: &mut TestEnv) {
             "Backend should be online after reload"
         );
 
-        // Verify can_sign is preserved
+        // Verify the mnemonic is preserved
         assert!(
-            reloaded_account.can_sign(),
-            "Should be able to sign after reload"
+            reloaded_account.get_config().mnemonic.is_some(),
+            "Should be configured with a mnemonic after reload"
         );
 
         // Verify balance is preserved (0 since no SP outputs)
@@ -1284,7 +1287,7 @@ fn test_full_wallet_lifecycle(env: &mut TestEnv) {
 /// This test verifies:
 /// - Account can be created with scan_sk + public spend_key
 /// - Scanning works normally
-/// - can_sign() returns false
+/// - The account was not configured with a mnemonic
 /// - SP address can still be generated
 fn test_watch_only_mode(env: &mut TestEnv) {
     let blindbit_url = env.url();
@@ -1315,10 +1318,10 @@ fn test_watch_only_mode(env: &mut TestEnv) {
 
     let account = bwk_sp::account::Account::new(config).expect("account creation");
 
-    // 5. Watch-only should NOT be able to sign
+    // 5. Watch-only should NOT be configured with a mnemonic
     assert!(
-        !account.can_sign(),
-        "Watch-only account should not be able to sign"
+        account.get_config().mnemonic.is_none(),
+        "Watch-only account should not be configured with a mnemonic"
     );
 
     // 6. But should still be able to get SP address
@@ -1425,7 +1428,7 @@ fn test_spend_only_resume_at_same_tip(env: &mut TestEnv) {
             builder.add_input(coin);
         }
         let mut psbt = builder.generate_v2().unwrap();
-        account.sign_and_finalize_v2(&mut psbt).unwrap()
+        sign_and_finalize_v2(&account, test_mnemonic(), &mut psbt)
     };
     env.broadcast_and_mine(&tx);
     let c2 = env.height;
@@ -1512,7 +1515,7 @@ fn test_unconfirmed_spend_injection(env: &mut TestEnv) {
     }
     let tx = {
         let mut psbt = builder.generate_v2().unwrap();
-        account.sign_and_finalize_v2(&mut psbt).unwrap()
+        sign_and_finalize_v2(&account, test_mnemonic(), &mut psbt)
     };
     let spend_txid = tx.compute_txid();
     let change = tx
@@ -1673,7 +1676,7 @@ fn test_broadcast_requires_electrum_endpoint(env: &mut TestEnv) {
     }
     let tx = {
         let mut psbt = builder.generate_v2().unwrap();
-        account.sign_and_finalize_v2(&mut psbt).unwrap()
+        sign_and_finalize_v2(&account, test_mnemonic(), &mut psbt)
     };
     let spend_txid = tx.compute_txid();
 
