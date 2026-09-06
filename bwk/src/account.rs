@@ -59,6 +59,35 @@ struct AttachedManager {
     pump: Option<JoinHandle<()>>,
 }
 
+/// One cached signer identity plus the name of the manager it came from, so
+/// [`Account::detach_signing_manager`] can drop exactly that manager's
+/// entries.
+struct CachedSigner {
+    manager: String,
+    info: SignerInfo,
+}
+
+/// Replaces every cached entry owned by `manager` with `list`: a signer whose
+/// state changes is dropped and re-registered rather than mutated, so a roster
+/// update is a wholesale replacement, not a merge.
+fn replace_manager_signers(
+    cache: &Mutex<BTreeMap<SignerId, CachedSigner>>,
+    manager: &str,
+    list: Vec<SignerInfo>,
+) {
+    let mut cache = cache.lock().expect("poisoned");
+    cache.retain(|_, entry| entry.manager != manager);
+    for info in list {
+        cache.insert(
+            info.id.clone(),
+            CachedSigner {
+                manager: manager.to_string(),
+                info,
+            },
+        );
+    }
+}
+
 /// Adapts a shared [`HotManager`] to [`SigningManager`] so it can sit in
 /// [`Account::managers`] like any other attached manager, while
 /// [`Account::sign_psbt`] and [`Account::master_xprivs`] keep a direct handle
@@ -147,10 +176,16 @@ fn response_to_notification(response: &Response) -> Option<Notification> {
 /// Bridges an attached manager's `crossbeam` response channel onto the
 /// account's `std::sync::mpsc` notification sender. Polls on a timeout so a
 /// `stop` request is picked up promptly even when the manager never answers.
+///
+/// Also keeps `signers` current: `Response::Signers` and
+/// `Response::SignersChanged` both carry a full roster for `manager_name`, so
+/// either one replaces that manager's cached entries wholesale.
 fn spawn_pump(
+    manager_name: String,
     rx: channel::Receiver<Response>,
     sender: mpsc::Sender<Notification>,
     stop: Arc<AtomicBool>,
+    signers: Arc<Mutex<BTreeMap<SignerId, CachedSigner>>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || loop {
         if stop.load(Ordering::Relaxed) {
@@ -158,6 +193,11 @@ fn spawn_pump(
         }
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(response) => {
+                if let Response::Signers { signers: list, .. }
+                | Response::SignersChanged { signers: list } = &response
+                {
+                    replace_manager_signers(&signers, &manager_name, list.clone());
+                }
                 if let Some(notif) = response_to_notification(&response) {
                     if sender.send(notif).is_err() {
                         return;
@@ -184,6 +224,11 @@ pub struct Account<P: ScanProfile = RamProfile<DefaultBackend>> {
     /// fetches its merkle proofs through it.
     headers: HeaderFollower<P>,
     managers: BTreeMap<String, AttachedManager>,
+    /// Cache of every signer reachable through `managers`, keyed by its
+    /// unique [`SignerId`] (never by fingerprint: several signers can share
+    /// one). Seeded from a manager's `signers()` on attach, dropped on
+    /// detach, and kept current by each manager's pump thread.
+    signers: Arc<Mutex<BTreeMap<SignerId, CachedSigner>>>,
     /// Shared handle to the hot manager built from the config mnemonic, kept
     /// so `sign_psbt` and `master_xprivs` can reach operations the
     /// `SigningManager` trait cannot express.
@@ -379,6 +424,7 @@ impl<P: OpenScanFromBackend> Account<P> {
             scanner,
             headers,
             managers: BTreeMap::new(),
+            signers: Arc::new(Mutex::new(BTreeMap::new())),
             hot: None,
             mnemonic,
             sender,
@@ -488,7 +534,17 @@ impl<P: ScanProfile> Account<P> {
         let (tx, rx) = channel::unbounded();
         manager.subscribe(tx);
         let stop = Arc::new(AtomicBool::new(false));
-        let pump = spawn_pump(rx, self.sender.clone(), stop.clone());
+        let pump = spawn_pump(
+            name.to_string(),
+            rx,
+            self.sender.clone(),
+            stop.clone(),
+            self.signers.clone(),
+        );
+        // A synchronous read of what the manager already knows, not a
+        // request, so it does not violate the non-blocking rule.
+        let initial = manager.signers();
+        replace_manager_signers(&self.signers, name, initial);
         self.managers.insert(
             name.to_string(),
             AttachedManager {
@@ -501,7 +557,8 @@ impl<P: ScanProfile> Account<P> {
     }
 
     /// Detaches the manager registered under `name`, stopping its pump
-    /// thread. Returns whether a manager was actually removed.
+    /// thread and dropping its signers from the cache. Returns whether a
+    /// manager was actually removed.
     pub fn detach_signing_manager(&mut self, name: &str) -> bool {
         let Some(mut attached) = self.managers.remove(name) else {
             return false;
@@ -511,12 +568,55 @@ impl<P: ScanProfile> Account<P> {
         if let Some(pump) = attached.pump.take() {
             let _ = pump.join();
         }
+        self.signers
+            .lock()
+            .expect("poisoned")
+            .retain(|_, entry| entry.manager != name);
         true
     }
 
     /// Names of every currently attached signing manager.
     pub fn signing_manager_names(&self) -> Vec<String> {
         self.managers.keys().cloned().collect()
+    }
+
+    /// Every signer reachable through an attached manager, from the local
+    /// cache. Keyed by unique id, never by fingerprint: two signers sharing a
+    /// fingerprint both appear. Synchronous and never touches a device.
+    pub fn signers(&self) -> Vec<SignerInfo> {
+        self.signers
+            .lock()
+            .expect("poisoned")
+            .values()
+            .map(|cached| cached.info.clone())
+            .collect()
+    }
+
+    /// The cached identity of one signer, if it is currently known.
+    pub fn signer(&self, id: &SignerId) -> Option<SignerInfo> {
+        self.signers
+            .lock()
+            .expect("poisoned")
+            .get(id)
+            .map(|cached| cached.info.clone())
+    }
+
+    /// Re-reads `signers()` from every attached manager and refreshes the
+    /// cache. Synchronous and cheap: it only reads what each manager already
+    /// holds, it never sends a request to a device.
+    pub fn refresh_signers(&self) {
+        for (name, attached) in self.managers.iter() {
+            let list = attached.manager.signers();
+            replace_manager_signers(&self.signers, name, list);
+        }
+    }
+
+    /// Turns device discovery on and off on every attached manager, mirroring
+    /// silent's `Host::requestSignerPolling`.
+    pub fn set_signer_polling(&mut self, enabled: bool) {
+        for attached in self.managers.values_mut() {
+            attached.manager.set_polling(enabled);
+        }
     }
 
     /// Signs `psbt` in place with the hot signers, when the hot manager is
@@ -651,10 +751,10 @@ mod tests {
     use bip39::Mnemonic;
     use bwk_descriptor::descriptor::ScriptType;
     use bwk_persist::{config_store::FileConfigStore, storage::Store, PersistenceKind};
-    use bwk_sign::{hot_signer::HotSigner, manager::SigningManager};
+    use bwk_sign::{hot_signer::HotSigner, identity::SignerState, manager::SigningManager};
     use miniscript::{
         bitcoin::{
-            bip32::{ChildNumber, DerivationPath},
+            bip32::{self, ChildNumber, DerivationPath},
             Network, ScriptBuf,
         },
         Descriptor, DescriptorPublicKey,
@@ -943,6 +1043,11 @@ mod tests {
         calls: Arc<Mutex<Vec<String>>>,
         captured_sender: Arc<Mutex<Option<channel::Sender<Response>>>>,
         requests: bwk_sign::protocol::RequestIdSource,
+        initial_signers: Vec<SignerInfo>,
+        /// When set, every request method panics instead of recording and
+        /// answering, so a test can assert that a non-blocking call never
+        /// reaches one.
+        panic_on_request: bool,
     }
 
     impl StubManager {
@@ -954,18 +1059,36 @@ mod tests {
                 calls,
                 captured_sender,
                 requests: bwk_sign::protocol::RequestIdSource::new(),
+                initial_signers: Vec::new(),
+                panic_on_request: false,
             }
+        }
+
+        fn with_signers(mut self, signers: Vec<SignerInfo>) -> Self {
+            self.initial_signers = signers;
+            self
+        }
+
+        fn panicking(mut self) -> Self {
+            self.panic_on_request = true;
+            self
         }
 
         fn record(&self, call: &str) {
             self.calls.lock().expect("poisoned").push(call.to_string());
+        }
+
+        fn deny_request(&self, call: &str) {
+            if self.panic_on_request {
+                panic!("request method {call} reached on a non-blocking call");
+            }
         }
     }
 
     impl SigningManager for StubManager {
         fn signers(&self) -> Vec<SignerInfo> {
             self.record("signers");
-            vec![]
+            self.initial_signers.clone()
         }
 
         fn subscribe(&mut self, sender: channel::Sender<Response>) {
@@ -978,11 +1101,13 @@ mod tests {
         }
 
         fn init(&mut self, _signer: &SignerId) -> Result<RequestId, manager::Error> {
+            self.deny_request("init");
             self.record("init");
             Ok(self.requests.next())
         }
 
         fn info(&self, _signer: &SignerId) -> Result<RequestId, manager::Error> {
+            self.deny_request("info");
             self.record("info");
             Ok(self.requests.next())
         }
@@ -993,6 +1118,7 @@ mod tests {
             _path: DerivationPath,
             _display: bool,
         ) -> Result<RequestId, manager::Error> {
+            self.deny_request("get_xpub");
             self.record("get_xpub");
             Ok(self.requests.next())
         }
@@ -1002,6 +1128,7 @@ mod tests {
             _signer: &SignerId,
             _descriptor: bwk_descriptor::descriptor::Descriptor,
         ) -> Result<RequestId, manager::Error> {
+            self.deny_request("is_descriptor_registered");
             self.record("is_descriptor_registered");
             Ok(self.requests.next())
         }
@@ -1011,6 +1138,7 @@ mod tests {
             _signer: &SignerId,
             _descriptor: bwk_descriptor::descriptor::Descriptor,
         ) -> Result<RequestId, manager::Error> {
+            self.deny_request("register_descriptor");
             self.record("register_descriptor");
             Ok(self.requests.next())
         }
@@ -1021,11 +1149,13 @@ mod tests {
             _descriptor: bwk_descriptor::descriptor::Descriptor,
             _psbt: Vec<u8>,
         ) -> Result<RequestId, manager::Error> {
+            self.deny_request("sign");
             self.record("sign");
             Ok(self.requests.next())
         }
 
         fn raw(&self, _signer: &SignerId, _request: Vec<u8>) -> Result<RequestId, manager::Error> {
+            self.deny_request("raw");
             self.record("raw");
             Ok(self.requests.next())
         }
@@ -1146,7 +1276,165 @@ mod tests {
             .unwrap();
 
         let seen = calls.lock().unwrap().clone();
-        assert_eq!(seen, vec!["subscribe".to_string()]);
+        assert_eq!(seen, vec!["subscribe".to_string(), "signers".to_string()]);
+    }
+
+    fn signer_info(id: &str, fingerprint: [u8; 4], state: SignerState) -> SignerInfo {
+        SignerInfo::new(
+            SignerId::new(id),
+            bip32::Fingerprint::from(fingerprint),
+            "wallet".to_string(),
+            state,
+        )
+    }
+
+    #[test]
+    fn attach_seeds_the_signer_list() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let a = signer_info("seed-a", [1, 1, 1, 1], SignerState::Ready);
+        let b = signer_info("seed-b", [2, 2, 2, 2], SignerState::Ready);
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)))
+            .with_signers(vec![a.clone(), b.clone()]);
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let ids: Vec<SignerId> = account
+            .signers()
+            .into_iter()
+            .map(|info| info.id)
+            .filter(|id| *id == a.id || *id == b.id)
+            .collect();
+        assert_eq!(ids, vec![a.id.clone(), b.id.clone()]);
+    }
+
+    #[test]
+    fn two_signers_share_a_fingerprint() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let fingerprint = [9, 9, 9, 9];
+        let a = signer_info("dup-a", fingerprint, SignerState::Ready);
+        let b = signer_info("dup-b", fingerprint, SignerState::Ready);
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)))
+            .with_signers(vec![a.clone(), b.clone()]);
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let signers = account.signers();
+        assert!(signers.contains(&a));
+        assert!(signers.contains(&b));
+    }
+
+    #[test]
+    fn detach_removes_only_that_managers_signers() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let a = signer_info("mgr-a-signer", [1, 1, 1, 1], SignerState::Ready);
+        let b = signer_info("mgr-b-signer", [2, 2, 2, 2], SignerState::Ready);
+        let stub_a = StubManager::new(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)))
+            .with_signers(vec![a.clone()]);
+        let stub_b = StubManager::new(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)))
+            .with_signers(vec![b.clone()]);
+        account
+            .attach_signing_manager("stub-a", Box::new(stub_a))
+            .unwrap();
+        account
+            .attach_signing_manager("stub-b", Box::new(stub_b))
+            .unwrap();
+
+        assert!(account.detach_signing_manager("stub-a"));
+
+        let signers = account.signers();
+        assert!(!signers.contains(&a));
+        assert!(signers.contains(&b));
+    }
+
+    #[test]
+    fn roster_update_replaces_wholesale() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let a = signer_info("roster-a", [3, 3, 3, 3], SignerState::Ready);
+        let b = signer_info("roster-b", [4, 4, 4, 4], SignerState::Ready);
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), captured_sender.clone())
+            .with_signers(vec![a.clone(), b.clone()]);
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let a_locked = SignerInfo::new(
+            a.id.clone(),
+            a.fingerprint,
+            a.wallet_name.clone(),
+            SignerState::Locked,
+        )
+        .with_detail("locked");
+
+        let sender = captured_sender.lock().unwrap().clone().unwrap();
+        sender
+            .send(Response::SignersChanged {
+                signers: vec![a_locked.clone()],
+            })
+            .unwrap();
+
+        let mut updated = false;
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(20));
+            let signers = account.signers();
+            if signers.contains(&a_locked) && !signers.contains(&a) && !signers.contains(&b) {
+                updated = true;
+                break;
+            }
+        }
+        assert!(updated, "roster update was not replaced wholesale in time");
+    }
+
+    #[test]
+    fn signers_is_non_blocking() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)))
+            .panicking();
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let _ = account.signers();
+        account.refresh_signers();
+    }
+
+    #[test]
+    fn polling_flag_reaches_every_manager() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let calls_a = Arc::new(Mutex::new(Vec::new()));
+        let calls_b = Arc::new(Mutex::new(Vec::new()));
+        account
+            .attach_signing_manager(
+                "stub-a",
+                Box::new(StubManager::new(
+                    calls_a.clone(),
+                    Arc::new(Mutex::new(None)),
+                )),
+            )
+            .unwrap();
+        account
+            .attach_signing_manager(
+                "stub-b",
+                Box::new(StubManager::new(
+                    calls_b.clone(),
+                    Arc::new(Mutex::new(None)),
+                )),
+            )
+            .unwrap();
+
+        account.set_signer_polling(true);
+        account.set_signer_polling(false);
+
+        let expected = vec![
+            "subscribe".to_string(),
+            "signers".to_string(),
+            "set_polling".to_string(),
+            "set_polling".to_string(),
+        ];
+        assert_eq!(calls_a.lock().unwrap().clone(), expected);
+        assert_eq!(calls_b.lock().unwrap().clone(), expected);
     }
 }
 

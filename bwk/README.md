@@ -148,6 +148,11 @@ drops the manager, and `signing_manager_names()` lists what is attached. A
 config carrying a mnemonic gets a hot manager attached at construction, under
 the name `hot`.
 
+`signers()` returns every signer cached across every attached manager and
+`signer(id)` one of them. `refresh_signers()` asks each manager for a fresh
+roster, and `set_signer_polling(enabled)` turns device discovery on and off on
+all of them at once.
+
 ## Features
 
 All off by default. `logger` installs `env_logger` as the global logger; leave
