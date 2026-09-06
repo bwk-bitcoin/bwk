@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{fmt, str::FromStr};
 
 use miniscript::{
     bitcoin::{
@@ -6,8 +6,8 @@ use miniscript::{
         NetworkKind,
     },
     descriptor::{
-        checksum::desc_checksum, DefiniteDescriptorKey, DescriptorPublicKey, DescriptorSecretKey,
-        SinglePubKey, Wildcard,
+        checksum::{desc_checksum, Formatter},
+        DefiniteDescriptorKey, DescriptorPublicKey, DescriptorSecretKey, SinglePubKey, Wildcard,
     },
     expression::Tree,
 };
@@ -229,6 +229,34 @@ impl SpDescriptor {
                     unreachable!("multipath secret keys are rejected at parse time")
                 }
             },
+        }
+    }
+
+    fn fmt_body<W: fmt::Write>(&self, w: &mut W) -> fmt::Result {
+        match self {
+            SpDescriptor::Packed(key) => write!(w, "sp({key})"),
+            SpDescriptor::Split { scan, spend } => write!(w, "sp({scan},{spend})"),
+        }
+    }
+
+    pub fn to_string_no_checksum(&self) -> String {
+        format!("{self:#}")
+    }
+}
+
+impl fmt::Display for SpDescriptor {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut wrapped = Formatter::new(f);
+        self.fmt_body(&mut wrapped)?;
+        wrapped.write_checksum_if_not_alt()
+    }
+}
+
+impl fmt::Display for SpendKey {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            SpendKey::Public(k) => write!(f, "{k}"),
+            SpendKey::Secret(k) => write!(f, "{k}"),
         }
     }
 }
@@ -477,12 +505,130 @@ mod tests {
     #[test]
     fn bad_checksum_rejected() {
         let fixture = scan_key_fixture();
-        let body = format!("sp({})", SpKey::Scan(fixture));
-        let s = format!("{body}#00000000");
-        assert!(matches!(
-            SpDescriptor::from_str(&s),
-            Err(Error::Checksum { .. })
-        ));
+        let d = SpDescriptor::Packed(SpKey::Scan(fixture));
+        let s = d.to_string();
+        let expected = desc_checksum(&d.to_string_no_checksum()).unwrap();
+
+        let mut bad = s.clone();
+        let last = bad.len() - 1;
+        let flipped = if bad.as_bytes()[last] as char == 'q' {
+            'p'
+        } else {
+            'q'
+        };
+        bad.replace_range(last..last + 1, &flipped.to_string());
+
+        match SpDescriptor::from_str(&bad) {
+            Err(Error::Checksum {
+                expected: found_expected,
+                ..
+            }) => assert_eq!(found_expected, expected),
+            other => panic!("expected Checksum error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn display_appends_checksum() {
+        let fixture = scan_key_fixture();
+        let d = SpDescriptor::Packed(SpKey::Scan(fixture));
+        let s = d.to_string();
+
+        assert_eq!(s.matches('#').count(), 1);
+        let checksum = s.rsplit('#').next().unwrap();
+        assert_eq!(checksum.len(), 8);
+        assert_eq!(checksum, desc_checksum(&d.to_string_no_checksum()).unwrap());
+    }
+
+    #[test]
+    fn alternate_display_omits_checksum() {
+        let fixture = scan_key_fixture();
+        let d = SpDescriptor::Packed(SpKey::Scan(fixture));
+        let s = format!("{d:#}");
+
+        assert!(!s.contains('#'));
+        assert!(s.starts_with("sp("));
+    }
+
+    #[test]
+    fn roundtrip_packed_scan() {
+        let fixture = scan_key_fixture();
+        let d = SpDescriptor::Packed(SpKey::Scan(fixture));
+        let s = d.to_string();
+
+        let parsed = SpDescriptor::from_str(&s).unwrap();
+        assert_eq!(parsed, d);
+        assert_eq!(parsed.to_string(), s);
+    }
+
+    #[test]
+    fn roundtrip_packed_spend() {
+        let fixture = spend_key_fixture();
+        let d = SpDescriptor::Packed(SpKey::Spend(fixture));
+        let s = d.to_string();
+
+        let parsed = SpDescriptor::from_str(&s).unwrap();
+        assert_eq!(parsed, d);
+        assert_eq!(parsed.to_string(), s);
+    }
+
+    #[test]
+    fn roundtrip_split_wif_pubkey() {
+        let s = "sp(L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1,\
+                  0260b2003c386519fc9eadf2b5cf124dd8eea4c4e68d5e154050a9346ea98ce600)";
+        let d = SpDescriptor::from_str(s).unwrap();
+        let rendered = d.to_string();
+
+        let parsed = SpDescriptor::from_str(&rendered).unwrap();
+        assert_eq!(parsed, d);
+        assert_eq!(parsed.to_string(), rendered);
+    }
+
+    #[test]
+    fn roundtrip_split_xprv_xpub() {
+        let secp = secp();
+        let xprv = xprv_fixture();
+        let fingerprint = xprv.fingerprint(&secp);
+        let xpub = miniscript::bitcoin::bip32::Xpub::from_priv(&secp, &xprv);
+
+        let s = format!("sp([{fingerprint}/352h/0h/0h]{xprv}/0h,{xpub}/0h)");
+        let d = SpDescriptor::from_str(&s).unwrap();
+        let rendered = d.to_string();
+
+        let parsed = SpDescriptor::from_str(&rendered).unwrap();
+        assert_eq!(parsed, d);
+        assert_eq!(parsed.to_string(), rendered);
+
+        let no_checksum = d.to_string_no_checksum();
+        assert!(no_checksum.contains(&format!("[{fingerprint}/352'/0'/0']")));
+        assert!(no_checksum.ends_with("/0')"));
+    }
+
+    #[test]
+    fn roundtrip_without_checksum() {
+        let fixture = scan_key_fixture();
+        let d = SpDescriptor::Packed(SpKey::Scan(fixture));
+        let s = format!("{d:#}");
+
+        let parsed = SpDescriptor::from_str(&s).unwrap();
+        assert_eq!(parsed, d);
+    }
+
+    #[test]
+    fn checksum_covers_the_whole_body() {
+        let secp = secp();
+        let xprv = xprv_fixture();
+        let fingerprint = xprv.fingerprint(&secp);
+        let spend_xprv1 = Xpriv::new_master(Network::Bitcoin, &[0x22; 64]).unwrap();
+        let spend_xprv2 = Xpriv::new_master(Network::Bitcoin, &[0x33; 64]).unwrap();
+
+        let s1 = format!("sp([{fingerprint}/352h/0h/0h]{xprv}/0h,{spend_xprv1}/0h)");
+        let s2 = format!("sp([{fingerprint}/352h/0h/0h]{xprv}/0h,{spend_xprv2}/0h)");
+        let d1 = SpDescriptor::from_str(&s1).unwrap();
+        let d2 = SpDescriptor::from_str(&s2).unwrap();
+
+        let checksum1 = d1.to_string().rsplit('#').next().unwrap().to_string();
+        let checksum2 = d2.to_string().rsplit('#').next().unwrap().to_string();
+        assert_ne!(checksum1, checksum2);
     }
 
     #[test]
