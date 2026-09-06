@@ -58,6 +58,11 @@ name = "watch_only"
 path = "tests/watch_only.rs"
 required-features = ["mnemonic"]
 
+[[test]]
+name = "signer_round_trip"
+path = "tests/signer_round_trip.rs"
+required-features = ["mnemonic"]
+
 [features]
 default = ["mnemonic"]
 # Enable usage of bip39 mnemonics.
