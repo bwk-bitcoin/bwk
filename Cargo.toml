@@ -14,6 +14,7 @@ members = [
     "persist",
     "p2p",
     "mitm",
+    "psbt",
     "hwi", "hwi/cli",
     "secp256k1_spscan-sys",
 ]
@@ -83,6 +84,7 @@ bwk-utils = { path = "utils" }
 bwk-p2p = { path = "p2p" }
 bwk-qr = { path = "qr" }
 bwk-qr-protocol = { path = "qr-protocol" }
+bwk-psbt = { path = "psbt" }
 bwk = { path = "bwk" }
 # bwk-error is the in-house derive. Aliasing the package as `thiserror` is deliberate,
 # not an oversight: error definitions across the tree keep reading `thiserror::Error`,
