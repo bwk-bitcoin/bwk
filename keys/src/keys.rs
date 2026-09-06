@@ -32,6 +32,7 @@ impl Debug for OXpriv {
 /// # Fields
 /// * `origin` - A tuple containing the fingerprint and derivation path.
 /// * `xkey` - The extended public key.
+#[derive(Clone, PartialEq, Eq)]
 pub struct OXpub {
     pub origin: (Fingerprint, DerivationPath),
     pub xkey: Xpub,
