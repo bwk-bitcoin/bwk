@@ -9,11 +9,11 @@ use std::{
 };
 
 use bitcoin::{bip32::ChildNumber, Network};
-use bwk::{
-    bwk_electrum::{config::Endpoint, raw_client::CertificateCheck},
-    miniscript::{Descriptor, DescriptorPublicKey},
+use bwk::bwk_electrum::{config::Endpoint, raw_client::CertificateCheck};
+use bwk_sign::{
+    bwk_descriptor::{self, descriptor::Descriptor},
+    hot_signer::HotSigner,
 };
-use bwk_sign::{bwk_descriptor, hot_signer::HotSigner};
 use serde::{Deserialize, Serialize};
 
 /// Default filename a [`bwk::persist::config_store::FileConfigStore`] uses for an
@@ -75,8 +75,9 @@ pub struct Config {
 /// Configuration for an embedded standard wallet sub-account.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubAccountConfig {
-    /// Miniscript descriptor (e.g. wpkh or tr)
-    pub descriptor: Descriptor<DescriptorPublicKey>,
+    /// Descriptor for this sub-account: a miniscript descriptor (e.g. wpkh
+    /// or tr) or a BIP392 `sp()` silent-payment descriptor.
+    pub descriptor: Descriptor,
     /// Optional mnemonic used to sign this sub-account.
     ///
     /// When absent, [`Account`](crate::account::Account) uses the parent SP
@@ -316,15 +317,11 @@ impl Config {
             }
         };
 
-        self.push_descriptor_maybe(descriptor, sub_account_mnemonic);
+        self.push_descriptor_maybe(descriptor.into(), sub_account_mnemonic);
         Ok(())
     }
 
-    fn push_descriptor_maybe(
-        &mut self,
-        descriptor: Descriptor<DescriptorPublicKey>,
-        mnemonic: Option<String>,
-    ) {
+    fn push_descriptor_maybe(&mut self, descriptor: Descriptor, mnemonic: Option<String>) {
         if self
             .descriptors
             .iter()
@@ -531,6 +528,66 @@ mod tests {
             .expect("second taproot insert");
 
         assert_eq!(config.descriptors.len(), 2);
+    }
+
+    #[test]
+    fn push_descriptor_maybe_deduplicates() {
+        let mut config = test_config();
+
+        config.add_default_segwit_sub_account().unwrap();
+        config.add_default_segwit_sub_account().unwrap();
+
+        assert_eq!(config.descriptors.len(), 1);
+    }
+
+    #[test]
+    fn sub_account_config_serde_is_a_bare_string() {
+        let mut config = test_config();
+        config.add_default_segwit_sub_account().unwrap();
+
+        let json = serde_json::to_value(&config).unwrap();
+        let descriptor_value = &json["descriptors"][0]["descriptor"];
+        assert_eq!(
+            descriptor_value.as_str().unwrap(),
+            config.descriptors[0].descriptor.to_string()
+        );
+    }
+
+    #[test]
+    fn sub_account_config_deserializes_a_pre_change_file() {
+        let mut config = test_config();
+        config.add_default_segwit_sub_account().unwrap();
+        let descriptor_str = config.descriptors[0].descriptor.to_string();
+
+        let json = format!(
+            r#"{{
+                "account_name": "alice",
+                "network": "signet",
+                "mnemonic": null,
+                "scan_sk": null,
+                "spend_key": null,
+                "blindbit_url": "https://blindbit.example.com",
+                "certificate_check": "validate",
+                "data_dir": "/tmp/bwk-test",
+                "persistence": "json",
+                "dust_limit": null,
+                "birthday_height": null,
+                "descriptors": [
+                    {{
+                        "descriptor": "{descriptor_str}",
+                        "certificate_check": "validate"
+                    }}
+                ]
+            }}"#
+        );
+
+        let loaded: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.descriptors.len(), 1);
+        assert!(matches!(
+            loaded.descriptors[0].descriptor,
+            Descriptor::Miniscript(_)
+        ));
+        assert_eq!(loaded.descriptors[0].descriptor.to_string(), descriptor_str);
     }
 
     #[test]

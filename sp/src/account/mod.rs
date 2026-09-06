@@ -563,7 +563,7 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
         for (i, sub_cfg) in config.descriptors.iter().enumerate() {
             let name = format!("{}-sub-{}", config.account_name, i);
             let mut scanner_config = ScannerConfig::new(
-                sub_cfg.descriptor.clone().into(),
+                sub_cfg.descriptor.clone(),
                 config.account_dir(),
                 name.clone(),
                 name,
@@ -934,7 +934,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
                 &mut self.signing_manager,
                 self.config.network,
                 &mnemonic,
-                scanner.descriptor(),
+                scanner.wallet_descriptor(),
             )?;
         }
         // Spawned first: the reconciler registers for the scan ticks, so a
@@ -1633,14 +1633,14 @@ fn register_sub_signer(
     signing_manager: &mut SigningManager,
     network: Network,
     mnemonic: &str,
-    descriptor: Descriptor<DescriptorPublicKey>,
+    descriptor: bwk_sign::bwk_descriptor::descriptor::Descriptor,
 ) -> Result<(), AccountError> {
     let signer = bwk_sign::hot_signer::HotSigner::new_from_mnemonics(network, mnemonic)
         .map_err(AccountError::SubAccountMnemonic)?;
     if !signing_manager.has_bip32_signer(&signer.fingerprint()) {
         signing_manager.add_bip32_signer(signer);
     }
-    signing_manager.register_bip32_descriptor(descriptor.into());
+    signing_manager.register_bip32_descriptor(descriptor);
     Ok(())
 }
 
@@ -1793,7 +1793,12 @@ pub(crate) mod mnemonic_probe {
 mod tests {
     use super::*;
     use crate::receiver::OwnedOutput;
-    use bitcoin::{absolute::Height, hashes::hash160, secp256k1::Parity};
+    use bitcoin::{
+        absolute::Height,
+        bip32::{Xpriv, Xpub},
+        hashes::hash160,
+        secp256k1::Parity,
+    };
     use bwk::bwk_electrum::raw_client::CertificateCheck;
     use std::path::PathBuf;
 
@@ -2137,10 +2142,41 @@ mod tests {
             .unwrap()
             .descriptor();
         config::SubAccountConfig {
-            descriptor,
+            descriptor: descriptor.into(),
             mnemonic: None,
             endpoint,
         }
+    }
+
+    #[test]
+    fn sp_sub_account_descriptor_is_rejected() {
+        let mut config = test_config();
+
+        let secp = Secp256k1::new();
+        let scan = Xpriv::new_master(Network::Testnet, &[0x02; 64]).unwrap();
+        let spend_xpub = Xpub::from_priv(
+            &secp,
+            &Xpriv::new_master(Network::Testnet, &[0x03; 64]).unwrap(),
+        );
+        let sp_descriptor_str = format!("sp([deadbeef/352h/0h/0h]{scan}/0h,{spend_xpub}/0h)");
+        let sp_descriptor =
+            bwk::bwk_descriptor::descriptor::Descriptor::from_str(&sp_descriptor_str).unwrap();
+        assert!(sp_descriptor.is_sp());
+
+        config.descriptors = vec![config::SubAccountConfig {
+            descriptor: sp_descriptor,
+            mnemonic: None,
+            endpoint: Endpoint::default(),
+        }];
+
+        let result = Account::new(config);
+
+        assert!(matches!(
+            result,
+            Err(AccountError::Open(
+                bwk::bwk_electrum::open::Error::SpDescriptor
+            ))
+        ));
     }
 
     fn endpoint_at(url: &str, port: u16, check: CertificateCheck) -> Endpoint {
