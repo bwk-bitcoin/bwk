@@ -563,7 +563,7 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
         for (i, sub_cfg) in config.descriptors.iter().enumerate() {
             let name = format!("{}-sub-{}", config.account_name, i);
             let mut scanner_config = ScannerConfig::new(
-                sub_cfg.descriptor.clone(),
+                sub_cfg.descriptor.clone().into(),
                 config.account_dir(),
                 name.clone(),
                 name,
@@ -2305,7 +2305,7 @@ mod tests {
             .unwrap()
             .descriptor();
         let mut config = ScannerConfig::new(
-            descriptor,
+            descriptor.into(),
             std::path::PathBuf::new(),
             String::new(),
             name.to_string(),
@@ -2343,7 +2343,7 @@ mod tests {
             .unwrap()
             .descriptor();
         let mut config = ScannerConfig::new(
-            descriptor,
+            descriptor.into(),
             std::path::PathBuf::new(),
             String::new(),
             "target-sub".to_string(),
