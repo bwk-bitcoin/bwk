@@ -116,7 +116,7 @@ TxBuilder
 ├── RecipientProvider trait - outputs (Recipient, SpRecipient, change providers)
 ├── CoinSource trait - input selection
 ├── coin_selection module - weighted random selection algorithm
-└── TxTemplate -> Psbt via generate()
+└── TxTemplate -> Psbt via generate(), PsbtV2 via generate_v2()
 ```
 
 Key traits:
