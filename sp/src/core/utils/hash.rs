@@ -33,6 +33,18 @@ sha256t_hash_newtype! {
     #[hash_newtype(forward)]
     pub(crate) struct SharedSecretHash(_);
 
+    pub struct DleqAuxTag = hash_str("BIP0374/aux");
+    #[hash_newtype(forward)]
+    pub struct DleqAuxHash(_);
+
+    pub struct DleqNonceTag = hash_str("BIP0374/nonce");
+    #[hash_newtype(forward)]
+    pub struct DleqNonceHash(_);
+
+    pub struct DleqChallengeTag = hash_str("BIP0374/challenge");
+    #[hash_newtype(forward)]
+    pub struct DleqChallengeHash(_);
+
 }
 
 impl InputsHash {

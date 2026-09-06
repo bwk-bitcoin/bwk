@@ -66,6 +66,7 @@ impl TryFrom<u8> for SpVersion {
 
 pub mod error;
 
+pub mod dleq;
 pub mod receiving;
 pub mod sending;
 pub mod utils;
