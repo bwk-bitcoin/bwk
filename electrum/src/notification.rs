@@ -1,7 +1,15 @@
 //! Events the scanner reports, and the errors it surfaces.
 
-use std::sync::{mpsc, Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{mpsc, Arc, Mutex},
+};
 
+use bwk_sign::{
+    bwk_keys::keys::OXpub,
+    identity::{SignerId, SignerInfo},
+    protocol::RequestId,
+};
 use miniscript::bitcoin::{Amount, OutPoint, Txid};
 #[cfg(feature = "sp")]
 use miniscript::{Descriptor, MiniscriptKey};
@@ -14,8 +22,16 @@ use crate::{header_store::InvalidCause, tx_listener};
 pub struct NotificationSender(Arc<Mutex<mpsc::Sender<Notification>>>);
 
 impl NotificationSender {
-    pub fn send(&self, notification: Notification) -> Result<(), mpsc::SendError<Notification>> {
-        self.0.lock().expect("poisoned").send(notification)
+    /// Boxed: a [`Notification`] is too large to return by value.
+    pub fn send(
+        &self,
+        notification: Notification,
+    ) -> Result<(), Box<mpsc::SendError<Notification>>> {
+        self.0
+            .lock()
+            .expect("poisoned")
+            .send(notification)
+            .map_err(Box::new)
     }
 
     pub fn set(&self, sender: mpsc::Sender<Notification>) {
@@ -65,6 +81,7 @@ pub enum Notification {
     /// A merkle proof failed verification, or the header store itself
     /// failed validation; the affected entry was refused promotion.
     ValidationFailed(ValidationFailure),
+    Signer(SignerNotification),
     #[cfg(feature = "sp")]
     Sp(SpNotification),
 }
@@ -104,6 +121,61 @@ pub enum CoinOrigin {
         /// Its position among the account's sub-account scanners.
         index: usize,
         kind: SubAccountKind,
+    },
+}
+
+/// Results and events from every attached signing manager. Not feature
+/// gated: every account has managers, even a watch-only one with none
+/// attached.
+#[derive(Debug)]
+pub enum SignerNotification {
+    ManagerAttached {
+        manager: String,
+    },
+    ManagerDetached {
+        manager: String,
+    },
+    Signers(Vec<SignerInfo>),
+    Initialized {
+        request: RequestId,
+        signer: SignerId,
+    },
+    Info {
+        request: RequestId,
+        signer: SignerId,
+        info: BTreeMap<String, String>,
+    },
+    Xpub {
+        request: RequestId,
+        signer: SignerId,
+        xpub: OXpub,
+    },
+    DescriptorIsRegistered {
+        request: RequestId,
+        signer: SignerId,
+        registered: bool,
+    },
+    DescriptorRegistered {
+        request: RequestId,
+        signer: SignerId,
+        registered: bool,
+    },
+    /// The bytes may or may not be fully signed: an updated PSBT is simply
+    /// recorded, not combined or verified here.
+    PsbtUpdated {
+        request: RequestId,
+        signer: SignerId,
+        psbt: Vec<u8>,
+    },
+    Raw {
+        request: RequestId,
+        signer: SignerId,
+        payload: Vec<u8>,
+    },
+    Error {
+        request: Option<RequestId>,
+        signer: Option<SignerId>,
+        message: String,
     },
 }
 
@@ -182,6 +254,12 @@ impl From<TxListenerNotif> for Notification {
 impl From<SpNotification> for Notification {
     fn from(sp: SpNotification) -> Self {
         Notification::Sp(sp)
+    }
+}
+
+impl From<SignerNotification> for Notification {
+    fn from(n: SignerNotification) -> Self {
+        Notification::Signer(n)
     }
 }
 
