@@ -126,6 +126,8 @@ pub enum AccountError {
     SilentPayment(#[from] crate::core::error::Error),
     #[error("psbtv2 error")]
     PsbtV2,
+    #[error("failed to decode psbt")]
+    PsbtDecode,
     #[error("{0}")]
     Bip375(String),
     #[error("signing manager {0} is already attached")]
@@ -1524,7 +1526,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     /// builder.feerate(1000);
     /// let mut psbt = builder.generate_v2()?;
     /// // Hand `psbt` to a signer (see `crate::signer::SpSigner`), then:
-    /// account.finalize_psbt_v2(&psbt)?;
+    /// account.finalize(&psbt.serialize()?)?;
     /// ```
     pub fn tx_builder(&self) -> bwk_tx::tx_builder::TxBuilder {
         let change_addr = self.sp_receiver.receiver.get_change_address();
@@ -1557,17 +1559,25 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
             .sp_updater(Box::new(updater))
     }
 
-    /// Finalizes an already-signed native PSBTv2 into a broadcast-ready
-    /// transaction.
-    pub fn finalize_psbt_v2(
-        &self,
-        psbt: &bwk_psbt::PsbtV2,
-    ) -> Result<bitcoin::Transaction, AccountError> {
-        let mut v0 = psbt
-            .clone()
-            .into_bitcoin_psbt()
-            .map_err(|_| AccountError::PsbtV2)?;
-        Self::finalize(&mut v0)
+    /// Finalizes an already-signed PSBT into a broadcast-ready transaction.
+    ///
+    /// Accepts either shape: PSBTv2 bytes for a transaction with a
+    /// silent-payment input or output, plain PSBTv0 bytes otherwise. A v0
+    /// PSBT cannot carry BIP375 fields, so it is never upgraded to v2 or run
+    /// through the verifier; it is extracted directly.
+    ///
+    /// The account is stateless: it holds no record of a PSBT it verified
+    /// earlier, so a v2 PSBT is re-verified here, on these bytes, every time.
+    /// Verification failing means the signer malfunctioned or lied about the
+    /// destination, and there is no way to finalize past that.
+    pub fn finalize(&self, psbt: &[u8]) -> Result<bitcoin::Transaction, AccountError> {
+        if let Ok(psbt) = bwk_psbt::PsbtV2::deserialize(psbt) {
+            bip375::verify_signed(&psbt)?;
+            let mut v0 = psbt.into_bitcoin_psbt().map_err(|_| AccountError::PsbtV2)?;
+            return Self::extract(&mut v0);
+        }
+        let mut v0 = bitcoin::Psbt::deserialize(psbt).map_err(|_| AccountError::PsbtDecode)?;
+        Self::extract(&mut v0)
     }
 
     /// Broadcast a signed spend in the background. Completion is reported via
@@ -1643,8 +1653,9 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
             .collect()
     }
 
-    /// Finalize a signed PSBT into a broadcast-ready transaction.
-    fn finalize(psbt: &mut bitcoin::Psbt) -> Result<bitcoin::Transaction, AccountError> {
+    /// Finalizes the witnesses of an already-verified, signed PSBT and
+    /// extracts the resulting transaction.
+    fn extract(psbt: &mut bitcoin::Psbt) -> Result<bitcoin::Transaction, AccountError> {
         let secp = bitcoin::secp256k1::Secp256k1::verification_only();
         PsbtExt::finalize_mut(psbt, &secp).map_err(AccountError::Finalize)?;
         Ok(psbt.clone().extract_tx_unchecked_fee_rate())
@@ -1937,13 +1948,19 @@ pub(crate) mod mnemonic_probe {
 #[cfg(all(test, feature = "mnemonic"))]
 mod tests {
     use super::*;
-    use crate::{receiver::OwnedOutput, signer::SpSigner};
+    use crate::{
+        account::recipient::SpRecipient,
+        receiver::OwnedOutput,
+        signer::{sign_taproot_key_spend, SpSigner},
+    };
     use bitcoin::{
         absolute::Height,
         bip32::{Xpriv, Xpub},
         hashes::hash160,
-        key::TweakedPublicKey,
+        key::{TapTweak, TweakedPublicKey},
         secp256k1::{Parity, Scalar, SecretKey},
+        sighash::SighashCache,
+        transaction, TxIn, Witness,
     };
     use bwk::{account::test_support::StubManager, bwk_electrum::raw_client::CertificateCheck};
     use bwk_sign::{identity::SignerState, protocol::Response};
@@ -2902,7 +2919,7 @@ mod tests {
 
         // No signer ever touched this PSBT: the account cannot produce a
         // spendable transaction on its own.
-        assert!(account.finalize_psbt_v2(&psbt).is_err());
+        assert!(account.finalize(&psbt.serialize().unwrap()).is_err());
     }
 
     #[test]
@@ -3345,7 +3362,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_psbt_v2_extracts_signed_tx() {
+    fn finalize_extracts_signed_tx() {
         let account = Account::new(test_config()).unwrap();
         let mnemonic = account.get_config().mnemonic.clone().unwrap();
         let secp = Secp256k1::new();
@@ -3385,7 +3402,7 @@ mod tests {
         let sign_and_finalize = || {
             let mut psbt = unsigned_psbt.clone();
             signing_signer.sign(&mut psbt).unwrap();
-            account.finalize_psbt_v2(&psbt).unwrap()
+            account.finalize(&psbt.serialize().unwrap()).unwrap()
         };
         let tx1 = sign_and_finalize();
         let tx2 = sign_and_finalize();
@@ -3397,6 +3414,162 @@ mod tests {
             .unwrap();
         assert!(!tx1.input[sp_index].witness.is_empty());
         assert_eq!(tx1.compute_txid(), tx2.compute_txid());
+    }
+
+    /// Builds an account plus a fully completed and signed PSBTv2 self-send:
+    /// one silent-payment input, one silent-payment output, shares, DLEQ
+    /// proof, output script and `tap_key_sig` all in place, `tx_modifiable`
+    /// frozen.
+    fn completed_sp_psbt() -> (Account, bwk_psbt::PsbtV2) {
+        let account = Account::new(test_config()).unwrap();
+        let mnemonic = account.get_config().mnemonic.clone().unwrap();
+        let secp = Secp256k1::new();
+        let network = account.network();
+        let signing_signer = SpSigner::from_mnemonic(
+            &mnemonic,
+            network,
+            bitcoin::bip32::ChildNumber::from_hardened_idx(0).unwrap(),
+        )
+        .unwrap();
+
+        let tweak = SecretKey::from_slice(&[41u8; 32]).unwrap();
+        let candidate = signing_signer.b_spend().add_tweak(&tweak.into()).unwrap();
+        let (x_only, _) = candidate.public_key(&secp).x_only_public_key();
+        let spk = bitcoin::ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(
+            x_only,
+        ));
+        let outpoint = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x41; 32]),
+            vout: 0,
+        };
+        account
+            .coin_store
+            .lock()
+            .expect("poisoned")
+            .insert(outpoint, fake_sp_owned(spk, 41));
+
+        let mut builder = account.tx_builder().feerate(1_000);
+        builder.add_output(SpRecipient::new(account.sp_address(), 1_000, network));
+        let mut psbt = builder.generate_v2().unwrap();
+        signing_signer.sign(&mut psbt).unwrap();
+        (account, psbt)
+    }
+
+    #[test]
+    fn finalize_extracts_a_verified_tx() {
+        let (account, psbt) = completed_sp_psbt();
+
+        let tx = account.finalize(&psbt.serialize().unwrap()).unwrap();
+
+        assert!(tx.input.iter().any(|input| !input.witness.is_empty()));
+    }
+
+    #[test]
+    fn finalize_rejects_a_tampered_script() {
+        let secp = Secp256k1::new();
+        let other_key =
+            PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[9u8; 32]).unwrap());
+        let (account, mut psbt) = completed_sp_psbt();
+        let output = psbt
+            .outputs
+            .iter_mut()
+            .find(|o| o.script_pubkey.is_some())
+            .unwrap();
+        output.script_pubkey = Some(bitcoin::ScriptBuf::new_p2tr_tweaked(
+            other_key.x_only_public_key().0.dangerous_assume_tweaked(),
+        ));
+
+        let result = account.finalize(&psbt.serialize().unwrap());
+
+        assert!(matches!(result, Err(AccountError::Bip375(_))));
+    }
+
+    #[test]
+    fn finalize_rejects_a_bad_proof() {
+        let (account, mut psbt) = completed_sp_psbt();
+        let scan_key = *bip375::scan_keys(&psbt).unwrap().iter().next().unwrap();
+        let mut proof = bwk_psbt::sp::sp_global_dleq_v2(&psbt, scan_key)
+            .unwrap()
+            .unwrap();
+        proof[0] ^= 0xff;
+        bwk_psbt::sp::set_sp_global_dleq_v2(&mut psbt, scan_key, proof);
+
+        let result = account.finalize(&psbt.serialize().unwrap());
+
+        assert!(matches!(result, Err(AccountError::Bip375(_))));
+    }
+
+    #[test]
+    fn finalize_rejects_an_unsigned_psbt() {
+        let (account, mut psbt) = completed_sp_psbt();
+        for input in &mut psbt.inputs {
+            input.psbt.tap_key_sig = None;
+        }
+
+        let result = account.finalize(&psbt.serialize().unwrap());
+
+        assert!(matches!(result, Err(AccountError::Finalize(_))));
+    }
+
+    #[test]
+    fn finalize_rejects_undecodable_bytes() {
+        let account = Account::new(test_config()).unwrap();
+
+        let result = account.finalize(&[0xff; 8]);
+
+        assert!(matches!(result, Err(AccountError::PsbtDecode)));
+    }
+
+    #[test]
+    fn finalize_accepts_a_non_sp_transaction() {
+        let secp = Secp256k1::new();
+        let raw_sk = SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let (_, parity) = raw_sk.x_only_public_key(&secp);
+        let sk = if parity == Parity::Odd {
+            raw_sk.negate()
+        } else {
+            raw_sk
+        };
+        let (x_only, _) = sk.x_only_public_key(&secp);
+        let spk = bitcoin::ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(
+            x_only,
+        ));
+        let prevout = TxOut {
+            value: Amount::from_sat(10_000),
+            script_pubkey: spk,
+        };
+        let outpoint = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x51; 32]),
+            vout: 0,
+        };
+        let tx = bitcoin::Transaction {
+            version: transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(9_000),
+                script_pubkey: ScriptBuf::new_op_return([]),
+            }],
+        };
+        let mut v0 = bitcoin::Psbt::from_unsigned_tx(tx.clone()).unwrap();
+        v0.inputs[0].witness_utxo = Some(prevout.clone());
+
+        let mut cache = SighashCache::new(&tx);
+        let aux_rand = [0u8; 32];
+        let signature =
+            sign_taproot_key_spend(&mut cache, &[prevout], 0, &sk, &secp, &aux_rand).unwrap();
+        v0.inputs[0].tap_key_sig = Some(signature);
+
+        let account = Account::new(test_config()).unwrap();
+
+        let result_tx = account.finalize(&v0.serialize()).unwrap();
+
+        assert!(!result_tx.input[0].witness.is_empty());
     }
 }
 

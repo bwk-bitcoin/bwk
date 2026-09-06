@@ -1116,7 +1116,7 @@ pub fn sign_and_finalize_v2(
         signer.sign(&mut v0);
     }
     *psbt = bwk_psbt::PsbtV2::from_bitcoin_psbt(v0).unwrap();
-    account.finalize_psbt_v2(psbt).unwrap()
+    account.finalize(&psbt.serialize().unwrap()).unwrap()
 }
 
 // Tests for test utilities
