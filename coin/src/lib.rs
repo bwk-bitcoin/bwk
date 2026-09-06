@@ -4,9 +4,7 @@
 //! below both `bwk-electrum` and `bwk-tx` rather than inside either.
 
 use miniscript::{
-    bitcoin::{
-        self, absolute, bip32::DerivationPath, key::rand, psbt, Psbt, ScriptBuf, TxIn, Witness,
-    },
+    bitcoin::{self, absolute, key::rand, psbt, Psbt, ScriptBuf, TxIn, Witness},
     psbt::PsbtExt,
     DefiniteDescriptorKey, Descriptor, DescriptorPublicKey,
 };
@@ -81,10 +79,7 @@ pub enum CoinSpendInfo {
         descriptor: Descriptor<DescriptorPublicKey>,
     },
     /// Silent Payment coin (BIP352)
-    Sp {
-        derivation: DerivationPath,
-        tweak: [u8; 32],
-    },
+    Sp { tweak: [u8; 32] },
 }
 
 /// High-level source/classification for a wallet coin.
@@ -164,7 +159,7 @@ impl Coin {
                 coin_path,
                 descriptor,
             } => self.spk_to_psbt_input(*coin_path, descriptor),
-            CoinSpendInfo::Sp { tweak, .. } => self.sp_to_psbt_input(*tweak),
+            CoinSpendInfo::Sp { tweak } => self.sp_to_psbt_input(*tweak),
         }
     }
 
@@ -337,10 +332,7 @@ mod tests {
             status: CoinStatus::Confirmed,
             label: None,
             satisfaction_size: 0,
-            spend_info: CoinSpendInfo::Sp {
-                derivation: DerivationPath::default(),
-                tweak: [0u8; 32],
-            },
+            spend_info: CoinSpendInfo::Sp { tweak: [0u8; 32] },
         };
 
         assert_eq!(coin.source(), CoinSourceKind::SilentPayment);
@@ -359,10 +351,7 @@ mod tests {
             status: CoinStatus::Confirmed,
             label: None,
             satisfaction_size: 0,
-            spend_info: CoinSpendInfo::Sp {
-                derivation: DerivationPath::default(),
-                tweak: [9u8; 32],
-            },
+            spend_info: CoinSpendInfo::Sp { tweak: [9u8; 32] },
         };
 
         let input = coin.to_psbt_input().unwrap();

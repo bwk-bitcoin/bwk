@@ -10,6 +10,7 @@ pub enum Error {
     CoinNotFound,
     /// Change output already added to template
     ChangeAlreadyAdded,
+    Input,
 }
 
 impl From<bwk_coin::Error> for Error {

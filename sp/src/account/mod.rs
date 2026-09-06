@@ -13,6 +13,7 @@ pub mod config;
 pub mod recipient;
 pub mod tx_store;
 pub mod unified;
+pub mod updater;
 
 #[cfg(feature = "mnemonic")]
 use {
@@ -22,6 +23,7 @@ use {
             config::Config,
             recipient::SpChangeRecipientProvider,
             tx_store::{SpTxEntry, SpTxStore},
+            updater::SpInputUpdater,
         },
         blindbit::{self, InfoResponse},
         core::utils::common::SilentPaymentAddress,
@@ -1293,7 +1295,20 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
             .collect();
         let merged_source = Box::new(MergedCoinSource::new(sp_source, bip32_sources));
 
-        bwk_tx::tx_builder::TxBuilder::new(change_provider).coin_source(merged_source)
+        let key_source = self.sp_master_xpriv().map(|(fingerprint, _)| {
+            (
+                fingerprint,
+                crate::receiver::spend_path(
+                    self.config.network,
+                    bitcoin::bip32::ChildNumber::from_hardened_idx(0).expect("zero"),
+                ),
+            )
+        });
+        let updater = SpInputUpdater::new(self.sp_receiver.spend_pubkey(), key_source);
+
+        bwk_tx::tx_builder::TxBuilder::new(change_provider)
+            .coin_source(merged_source)
+            .sp_updater(Box::new(updater))
     }
 
     /// Sign all inputs in a PSBT, both SP and BIP32 (segwit/taproot).
@@ -1787,7 +1802,6 @@ pub fn sp_coin_entry_to_coin(outpoint: OutPoint, entry: &SpCoinEntry) -> bwk_coi
         label: None,
         satisfaction_size: bwk_coin::TAPROOT_KEYSPEND_SATISFACTION_WU,
         spend_info: bwk_coin::CoinSpendInfo::Sp {
-            derivation: bitcoin::bip32::DerivationPath::default(),
             tweak: *entry.tweak(),
         },
     }
@@ -2645,6 +2659,115 @@ mod tests {
             bwk::bwk_electrum::address_store::AddressStatus::Used
         );
         assert!(hit.funding_txids.contains(&outpoint.txid));
+    }
+
+    /// A minimal external `bwk_tx::recipient::Recipient`, unrelated to this wallet, used
+    /// to force a v2 PSBT with a real spend of the seeded SP coin.
+    fn external_v2_recipient() -> bwk_tx::recipient::Recipient {
+        let address: bitcoin::Address<bitcoin::address::NetworkUnchecked> =
+            "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"
+                .parse()
+                .unwrap();
+        bwk_tx::recipient::Recipient {
+            address,
+            amount: bwk_tx::transaction::Amount::Value(1_000),
+            label: None,
+            origin: None,
+            descriptor: None,
+        }
+    }
+
+    #[test]
+    fn generated_psbt_carries_bip376_fields() {
+        let account = Account::new(test_config()).unwrap();
+        let spk = fake_tr_spk(21);
+        let outpoint = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x11; 32]),
+            vout: 0,
+        };
+        let tweak = [21u8; 32];
+        account
+            .coin_store
+            .lock()
+            .expect("poisoned")
+            .insert(outpoint, fake_sp_owned(spk, 21));
+
+        let mut builder = account.tx_builder().feerate(1_000);
+        builder.add_output(external_v2_recipient());
+        let psbt = builder.generate_v2().unwrap();
+
+        let sp_index = psbt
+            .inputs
+            .iter()
+            .position(|i| i.previous_output == outpoint)
+            .unwrap();
+
+        assert_eq!(
+            bwk_psbt::sp::sp_input_tweak(&psbt.inputs[sp_index].psbt),
+            Ok(Some(tweak))
+        );
+
+        let (fingerprint, _) = account.sp_master_xpriv().unwrap();
+        let expected_path = crate::receiver::spend_path(
+            account.network(),
+            bitcoin::bip32::ChildNumber::from_hardened_idx(0).unwrap(),
+        );
+        assert_eq!(
+            bwk_psbt::sp::sp_input_spend_bip32_derivation(
+                &psbt.inputs[sp_index].psbt,
+                account.sp_receiver().spend_pubkey(),
+            ),
+            Ok(Some((fingerprint, expected_path)))
+        );
+        psbt.validate().unwrap();
+    }
+
+    #[test]
+    fn watch_only_psbt_carries_tweak_only() {
+        let watch_only_config = Config::from_descriptor(
+            "watch-only-bip376".to_string(),
+            Network::Signet,
+            test_config().descriptor,
+            "https://blindbit.example.com".to_string(),
+            PathBuf::from("/tmp/bwk-sp-account-watch-only-bip376-test"),
+        )
+        .with_persistence(None);
+        let account = Account::new(watch_only_config).unwrap();
+
+        let spk = fake_tr_spk(22);
+        let outpoint = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x22; 32]),
+            vout: 0,
+        };
+        let tweak = [22u8; 32];
+        account
+            .coin_store
+            .lock()
+            .expect("poisoned")
+            .insert(outpoint, fake_sp_owned(spk, 22));
+
+        let mut builder = account.tx_builder().feerate(1_000);
+        builder.add_output(external_v2_recipient());
+        let psbt = builder.generate_v2().unwrap();
+
+        let sp_index = psbt
+            .inputs
+            .iter()
+            .position(|i| i.previous_output == outpoint)
+            .unwrap();
+
+        assert_eq!(
+            bwk_psbt::sp::sp_input_tweak(&psbt.inputs[sp_index].psbt),
+            Ok(Some(tweak))
+        );
+        assert_eq!(
+            bwk_psbt::sp::sp_input_spend_bip32_derivation(
+                &psbt.inputs[sp_index].psbt,
+                account.sp_receiver().spend_pubkey(),
+            ),
+            Ok(None)
+        );
+        psbt.validate().unwrap();
     }
 }
 

@@ -446,7 +446,6 @@ impl<P: SpStorageProfile + Send + Sync + 'static> CoinSource for SpCoinSource<P>
                 label: None,
                 satisfaction_size: TR_KEYSPEND_SATISFACTION_WEIGHT,
                 spend_info: CoinSpendInfo::Sp {
-                    derivation: bitcoin::bip32::DerivationPath::default(),
                     tweak: *entry.tweak(),
                 },
             })
