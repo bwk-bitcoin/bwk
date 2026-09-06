@@ -9,7 +9,7 @@ use crate::{
 };
 use bwk_descriptor::{
     derivator::SpkDerivator,
-    descriptor::{tr, tr_path, wpkh, wpkh_path},
+    descriptor::{tr, tr_path, wpkh, wpkh_path, Descriptor},
 };
 use bwk_keys::{
     derivator::KeyDerivator,
@@ -32,7 +32,7 @@ use {
             secp256k1::{self, All, Message},
             sighash, EcdsaSighashType, NetworkKind, Psbt,
         },
-        Descriptor, DescriptorPublicKey, ForEachKey,
+        DescriptorPublicKey, ForEachKey,
     },
 };
 
@@ -51,13 +51,17 @@ impl Signer for HotSigner {
         send!(self, Xpub(xpub));
     }
 
-    fn is_descriptor_registered(&self, descriptor: Descriptor<DescriptorPublicKey>) {
+    fn is_descriptor_registered(&self, descriptor: Descriptor) {
         let registered = self.descriptors.contains(&descriptor);
         send!(self, DescriptorRegistered(descriptor, registered));
     }
 
-    fn register_descriptor(&mut self, descriptor: Descriptor<DescriptorPublicKey>) {
-        let wrong_network = descriptor.for_any_key(|k| match k {
+    fn register_descriptor(&mut self, descriptor: Descriptor) {
+        let Some(inner) = descriptor.as_miniscript() else {
+            send!(self, Error(Error::SpDescriptor));
+            return;
+        };
+        let wrong_network = inner.for_any_key(|k| match k {
             DescriptorPublicKey::Single(_) => true,
             DescriptorPublicKey::XPub(key) => match (self.network, key.xkey.network) {
                 (bitcoin::Network::Bitcoin, NetworkKind::Main) => false,
@@ -82,9 +86,13 @@ impl Signer for HotSigner {
         };
     }
 
-    fn sign_with_descriptor(&self, mut psbt: Psbt, descriptor: Descriptor<DescriptorPublicKey>) {
+    fn sign_with_descriptor(&self, mut psbt: Psbt, descriptor: Descriptor) {
+        let Some(inner) = descriptor.as_miniscript() else {
+            send!(self, Error(Error::SpDescriptor));
+            return;
+        };
         if self.descriptors.contains(&descriptor) {
-            if let Err(e) = self.inner_sign(&mut psbt, &descriptor) {
+            if let Err(e) = self.inner_sign(&mut psbt, inner) {
                 send!(self, Error(e));
             } else {
                 send!(self, Signed(psbt));
@@ -103,7 +111,7 @@ impl Signer for HotSigner {
 #[derive(Debug, Clone)]
 pub struct HotSigner {
     derivator: KeyDerivator,
-    descriptors: BTreeSet<Descriptor<DescriptorPublicKey>>,
+    descriptors: BTreeSet<Descriptor>,
     network: bitcoin::Network,
     sender: Option<channel::Sender<SignerNotif>>,
 }
@@ -198,7 +206,7 @@ impl HotSigner {
         .map_err(|_| Error::DerivationPath)?;
         let oxpub = signer.xpub(&deriv);
         let descriptor = tr(oxpub);
-        signer.register_descriptor(descriptor);
+        signer.register_descriptor(descriptor.into());
         Ok(signer)
     }
 
@@ -226,7 +234,7 @@ impl HotSigner {
         .map_err(|_| Error::DerivationPath)?;
         let oxpub = signer.xpub(&deriv);
         let descriptor = wpkh(oxpub);
-        signer.register_descriptor(descriptor);
+        signer.register_descriptor(descriptor.into());
         Ok(signer)
     }
 
@@ -256,7 +264,7 @@ impl HotSigner {
     ///
     /// # Arguments
     /// * `descriptor` - The descriptor to be registered.
-    pub fn inner_register_descriptor(&mut self, descriptor: Descriptor<DescriptorPublicKey>) {
+    pub fn inner_register_descriptor(&mut self, descriptor: Descriptor) {
         if !self.descriptors.contains(&descriptor) {
             self.descriptors.insert(descriptor);
         }
@@ -310,6 +318,9 @@ impl HotSigner {
 
     pub fn sign(&self, psbt: &mut Psbt) {
         for descr in &self.descriptors {
+            let Some(descr) = descr.as_miniscript() else {
+                continue;
+            };
             match self.inner_sign(psbt, descr) {
                 Ok(()) => {}
                 // A descriptor that signs no input simply doesn't apply to
@@ -325,7 +336,7 @@ impl HotSigner {
     pub fn sign_v2(
         &self,
         psbt: &mut PsbtV2,
-        descriptor: &Descriptor<DescriptorPublicKey>,
+        descriptor: &miniscript::Descriptor<DescriptorPublicKey>,
     ) -> Result<(), Error> {
         let mut v0 = validated_v0(psbt)?;
         self.inner_sign(&mut v0, descriptor)?;
@@ -353,7 +364,7 @@ impl HotSigner {
     pub fn inner_sign(
         &self,
         psbt: &mut Psbt,
-        descriptor: &Descriptor<DescriptorPublicKey>,
+        descriptor: &miniscript::Descriptor<DescriptorPublicKey>,
     ) -> Result<(), Error> {
         let mut cache = sighash::SighashCache::new(psbt.unsigned_tx.clone());
         let derivator = SpkDerivator::new(descriptor.clone(), self.network).unwrap();
@@ -678,7 +689,7 @@ impl HotSigner {
         self.derivator.mnemonic()
     }
 
-    pub fn descriptors(&self) -> Vec<Descriptor<DescriptorPublicKey>> {
+    pub fn descriptors(&self) -> Vec<Descriptor> {
         self.descriptors.clone().into_iter().collect()
     }
 
@@ -706,7 +717,8 @@ impl HotSigner {
         let descriptor = self
             .descriptors
             .iter()
-            .find(|d| matches!(d, Descriptor::Tr(_)))
+            .filter_map(|d| d.as_miniscript())
+            .find(|d| matches!(d, miniscript::Descriptor::Tr(_)))
             .expect("no taproot descriptor registered");
         let derivator = SpkDerivator::new(descriptor.clone(), self.network)
             .expect("failed to create derivator");
@@ -750,7 +762,8 @@ impl HotSigner {
         let descriptor = self
             .descriptors
             .iter()
-            .find(|d| matches!(d, Descriptor::Wpkh(_)))
+            .filter_map(|d| d.as_miniscript())
+            .find(|d| matches!(d, miniscript::Descriptor::Wpkh(_)))
             .expect("no wpkh descriptor registered");
         let derivator = SpkDerivator::new(descriptor.clone(), self.network)
             .expect("failed to create derivator");
@@ -957,6 +970,7 @@ mod tests {
     use bwk_descriptor::{
         derivator::SpkDerivator,
         descriptor::{tr, wpkh},
+        sp_descriptor::SpDescriptor,
     };
     use bwk_utils::test::{random_output, setup_logger, txid};
     use crossbeam::channel;
@@ -1365,7 +1379,8 @@ mod tests {
         signer.init(sender);
         // info notif
         let _ = mock.receiver.recv();
-        let descriptor = wpkh(signer.xpub(&DerivationPath::from_str("m/84'/0'/0'/0").unwrap()));
+        let descriptor: Descriptor =
+            wpkh(signer.xpub(&DerivationPath::from_str("m/84'/0'/0'/0").unwrap())).into();
 
         signer.is_descriptor_registered(descriptor.clone());
         let notif = mock.receiver.recv().unwrap();
@@ -1421,12 +1436,12 @@ mod tests {
             _ => panic!("Expected DescriptorRegistered notification"),
         }
 
-        signer.register_descriptor(descriptor.clone());
+        signer.register_descriptor(descriptor.clone().into());
         let notif = mock.receiver.recv().unwrap();
         match notif {
             SignerNotif::DescriptorRegistered(fg, desc, true) => {
                 assert_eq!(signer.fingerprint(), fg);
-                assert_eq!(desc, descriptor);
+                assert_eq!(desc, Descriptor::from(descriptor.clone()));
             }
             _ => panic!("Expected DescriptorRegistered notification"),
         }
@@ -1471,7 +1486,7 @@ mod tests {
             .bip32_derivation
             .insert(pubkey, (signer.fingerprint(), deriv_p));
 
-        signer.sign_with_descriptor(psbt, descriptor);
+        signer.sign_with_descriptor(psbt, descriptor.into());
         let notif = mock.receiver.recv().unwrap();
         match notif {
             SignerNotif::Signed(fg, psbt) => {
@@ -1674,5 +1689,95 @@ mod tests {
         signer.inner_sign(&mut psbt, &descriptor).unwrap();
         assert!(!psbt.inputs[0].tap_script_sigs.is_empty());
         assert!(psbt.inputs[0].tap_key_sig.is_none());
+    }
+
+    fn sp_descriptor(fingerprint: &str, spend_seed: u8) -> Descriptor {
+        let secp = secp256k1::Secp256k1::new();
+        let scan = bip32::Xpriv::new_master(Network::Testnet, &[0x09; 64]).unwrap();
+        let spend_xpriv = bip32::Xpriv::new_master(Network::Testnet, &[spend_seed; 64]).unwrap();
+        let spend_xpub = bip32::Xpub::from_priv(&secp, &spend_xpriv);
+        let s = format!("sp([{fingerprint}/352h/0h/0h]{scan}/0h,{spend_xpub}/0h)");
+        SpDescriptor::from_str(&s).unwrap().into()
+    }
+
+    #[test]
+    fn hot_signer_registers_miniscript_descriptor() {
+        let (sender, mock) = MockSender::new();
+        let mut signer = new_signer(Network::Regtest);
+        signer.init(sender);
+        let _ = mock.receiver.recv();
+
+        let descriptor: Descriptor =
+            wpkh(signer.xpub(&DerivationPath::from_str("m/84'/0'/0'/0").unwrap())).into();
+
+        signer.register_descriptor(descriptor.clone());
+        let notif = mock.receiver.recv().unwrap();
+        match notif {
+            SignerNotif::DescriptorRegistered(_, desc, true) => assert_eq!(desc, descriptor),
+            other => panic!("expected DescriptorRegistered, got {other:?}"),
+        }
+        assert!(signer.descriptors().contains(&descriptor));
+    }
+
+    #[test]
+    fn hot_signer_rejects_sp_descriptor() {
+        let (sender, mock) = MockSender::new();
+        let mut signer = new_signer(Network::Regtest);
+        let fingerprint = signer.fingerprint();
+        signer.init(sender);
+        let _ = mock.receiver.recv();
+
+        let descriptor = sp_descriptor(&fingerprint.to_string(), 0x0a);
+
+        signer.register_descriptor(descriptor);
+        let notif = mock.receiver.recv().unwrap();
+        match notif {
+            SignerNotif::Error(_, Error::SpDescriptor) => {}
+            other => panic!("expected Error(SpDescriptor), got {other:?}"),
+        }
+        assert!(signer.descriptors().is_empty());
+    }
+
+    #[test]
+    fn hot_signer_sign_rejects_sp_descriptor() {
+        let (sender, mock) = MockSender::new();
+        let mut signer = new_signer(Network::Regtest);
+        let fingerprint = signer.fingerprint();
+        signer.init(sender);
+        let _ = mock.receiver.recv();
+
+        let descriptor = sp_descriptor(&fingerprint.to_string(), 0x0b);
+        let psbt = base_psbt();
+
+        signer.sign_with_descriptor(psbt, descriptor);
+        let notif = mock.receiver.recv().unwrap();
+        match notif {
+            SignerNotif::Error(_, Error::SpDescriptor) => {}
+            other => panic!("expected Error(SpDescriptor), got {other:?}"),
+        }
+        assert!(mock.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn json_signer_roundtrips_both_kinds() {
+        let network = Network::Regtest;
+        let mnemonic = bip39::Mnemonic::generate(12).unwrap();
+        let signer = HotSigner::new_from_mnemonics(network, &mnemonic.to_string()).unwrap();
+        let miniscript_descriptor: Descriptor =
+            wpkh(signer.xpub(&DerivationPath::from_str("m/84'/0'/0'/0").unwrap())).into();
+        let sp_descr = sp_descriptor(&signer.fingerprint().to_string(), 0x0c);
+
+        let json = JsonSigner {
+            mnemonic,
+            descriptors: [miniscript_descriptor.to_string(), sp_descr.to_string()]
+                .into_iter()
+                .collect(),
+            network,
+        };
+
+        let restored = HotSigner::from_json(json);
+        let descriptors = restored.descriptors();
+        assert!(descriptors.contains(&miniscript_descriptor));
+        assert!(descriptors.contains(&sp_descr));
     }
 }

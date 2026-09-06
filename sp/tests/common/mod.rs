@@ -685,7 +685,13 @@ pub fn bip32_mnemonic() -> &'static str {
 /// by the BIP32 mnemonic every sub-account here shares.
 #[allow(dead_code)]
 fn add_offline_sub_account(account: &mut bwk_sp::account::Account, name: &str, signer: &HotSigner) {
-    let descriptor = signer.descriptors().into_iter().next().unwrap();
+    let descriptor = signer
+        .descriptors()
+        .into_iter()
+        .next()
+        .unwrap()
+        .into_miniscript()
+        .unwrap();
     let mut config = ScannerConfig::new(
         descriptor,
         std::path::PathBuf::new(),
@@ -908,7 +914,13 @@ impl TestEnv {
             .unwrap();
         let height = bwk_utils::test::get_tx_height(&mut self.bitcoind.client, txid);
 
-        let descriptor = signer.descriptors().into_iter().next().unwrap();
+        let descriptor = signer
+            .descriptors()
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_miniscript()
+            .unwrap();
         Coin {
             txout,
             outpoint: OutPoint {
@@ -948,7 +960,13 @@ impl TestEnv {
             .unwrap();
         let height = bwk_utils::test::get_tx_height(&mut self.bitcoind.client, txid);
 
-        let descriptor = signer.descriptors().into_iter().next().unwrap();
+        let descriptor = signer
+            .descriptors()
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_miniscript()
+            .unwrap();
         let satisfaction = descriptor
             .clone()
             .into_single_descriptors()
