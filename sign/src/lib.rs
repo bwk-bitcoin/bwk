@@ -4,6 +4,7 @@ pub mod hot_signer;
 pub mod hwi;
 pub mod identity;
 pub mod manager;
+pub mod protocol;
 pub mod signer;
 pub mod signing_manager;
 

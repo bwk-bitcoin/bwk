@@ -1,33 +1,16 @@
 //! The signing manager trait: one object-safe, store-free abstraction that
 //! every signing back end (hot, hardware, remote, mock) implements.
 
-use std::fmt;
+use crossbeam::channel;
 
 use miniscript::bitcoin::bip32::DerivationPath;
 
 use bwk_descriptor::descriptor::Descriptor;
 
-use crate::identity::{SignerId, SignerInfo};
-
-/// Correlates a manager call with the notification answering it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RequestId(u64);
-
-impl RequestId {
-    pub fn new(n: u64) -> Self {
-        Self(n)
-    }
-
-    pub fn as_u64(self) -> u64 {
-        self.0
-    }
-}
-
-impl fmt::Display for RequestId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+use crate::{
+    identity::{SignerId, SignerInfo},
+    protocol::{RequestId, Response},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
@@ -51,14 +34,21 @@ pub enum Error {
 ///
 /// Every operation queues work and returns immediately with a [`RequestId`];
 /// none of them blocks and none of them carries a result. The result arrives
-/// later as a notification, and the `RequestId` correlates that notification
-/// back to the call that triggered it. Errors that no call asked for (a device
-/// unplugged, a remote link dropped) may also be notified, with an optional
-/// request id.
+/// later as a [`Response`] on the channel supplied through `subscribe`, and
+/// the `RequestId` correlates that notification back to the call that
+/// triggered it. Errors that no call asked for (a device unplugged, a remote
+/// link dropped) may also arrive on that channel, with an optional request
+/// id.
 pub trait SigningManager: Send + Sync {
     /// Signers currently known to the manager, from a local cache. Never
     /// performs IO.
     fn signers(&self) -> Vec<SignerInfo>;
+
+    /// Delivers every [`Response`] on the most recently subscribed channel.
+    /// Subscribing again replaces the previous one. A manager with no
+    /// subscriber returns [`Error::NoSubscriber`] from every operation that
+    /// would otherwise have nothing to report to.
+    fn subscribe(&mut self, sender: channel::Sender<Response>);
 
     /// Turns device discovery on and off, mirroring silent's
     /// `Host::requestSignerPolling`. A manager with no discovery (the hot

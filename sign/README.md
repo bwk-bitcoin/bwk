@@ -74,15 +74,30 @@ All signers implement `Signer` trait with async notification pattern:
 `manager::SigningManager` is the object-safe, store-free abstraction every
 signing back end implements. Every operation queues work and returns a
 `RequestId` at once: none of them blocks and none of them carries a result.
-The result arrives later as a notification, and the `RequestId` ties it back
-to the call that triggered it. A back end may also report what nobody asked
-for, such as a device being unplugged.
+The result arrives later as a `Response` on the channel handed to
+`subscribe`, and the `RequestId` ties it back to the call that triggered it.
+A back end may also push what nobody asked for, such as a device being
+unplugged.
 
 Operations take a `SignerId`, not a fingerprint: a fingerprint identifies a
 seed, and two signers (a hot one and a device) can hold the same seed. Each
 manager mints its own ids. `signers()` lists what the manager knows from a
 local cache and never does IO, and `set_polling` turns device discovery on and
 off for the back ends that have any.
+
+## Protocol
+
+`Request` and `Response` are the whole vocabulary between a manager and its
+back end, and `RequestId` correlates the two. Every `Request` carries its own
+id, because a remote back end has to echo it, so it travels on the wire rather
+than living in a caller-side map.
+
+`Response::SignersChanged` and `Response::Error` are the two unsolicited
+variants: device discovery can change the signer list with nothing having
+asked, and a back end can fail without any request having caused it.
+
+A remote back end is therefore a channel pair carrying exactly these two
+enums, so an out-of-tree signer never has to implement a Rust trait.
 
 ## send! Macro
 
