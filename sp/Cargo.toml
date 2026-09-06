@@ -77,6 +77,7 @@ bwk-utils = { workspace = true, features = ["ureq"] }
 bwk-sign = { workspace = true, default-features = false, features = ["sp"] }
 bwk-coin = { workspace = true }
 bwk-tx = { workspace = true }
+bwk-psbt = { workspace = true }
 secp256k1_spscan-sys = { workspace = true }
 
 # Bitcoin
