@@ -22,7 +22,3 @@ pub mod tx_store;
 pub mod url;
 pub mod validation;
 pub mod worker;
-
-pub use client::Client;
-pub use url::{parse_electrum_url, ElectrumScheme};
-pub use validation::{PsbtValidationReport, ReusedOutput, SpentInput, ValidationError};
