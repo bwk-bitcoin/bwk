@@ -15,7 +15,7 @@ use ledger_transport_hidapi::TransportNativeHID;
 
 use ledger_bitcoin_client::{
     apdu::{APDUCommand, StatusWord},
-    client::BitcoinClient,
+    client::{BitcoinClient, Transport},
     error::BitcoinClientError,
     psbt::PartialSignature,
     wallet::{Version as WalletVersion, WalletPolicy, WalletPubKey},
@@ -23,8 +23,8 @@ use ledger_bitcoin_client::{
 
 use crate::{parse_version, utils, AddressScript, DeviceKind, Error as HWIError, HWI};
 
-pub use hidapi::{DeviceInfo, HidApi};
-pub use ledger_bitcoin_client::client::Transport;
+pub use hidapi;
+use hidapi::{DeviceInfo, HidApi};
 
 const RECV_INDEX: ChildNumber = ChildNumber::Normal { index: 0 };
 const CHANGE_INDEX: ChildNumber = ChildNumber::Normal { index: 1 };

@@ -27,12 +27,13 @@ use bitcoin::{
 };
 use crossbeam::channel;
 use hidapi::{DeviceInfo, HidApi};
+use ledger_bitcoin_client::client::Transport;
 use ledger_transport_hidapi::TransportNativeHID;
 use serde::{Deserialize, Serialize};
 use std::thread::{self, JoinHandle};
 
 #[cfg(feature = "bitbox")]
-use crate::bitbox::{ConfigError, NoiseConfig, NoiseConfigData};
+use bitbox_api::noise::{ConfigError, NoiseConfig, NoiseConfigData};
 
 /// Wrapper that implements NoiseConfig by delegating to an Arc<dyn NoiseConfig>.
 /// This allows cloning the Arc and converting it to Box<dyn NoiseConfig> for APIs that require Box.
@@ -591,7 +592,7 @@ fn listen<Message, Id>(
 {
     tracing::info!("HWI listener starting for network: {:?}", network);
 
-    let mut hid = match ledger::HidApi::new() {
+    let mut hid = match HidApi::new() {
         Ok(api) => {
             tracing::debug!("HID API initialized successfully");
             api
@@ -661,7 +662,7 @@ fn listen<Message, Id>(
         #[cfg(feature = "bitbox")]
         let bitbox_devices: Vec<_> = list
             .iter()
-            .filter_map(|d| crate::bitbox::is_bitbox02(d).then_some(*d))
+            .filter_map(|d| bitbox_api::usb::is_bitbox02(d).then_some(*d))
             .collect();
         #[cfg(feature = "bitbox")]
         tracing::trace!(
@@ -1361,7 +1362,7 @@ fn handle_bitbox02<Message, Id>(
     Id: Send + Clone + 'static,
 {
     /// Prefer serial number for stable ID across USB ports; fall back to path.
-    fn bitbox_id(device_info: &ledger::DeviceInfo) -> String {
+    fn bitbox_id(device_info: &DeviceInfo) -> String {
         let id = if let Some(sn) = device_info.serial_number() {
             format!("bitbox-{sn}")
         } else {
@@ -1386,7 +1387,7 @@ fn handle_bitbox02<Message, Id>(
     cleanup_disconnected(sender, handles, &devices, &connected_ids, "bitbox-");
 
     for device_info in list {
-        if crate::bitbox::is_bitbox02(device_info) {
+        if bitbox_api::usb::is_bitbox02(device_info) {
             let id = bitbox_id(device_info);
             tracing::trace!(
                 "handle_bitbox02: checking device {} (vid={}, pid={})",
@@ -1540,7 +1541,7 @@ fn handle_coldcard<Message, Id>(
     Message: From<SigningDeviceMsg<Id>> + Send + Clone + 'static,
     Id: Send + Clone + 'static,
 {
-    fn coldcard_id(device_info: &ledger::DeviceInfo) -> String {
+    fn coldcard_id(device_info: &DeviceInfo) -> String {
         let id = format!(
             "coldcard-{:?}-{}-{}",
             device_info.path(),
@@ -1692,7 +1693,7 @@ fn handle_ledger<Message, Id>(
     Message: From<SigningDeviceMsg<Id>> + Send + Clone + 'static,
     Id: Send + Clone + 'static,
 {
-    fn ledger_id(detected: &ledger::DeviceInfo) -> String {
+    fn ledger_id(detected: &DeviceInfo) -> String {
         let id = format!(
             "ledger-{:?}-{}-{}",
             detected.path(),
@@ -1781,7 +1782,7 @@ fn handle_ledger<Message, Id>(
 }
 
 #[cfg(feature = "ledger")]
-fn handle_ledger_device<Message, Id, T: crate::ledger::Transport + Sync + Send + 'static>(
+fn handle_ledger_device<Message, Id, T: Transport + Sync + Send + 'static>(
     id: String,
     device: ledger::Ledger<T>,
     sender: channel::Sender<Message>,

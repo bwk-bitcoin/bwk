@@ -239,7 +239,7 @@ None);
 For BitBox02 devices, you can provide a noise configuration to persist pairing:
 
 ```rust
-use bwk_hwi::bitbox::{NoiseConfig, NoiseConfigData, ConfigError};
+use bwk_hwi::bitbox::api::noise::{NoiseConfig, NoiseConfigData, ConfigError};
 use std::sync::Arc;
 
 struct MyNoiseConfig {

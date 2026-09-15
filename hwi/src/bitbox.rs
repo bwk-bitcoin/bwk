@@ -4,6 +4,7 @@ use bitbox_api::{
     btc::KeyOriginInfo,
     error::{BitBoxError, Error},
     keypath::Keypath,
+    noise::{ConfigError, NoiseConfig, NoiseConfigData, NoiseConfigNoCache},
     pb::{self, BtcScriptConfig},
     usb::UsbError,
     PairedBitBox, PairingBitBox,
@@ -18,11 +19,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-pub use bitbox_api::{
-    self as api,
-    noise::{ConfigError, NoiseConfig, NoiseConfigData, NoiseConfigNoCache},
-    usb::{get_any_bitbox02, is_bitbox02},
-};
+pub use bitbox_api as api;
 
 #[derive(Clone)]
 struct Cache(Arc<Mutex<Option<NoiseConfigData>>>);

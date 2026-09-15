@@ -4,7 +4,7 @@ pub mod command {
         bitbox::{BitBox02, PairingBitbox02WithLocalCache},
         coldcard,
         jade::{self, Jade},
-        ledger::{HidApi, Ledger, LedgerSimulator, TransportHID},
+        ledger::{hidapi::HidApi, Ledger, LedgerSimulator, TransportHID},
         specter::{Specter, SpecterSimulator},
         HWI,
     };
@@ -58,7 +58,7 @@ pub mod command {
         let api = Box::new(HidApi::new().unwrap());
 
         for device_info in api.device_list() {
-            if bwk_hwi::bitbox::is_bitbox02(device_info) {
+            if bwk_hwi::bitbox::api::usb::is_bitbox02(device_info) {
                 if let Ok(device) = device_info.open_device(&api) {
                     if let Ok(device) = PairingBitbox02WithLocalCache::connect(device, None) {
                         if let Ok((device, _)) = device.wait_confirm() {
