@@ -19,7 +19,11 @@ use crate::{
 use bitcoin::{hashes::Hash, Amount, OutPoint, ScriptBuf};
 use bwk::{
     bwk_electrum::profile::DefaultBackend,
-    persist::{NoopBackend, PersistError, PersistenceBackend, RamStore, Store},
+    persist::{
+        backend::{noop::NoopBackend, PersistenceBackend},
+        storage::{ram::RamStore, Store},
+        PersistError,
+    },
 };
 use serde::{Deserialize, Serialize};
 
@@ -561,7 +565,7 @@ impl CoinSource for KeyedBip32Source {
 mod tests {
     use super::*;
     use bitcoin::{absolute::Height, hashes::Hash, Txid};
-    use bwk::persist::JsonBackend;
+    use bwk::persist::backend::json::JsonBackend;
     use std::fs;
 
     fn test_outpoint() -> OutPoint {

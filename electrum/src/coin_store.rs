@@ -1575,9 +1575,9 @@ mod tests {
         let (notif_sender, _notif_recv) = mpsc::channel();
         let tx_store = TxStore::new();
         let label_store = Arc::new(Mutex::new(LabelStore::new()));
-        let mock_backend: Arc<dyn bwk_persist::PersistenceBackend> =
-            Arc::new(bwk_persist::NoopBackend);
-        let account_store = Arc::new(Mutex::new(bwk_persist::RamStore::empty(
+        let mock_backend: Arc<dyn bwk_persist::backend::PersistenceBackend> =
+            Arc::new(bwk_persist::backend::noop::NoopBackend);
+        let account_store = Arc::new(Mutex::new(bwk_persist::storage::ram::RamStore::empty(
             mock_backend,
             bwk_persist::ACCOUNT_STORE_KEY,
             crate::profile::encode_account_key,

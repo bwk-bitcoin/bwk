@@ -19,7 +19,7 @@ use std::{
 
 use bwk_backoff::Backoff;
 use bwk_descriptor::derivator::SpkDerivator;
-use bwk_persist::Store;
+use bwk_persist::storage::Store;
 use miniscript::bitcoin::{ScriptBuf, Txid};
 
 use crate::{
@@ -431,7 +431,7 @@ mod tests {
     };
     use bwk_coin::CoinStatus;
     use bwk_descriptor::{derivator::SpkDerivator, descriptor::wpkh};
-    use bwk_persist::{NoopBackend, PersistenceBackend};
+    use bwk_persist::backend::{noop::NoopBackend, PersistenceBackend};
     use bwk_sign::{bip39::Mnemonic, HotSigner};
     use bwk_utils::test::{funding_tx, setup_logger, spending_tx};
     use miniscript::{
@@ -505,13 +505,13 @@ mod tests {
             let tx_store = TxStore::new();
             let label_store = Arc::new(Mutex::new(LabelStore::new()));
             let mock_backend: Arc<dyn PersistenceBackend> = Arc::new(NoopBackend);
-            let account_store = Arc::new(Mutex::new(bwk_persist::RamStore::empty(
+            let account_store = Arc::new(Mutex::new(bwk_persist::storage::ram::RamStore::empty(
                 mock_backend.clone(),
                 bwk_persist::ACCOUNT_STORE_KEY,
                 encode_account_key,
                 encode_account_value,
             )));
-            let statuses_store = bwk_persist::RamStore::open(
+            let statuses_store = bwk_persist::storage::ram::RamStore::open(
                 mock_backend,
                 bwk_persist::STATUSES_STORE_KEY,
                 encode_status_key,

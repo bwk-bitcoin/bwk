@@ -35,7 +35,7 @@ fn base_dir() -> Option<PathBuf> {
     }
 }
 
-/// Filename used by [`bwk_persist::FileConfigStore`].
+/// Filename used by [`bwk_persist::config_store::FileConfigStore`].
 ///
 /// Lives on `Config` for backwards-compat with existing on-disk layouts;
 /// one could build its `FileConfigStore` path as
@@ -143,7 +143,7 @@ impl Config {
     /// Under [`PersistenceKind::Sqlite`] the mnemonic is stripped so it
     /// never lands on disk; under [`PersistenceKind::Json`] (default)
     /// the config is returned unchanged. Used by `Account` when handing
-    /// config to a [`bwk_persist::ConfigStore`].
+    /// config to a [`bwk_persist::config_store::ConfigStore`].
     pub fn for_persistence(&self) -> Config {
         if self.excludes_signer_data() {
             let mut stripped = self.clone();
@@ -207,7 +207,7 @@ pub fn is_descriptor_valid(descriptor: String) -> bool {
 
 #[cfg(test)]
 pub mod tests {
-    use bwk_persist::{ConfigStore, FileConfigStore};
+    use bwk_persist::config_store::{ConfigStore, FileConfigStore};
     use miniscript::bitcoin::bip32::ChildNumber;
 
     use super::*;

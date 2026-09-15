@@ -11,7 +11,10 @@ use std::marker::PhantomData;
 use bitcoin::{OutPoint, Txid};
 use bwk::{
     bwk_electrum::profile::DefaultBackend,
-    persist::{PersistenceBackend, RamStore, Store},
+    persist::{
+        backend::PersistenceBackend,
+        storage::{ram::RamStore, Store},
+    },
 };
 
 use crate::account::{coin_store::SpCoinEntry, tx_store::SpTxEntry};

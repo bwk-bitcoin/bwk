@@ -16,7 +16,7 @@ use bwk::{
 use bwk_sign::{bwk_descriptor, HotSigner};
 use serde::{Deserialize, Serialize};
 
-/// Default filename a [`bwk::persist::FileConfigStore`] uses for an
+/// Default filename a [`bwk::persist::config_store::FileConfigStore`] uses for an
 /// SP account's config. Consumers are free to choose another path
 /// when constructing the store.
 pub const CONFIG_FILENAME: &str = "config.json";
@@ -381,7 +381,7 @@ impl Config {
     /// material (mnemonic, scan_sk, spend_key) is stripped so it never
     /// lands on disk; under [`bwk::persist::PersistenceKind::Json`]
     /// (default) the config is returned unchanged. Used by `Account`
-    /// when handing config to a [`bwk::persist::ConfigStore`].
+    /// when handing config to a [`bwk::persist::config_store::ConfigStore`].
     pub fn for_persistence(&self) -> Config {
         if self.excludes_signer_data() {
             let mut stripped = self.clone();
@@ -774,7 +774,7 @@ mod tests {
 
     #[test]
     fn test_config_round_trips_through_file_store() {
-        use bwk::persist::{ConfigStore, FileConfigStore};
+        use bwk::persist::config_store::{ConfigStore, FileConfigStore};
         use std::env;
 
         let temp_dir = env::temp_dir().join("bwk-sp-config-test");
@@ -804,7 +804,7 @@ mod tests {
 
     #[test]
     fn test_file_store_load_returns_none_when_missing() {
-        use bwk::persist::{ConfigStore, FileConfigStore};
+        use bwk::persist::config_store::{ConfigStore, FileConfigStore};
 
         let store: FileConfigStore<Config> =
             FileConfigStore::new(PathBuf::from("/nonexistent/path/config.json"));

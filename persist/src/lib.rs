@@ -5,15 +5,15 @@
 //! [`PersistenceBackend`]. The main backends are:
 //!
 //! - [`JsonBackend`]: one JSON file per store inside a directory.
-//! - [`HeaderBackend`]: one binary fixed-record file for the validated
-//!   header chain.
+//! - [`HeaderBackend`](backend::headers::HeaderBackend): one binary
+//!   fixed-record file for the validated header chain.
 //! - [`SqliteBackend`]: a single SQLite file per account, behind the
 //!   `sqlite` Cargo feature.
 //!
 //! [`NoopBackend`] replaces the old `persist: bool = false` escape hatch.
 //!
-//! The typed, cache-or-no-cache [`Store`] trait sits on top of a
-//! backend; [`RamStore`] is the RAM-cached + write-back reference
+//! The typed, cache-or-no-cache [`Store`](storage::Store) trait sits on top of a
+//! backend; [`RamStore`](storage::ram::RamStore) is the RAM-cached + write-back reference
 //! implementation.
 //!
 //! [`PersistenceKind`] and [`build_backend`] close the surface: config
@@ -50,15 +50,13 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "sqlite")]
+use crate::backend::sqlite::SqliteBackend;
+use crate::backend::{json::JsonBackend, noop::NoopBackend, PersistenceBackend};
+
 pub mod backend;
 pub mod config_store;
 pub mod storage;
-
-#[cfg(feature = "sqlite")]
-pub use backend::SqliteBackend;
-pub use backend::{HeaderBackend, JsonBackend, NoopBackend, PersistenceBackend};
-pub use config_store::{CallbackConfigStore, ConfigStore, FileConfigStore, NoopConfigStore};
-pub use storage::{RamStore, Store};
 
 /// Monotonic integer stamped into every persistence medium (both JSON
 /// and SQLite) by the running binary.
@@ -108,8 +106,8 @@ pub const SIGNERS_STORE_KEY: &str = "signers";
 /// Logical store name for the bwk validated header chain.
 ///
 /// The header chain uses a binary fixed-record cache keyed by block height.
-/// Domain code still reaches it through the typed [`Store`] layer; the
-/// binary layout is isolated inside [`HeaderBackend`].
+/// Domain code still reaches it through the typed [`Store`](storage::Store) layer; the
+/// binary layout is isolated inside [`HeaderBackend`](backend::headers::HeaderBackend).
 pub const HEADERS_STORE_KEY: &str = "headers";
 
 /// The complete set of logical store names the bwk ecosystem uses.

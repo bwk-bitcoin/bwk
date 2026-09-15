@@ -6,7 +6,11 @@ use std::{
 
 use crossbeam::channel;
 
-use bwk_persist::{NoopBackend, PersistError, PersistenceBackend, RamStore, Store};
+use bwk_persist::{
+    backend::{noop::NoopBackend, PersistenceBackend},
+    storage::{ram::RamStore, Store},
+    PersistError,
+};
 
 use miniscript::{
     bitcoin::{self, bip32},

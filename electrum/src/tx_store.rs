@@ -2,7 +2,11 @@ use miniscript::bitcoin::{self, BlockHash, Txid};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt::Debug, str::FromStr, sync::Arc};
 
-use bwk_persist::{NoopBackend, PersistError, PersistenceBackend, RamStore, Store};
+use bwk_persist::{
+    backend::{noop::NoopBackend, PersistenceBackend},
+    storage::{ram::RamStore, Store},
+    PersistError,
+};
 
 use crate::{
     coin_store::Update,

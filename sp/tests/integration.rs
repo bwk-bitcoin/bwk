@@ -22,8 +22,8 @@ use common::{
 use bwk::{
     bwk_electrum::label_store::{LabelKey, LabelStore},
     persist::{
-        JsonBackend, PersistenceBackend, ACCOUNT_STORE_KEY, COINS_STORE_KEY, LABELS_STORE_KEY,
-        TXS_STORE_KEY,
+        backend::{json::JsonBackend, PersistenceBackend},
+        ACCOUNT_STORE_KEY, COINS_STORE_KEY, LABELS_STORE_KEY, TXS_STORE_KEY,
     },
 };
 use bwk_sp::account::{coin_store::SpCoinStore, config::Config, tx_store::SpTxStore};
@@ -141,7 +141,7 @@ fn test_config_with_all_options(_env: &mut TestEnv) {
 
 /// Test config persistence and reload via FileConfigStore.
 fn test_config_persistence_roundtrip(_env: &mut TestEnv) {
-    use bwk::persist::{ConfigStore, FileConfigStore};
+    use bwk::persist::config_store::{ConfigStore, FileConfigStore};
     use bwk_sp::account::config::CONFIG_FILENAME;
 
     let dir = TempDir::new().unwrap();

@@ -7,7 +7,11 @@ use std::{str::FromStr, sync::Arc};
 use bitcoin::{Transaction, Txid};
 use bwk::{
     bwk_electrum::profile::DefaultBackend,
-    persist::{NoopBackend, PersistError, PersistenceBackend, RamStore, Store},
+    persist::{
+        backend::{noop::NoopBackend, PersistenceBackend},
+        storage::{ram::RamStore, Store},
+        PersistError,
+    },
 };
 
 use crate::profile::{SpRamProfile, SpStorageProfile};

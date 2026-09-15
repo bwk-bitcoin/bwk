@@ -8,7 +8,11 @@ use std::sync::Arc;
 use bwk_electrum::profile::{
     DefaultBackend, OpenScanFromBackend, RamProfile, ScanProfile, ScanStores,
 };
-use bwk_persist::{PersistError, PersistenceBackend, RamStore, Store};
+use bwk_persist::{
+    backend::PersistenceBackend,
+    storage::{ram::RamStore, Store},
+    PersistError,
+};
 use bwk_sign::{
     signing_manager::{
         decode_fingerprint, decode_json_signer, encode_fingerprint, encode_json_signer,
@@ -36,8 +40,8 @@ pub struct Stores<P: StorageProfile> {
 ///
 /// `secrets_backend` only carries hot-signer material. Under
 /// [`bwk_persist::PersistenceKind::Sqlite`] the caller passes
-/// [`bwk_persist::NoopBackend`] so signer state never reaches the database;
-/// otherwise both arguments are the same handle.
+/// [`bwk_persist::backend::noop::NoopBackend`] so signer state never reaches
+/// the database; otherwise both arguments are the same handle.
 pub trait OpenFromBackend: StorageProfile + OpenScanFromBackend {
     fn open(
         backend: Arc<dyn PersistenceBackend>,

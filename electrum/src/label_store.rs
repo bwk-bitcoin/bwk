@@ -1,6 +1,10 @@
 use std::sync::Arc;
 
-use bwk_persist::{NoopBackend, PersistError, PersistenceBackend, RamStore, Store};
+use bwk_persist::{
+    backend::{noop::NoopBackend, PersistenceBackend},
+    storage::{ram::RamStore, Store},
+    PersistError,
+};
 use miniscript::bitcoin::{self, address::NetworkUnchecked, OutPoint};
 use serde::{Deserialize, Serialize};
 

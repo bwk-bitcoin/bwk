@@ -20,7 +20,7 @@ use std::{
 
 use bwk_coin::{Coin, KeyChain};
 use bwk_descriptor::derivator::SpkDerivator;
-use bwk_persist::{PersistenceBackend, Store};
+use bwk_persist::{backend::PersistenceBackend, storage::Store};
 use miniscript::{
     bitcoin::{self, OutPoint, Txid},
     Descriptor, DescriptorPublicKey,

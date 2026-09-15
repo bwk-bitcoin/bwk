@@ -2,16 +2,16 @@
 //!
 //! A [`PersistenceBackend`] is the narrow interface that every concrete
 //! on-disk (or no-op) store implements. Its rows are opaque bytes; the
-//! typed [`Store`](crate::Store) layer (in [`crate::storage`]) sits on
+//! typed [`Store`](crate::storage::Store) layer (in [`crate::storage`]) sits on
 //! top and handles encoding.
 //!
 //! Concrete backends ship in their own submodule:
-//! - [`NoopBackend`]: discards all writes, reads as absent.
-//! - [`JsonBackend`]: one JSON file per store inside a directory.
-//! - [`HeaderBackend`]: one binary fixed-record file for validated
-//!   headers.
-//! - [`SqliteBackend`]: a single SQLite file per account (requires the
-//!   `sqlite` Cargo feature).
+//! - [`NoopBackend`](noop::NoopBackend): discards all writes, reads as absent.
+//! - [`JsonBackend`](json::JsonBackend): one JSON file per store inside a directory.
+//! - [`HeaderBackend`](headers::HeaderBackend): one binary fixed-record file
+//!   for validated headers.
+//! - [`SqliteBackend`](sqlite::SqliteBackend): a single SQLite file per
+//!   account (requires the `sqlite` Cargo feature).
 
 use std::sync::Arc;
 
@@ -19,19 +19,11 @@ use crate::{PersistError, KNOWN_STORES};
 
 mod lock;
 
-mod noop;
-pub use noop::NoopBackend;
-
-mod json;
-pub use json::JsonBackend;
-
-mod headers;
-pub use headers::HeaderBackend;
-
+pub mod headers;
+pub mod json;
+pub mod noop;
 #[cfg(feature = "sqlite")]
-mod sqlite;
-#[cfg(feature = "sqlite")]
-pub use sqlite::SqliteBackend;
+pub mod sqlite;
 
 /// Trait abstracting where a store's rows live.
 ///
@@ -45,7 +37,7 @@ pub use sqlite::SqliteBackend;
 /// flushing a set of dirty / removed entries in one shot), use
 /// [`flush_batch`](Self::flush_batch). Its default impl loops the row
 /// primitives, but backends override it when they can do better (e.g.
-/// [`JsonBackend`] rewrites the per-store file in one I/O; the SQLite
+/// [`JsonBackend`](json::JsonBackend) rewrites the per-store file in one I/O; the SQLite
 /// impl folds every row into a single transaction).
 pub trait PersistenceBackend: Send + Sync + std::fmt::Debug {
     /// Reject `store` names that aren't in [`KNOWN_STORES`].

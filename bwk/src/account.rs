@@ -15,7 +15,10 @@ use bwk_electrum::{
     reconcile::Reconciler,
     scanner::ElectrumScanner,
 };
-use bwk_persist::{ConfigStore, NoopConfigStore, PersistenceBackend};
+use bwk_persist::{
+    backend::PersistenceBackend,
+    config_store::{ConfigStore, NoopConfigStore},
+};
 use bwk_sign::signing_manager::SigningManager;
 use bwk_tx::{tx_builder::TxBuilder, ChangeRecipientProvider};
 
@@ -46,8 +49,8 @@ pub struct Account<P: StorageProfile = RamProfile<DefaultBackend>> {
     receiver: Option<mpsc::Receiver<Notification>>,
     /// Persistence sink for the config. [`NoopConfigStore`] by default.
     /// Consumers wire whatever shape suits them, a
-    /// [`bwk_persist::FileConfigStore`] for file-backed persistence, a
-    /// [`bwk_persist::CallbackConfigStore`] to bridge save/load through
+    /// [`bwk_persist::config_store::FileConfigStore`] for file-backed persistence, a
+    /// [`bwk_persist::config_store::CallbackConfigStore`] to bridge save/load through
     /// host-supplied closures, or any other [`ConfigStore`] impl.
     config_store: Arc<dyn ConfigStore<Config>>,
     /// Declared last so its thread is joined after the scanner's: both hold the
@@ -72,7 +75,7 @@ impl<P: OpenFromBackend> Account<P> {
     /// Creates a new `Account` instance with the given configuration.
     ///
     /// Opens the profile's stores against whatever backend the config
-    /// selects ([`JsonBackend`][bwk_persist::JsonBackend] by default,
+    /// selects ([`JsonBackend`][bwk_persist::backend::json::JsonBackend] by default,
     /// `SqliteBackend` under `PersistenceKind::Sqlite`). Defaults to
     /// the [`RamProfile<DefaultBackend>`] storage strategy via the
     /// `Account` struct's default type parameter.
@@ -83,8 +86,8 @@ impl<P: OpenFromBackend> Account<P> {
     ///
     /// Config persistence defaults to [`NoopConfigStore`]; use
     /// [`Account::try_with_config_store`] to wire a concrete impl
-    /// ([`bwk_persist::FileConfigStore`] for file-backed,
-    /// [`bwk_persist::CallbackConfigStore`] to bridge through
+    /// ([`bwk_persist::config_store::FileConfigStore`] for file-backed,
+    /// [`bwk_persist::config_store::CallbackConfigStore`] to bridge through
     /// caller-supplied closures, or any other [`ConfigStore`]).
     ///
     /// Returns [`open::Error`] if the account name is empty, the descriptor is
@@ -190,7 +193,7 @@ impl<P: OpenFromBackend> Account<P> {
             config.scanner.persistence,
             Some(bwk_persist::PersistenceKind::Sqlite)
         ) {
-            Arc::new(bwk_persist::NoopBackend)
+            Arc::new(bwk_persist::backend::noop::NoopBackend)
         } else {
             backend.clone()
         };
@@ -433,7 +436,7 @@ mod tests {
     use super::*;
     use bip39::Mnemonic;
     use bwk_descriptor::descriptor::ScriptType;
-    use bwk_persist::{PersistenceKind, Store};
+    use bwk_persist::{storage::Store, PersistenceKind};
     use bwk_sign::hot_signer::HotSigner;
     use miniscript::{
         bitcoin::{
@@ -548,8 +551,8 @@ mod tests {
         let account_dir = config.scanner.account_dir();
         {
             let backend: Arc<dyn PersistenceBackend> =
-                Arc::new(bwk_persist::JsonBackend::open(account_dir).unwrap());
-            let mut statuses = bwk_persist::RamStore::open(
+                Arc::new(bwk_persist::backend::json::JsonBackend::open(account_dir).unwrap());
+            let mut statuses = bwk_persist::storage::ram::RamStore::open(
                 backend,
                 bwk_persist::STATUSES_STORE_KEY,
                 bwk_electrum::profile::encode_status_key,
@@ -591,8 +594,8 @@ mod tests {
         let account_dir = config.scanner.account_dir();
         {
             let backend: Arc<dyn PersistenceBackend> =
-                Arc::new(bwk_persist::JsonBackend::open(account_dir).unwrap());
-            let mut statuses = bwk_persist::RamStore::open(
+                Arc::new(bwk_persist::backend::json::JsonBackend::open(account_dir).unwrap());
+            let mut statuses = bwk_persist::storage::ram::RamStore::open(
                 backend,
                 bwk_persist::STATUSES_STORE_KEY,
                 bwk_electrum::profile::encode_status_key,
@@ -1386,7 +1389,7 @@ mod sqlite_signer_exclusion {
     use crate::config::{Config, CONFIG_FILENAME};
     use bip39::Mnemonic;
     use bwk_descriptor::descriptor::ScriptType;
-    use bwk_persist::{FileConfigStore, PersistenceKind};
+    use bwk_persist::{config_store::FileConfigStore, PersistenceKind};
     use miniscript::bitcoin::{bip32::ChildNumber, Network};
     use temp_dir::TempDir;
 

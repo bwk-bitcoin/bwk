@@ -49,7 +49,7 @@ use {
             reconcile::Reconciler,
             scanner::ElectrumScanner,
         },
-        persist::{ConfigStore, NoopConfigStore},
+        persist::config_store::{ConfigStore, NoopConfigStore},
     },
     bwk_sign::signing_manager::SigningManager,
     miniscript::{psbt::PsbtExt, Descriptor, DescriptorPublicKey, ForEachKey},
@@ -418,8 +418,8 @@ pub struct Account<
     pub(crate) scan_runtime: ScanRuntimeConfig,
     /// Persistence sink for `config`. [`NoopConfigStore`] by default.
     /// Consumers wire whatever shape suits them, a
-    /// [`bwk::persist::FileConfigStore`] for file-backed persistence, a
-    /// [`bwk::persist::CallbackConfigStore`] to bridge save/load through
+    /// [`bwk::persist::config_store::FileConfigStore`] for file-backed persistence, a
+    /// [`bwk::persist::config_store::CallbackConfigStore`] to bridge save/load through
     /// host-supplied closures, or any other [`ConfigStore`] impl.
     config_store: Arc<dyn ConfigStore<Config>>,
     pub(crate) sender: mpsc::Sender<Notification>,
@@ -480,8 +480,8 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
     }
 
     /// Like [`Account::new`] but with an explicit config store
-    /// ([`bwk::persist::FileConfigStore`] for file-backed,
-    /// [`bwk::persist::CallbackConfigStore`] to bridge through
+    /// ([`bwk::persist::config_store::FileConfigStore`] for file-backed,
+    /// [`bwk::persist::config_store::CallbackConfigStore`] to bridge through
     /// caller-supplied closures, or any other [`ConfigStore`]).
     pub fn with_config_store(
         config: Config,
@@ -736,16 +736,16 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
 
     /// Create or load stores based on `config.persistence`.
     ///
-    /// Builds a single backend ([`bwk::persist::JsonBackend`] or
-    /// [`bwk::persist::SqliteBackend`]) from the config and threads it into
-    /// every store. JSON layout is byte-for-byte equivalent to the
+    /// Builds a single backend ([`bwk::persist::backend::json::JsonBackend`] or
+    /// [`bwk::persist::backend::sqlite::SqliteBackend`]) from the config and
+    /// threads it into every store. JSON layout is byte-for-byte equivalent to the
     /// pre-backend layout (one `{store}.json` file per store name).
     fn create_or_load_stores(config: &Config) -> Result<Stores, AccountError> {
         let birthday = config
             .birthday_height
             .unwrap_or_else(|| config.min_birthday_height());
 
-        let backend: Arc<dyn bwk::persist::PersistenceBackend> =
+        let backend: Arc<dyn bwk::persist::backend::PersistenceBackend> =
             bwk::persist::build_backend(config.persistence, config.account_dir())?;
 
         let coin_store =
@@ -2230,7 +2230,7 @@ mod tests {
     /// the previous server while the account half points at the new one.
     #[test]
     fn set_electrum_settings_moves_the_sub_account_endpoints_too() {
-        use bwk::persist::CallbackConfigStore;
+        use bwk::persist::config_store::CallbackConfigStore;
 
         let mut config = test_config();
         let mnemonic = config

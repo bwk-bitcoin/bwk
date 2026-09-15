@@ -118,7 +118,7 @@ Notification::CoinUpdate ──► Account consumer
 - `HeaderStore`: Shared validated chain-header store used to verify merkle
   proofs and track reorgs across accounts.
 
-Stores wrap the typed `bwk-persist::Store` abstraction. Serialization lives in
+Stores wrap the typed `bwk-persist::storage::Store` abstraction. Serialization lives in
 store-local encode/decode helpers; file or database layout details live in
 `PersistenceBackend` implementations.
 

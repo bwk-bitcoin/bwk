@@ -1,6 +1,6 @@
 use bwk_coin::{ChangeTip, KeyChain};
 use bwk_descriptor::derivator::SpkDerivator;
-use bwk_persist::Store;
+use bwk_persist::storage::Store;
 use miniscript::bitcoin::{self, address::NetworkUnchecked, Script, ScriptBuf, Txid};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -93,9 +93,9 @@ impl<P: ScanProfile> std::fmt::Debug for AddressStore<P> {
 
 impl AddressStore<RamProfile<DefaultBackend>> {
     /// Convenience constructor for the default RAM profile: wraps a
-    /// noop-backed [`RamStore`](bwk_persist::RamStore) as the `AccountStore`
-    /// so tests can use `AddressStore::new(...)` without threading a full
-    /// profile.
+    /// noop-backed [`RamStore`](bwk_persist::storage::ram::RamStore) as the
+    /// `AccountStore` so tests can use `AddressStore::new(...)` without
+    /// threading a full profile.
     pub fn new(
         derivator: SpkDerivator,
         notification: mpsc::Sender<Notification>,
@@ -103,9 +103,9 @@ impl AddressStore<RamProfile<DefaultBackend>> {
         change_tip: u32,
         look_ahead: u32,
     ) -> Self {
-        use bwk_persist::{NoopBackend, RamStore};
+        use bwk_persist::{backend::noop::NoopBackend, storage::ram::RamStore};
         use std::sync::Arc;
-        let noop: Arc<dyn bwk_persist::PersistenceBackend> = Arc::new(NoopBackend);
+        let noop: Arc<dyn bwk_persist::backend::PersistenceBackend> = Arc::new(NoopBackend);
         let account_store = Arc::new(Mutex::new(RamStore::empty(
             noop,
             bwk_persist::ACCOUNT_STORE_KEY,

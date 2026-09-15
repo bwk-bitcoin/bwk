@@ -1,12 +1,12 @@
 //! Per-datadir advisory file lock.
 //!
-//! [`JsonBackend`](super::JsonBackend) and
-//! [`SqliteBackend`](super::SqliteBackend) acquire a [`DirLock`] at
+//! [`JsonBackend`](crate::backend::json::JsonBackend) and
+//! [`SqliteBackend`](crate::backend::sqlite::SqliteBackend) acquire a [`DirLock`] at
 //! open time so a second process (or a second in-process opener)
 //! can't share the same account directory. Wallet state has exactly
 //! one owner; racing scanners / tip updates / store flushes corrupt
 //! invariants even when the byte-level I/O itself is atomic.
-//! [`HeaderBackend`](super::HeaderBackend) reuses the same lock via a
+//! [`HeaderBackend`](crate::backend::headers::HeaderBackend) reuses the same lock via a
 //! per-file sentinel (`{file}.lock`) rather than the directory `.lock`,
 //! since its cache file lives inside an account dir a `JsonBackend`
 //! already locks.

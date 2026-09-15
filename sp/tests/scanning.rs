@@ -24,7 +24,8 @@ use bwk::{
         notification::{Notification, SpNotification},
     },
     persist::{
-        JsonBackend, PersistenceBackend, ACCOUNT_STORE_KEY, COINS_STORE_KEY, LABELS_STORE_KEY,
+        backend::{json::JsonBackend, PersistenceBackend},
+        ACCOUNT_STORE_KEY, COINS_STORE_KEY, LABELS_STORE_KEY,
     },
 };
 use bwk_sp::account::config::Config;

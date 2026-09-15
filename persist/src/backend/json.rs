@@ -2,7 +2,7 @@
 //!
 //! On-disk layout for an account directory `{dir}`:
 //! - `{dir}/version`: plain-text decimal integer, the
-//!   [`DB_VERSION`](crate::DB_VERSION) stamped when the wallet was
+//!   [`DB_VERSION`] stamped when the wallet was
 //!   first initialised. Deliberately kept as its own file for dumb
 //!   parsing (no JSON framework needed to read it).
 //! - `{dir}/{store}.json`: for every logical store, a JSON object

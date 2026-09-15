@@ -10,7 +10,7 @@ use miniscript::{Descriptor, DescriptorPublicKey};
 use serde::{Deserialize, Serialize};
 
 use bwk_descriptor::{derivator, descriptor::DescriptorDerivator};
-use bwk_persist::{PersistError, PersistenceBackend, PersistenceKind};
+use bwk_persist::{backend::PersistenceBackend, PersistError, PersistenceKind};
 
 use crate::raw_client::CertificateCheck;
 

@@ -6,7 +6,11 @@
 
 use std::sync::Arc;
 
-use bwk::persist::{self as persist, NoopBackend, PersistError, PersistenceBackend};
+use bwk::persist::{
+    self as persist,
+    backend::{noop::NoopBackend, PersistenceBackend},
+    PersistError,
+};
 
 /// Row key under the `account` store for [`ScanState::last_scanned_height`].
 const LAST_SCANNED_HEIGHT_ROW: &str = "last_scanned_height";
@@ -258,7 +262,7 @@ impl ScanState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bwk::persist::JsonBackend;
+    use bwk::persist::backend::json::JsonBackend;
     use std::fs;
 
     #[test]

@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::hash::Hash;
 
 use super::Store;
-use crate::{PersistError, PersistenceBackend};
+use crate::{backend::PersistenceBackend, PersistError};
 
 /// RAM-cached [`Store`] that writes back to a [`PersistenceBackend`]
 /// on [`Store::flush`]. Mutations accumulate in in-memory `dirty` and
@@ -75,7 +75,7 @@ impl<B: PersistenceBackend, K: Ord + Clone + Hash + Eq, V: Clone> RamStore<B, K,
 
     /// Construct an empty `RamStore` without touching the backend.
     /// Useful when persistence is disabled and `backend` is a
-    /// [`NoopBackend`](crate::NoopBackend).
+    /// [`NoopBackend`](crate::backend::noop::NoopBackend).
     pub fn empty(
         backend: B,
         store_key: &'static str,
@@ -243,7 +243,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::JsonBackend;
+    use crate::backend::json::JsonBackend;
 
     #[allow(clippy::ptr_arg)]
     fn encode_k(k: &String) -> String {

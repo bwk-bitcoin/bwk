@@ -6,11 +6,11 @@
 //! server.
 //!
 //! `HeaderStore` follows the same domain-store pattern as `TxStore` and
-//! `LabelStore`: it wraps a typed [`Store`](bwk_persist::Store), keeps
+//! `LabelStore`: it wraps a typed [`Store`](bwk_persist::storage::Store), keeps
 //! encoding in explicit helpers, and leaves persistence layout details to a
 //! backend. The default file-backed backend is
-//! [`HeaderBackend`](bwk_persist::HeaderBackend), which stores the chain as
-//! `magic || min_stored || raw headers`. Sparse caches that start at a
+//! [`HeaderBackend`](bwk_persist::backend::headers::HeaderBackend), which
+//! stores the chain as `magic || min_stored || raw headers`. Sparse caches that start at a
 //! 2016-block boundary above genesis are therefore represented without
 //! fabricating lower-height rows. The chain is always binary-backed through
 //! `HeaderBackend`, even when the account's other stores use the JSON or
@@ -34,8 +34,9 @@ use crate::{
     worker::Worker,
 };
 use bwk_persist::{
-    HeaderBackend, NoopBackend, PersistError, PersistenceBackend, RamStore, Store,
-    HEADERS_STORE_KEY,
+    backend::{headers::HeaderBackend, noop::NoopBackend, PersistenceBackend},
+    storage::{ram::RamStore, Store},
+    PersistError, HEADERS_STORE_KEY,
 };
 use miniscript::bitcoin::{
     block::Header,

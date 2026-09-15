@@ -14,7 +14,11 @@
 
 use std::{marker::PhantomData, sync::Arc};
 
-use bwk_persist::{PersistError, PersistenceBackend, RamStore, Store};
+use bwk_persist::{
+    backend::PersistenceBackend,
+    storage::{ram::RamStore, Store},
+    PersistError,
+};
 use miniscript::bitcoin::{block::Header, ScriptBuf, Txid};
 
 use crate::{
@@ -267,7 +271,7 @@ mod tests {
     //!
     //! These tests would fail with the pre-fix `Tip::persist` body.
     use super::*;
-    use bwk_persist::{JsonBackend, ACCOUNT_STORE_KEY};
+    use bwk_persist::{backend::json::JsonBackend, ACCOUNT_STORE_KEY};
 
     fn open_account_store(
         backend: Arc<dyn PersistenceBackend>,
