@@ -16,12 +16,16 @@ use bwk_persist::{
     PersistError,
 };
 
-use miniscript::bitcoin::{
-    self,
-    bip32::{self, DerivationPath},
+use miniscript::{
+    bitcoin::{
+        self,
+        bip32::{self, DerivationPath},
+    },
+    DescriptorPublicKey,
 };
 
 use crate::{
+    error,
     hot_signer::{HotSigner, JsonSigner},
     identity::{SignerId, SignerInfo, SignerState},
     manager,
@@ -98,6 +102,39 @@ fn notif_fingerprint(notif: &SignerNotif) -> Option<bip32::Fingerprint> {
         SignerNotif::Manager(_) => None,
         #[cfg(all(feature = "hwi", not(target_os = "android")))]
         SignerNotif::DeviceUpdate => None,
+    }
+}
+
+enum ParsedPsbt {
+    V0(bitcoin::Psbt),
+    V2(bwk_psbt::PsbtV2),
+}
+
+impl ParsedPsbt {
+    fn parse(bytes: &[u8]) -> Result<Self, manager::Error> {
+        match bwk_psbt::PsbtV2::deserialize(bytes) {
+            Ok(psbt) => Ok(Self::V2(psbt)),
+            Err(_) => bitcoin::Psbt::deserialize(bytes)
+                .map(Self::V0)
+                .map_err(|_| manager::Error::Psbt),
+        }
+    }
+
+    fn sign(
+        self,
+        hot: &HotSigner,
+        descriptor: &miniscript::Descriptor<DescriptorPublicKey>,
+    ) -> Result<Vec<u8>, error::Error> {
+        match self {
+            Self::V0(mut psbt) => {
+                hot.inner_sign(&mut psbt, descriptor)?;
+                Ok(psbt.serialize())
+            }
+            Self::V2(mut psbt) => {
+                hot.sign_v2(&mut psbt, descriptor)?;
+                psbt.serialize().map_err(|_| error::Error::PsbtV2)
+            }
+        }
     }
 }
 
@@ -667,15 +704,15 @@ where
     ) -> Result<RequestId, manager::Error> {
         if let Some(hot) = self.bip32_signers.get(signer) {
             let sender = self.require_subscriber()?;
-            let mut parsed = bitcoin::Psbt::deserialize(&psbt).map_err(|_| manager::Error::Psbt)?;
+            let parsed = ParsedPsbt::parse(&psbt)?;
             let request = self.requests.next();
             match descriptor.as_miniscript() {
-                Some(inner) => match hot.inner_sign(&mut parsed, inner) {
-                    Ok(()) => {
+                Some(inner) => match parsed.sign(hot, inner) {
+                    Ok(signed) => {
                         let _ = sender.send(Response::Signed {
                             request,
                             signer: signer.clone(),
-                            psbt: parsed.serialize(),
+                            psbt: signed,
                         });
                     }
                     Err(e) => {
@@ -824,8 +861,7 @@ mod tests {
         assert_eq!(manager.info(&id), Err(manager::Error::NoSubscriber));
     }
 
-    #[test]
-    fn sign_produces_a_signed_psbt() {
+    fn sign_wpkh_psbt(serialize: fn(bitcoin::Psbt) -> Vec<u8>) -> Vec<u8> {
         let mut manager = HotManager::new();
         let id =
             manager.new_bip32_signer_from_mnemonic(bitcoin::Network::Regtest, MNEMONIC.to_string());
@@ -862,7 +898,7 @@ mod tests {
             .bip32_derivation
             .insert(pubkey, (fingerprint, deriv_p));
 
-        let request = manager.sign(&id, descriptor, psbt.serialize()).unwrap();
+        let request = manager.sign(&id, descriptor, serialize(psbt)).unwrap();
         match rx.recv().unwrap() {
             Response::Signed {
                 request: req,
@@ -871,11 +907,29 @@ mod tests {
             } => {
                 assert_eq!(req, request);
                 assert_eq!(signer, id);
-                let signed = bitcoin::Psbt::deserialize(&psbt).unwrap();
-                assert!(!signed.inputs[0].partial_sigs.is_empty());
+                psbt
             }
             other => panic!("expected Signed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sign_produces_a_signed_psbt() {
+        let signed = sign_wpkh_psbt(|psbt| psbt.serialize());
+        let signed = bitcoin::Psbt::deserialize(&signed).unwrap();
+        assert!(!signed.inputs[0].partial_sigs.is_empty());
+    }
+
+    #[test]
+    fn sign_produces_a_signed_psbt_v2() {
+        let signed = sign_wpkh_psbt(|psbt| {
+            bwk_psbt::PsbtV2::from_bitcoin_psbt(psbt)
+                .unwrap()
+                .serialize()
+                .unwrap()
+        });
+        let signed = bwk_psbt::PsbtV2::deserialize(&signed).unwrap();
+        assert!(!signed.inputs[0].psbt.partial_sigs.is_empty());
     }
 
     #[test]
