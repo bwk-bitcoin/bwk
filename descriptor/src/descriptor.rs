@@ -9,7 +9,7 @@ use miniscript::{
     Descriptor, DescriptorPublicKey,
 };
 
-use crate::SpkDerivator;
+use crate::derivator::SpkDerivator;
 
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 pub enum Error {

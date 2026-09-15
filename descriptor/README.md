@@ -15,7 +15,10 @@ or full miniscript policy (use miniscript directly).
 ## Usage
 
 ```rust
-use bwk_descriptor::{SpkDerivator, wpkh, tr};
+use bwk_descriptor::{
+    derivator::SpkDerivator,
+    descriptor::{tr, wpkh},
+};
 use bwk_keys::keys::OXpub;
 use miniscript::bitcoin::Network;
 

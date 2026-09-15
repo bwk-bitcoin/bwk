@@ -13,7 +13,10 @@ use {
     bitcoin::bip32::ChildNumber,
     bitcoin::Network,
     bwk_coin::{CoinSpendInfo, CoinStatus, KeyChain},
-    bwk_descriptor::{tr_path, wpkh_path, SpkDerivator},
+    bwk_descriptor::{
+        derivator::SpkDerivator,
+        descriptor::{tr_path, wpkh_path},
+    },
     bwk_sign::HotSigner,
     bwk_sign::Signer,
     bwk_utils::test::{

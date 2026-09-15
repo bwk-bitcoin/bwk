@@ -7,7 +7,10 @@ use crate::{
     send,
     signer::{Signer, SignerNotif},
 };
-use bwk_descriptor::{derivator::SpkDerivator, tr, tr_path, wpkh, wpkh_path};
+use bwk_descriptor::{
+    derivator::SpkDerivator,
+    descriptor::{tr, tr_path, wpkh, wpkh_path},
+};
 use bwk_keys::{
     derivator::KeyDerivator,
     keys::{OXpriv, OXpub},

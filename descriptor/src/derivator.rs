@@ -5,7 +5,7 @@ use miniscript::{
     Descriptor, DescriptorPublicKey, ForEachKey,
 };
 
-use crate::{tr, wpkh};
+use crate::descriptor::{tr, wpkh};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

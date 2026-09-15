@@ -301,16 +301,16 @@ impl Config {
         let account = ChildNumber::from_hardened_idx(0).expect("hardcoded account index");
         let descriptor = match kind {
             SubAccountKind::Segwit => {
-                let path = bwk_descriptor::wpkh_path(self.network, account)
+                let path = bwk_descriptor::descriptor::wpkh_path(self.network, account)
                     .map_err(ConfigError::DescriptorPath)?;
-                bwk_descriptor::SpkDerivator::new_wpkh(signer.xpub(&path), self.network)
+                bwk_descriptor::derivator::SpkDerivator::new_wpkh(signer.xpub(&path), self.network)
                     .map_err(ConfigError::Derivator)?
                     .descriptor()
             }
             SubAccountKind::Taproot => {
-                let path = bwk_descriptor::tr_path(self.network, account)
+                let path = bwk_descriptor::descriptor::tr_path(self.network, account)
                     .map_err(ConfigError::DescriptorPath)?;
-                bwk_descriptor::SpkDerivator::new_tr(signer.xpub(&path), self.network)
+                bwk_descriptor::derivator::SpkDerivator::new_tr(signer.xpub(&path), self.network)
                     .map_err(ConfigError::Derivator)?
                     .descriptor()
             }

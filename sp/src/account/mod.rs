@@ -2132,10 +2132,13 @@ mod tests {
         use miniscript::bitcoin::bip32::ChildNumber;
 
         let signer = HotSigner::new_from_mnemonics(network, mnemonic).unwrap();
-        let path =
-            bwk_descriptor::wpkh_path(network, ChildNumber::from_hardened_idx(0).unwrap()).unwrap();
+        let path = bwk_descriptor::descriptor::wpkh_path(
+            network,
+            ChildNumber::from_hardened_idx(0).unwrap(),
+        )
+        .unwrap();
         let xpub = signer.xpub(&path);
-        let descriptor = bwk_descriptor::SpkDerivator::new_wpkh(xpub, network)
+        let descriptor = bwk_descriptor::derivator::SpkDerivator::new_wpkh(xpub, network)
             .unwrap()
             .descriptor();
         config::SubAccountConfig {
@@ -2297,10 +2300,13 @@ mod tests {
         let network = bitcoin::Network::Regtest;
         let mnemo = Mnemonic::generate(12).unwrap();
         let signer = HotSigner::new_from_mnemonics(network, &mnemo.to_string()).unwrap();
-        let path =
-            bwk_descriptor::wpkh_path(network, ChildNumber::from_hardened_idx(0).unwrap()).unwrap();
+        let path = bwk_descriptor::descriptor::wpkh_path(
+            network,
+            ChildNumber::from_hardened_idx(0).unwrap(),
+        )
+        .unwrap();
         let xpub = signer.xpub(&path);
-        let descriptor = bwk_descriptor::SpkDerivator::new_wpkh(xpub, network)
+        let descriptor = bwk_descriptor::derivator::SpkDerivator::new_wpkh(xpub, network)
             .unwrap()
             .descriptor();
         let mut config = ScannerConfig::new(
@@ -2332,10 +2338,13 @@ mod tests {
         let network = bitcoin::Network::Regtest;
         let mnemo = Mnemonic::generate(12).unwrap();
         let signer = HotSigner::new_from_mnemonics(network, &mnemo.to_string()).unwrap();
-        let path =
-            bwk_descriptor::wpkh_path(network, ChildNumber::from_hardened_idx(0).unwrap()).unwrap();
+        let path = bwk_descriptor::descriptor::wpkh_path(
+            network,
+            ChildNumber::from_hardened_idx(0).unwrap(),
+        )
+        .unwrap();
         let xpub = signer.xpub(&path);
-        let descriptor = bwk_descriptor::SpkDerivator::new_wpkh(xpub, network)
+        let descriptor = bwk_descriptor::derivator::SpkDerivator::new_wpkh(xpub, network)
             .unwrap()
             .descriptor();
         let mut config = ScannerConfig::new(

@@ -1557,7 +1557,7 @@ mod tests {
     //! drives funding/spending txs through the in-memory
     //! [`TxStore`].
     use super::*;
-    use bwk_descriptor::wpkh_path;
+    use bwk_descriptor::descriptor::wpkh_path;
     use bwk_sign::{bip39::Mnemonic, HotSigner};
     use bwk_utils::test::{funding_tx, spending_tx};
     use miniscript::bitcoin::bip32::ChildNumber;
