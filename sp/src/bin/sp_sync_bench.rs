@@ -16,6 +16,7 @@
 //!
 //! Run with `--help` for usage.
 
+#[cfg(not(feature = "instrumentation"))]
 use std::time::{Duration, Instant};
 
 use bwk_sp::bitcoin;
