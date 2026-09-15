@@ -18,7 +18,10 @@ use bitcoin::{
     psbt::Psbt,
 };
 
-use std::{cmp::Ordering, fmt::Debug, str::FromStr};
+use std::{cmp::Ordering, fmt::Debug};
+
+#[cfg(feature = "regex")]
+use std::str::FromStr;
 
 #[derive(Debug, Clone)]
 pub enum Error {
@@ -224,6 +227,7 @@ impl std::str::FromStr for DeviceKind {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "regex")]
     use super::*;
 
     #[cfg(feature = "regex")]

@@ -1,4 +1,7 @@
-use std::{cmp::Ordering, collections::BTreeMap, str::FromStr};
+use std::{cmp::Ordering, collections::BTreeMap};
+
+#[cfg(feature = "regex")]
+use std::str::FromStr;
 
 use bitcoin::{
     bip32::{ChildNumber, DerivationPath, KeySource},
@@ -174,6 +177,7 @@ mod tests {
         assert_eq!(psbt.inputs[1].bip32_derivation.len(), 2);
     }
 
+    #[cfg(feature = "regex")]
     #[test]
     fn test_extract_keys_and_template() {
         let res = extract_keys_and_template::<String>("wsh(or_d(pk([f5acc2fd/49'/1'/0']tpubDCbK3Ysvk8HjcF6mPyrgMu3KgLiaaP19RjKpNezd8GrbAbNg6v5BtWLaCt8FNm6QkLseopKLf5MNYQFtochDTKHdfgG6iqJ8cqnLNAwtXuP/**),and_v(v:pkh(tpubDDtb2WPYwEWw2WWDV7reLV348iJHw2HmhzvPysKKrJw3hYmvrd4jasyoioVPdKGQqjyaBMEvTn1HvHWDSVqQ6amyyxRZ5YjpPBBGjJ8yu8S/**),older(100))))").unwrap();
