@@ -1,24 +1,26 @@
 //! Unified views of coins and spendable totals across the SP account and its
 //! BIP32 sub-accounts.
 //!
-//! The SP [`Account`](crate::Account) embeds zero or more scanner
+//! The SP [`Account`](crate::account::Account) embeds zero or more scanner
 //! sub-accounts (segwit, taproot, ...). These helpers fold all
 //! of them into one structure keyed by outpoint so callers (including FFI
 //! bindings) do not have to stitch them together themselves.
 
 use bitcoin::{Amount, OutPoint};
 
-/// Where a coin lives inside a composite SP [`Account`](crate::Account).
+/// Where a coin lives inside a composite SP
+/// [`Account`](crate::account::Account).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoinOrigin {
     /// The Silent Payments main account.
     Sp,
     /// An embedded BIP32 sub-account, addressed by its index in
-    /// [`Account::scanners`](crate::Account::scanners).
+    /// [`Account::scanners`](crate::account::Account::scanners).
     SubAccount(usize),
 }
 
-/// A coin from anywhere in the composite SP [`Account`](crate::Account).
+/// A coin from anywhere in the composite SP
+/// [`Account`](crate::account::Account).
 ///
 /// Spent / being-spent coins are included; filter by [`UnifiedCoin::spendable`]
 /// to keep only live UTXOs.

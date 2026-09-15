@@ -29,8 +29,8 @@ use crate::PersistError;
 /// Persistence interface for a wallet `Config` struct.
 ///
 /// `C` is the consumer's config type (`bwk::config::Config` /
-/// `bwk_sp::Config`). The trait itself is unconstrained; only
-/// [`FileConfigStore`] requires `Serialize + DeserializeOwned`.
+/// `bwk_sp::account::config::Config`). The trait itself is unconstrained;
+/// only [`FileConfigStore`] requires `Serialize + DeserializeOwned`.
 pub trait ConfigStore<C>: Send + Sync {
     fn save(&self, config: &C) -> Result<(), PersistError>;
     /// Returns `Ok(None)` when nothing is persisted yet (first run).

@@ -1,5 +1,5 @@
-//! Serializable transaction request used by [`bwk_sp::Account`] orchestration
-//! helpers.
+//! Serializable transaction request used by [`bwk_sp::account::Account`]
+//! orchestration helpers.
 //!
 //! A [`TxRequest`] is a binding-friendly description of a transaction to
 //! build: outputs (address strings, amounts, optional labels, optional
@@ -38,7 +38,8 @@ pub struct TxRequest {
     pub input_outpoints: Vec<bitcoin::OutPoint>,
 }
 
-/// Result of [`bwk_sp::Account::simulate`]: fee, weight, and the selected input set.
+/// Result of [`bwk_sp::account::Account::simulate`]: fee, weight, and the
+/// selected input set.
 #[derive(Debug, Clone)]
 pub struct TxSimulation {
     /// Estimated fee.

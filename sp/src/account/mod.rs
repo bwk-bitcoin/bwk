@@ -1687,7 +1687,7 @@ pub enum AddressSource {
 /// One address the wallet owns, aggregated across sub-accounts
 /// (BIP32) and the SP wallet. `account_name` identifies the
 /// originating keychain, see [`ElectrumScanner::name`] /
-/// [`crate::Account::name`]. `source` carries the per-spk provenance
+/// [`crate::account::Account::name`]. `source` carries the per-spk provenance
 /// (see [`AddressSource`]).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OwnedAddress {

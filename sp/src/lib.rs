@@ -17,8 +17,4 @@ pub use bwk;
 // Re-export external types for convenience
 pub use bitcoin;
 pub use bwk_sign;
-pub use bwk_tx::{
-    self,
-    recipient::{FinalizationContext, PsbtOutputInfo, RecipientProvider, SpPartialSecretProvider},
-    transaction::Fees,
-};
+pub use bwk_tx;

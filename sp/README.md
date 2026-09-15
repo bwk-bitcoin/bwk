@@ -15,7 +15,10 @@ wallets (use bwk) or direct Electrum queries (use bwk-electrum).
 ## Usage
 
 ```rust
-use bwk_sp::{Account, Config, Notification, ScanMode};
+use bwk_sp::{
+    account::{config::Config, Account, ScanMode},
+    bwk::bwk_electrum::notification::Notification,
+};
 use bitcoin::Network;
 
 // Create account from SP keys

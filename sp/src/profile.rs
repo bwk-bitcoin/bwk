@@ -1,4 +1,4 @@
-//! Storage profile for `bwk_sp::Account`.
+//! Storage profile for `bwk_sp::account::Account`.
 //!
 //! Names the two SP-specific stores (coins / SP txs). Labels are
 //! stored through [`bwk::bwk_electrum::label_store::LabelStore`] directly: silent-payment label

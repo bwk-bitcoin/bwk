@@ -79,9 +79,9 @@ pub struct SubAccountConfig {
     pub descriptor: Descriptor<DescriptorPublicKey>,
     /// Optional mnemonic used to sign this sub-account.
     ///
-    /// When absent, [`Account`](crate::Account) uses the parent SP config's
-    /// mnemonic. This field is only needed for externally supplied sub-account
-    /// mnemonics.
+    /// When absent, [`Account`](crate::account::Account) uses the parent SP
+    /// config's mnemonic. This field is only needed for externally supplied
+    /// sub-account mnemonics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mnemonic: Option<String>,
     /// Electrum server this sub-account watches (offline while unset), and the
