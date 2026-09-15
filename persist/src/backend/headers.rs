@@ -19,7 +19,7 @@ use crate::PersistError;
 const CACHE_MAGIC: [u8; 4] = *b"BWKH";
 const CACHE_PREFIX_LEN: usize = 8;
 
-/// Fixed-record binary backend used by `bwk::HeaderStore`.
+/// Fixed-record binary backend used by `bwk_electrum::header_store::HeaderStore`.
 ///
 /// The header chain is always binary-backed through this backend, even when
 /// the wallet's other stores use the JSON or SQLite backend: the fixed-record
