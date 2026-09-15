@@ -18,6 +18,41 @@ name = "spdk_sync_bench"
 path = "src/bin/spdk_sync_bench.rs"
 required-features = ["bench-spdk"]
 
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+required-features = ["mnemonic"]
+
+[[test]]
+name = "reorg"
+path = "tests/reorg.rs"
+required-features = ["mnemonic"]
+
+[[test]]
+name = "scanning"
+path = "tests/scanning.rs"
+required-features = ["mnemonic"]
+
+[[test]]
+name = "template"
+path = "tests/template.rs"
+required-features = ["mnemonic"]
+
+[[test]]
+name = "transactions"
+path = "tests/transactions.rs"
+required-features = ["mnemonic"]
+
+[[test]]
+name = "unified"
+path = "tests/unified.rs"
+required-features = ["mnemonic"]
+
+[[test]]
+name = "unit"
+path = "tests/unit.rs"
+required-features = ["mnemonic"]
+
 [features]
 default = ["mnemonic"]
 # Enable usage of bip39 mnemonics.
