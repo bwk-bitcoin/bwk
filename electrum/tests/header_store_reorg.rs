@@ -9,7 +9,9 @@
 use std::{sync::mpsc, time::Duration};
 
 use bwk_electrum::{
-    config::HEADERS_FILENAME, header_store::HeaderStore, raw_client::CertificateCheck,
+    config::HEADERS_FILENAME,
+    header_store::{HeaderAnchor, HeaderStore},
+    raw_client::CertificateCheck,
 };
 use bwk_utils::test::regtest::{
     bootstrap_electrs, generate, get_block_hash_str, get_block_height, invalidate_block, wait_until,
@@ -42,7 +44,7 @@ fn header_store_follows_tip_and_resolves_reorg() {
         port,
         Network::Regtest,
         Some(path),
-        Some(base_height),
+        Some(HeaderAnchor::unpinned(base_height)),
         CertificateCheck::Validate,
     )
     .unwrap();

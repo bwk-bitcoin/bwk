@@ -1984,6 +1984,7 @@ mod tests {
             sender: tx,
             header_store: bwk::bwk_electrum::header_store::HeaderStore::new_in_memory(
                 bitcoin::Network::Regtest,
+                None,
             ),
         };
         (stores, rx)

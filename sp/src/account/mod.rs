@@ -607,7 +607,12 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
                 config.account_dir(),
                 // Backfill from the birthday so the worker covers the scan
                 // range, whose confirmation block times the scanner reads here.
-                Some(config.min_birthday_height()),
+                // The anchor pin is the app's to supply; `None` keeps the proof
+                // of work only anchor.
+                Some(bwk::bwk_electrum::header_store::HeaderAnchor {
+                    min_height: config.min_birthday_height(),
+                    pin: config.header_anchor_pin,
+                }),
                 sender.clone(),
             )?,
         };
@@ -2182,7 +2187,8 @@ mod tests {
             ),
         ];
 
-        let shared = bwk::bwk_electrum::header_store::HeaderStore::new_in_memory(config.network);
+        let shared =
+            bwk::bwk_electrum::header_store::HeaderStore::new_in_memory(config.network, None);
         let mut account = Account::with_header_store(config, shared).expect("with_header_store");
         account.stop_electrum();
 
@@ -2211,7 +2217,8 @@ mod tests {
             sub_account_config(&mnemonic, config.network, Endpoint::default()),
         ];
 
-        let shared = bwk::bwk_electrum::header_store::HeaderStore::new_in_memory(config.network);
+        let shared =
+            bwk::bwk_electrum::header_store::HeaderStore::new_in_memory(config.network, None);
         let account =
             Account::with_header_store(config, shared.clone()).expect("with_header_store");
 
@@ -2265,7 +2272,8 @@ mod tests {
             .expect("poisoned")
             .clone()
             .expect("set_electrum_settings persisted the config");
-        let shared = bwk::bwk_electrum::header_store::HeaderStore::new_in_memory(saved.network);
+        let shared =
+            bwk::bwk_electrum::header_store::HeaderStore::new_in_memory(saved.network, None);
         let mut reopened = Account::with_header_store(saved, shared).expect("with_header_store");
         reopened.stop_electrum();
 

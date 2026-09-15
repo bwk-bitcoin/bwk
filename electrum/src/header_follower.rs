@@ -23,7 +23,7 @@ use miniscript::bitcoin::Network;
 
 use crate::{
     config::{Endpoint, HEADERS_FILENAME},
-    header_store::{HeaderStore, StartError},
+    header_store::{HeaderAnchor, HeaderStore, StartError},
     notification::Notification,
     profile::{OpenScanFromBackend, ScanProfile},
     raw_client::CertificateCheck,
@@ -65,9 +65,9 @@ impl<P: OpenScanFromBackend> HeaderFollower<P> {
     /// Open this wallet's own store: online against `endpoint` when there is
     /// one, idle otherwise. Headers are always binary-backed, at
     /// [`HEADERS_FILENAME`] under `account_dir`, whenever the wallet persists
-    /// at all. `min_height` snaps the initial backfill down to the retarget
-    /// boundary at or below it, for a wallet that knows how far back its
-    /// history reaches.
+    /// at all. `anchor` snaps the initial backfill down to the retarget boundary
+    /// at or below its `min_height`, for a wallet that knows how far back its
+    /// history reaches, and binds that anchor to its pin when it carries one.
     ///
     /// A configured endpoint that cannot be reached is a [`StartError`]:
     /// header-sync progress gates `Verified` state, so a degraded store must
@@ -77,7 +77,7 @@ impl<P: OpenScanFromBackend> HeaderFollower<P> {
         network: Network,
         persistence: Option<PersistenceKind>,
         account_dir: PathBuf,
-        min_height: Option<u32>,
+        anchor: Option<HeaderAnchor>,
         notification: mpsc::Sender<Notification>,
     ) -> Result<Self, StartError> {
         let path = persistence
@@ -88,7 +88,7 @@ impl<P: OpenScanFromBackend> HeaderFollower<P> {
             None => (None, None, CertificateCheck::default()),
         };
         let store =
-            HeaderStore::start_or_open(url, port, network, path, min_height, certificate_check)?;
+            HeaderStore::start_or_open(url, port, network, path, anchor, certificate_check)?;
         Ok(Self {
             store,
             owned: true,

@@ -48,7 +48,11 @@ use bwk::{
 };
 use bwk_coin::CoinStatus;
 use bwk_descriptor::descriptor::ScriptType;
-use bwk_electrum::{header_store::HeaderStore, raw_client::CertificateCheck, tx_store::Inclusion};
+use bwk_electrum::{
+    header_store::{HeaderAnchor, HeaderStore},
+    raw_client::CertificateCheck,
+    tx_store::Inclusion,
+};
 use bwk_utils::test::{
     regtest::{
         bootstrap_electrs, generate, get_block_hash_str, get_block_height, init_logger,
@@ -504,7 +508,7 @@ fn sparse_anchor_above_retarget_boundary_syncs_and_verifies() {
         port,
         Network::Regtest,
         None,
-        Some(4100),
+        Some(HeaderAnchor::unpinned(4100)),
         CertificateCheck::Validate,
     )
     .unwrap();

@@ -605,7 +605,7 @@ mod tests {
         // never demotes, so the Verified-at-M claim is left untouched; the
         // header is present so the seeded state is internally consistent.
         let (map, hash_at_m) = build_header_map(m + 1);
-        let header_store = HeaderStore::from_map(Network::Regtest, map);
+        let header_store = HeaderStore::from_map(Network::Regtest, map, None);
 
         {
             let mut store = coin_store.lock().unwrap();
@@ -657,7 +657,7 @@ mod tests {
         let h: u32 = 6;
 
         let (map, hash_at_h) = build_header_map(h + 1);
-        let header_store = HeaderStore::from_map(Network::Regtest, map);
+        let header_store = HeaderStore::from_map(Network::Regtest, map, None);
 
         let (req_tx, req_rx) = mpsc::channel::<CoinRequest>();
         header_store.set_merkle_sender_for_test(req_tx);
@@ -732,7 +732,7 @@ mod tests {
         // HeaderStore holds a real header at H, so the seeded Verified state
         // is internally consistent.
         let (map, hash_at_h) = build_header_map(h + 1);
-        let header_store = HeaderStore::from_map(Network::Regtest, map);
+        let header_store = HeaderStore::from_map(Network::Regtest, map, None);
 
         {
             let mut store = coin_store.lock().unwrap();
@@ -792,7 +792,7 @@ mod tests {
         let h: u32 = 5;
 
         let (map, hash_at_h) = build_header_map(h + 1);
-        let header_store = HeaderStore::from_map(Network::Regtest, map);
+        let header_store = HeaderStore::from_map(Network::Regtest, map, None);
 
         {
             let mut store = coin_store.lock().unwrap();
@@ -847,7 +847,7 @@ mod tests {
         let h: u32 = 5;
 
         let (map, hash_at_h) = build_header_map(h + 1);
-        let header_store = HeaderStore::from_map(Network::Regtest, map);
+        let header_store = HeaderStore::from_map(Network::Regtest, map, None);
 
         {
             let mut store = coin_store.lock().unwrap();
@@ -902,7 +902,7 @@ mod tests {
         let h: u32 = 5;
 
         let (map, hash_at_h) = build_header_map(h + 1);
-        let header_store = HeaderStore::from_map(Network::Regtest, map);
+        let header_store = HeaderStore::from_map(Network::Regtest, map, None);
 
         {
             let mut store = coin_store.lock().unwrap();
@@ -951,7 +951,7 @@ mod tests {
         // Build a HeaderStore whose header at H has block hash B_new,
         // distinct from the B_old we seed the tx with below.
         let (map, b_new) = build_header_map(h + 1);
-        let header_store = HeaderStore::from_map(Network::Regtest, map);
+        let header_store = HeaderStore::from_map(Network::Regtest, map, None);
 
         // A clearly different (stale) block hash B_old, distinct from B_new.
         let b_old = miniscript::bitcoin::BlockHash::from_byte_array([0x7au8; 32]);
@@ -1018,7 +1018,7 @@ mod tests {
         let h: u32 = 4;
 
         let (map, block_hash) = build_header_map(h + 1);
-        let header_store = HeaderStore::from_map(Network::Regtest, map);
+        let header_store = HeaderStore::from_map(Network::Regtest, map, None);
         header_store.set_validation_state_for_test(HeaderValidationState::Validating);
 
         coin_store.lock().unwrap().insert_pending_claim(ClaimAt {
@@ -1096,7 +1096,7 @@ mod tests {
         let txid = tx.compute_txid();
         let h: u32 = 4;
         let (map, block_hash) = build_header_map(h + 1);
-        let header_store = HeaderStore::from_map(Network::Regtest, map);
+        let header_store = HeaderStore::from_map(Network::Regtest, map, None);
         {
             let mut store = coin_store.lock().unwrap();
             store.tx_store_mut().update(TxEntry::for_test(tx));
@@ -1182,7 +1182,7 @@ mod tests {
         // header yet, so the re-report at n_new takes the queue branch
         // while n_old IS reachable (the dangerous case).
         let (map, _tip) = build_header_map(n_old + 1);
-        let header_store = HeaderStore::from_map(Network::Regtest, map);
+        let header_store = HeaderStore::from_map(Network::Regtest, map, None);
 
         // Seed the tx as Unconfirmed (post-reorg history reset state).
         {
@@ -1331,7 +1331,7 @@ mod tests {
         // Header at H is present, so a Valid store would promote the claim;
         // the Invalid state below is what must block it.
         let (map, _tip) = build_header_map(h + 1);
-        let header_store = HeaderStore::from_map(Network::Regtest, map);
+        let header_store = HeaderStore::from_map(Network::Regtest, map, None);
         header_store
             .set_validation_state_for_test(HeaderValidationState::Invalid(InvalidCause::Sanity));
 
@@ -1382,7 +1382,7 @@ mod tests {
     fn resolve_pending_claims_drops_removed_txid() {
         let (coin_store, _deriv) = bare_coin_store();
         let (map, _tip) = build_header_map(5);
-        let header_store = HeaderStore::from_map(Network::Regtest, map);
+        let header_store = HeaderStore::from_map(Network::Regtest, map, None);
 
         let txid = funding_tx(bitcoin::ScriptBuf::new(), 0.1).compute_txid();
         let h: u32 = 3;
@@ -1416,7 +1416,7 @@ mod tests {
         let h: u32 = 3;
 
         let (map, _tip) = build_header_map(h + 1);
-        let header_store = HeaderStore::from_map(Network::Regtest, map);
+        let header_store = HeaderStore::from_map(Network::Regtest, map, None);
         let block_hash = header_store.block_hash(h).expect("header at h present");
 
         {
@@ -1487,7 +1487,7 @@ mod tests {
         let h: u32 = 3;
 
         let (map, _tip) = build_header_map(h + 1);
-        let header_store = HeaderStore::from_map(Network::Regtest, map);
+        let header_store = HeaderStore::from_map(Network::Regtest, map, None);
         let stale_hash = bitcoin::BlockHash::all_zeros();
         assert_ne!(
             header_store.block_hash(h).expect("header at h present"),
@@ -1558,7 +1558,7 @@ mod tests {
         let h: u32 = 5;
 
         let (map, _tip) = build_header_map(h + 1);
-        let header_store = HeaderStore::from_map(Network::Regtest, map);
+        let header_store = HeaderStore::from_map(Network::Regtest, map, None);
         let (req_tx, req_rx) = mpsc::channel::<CoinRequest>();
         header_store.set_merkle_sender_for_test(req_tx);
 
