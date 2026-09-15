@@ -9,7 +9,6 @@ use bitcoin::{
     bip32::{ChildNumber, DerivationPath, Fingerprint, Xpub},
     psbt::Psbt,
 };
-use ledger_bitcoin_client::psbt::PartialSignature;
 
 use ledger_apdu::APDUAnswer;
 use ledger_transport_hidapi::TransportNativeHID;
@@ -18,8 +17,8 @@ use ledger_bitcoin_client::{
     apdu::{APDUCommand, StatusWord},
     client::BitcoinClient,
     error::BitcoinClientError,
-    wallet::Version as WalletVersion,
-    WalletPolicy, WalletPubKey,
+    psbt::PartialSignature,
+    wallet::{Version as WalletVersion, WalletPolicy, WalletPubKey},
 };
 
 use crate::{parse_version, utils, AddressScript, DeviceKind, Error as HWIError, HWI};
