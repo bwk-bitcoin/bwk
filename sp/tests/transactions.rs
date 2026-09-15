@@ -9,7 +9,7 @@ mod common;
 
 use bitcoin::Network;
 use bwk::bwk_electrum::coin_store::PaymentType;
-use bwk_sign::HotSigner;
+use bwk_sign::hot_signer::HotSigner;
 use bwk_sp::account::recipient::{SpRecipientAddress, TxBuilderSpExt};
 use bwk_tx::{transaction::Amount, Recipient};
 

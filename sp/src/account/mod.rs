@@ -85,7 +85,7 @@ pub enum AccountError {
     #[error("invalid mnemonic: {0}")]
     InvalidMnemonic(bip39::Error),
     #[error("invalid sub-account mnemonic: {0}")]
-    SubAccountMnemonic(bwk_sign::Error),
+    SubAccountMnemonic(bwk_sign::error::Error),
     #[error("invalid scan_sk hex: {0}")]
     ScanSkHex(hex::FromHexError),
     #[error("invalid scan_sk: {0}")]
@@ -1640,7 +1640,7 @@ fn register_sub_signer(
     mnemonic: &str,
     descriptor: Descriptor<DescriptorPublicKey>,
 ) -> Result<(), AccountError> {
-    let signer = bwk_sign::HotSigner::new_from_mnemonics(network, mnemonic)
+    let signer = bwk_sign::hot_signer::HotSigner::new_from_mnemonics(network, mnemonic)
         .map_err(AccountError::SubAccountMnemonic)?;
     if !signing_manager.has_bip32_signer(&signer.fingerprint()) {
         signing_manager.add_bip32_signer(signer);
@@ -2128,7 +2128,7 @@ mod tests {
         network: Network,
         endpoint: Endpoint,
     ) -> config::SubAccountConfig {
-        use bwk_sign::{bwk_descriptor, HotSigner};
+        use bwk_sign::{bwk_descriptor, hot_signer::HotSigner};
         use miniscript::bitcoin::bip32::ChildNumber;
 
         let signer = HotSigner::new_from_mnemonics(network, mnemonic).unwrap();
@@ -2294,7 +2294,7 @@ mod tests {
         name: &str,
     ) -> (ElectrumScanner<RamProfile<DefaultBackend>>, String) {
         use bip39::Mnemonic;
-        use bwk_sign::{bwk_descriptor, HotSigner};
+        use bwk_sign::{bwk_descriptor, hot_signer::HotSigner};
         use miniscript::bitcoin::bip32::ChildNumber;
 
         let network = bitcoin::Network::Regtest;
@@ -2332,7 +2332,7 @@ mod tests {
         check: CertificateCheck,
     ) -> ElectrumScanner<RamProfile<DefaultBackend>> {
         use bip39::Mnemonic;
-        use bwk_sign::{bwk_descriptor, HotSigner};
+        use bwk_sign::{bwk_descriptor, hot_signer::HotSigner};
         use miniscript::bitcoin::bip32::ChildNumber;
 
         let network = bitcoin::Network::Regtest;

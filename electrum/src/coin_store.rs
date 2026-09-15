@@ -1558,7 +1558,7 @@ mod tests {
     //! [`TxStore`].
     use super::*;
     use bwk_descriptor::descriptor::wpkh_path;
-    use bwk_sign::{bip39::Mnemonic, HotSigner};
+    use bwk_sign::{bip39::Mnemonic, hot_signer::HotSigner};
     use bwk_utils::test::{funding_tx, spending_tx};
     use miniscript::bitcoin::bip32::ChildNumber;
     use std::sync::mpsc;

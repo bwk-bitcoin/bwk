@@ -15,7 +15,10 @@ derivation paths (use bwk-keys) or descriptor parsing (use bwk-descriptor).
 ## Usage
 
 ```rust
-use bwk_sign::{SigningManager, Signer, SignerNotif};
+use bwk_sign::{
+    signer::{Signer, SignerNotif},
+    signing_manager::SigningManager,
+};
 use miniscript::bitcoin::Network;
 use std::path::PathBuf;
 

@@ -65,7 +65,7 @@ fn test_reorg_detection_block_hash_mismatch(env: &mut TestEnv) {
 /// 2. Force reorg that orphans the block containing the output
 /// 3. After rescan, the coin should not be found (was in orphaned block)
 fn test_reorg_removes_orphaned_coins(env: &mut TestEnv) {
-    use bwk_sign::{bip39, HotSigner};
+    use bwk_sign::{bip39, hot_signer::HotSigner};
     use bwk_sp::receiver::SpReceiver;
     use common::{generate_recipient_pubkey, swap_to_sp};
     let secp = bitcoin::secp256k1::Secp256k1::new();
@@ -178,7 +178,7 @@ fn test_reorg_removes_orphaned_coins(env: &mut TestEnv) {
 /// 3. Re-broadcast the SP tx and mine it in the new chain
 /// 4. After rescan, coin should be found again
 fn test_reorg_coin_reappears_in_new_chain(env: &mut TestEnv) {
-    use bwk_sign::{bip39, HotSigner};
+    use bwk_sign::{bip39, hot_signer::HotSigner};
     use bwk_sp::receiver::SpReceiver;
     use common::{generate_recipient_pubkey, swap_to_sp};
     let secp = bitcoin::secp256k1::Secp256k1::new();

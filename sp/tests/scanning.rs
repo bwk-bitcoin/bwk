@@ -160,7 +160,7 @@ fn test_scan_no_matches(env: &mut TestEnv) {
 /// 4. Scan and verify detection
 ///
 fn test_scan_single_sp_output(env: &mut TestEnv) {
-    use bwk_sign::{bip39, HotSigner};
+    use bwk_sign::{bip39, hot_signer::HotSigner};
     use bwk_sp::receiver::SpReceiver;
     use common::{generate_recipient_pubkey, swap_to_sp};
 
@@ -245,7 +245,7 @@ fn test_scan_single_sp_output(env: &mut TestEnv) {
 }
 
 fn test_scan_oneshot_from_chosen_height(env: &mut TestEnv) {
-    use bwk_sign::{bip39, HotSigner};
+    use bwk_sign::{bip39, hot_signer::HotSigner};
     use bwk_sp::receiver::SpReceiver;
     use common::{generate_recipient_pubkey, swap_to_sp, wait_for_oneshot_done};
 
@@ -335,7 +335,7 @@ fn test_scan_oneshot_from_chosen_height(env: &mut TestEnv) {
 /// - All outputs are tracked in coin_store
 /// - Total balance is sum of all outputs
 fn test_scan_multiple_sp_outputs(env: &mut TestEnv) {
-    use bwk_sign::{bip39, HotSigner};
+    use bwk_sign::{bip39, hot_signer::HotSigner};
     use bwk_sp::receiver::SpReceiver;
     use common::{generate_recipient_pubkey, swap_to_sp};
 
@@ -437,7 +437,7 @@ fn test_scan_multiple_sp_outputs(env: &mut TestEnv) {
 /// - Each pass adds newly found outputs
 /// - No duplicates from overlapping ranges
 fn test_incremental_scanning(env: &mut TestEnv) {
-    use bwk_sign::{bip39, HotSigner};
+    use bwk_sign::{bip39, hot_signer::HotSigner};
     use bwk_sp::receiver::SpReceiver;
     use common::{generate_recipient_pubkey, swap_to_sp};
 
@@ -674,7 +674,7 @@ fn test_scan_notifications(env: &mut TestEnv) {
 /// - Notification contains correct outpoint
 ///
 fn test_new_output_notification(env: &mut TestEnv) {
-    use bwk_sign::{bip39, HotSigner};
+    use bwk_sign::{bip39, hot_signer::HotSigner};
     use bwk_sp::receiver::SpReceiver;
     use common::{generate_recipient_pubkey, swap_to_sp};
 
@@ -1031,7 +1031,7 @@ fn test_label_transaction(env: &mut TestEnv) {
 /// 6. Verify spendable_coins() returns correct data
 /// 7. Verify can_sign() returns true for mnemonic-based account
 fn test_full_wallet_flow(env: &mut TestEnv) {
-    use bwk_sign::{bip39, HotSigner};
+    use bwk_sign::{bip39, hot_signer::HotSigner};
     use bwk_sp::receiver::SpReceiver;
     use common::{generate_recipient_pubkey, swap_to_sp};
 

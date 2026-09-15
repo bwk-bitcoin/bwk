@@ -432,7 +432,7 @@ mod tests {
     use bwk_coin::CoinStatus;
     use bwk_descriptor::{derivator::SpkDerivator, descriptor::wpkh};
     use bwk_persist::backend::{noop::NoopBackend, PersistenceBackend};
-    use bwk_sign::{bip39::Mnemonic, HotSigner};
+    use bwk_sign::{bip39::Mnemonic, hot_signer::HotSigner};
     use bwk_utils::test::{funding_tx, setup_logger, spending_tx};
     use miniscript::{
         bitcoin::{self, bip32::DerivationPath, Network, OutPoint},

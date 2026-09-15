@@ -17,8 +17,7 @@ use {
         derivator::SpkDerivator,
         descriptor::{tr_path, wpkh_path},
     },
-    bwk_sign::HotSigner,
-    bwk_sign::Signer,
+    bwk_sign::{hot_signer::HotSigner, signer::Signer},
     bwk_utils::test::{
         corepc_node, generate_blocks, get_tx, get_tx_height, random_input, random_output, txid,
     },

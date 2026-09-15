@@ -675,7 +675,7 @@ pub fn swap_to_sp(
 
 use bwk::bwk_electrum::{config::ScannerConfig, scanner::ElectrumScanner};
 use bwk_coin::{Coin, CoinSpendInfo, CoinStatus, KeyChain};
-use bwk_sign::HotSigner;
+use bwk_sign::hot_signer::HotSigner;
 
 /// Mnemonic for BIP32 coins (different from SP mnemonics).
 #[allow(dead_code)]

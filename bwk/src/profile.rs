@@ -14,10 +14,10 @@ use bwk_persist::{
     PersistError,
 };
 use bwk_sign::{
+    hot_signer::JsonSigner,
     signing_manager::{
         decode_fingerprint, decode_json_signer, encode_fingerprint, encode_json_signer,
     },
-    JsonSigner,
 };
 use miniscript::bitcoin::bip32;
 

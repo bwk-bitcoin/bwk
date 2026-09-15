@@ -13,7 +13,7 @@ use bwk::{
     bwk_electrum::{config::Endpoint, raw_client::CertificateCheck},
     miniscript::{Descriptor, DescriptorPublicKey},
 };
-use bwk_sign::{bwk_descriptor, HotSigner};
+use bwk_sign::{bwk_descriptor, hot_signer::HotSigner};
 use serde::{Deserialize, Serialize};
 
 /// Default filename a [`bwk::persist::config_store::FileConfigStore`] uses for an
@@ -416,7 +416,7 @@ pub enum ConfigError {
     #[error("missing mnemonic")]
     MissingMnemonic,
     #[error("signer error: {0}")]
-    Signer(bwk_sign::Error),
+    Signer(bwk_sign::error::Error),
     #[error("descriptor path error: {0}")]
     DescriptorPath(#[source] bwk_descriptor::descriptor::Error),
     #[error("derivator error: {0}")]

@@ -245,7 +245,7 @@ fn test_real_backend_scan(env: &mut TestEnv) {
 /// 3. Mining a longer chain B (without the SP output)
 /// 4. Verifying the SP output is no longer detected after reorg
 fn test_reorg_handling(env: &mut TestEnv) {
-    use bwk_sign::{bip39, HotSigner};
+    use bwk_sign::{bip39, hot_signer::HotSigner};
     use bwk_sp::receiver::SpReceiver;
     use common::{generate_recipient_pubkey, swap_to_sp};
     let secp = bitcoin::secp256k1::Secp256k1::new();
@@ -619,7 +619,7 @@ fn test_scan_state_consistent_after_crash(env: &mut TestEnv) {
 /// 2. While scan is running, create and confirm an SP output
 /// 3. After scan completes, verify the output is detected
 fn test_concurrent_funding_during_scan(env: &mut TestEnv) {
-    use bwk_sign::{bip39, HotSigner};
+    use bwk_sign::{bip39, hot_signer::HotSigner};
     use bwk_sp::receiver::SpReceiver;
     use common::{generate_recipient_pubkey, swap_to_sp};
 
@@ -734,7 +734,7 @@ fn test_concurrent_funding_during_scan(env: &mut TestEnv) {
 /// - Balance remains 0 until the transaction is mined
 /// - After mining, the output is detected and balance is updated
 fn test_mempool_tx_not_counted_in_balance(env: &mut TestEnv) {
-    use bwk_sign::HotSigner;
+    use bwk_sign::hot_signer::HotSigner;
     use bwk_sp::account::{config::Config, Account};
     use common::{generate_recipient_pubkey, swap_to_sp, TempDir};
 
@@ -852,7 +852,7 @@ fn test_mempool_tx_not_counted_in_balance(env: &mut TestEnv) {
 /// Run with: `cargo test --test integration -- --ignored`
 fn test_notification_order_full_sequence(env: &mut TestEnv) {
     use bwk::bwk_electrum::notification::{Notification, SpNotification};
-    use bwk_sign::{bip39, HotSigner};
+    use bwk_sign::{bip39, hot_signer::HotSigner};
     use bwk_sp::receiver::SpReceiver;
     use common::{generate_recipient_pubkey, swap_to_sp};
 
@@ -1007,7 +1007,7 @@ fn test_notification_order_full_sequence(env: &mut TestEnv) {
 fn test_notification_multiple_outputs_same_block(env: &mut TestEnv) {
     use std::collections::HashSet;
 
-    use bwk_sign::{bip39, HotSigner};
+    use bwk_sign::{bip39, hot_signer::HotSigner};
     use bwk_sp::receiver::SpReceiver;
     use common::{generate_recipient_pubkey, swap_to_sp};
 
@@ -1203,7 +1203,7 @@ fn test_birthday_height_skips_old_blocks(env: &mut TestEnv) {
 /// This test requires BlindbitD backend which is not available in unit tests.
 /// Run with: `cargo test --test integration -- --ignored`
 fn test_birthday_height_misses_earlier_outputs(env: &mut TestEnv) {
-    use bwk_sign::HotSigner;
+    use bwk_sign::hot_signer::HotSigner;
     use bwk_sp::account::{config::Config, Account};
     use common::{generate_recipient_pubkey, swap_to_sp, TempDir};
 
@@ -1321,7 +1321,7 @@ fn test_birthday_height_misses_earlier_outputs(env: &mut TestEnv) {
 /// the test will fail. The filtering happens at query time via the dustLimit
 /// query parameter.
 fn test_dust_limit_filters_small_outputs(env: &mut TestEnv) {
-    use bwk_sign::{bip39, HotSigner};
+    use bwk_sign::{bip39, hot_signer::HotSigner};
     use bwk_sp::receiver::SpReceiver;
     use common::generate_recipient_pubkey;
 
@@ -1495,7 +1495,7 @@ fn test_dust_limit_filters_small_outputs(env: &mut TestEnv) {
 /// Verifies that when no dust_limit is set (None), even small outputs
 /// like 330 sats are detected by the scanner.
 fn test_dust_limit_zero_accepts_all(env: &mut TestEnv) {
-    use bwk_sign::{bip39, HotSigner};
+    use bwk_sign::{bip39, hot_signer::HotSigner};
     use bwk_sp::receiver::SpReceiver;
     use common::generate_recipient_pubkey;
 
@@ -1776,7 +1776,7 @@ fn test_sp_address_different_per_mnemonic(env: &mut TestEnv) {
 /// - Outputs sent to that address are detected during scanning
 /// - The detected output has the correct label associated
 fn test_receive_with_sp_label(env: &mut TestEnv) {
-    use bwk_sign::{bip39, HotSigner};
+    use bwk_sign::{bip39, hot_signer::HotSigner};
     use bwk_sp::receiver::SpReceiver;
     use common::{generate_recipient_pubkey, swap_to_sp};
 
@@ -2076,7 +2076,7 @@ fn test_scanner_with_concurrent_api_calls(env: &mut TestEnv) {
 /// This test requires BlindbitD backend which is not available in unit tests.
 /// Run with: `cargo test --test integration -- --ignored`
 fn test_persists_immediately_on_new_output(env: &mut TestEnv) {
-    use bwk_sign::{bip39, HotSigner};
+    use bwk_sign::{bip39, hot_signer::HotSigner};
     use bwk_sp::receiver::SpReceiver;
     use common::{generate_recipient_pubkey, swap_to_sp};
 
