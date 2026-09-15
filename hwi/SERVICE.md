@@ -246,7 +246,7 @@ struct MyNoiseConfig {
     // Your storage implementation
 }
 
-impl bitbox_api::Threading for MyNoiseConfig {}
+impl bitbox_api::util::Threading for MyNoiseConfig {}
 
 impl NoiseConfig for MyNoiseConfig {
     fn read_config(&self) -> Result<NoiseConfigData, ConfigError> {

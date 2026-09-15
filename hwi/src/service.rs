@@ -40,7 +40,7 @@ use crate::bitbox::{ConfigError, NoiseConfig, NoiseConfigData};
 struct ArcNoiseConfig(Arc<dyn NoiseConfig>);
 
 #[cfg(feature = "bitbox")]
-impl bitbox_api::Threading for ArcNoiseConfig {}
+impl bitbox_api::util::Threading for ArcNoiseConfig {}
 
 #[cfg(feature = "bitbox")]
 impl NoiseConfig for ArcNoiseConfig {

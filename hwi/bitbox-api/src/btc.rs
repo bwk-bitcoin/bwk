@@ -1,15 +1,13 @@
 //! Functions and methods related to Bitcoin.
 
-use crate::error::Error;
-use crate::pb::{self, request::Request, response::Response};
-use crate::Keypath;
-use crate::PairedBitBox;
-
-pub use bitcoin::{
-    bip32::{Fingerprint, Xpub},
-    blockdata::script::witness_version::WitnessVersion,
-    Script,
+use crate::{
+    error::Error,
+    keypath::Keypath,
+    pb::{self, request::Request, response::Response},
+    PairedBitBox,
 };
+
+use bitcoin::Script;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PrevTxInput {

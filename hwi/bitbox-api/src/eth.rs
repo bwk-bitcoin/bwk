@@ -1,13 +1,15 @@
-use crate::error::Error;
-use crate::pb::{
-    self,
-    eth_sign_typed_message_request::{DataType, Member, MemberType, StructType},
-    eth_typed_message_value_response::RootObject,
-    request::Request,
-    response::Response,
+use crate::{
+    error::Error,
+    keypath::Keypath,
+    pb::{
+        self,
+        eth_sign_typed_message_request::{DataType, Member, MemberType, StructType},
+        eth_typed_message_value_response::RootObject,
+        request::Request,
+        response::Response,
+    },
+    PairedBitBox,
 };
-use crate::Keypath;
-use crate::PairedBitBox;
 
 use std::collections::HashMap;
 use std::str::FromStr;

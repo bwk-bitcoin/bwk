@@ -1,7 +1,9 @@
-use crate::error::Error;
-use crate::pb::{self, request::Request, response::Response};
-use crate::Keypath;
-use crate::PairedBitBox;
+use crate::{
+    error::Error,
+    keypath::Keypath,
+    pb::{self, request::Request, response::Response},
+    PairedBitBox,
+};
 
 /// Create a Shelley PaymentKeyHash/StakeKeyHash config.
 /// <https://github.com/cardano-foundation/CIPs/blob/6c249ef48f8f5b32efc0ec768fadf4321f3173f2/CIP-0019/CIP-0019.md#shelley-addresses>

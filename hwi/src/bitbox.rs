@@ -3,9 +3,10 @@ use api::btc::make_script_config_simple;
 use bitbox_api::{
     btc::KeyOriginInfo,
     error::{BitBoxError, Error},
+    keypath::Keypath,
     pb::{self, BtcScriptConfig},
     usb::UsbError,
-    Keypath, PairedBitBox, PairingBitBox,
+    PairedBitBox, PairingBitBox,
 };
 use bitcoin::{
     bip32::{ChildNumber, DerivationPath, Fingerprint, Xpub},
@@ -19,14 +20,14 @@ use std::{
 
 pub use bitbox_api::{
     self as api,
+    noise::{ConfigError, NoiseConfig, NoiseConfigData, NoiseConfigNoCache},
     usb::{get_any_bitbox02, is_bitbox02},
-    ConfigError, NoiseConfig, NoiseConfigData, NoiseConfigNoCache,
 };
 
 #[derive(Clone)]
 struct Cache(Arc<Mutex<Option<NoiseConfigData>>>);
 
-impl bitbox_api::Threading for Cache {}
+impl bitbox_api::util::Threading for Cache {}
 
 impl NoiseConfig for Cache {
     fn read_config(&self) -> Result<NoiseConfigData, ConfigError> {

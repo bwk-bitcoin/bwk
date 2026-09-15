@@ -4,16 +4,16 @@ pub mod btc;
 pub mod cardano;
 pub mod error;
 pub mod eth;
-mod noise;
+pub mod noise;
 #[cfg(feature = "usb")]
 pub mod usb;
 
 mod antiklepto;
-mod communication;
+pub mod communication;
 mod constants;
-mod keypath;
+pub mod keypath;
 mod u2fframing;
-mod util;
+pub mod util;
 
 /// BitBox protobuf messages.
 #[allow(clippy::all)]
@@ -31,14 +31,8 @@ use prost::Message;
 
 use std::sync::Mutex;
 
-pub use keypath::Keypath;
-pub use noise::PersistedNoiseConfig;
-pub use noise::{ConfigError, NoiseConfig, NoiseConfigData, NoiseConfigNoCache};
-pub use util::Threading;
-
-use communication::HwwCommunication;
-
-pub use communication::Product;
+use communication::{HwwCommunication, Product};
+use noise::NoiseConfig;
 
 const OP_I_CAN_HAS_HANDSHAEK: u8 = b'h';
 const OP_HER_COMEZ_TEH_HANDSHAEK: u8 = b'H';
@@ -77,7 +71,7 @@ impl BitBox {
     /// Creates a new BitBox instance. The provided noise config determines how the pairing
     /// information is persisted. Use `usb::get_any_bitbox02()` to find a BitBox02 HID device.
     ///
-    /// Use `bitbox_api::PersistedNoiseConfig::new(...)` to persist the pairing in a JSON file
+    /// Use `bitbox_api::noise::PersistedNoiseConfig::new(...)` to persist the pairing in a JSON file
     /// (`serde` feature required) or provide your own implementation of the `NoiseConfig` trait.
     #[cfg(feature = "usb")]
     pub fn from_hid_device(
@@ -322,7 +316,7 @@ impl PairedBitBox {
     fn is_multi_edition(&self) -> bool {
         matches!(
             self.product(),
-            crate::Product::BitBox02Multi | crate::Product::BitBox02NovaMulti
+            Product::BitBox02Multi | Product::BitBox02NovaMulti
         )
     }
 
