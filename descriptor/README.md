@@ -16,7 +16,7 @@ or full miniscript policy (use miniscript directly).
 
 ```rust
 use bwk_descriptor::{SpkDerivator, wpkh, tr};
-use bwk_keys::OXpub;
+use bwk_keys::keys::OXpub;
 use miniscript::bitcoin::Network;
 
 // Build descriptor from xpub

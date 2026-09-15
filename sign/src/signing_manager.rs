@@ -200,7 +200,7 @@ where
     #[cfg(all(feature = "hwi", not(target_os = "android")))]
     fn convert_hw_message(&self, msg: crate::hwi::HwMessage) -> Option<SignerNotif> {
         use bwk_hwi::service::SigningDeviceMsg;
-        use bwk_keys::OXpub;
+        use bwk_keys::keys::OXpub;
         match msg {
             crate::hwi::HwMessage::Device(device_msg) => match device_msg {
                 SigningDeviceMsg::Update => Some(SignerNotif::DeviceUpdate),

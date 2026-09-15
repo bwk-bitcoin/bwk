@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use bwk_keys::OXpub;
+use bwk_keys::keys::OXpub;
 use miniscript::{
     bitcoin::{
         self,

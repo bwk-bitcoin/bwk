@@ -2,7 +2,7 @@ use crossbeam::channel;
 
 use crate::error::Error;
 use crate::signing_manager;
-use bwk_keys::OXpub;
+use bwk_keys::keys::OXpub;
 use miniscript::{
     bitcoin::{
         bip32::{self, DerivationPath},

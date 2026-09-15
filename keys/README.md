@@ -15,7 +15,10 @@ address generation.
 ## Usage
 
 ```rust
-use bwk_keys::{KeyDerivator, OXpriv, OXpub};
+use bwk_keys::{
+    derivator::KeyDerivator,
+    keys::{OXpriv, OXpub},
+};
 use bitcoin::Network;
 
 // Derive from mnemonic

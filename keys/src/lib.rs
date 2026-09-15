@@ -1,9 +1,6 @@
 pub mod derivator;
 pub mod keys;
 
-pub use derivator::KeyDerivator;
-pub use keys::{OXpriv, OXpub};
-
 use thiserror::Error;
 
 #[derive(Debug, Error)]

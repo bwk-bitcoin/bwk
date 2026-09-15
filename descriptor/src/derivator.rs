@@ -1,4 +1,4 @@
-use bwk_keys::OXpub;
+use bwk_keys::keys::OXpub;
 use miniscript::{
     bitcoin::{self, Network, ScriptBuf},
     descriptor::Wildcard,

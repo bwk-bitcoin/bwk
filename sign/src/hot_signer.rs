@@ -8,7 +8,10 @@ use crate::{
     signer::{Signer, SignerNotif},
 };
 use bwk_descriptor::{derivator::SpkDerivator, tr, tr_path, wpkh, wpkh_path};
-use bwk_keys::{KeyDerivator, OXpriv, OXpub};
+use bwk_keys::{
+    derivator::KeyDerivator,
+    keys::{OXpriv, OXpub},
+};
 use miniscript::{
     bitcoin::{bip32::ChildNumber, hashes::Hash, key::TapTweak},
     psbt::PsbtExt,
