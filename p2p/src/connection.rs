@@ -16,7 +16,7 @@ use bitcoin::{
     Network,
 };
 
-use crate::Error;
+use crate::error::Error;
 
 const USER_AGENT: &str = "/bwk-p2p:0.0.1/";
 const PROTOCOL_VERSION: u32 = 70_016;

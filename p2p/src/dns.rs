@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use dns_lookup::lookup_host;
 
-use crate::Error;
+use crate::error::Error;
 
 pub const DNS_SEED_SERVERS: [&str; 8] = [
     "seed.bitcoin.sipa.be",

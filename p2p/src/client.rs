@@ -16,8 +16,7 @@ use bitcoin::p2p::{
 };
 use bitcoin::{Block, BlockHash, Network, Transaction};
 
-use crate::connection::network_to_magic;
-use crate::Error;
+use crate::{connection::network_to_magic, error::Error};
 
 #[derive(Debug)]
 pub struct Client {

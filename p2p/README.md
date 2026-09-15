@@ -13,7 +13,10 @@ handle full node validation, block storage, or mempool management.
 ## Usage
 
 ```rust
-use bwk_p2p::{Client, fetch_peers, DNS_SEED_SERVERS};
+use bwk_p2p::{
+    client::Client,
+    dns::{fetch_peers, DNS_SEED_SERVERS},
+};
 use bitcoin::Network;
 
 // Discover peers via DNS
