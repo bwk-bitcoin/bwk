@@ -13,10 +13,11 @@ pub use bitcoin;
 
 use std::str::FromStr;
 
+#[cfg(feature = "mnemonic")]
+use bitcoin::bip32;
 use bitcoin::{
     absolute::Height,
     address::NetworkUnchecked,
-    bip32,
     hex::{DisplayHex, FromHex},
     secp256k1::{All, PublicKey, Secp256k1, SecretKey},
     Address, Amount, BlockHash, Network, ScriptBuf, Txid,
