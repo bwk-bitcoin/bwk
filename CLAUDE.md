@@ -32,9 +32,12 @@ cargo fmt -- --check
 
 MSRV: 1.88
 
-**Before committing:** Ensure CI will pass by running clippy, fmt check, and
-tests locally. Commit messages must be single-line and follow existing style
-(e.g., `crate: short description`).
+**Before committing:** run `clippy_rebase <N>` over the branch commits
+(`cargo clippy --all-targets --all-features -- -D warnings` and
+`cargo fmt -- --check` on each commit; from a non-interactive shell:
+`zsh -ic 'clippy_rebase <N>'`). Do not run builds, tests or CI unless
+explicitly asked. Commit messages must be single-line and follow existing
+style (e.g., `crate: short description`).
 
 ## Workspace Crates
 
