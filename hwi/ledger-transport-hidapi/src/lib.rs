@@ -13,10 +13,10 @@
 *  See the License for the specific language governing permissions and
 *  limitations under the License.
 ********************************************************************************/
-mod errors;
-pub use errors::LedgerHIDError;
+pub mod errors;
 
 use byteorder::{BigEndian, ReadBytesExt};
+use errors::LedgerHIDError;
 use hidapi::{DeviceInfo, HidApi, HidDevice};
 use log::info;
 
