@@ -760,7 +760,7 @@ mod test {
         };
 
         // Create change recipient prototype for fee estimation
-        let change_proto = crate::Recipient {
+        let change_proto = crate::recipient::Recipient {
             address: descriptor
                 .clone()
                 .into_single_descriptors()
@@ -804,7 +804,7 @@ mod test {
             .address(Network::Signet)
             .unwrap();
         let change_amount = Amount::Value(res.change.unwrap().to_sat());
-        let change_recip = crate::Recipient {
+        let change_recip = crate::recipient::Recipient {
             address: change_addr.as_unchecked().clone(),
             amount: change_amount.clone(),
             label: None,

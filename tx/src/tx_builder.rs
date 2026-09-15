@@ -1,15 +1,20 @@
 use crate::{
     coin_selection::{CoinSelector, DefaultCoinSelector},
-    recipient::SpPartialSecretProvider,
-    transaction::{process_transaction, tx_estimated_weight, Amount, Error},
-    Fees, Recipient, RecipientProvider, TransactionResult, TxTemplate,
+    recipient::{Recipient, RecipientProvider, SpPartialSecretProvider},
+    transaction::{
+        process_transaction, tx_estimated_weight, Amount, Error, Fees, TransactionResult,
+        TxTemplate,
+    },
 };
 use bitcoin::Psbt;
 use bwk_coin::{Coin, CoinSource};
 
 #[cfg(feature = "test")]
 use {
-    crate::{FinalizationContext, PsbtOutputInfo, Warning},
+    crate::{
+        recipient::{FinalizationContext, PsbtOutputInfo},
+        transaction::Warning,
+    },
     bitcoin::bip32::ChildNumber,
     bitcoin::Network,
     bwk_coin::{CoinSpendInfo, CoinStatus, KeyChain},
@@ -49,7 +54,7 @@ impl TxBuilder {
             tx_template: TxTemplate {
                 inputs: vec![],
                 outputs: vec![],
-                fees: crate::Fees::MilliSatsVb(1_000),
+                fees: Fees::MilliSatsVb(1_000),
             },
             coin_source: None,
             sp_provider: None,
@@ -71,7 +76,7 @@ impl TxBuilder {
             tx_template: TxTemplate {
                 inputs: vec![],
                 outputs: vec![],
-                fees: crate::Fees::MilliSatsVb(1_000),
+                fees: Fees::MilliSatsVb(1_000),
             },
             coin_source: Some(Box::new(BTreeMap::new())),
             sp_provider: None,
@@ -145,14 +150,14 @@ impl TxBuilder {
         self.tx_template = TxTemplate {
             inputs: vec![],
             outputs: vec![],
-            fees: crate::Fees::MilliSatsVb(1_000),
+            fees: Fees::MilliSatsVb(1_000),
         };
     }
     /// Send <amount> to <address>
     pub fn send_to(&mut self, address: bitcoin::Address, amount: u64) {
         let recipient = Recipient {
             address: address.as_unchecked().clone(),
-            amount: crate::Amount::Value(amount),
+            amount: Amount::Value(amount),
             label: None,
             origin: None,
             descriptor: None,
@@ -167,7 +172,7 @@ impl TxBuilder {
         let label = Some(label.into());
         let recipient = Recipient {
             address: address.as_unchecked().clone(),
-            amount: crate::Amount::Value(amount),
+            amount: Amount::Value(amount),
             label,
             origin: None,
             descriptor: None,
@@ -274,7 +279,7 @@ impl TxBuilder {
         label: Option<String>,
     ) -> Result<bitcoin::Psbt, Error> {
         self.new_template();
-        self._pay_with_label(crate::Amount::Value(amount), address, feerate, label)
+        self._pay_with_label(Amount::Value(amount), address, feerate, label)
     }
     pub fn pay(
         &mut self,
@@ -290,18 +295,18 @@ impl TxBuilder {
         feerate: u64, /* msats/vb */
         label: Option<String>,
     ) -> Result<bitcoin::Psbt, Error> {
-        self._pay_with_label(crate::Amount::Max(None), address, feerate, label)
+        self._pay_with_label(Amount::Max(None), address, feerate, label)
     }
     pub fn sweep(
         &mut self,
         address: bitcoin::Address,
         feerate: u64, /* msats/vb */
     ) -> Result<bitcoin::Psbt, Error> {
-        self._pay_with_label(crate::Amount::Max(None), address, feerate, None)
+        self._pay_with_label(Amount::Max(None), address, feerate, None)
     }
     fn _pay_with_label(
         &mut self,
-        amount: crate::Amount,
+        amount: Amount,
         address: bitcoin::Address,
         feerate: u64, /* msats/vb */
         label: Option<String>,
@@ -378,9 +383,9 @@ impl TxBuilder {
                     if descriptor == this_descriptor {
                         // Create TxOut from recipient
                         let value = match recipient.amount() {
-                            crate::Amount::Value(v) => bitcoin::Amount::from_sat(v),
-                            crate::Amount::Max(Some(v)) => bitcoin::Amount::from_sat(v),
-                            crate::Amount::Max(None) | crate::Amount::Anchor => continue,
+                            Amount::Value(v) => bitcoin::Amount::from_sat(v),
+                            Amount::Max(Some(v)) => bitcoin::Amount::from_sat(v),
+                            Amount::Max(None) | Amount::Anchor => continue,
                         };
                         let txout = bitcoin::TxOut {
                             value,
@@ -448,7 +453,7 @@ impl TxBuilder {
         let addr = self.derivator().receive_at(index as u32);
         let recipient = Recipient {
             address: addr.as_unchecked().clone(),
-            amount: crate::Amount::Value(amount),
+            amount: Amount::Value(amount),
             label: None,
             origin: Some((KeyChain::Receive, index as u32)),
             descriptor: Some(self.derivator().descriptor()),
@@ -506,7 +511,7 @@ impl TxBuilder {
 #[cfg(feature = "test")]
 pub mod test {
     use super::*;
-    use crate::Amount;
+    use crate::transaction::Amount;
 
     /// Create a TxBuilder from a derivator (for tests)
     pub fn builder_from_derivator(derivator: SpkDerivator) -> TxBuilder {
@@ -794,10 +799,7 @@ mod tests {
     fn test_feerate_sat_vb_converts_to_msat() {
         let (_signer, derivator) = wpkh_signer();
         let builder = test::builder_from_derivator(derivator).feerate_sat_vb(7);
-        assert!(matches!(
-            builder.tx_template.fees,
-            crate::Fees::MilliSatsVb(7_000)
-        ));
+        assert!(matches!(builder.tx_template.fees, Fees::MilliSatsVb(7_000)));
     }
 
     #[test]
@@ -806,7 +808,7 @@ mod tests {
         let builder = test::builder_from_derivator(derivator).feerate_sat_vb(u64::MAX);
         assert!(matches!(
             builder.tx_template.fees,
-            crate::Fees::MilliSatsVb(u64::MAX)
+            Fees::MilliSatsVb(u64::MAX)
         ));
     }
 
@@ -1398,7 +1400,7 @@ mod tests {
         let mut builder = test::builder_from_derivator(derivator);
         let address = builder.receive_address_at(0);
 
-        let result = builder._pay_with_label(crate::Amount::Anchor, address, 1000, None);
+        let result = builder._pay_with_label(Amount::Anchor, address, 1000, None);
         assert!(matches!(result, Err(Error::PayToAnchor)));
     }
 

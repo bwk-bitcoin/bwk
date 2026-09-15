@@ -20,7 +20,7 @@ use bwk_persist::{
     config_store::{ConfigStore, NoopConfigStore},
 };
 use bwk_sign::signing_manager::SigningManager;
-use bwk_tx::{tx_builder::TxBuilder, ChangeRecipientProvider};
+use bwk_tx::{recipient::ChangeRecipientProvider, tx_builder::TxBuilder};
 
 use miniscript::bitcoin::{self, Txid};
 

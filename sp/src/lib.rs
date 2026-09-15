@@ -18,5 +18,7 @@ pub use bwk;
 pub use bitcoin;
 pub use bwk_sign;
 pub use bwk_tx::{
-    self, Fees, FinalizationContext, PsbtOutputInfo, RecipientProvider, SpPartialSecretProvider,
+    self,
+    recipient::{FinalizationContext, PsbtOutputInfo, RecipientProvider, SpPartialSecretProvider},
+    transaction::Fees,
 };

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use bwk_coin::{derive_descriptor, ChangeTip, Coin, KeyChain};
 
-use crate::{transaction::Amount, Error};
+use crate::{error::Error, transaction::Amount};
 
 /// Context passed during transaction finalization.
 /// Contains all information needed to create output scripts.

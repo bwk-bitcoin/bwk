@@ -13,8 +13,9 @@ use crate::{
 
 use bwk_coin::{Coin, CoinSpendInfo};
 use bwk_tx::{
-    transaction::Amount, Error as TxError, FinalizationContext, PsbtOutputInfo, RecipientProvider,
-    SpPartialSecretProvider,
+    error::Error as TxError,
+    recipient::{FinalizationContext, PsbtOutputInfo, RecipientProvider, SpPartialSecretProvider},
+    transaction::Amount,
 };
 
 const TR_OUTPUT_WEIGHT: u64 = 172;
@@ -291,7 +292,7 @@ pub trait TxBuilderSpExt {
     ) -> Result<(), SpRecipientError>;
 }
 
-impl TxBuilderSpExt for bwk_tx::TxBuilder {
+impl TxBuilderSpExt for bwk_tx::tx_builder::TxBuilder {
     fn send_to_sp(&mut self, address: SilentPaymentAddress, amount: u64) {
         let network = self.network();
         self.add_output(SpRecipientAddress::from_sp(address, amount, network));
@@ -317,8 +318,8 @@ impl TxBuilderSpExt for bwk_tx::TxBuilder {
 /// Change output provider for Silent Payment wallets.
 ///
 /// Wraps an [`SpRecipient`] for the wallet's change address, adding
-/// `is_change() = true` so that [`TxBuilder`](bwk_tx::TxBuilder) handles it
-/// correctly during fee estimation and finalization.
+/// `is_change() = true` so that [`TxBuilder`](bwk_tx::tx_builder::TxBuilder)
+/// handles it correctly during fee estimation and finalization.
 #[derive(Debug, Clone)]
 pub struct SpChangeRecipientProvider(SpRecipient);
 
@@ -452,7 +453,7 @@ fn batch_derive_sp_scripts(
 // SpSecretProvider
 
 /// Standalone [`SpPartialSecretProvider`] that can be boxed into a
-/// [`TxBuilder`](bwk_tx::TxBuilder).
+/// [`TxBuilder`](bwk_tx::tx_builder::TxBuilder).
 ///
 /// Holds a cloned [`SpReceiver`] and a shared coin store reference to look up
 /// `OwnedOutput` tweaks for selected inputs. Also stores master xprivs from
@@ -706,9 +707,9 @@ mod tests {
     }
 
     /// A minimal TxBuilder bound to `network` (SP change provider only).
-    fn builder(network: Network) -> bwk_tx::TxBuilder {
+    fn builder(network: Network) -> bwk_tx::tx_builder::TxBuilder {
         let change = SpChangeRecipientProvider::new(sp_address(sp_net(network)), network);
-        bwk_tx::TxBuilder::new(Box::new(change))
+        bwk_tx::tx_builder::TxBuilder::new(Box::new(change))
     }
 
     #[test]

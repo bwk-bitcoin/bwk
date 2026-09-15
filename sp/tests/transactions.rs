@@ -11,7 +11,7 @@ use bitcoin::Network;
 use bwk::bwk_electrum::coin_store::PaymentType;
 use bwk_sign::hot_signer::HotSigner;
 use bwk_sp::account::recipient::{SpRecipientAddress, TxBuilderSpExt};
-use bwk_tx::{transaction::Amount, Recipient};
+use bwk_tx::{recipient::Recipient, transaction::Amount};
 
 use common::{test_mnemonic, test_mnemonic_2, TestEnv};
 

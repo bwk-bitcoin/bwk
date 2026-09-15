@@ -16,7 +16,7 @@ selects over (they come from bwk-coin).
 ## Usage
 
 ```rust
-use bwk_tx::{ChangeRecipientProvider, TxBuilder};
+use bwk_tx::{recipient::ChangeRecipientProvider, tx_builder::TxBuilder};
 
 // The change provider and the coin source are boxed trait objects
 let change_provider = ChangeRecipientProvider::new(descriptor, network);

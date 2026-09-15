@@ -1109,17 +1109,17 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         out
     }
 
-    /// Build a configured `TxBuilder` from a [`bwk_tx::TxRequest`].
+    /// Build a configured `TxBuilder` from a [`bwk_tx::template::TxRequest`].
     ///
     /// The returned builder has the request's outputs added, fee policy set,
     /// and inputs selected per the rules: manual outpoints when supplied,
     /// drain when any output sets `max`, otherwise auto-select.
     pub fn tx_builder_from_request(
         &self,
-        request: &bwk_tx::TxRequest,
-    ) -> Result<bwk_tx::TxBuilder, bwk_tx::TxRequestError> {
+        request: &bwk_tx::template::TxRequest,
+    ) -> Result<bwk_tx::tx_builder::TxBuilder, bwk_tx::template::TxRequestError> {
         use crate::{account::recipient::SpRecipientAddress, receiver::RecipientAddress};
-        use bwk_tx::{Amount as BwkAmount, TxRequestError};
+        use bwk_tx::{template::TxRequestError, transaction::Amount as BwkAmount};
 
         let network = self.network();
 
@@ -1199,11 +1199,11 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         Ok(builder)
     }
 
-    /// Simulate a transaction described by a [`bwk_tx::TxRequest`].
+    /// Simulate a transaction described by a [`bwk_tx::template::TxRequest`].
     pub fn simulate(
         &self,
-        request: &bwk_tx::TxRequest,
-    ) -> Result<bwk_tx::TxSimulation, bwk_tx::TxRequestError> {
+        request: &bwk_tx::template::TxRequest,
+    ) -> Result<bwk_tx::template::TxSimulation, bwk_tx::template::TxRequestError> {
         let builder = self.tx_builder_from_request(request)?;
         // Inputs auto-selected from the builder's registered selector/source
         // when the request did not specify input_outpoints.
@@ -1228,7 +1228,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
             .iter()
             .map(|c| c.outpoint)
             .collect();
-        Ok(bwk_tx::TxSimulation {
+        Ok(bwk_tx::template::TxSimulation {
             fee,
             weight,
             input_total,
@@ -1237,11 +1237,11 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         })
     }
 
-    /// Build an unsigned PSBT from a [`bwk_tx::TxRequest`].
+    /// Build an unsigned PSBT from a [`bwk_tx::template::TxRequest`].
     pub fn prepare(
         &self,
-        request: &bwk_tx::TxRequest,
-    ) -> Result<bitcoin::Psbt, bwk_tx::TxRequestError> {
+        request: &bwk_tx::template::TxRequest,
+    ) -> Result<bitcoin::Psbt, bwk_tx::template::TxRequestError> {
         let mut builder = self.tx_builder_from_request(request)?;
         builder.generate().map_err(Into::into)
     }
@@ -1285,7 +1285,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     /// let mut psbt = builder.generate()?;
     /// account.sign_psbt(&mut psbt)?;
     /// ```
-    pub fn tx_builder(&self) -> bwk_tx::TxBuilder {
+    pub fn tx_builder(&self) -> bwk_tx::tx_builder::TxBuilder {
         let change_addr = self.sp_receiver.receiver.get_change_address();
         let change_provider = Box::new(SpChangeRecipientProvider::new(
             change_addr,
@@ -1316,7 +1316,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
             .collect();
         let merged_source = Box::new(MergedCoinSource::new(sp_source, bip32_sources));
 
-        bwk_tx::TxBuilder::new(change_provider)
+        bwk_tx::tx_builder::TxBuilder::new(change_provider)
             .coin_source(merged_source)
             .sp_provider(sp_provider)
     }

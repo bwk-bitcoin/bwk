@@ -420,7 +420,8 @@ use bitcoin::{
 const TR_KEYSPEND_SATISFACTION_WEIGHT: u64 = 66;
 
 /// Implements [`CoinSource`] for the SP coin store, providing spendable coins
-/// to [`TxBuilder`](bwk_tx::TxBuilder). Generic over any `SpCoinStore<S>`.
+/// to [`TxBuilder`](bwk_tx::tx_builder::TxBuilder). Generic over any
+/// `SpCoinStore<S>`.
 pub struct SpCoinSource<P: SpStorageProfile = SpRamProfile<DefaultBackend>>(
     Arc<Mutex<SpCoinStore<P>>>,
 );

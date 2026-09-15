@@ -640,7 +640,9 @@ mod tests {
     use super::*;
     use bwk_descriptor::{derivator::SpkDerivator, descriptor::tr_path};
     use bwk_sign::hot_signer::HotSigner;
-    use bwk_tx::{ChangeRecipientProvider, FinalizationContext, PsbtOutputInfo, RecipientProvider};
+    use bwk_tx::recipient::{
+        ChangeRecipientProvider, FinalizationContext, PsbtOutputInfo, RecipientProvider,
+    };
     use miniscript::bitcoin::{bip32::ChildNumber, Network};
 
     fn test_derivator() -> SpkDerivator {

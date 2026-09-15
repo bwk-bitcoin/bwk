@@ -1,4 +1,4 @@
-//! Tests for the [`bwk_tx::TxRequest`]-driven `Account` helpers.
+//! Tests for the [`bwk_tx::template::TxRequest`]-driven `Account` helpers.
 //!
 //! These cover the request-validation paths that don't need actual UTXOs:
 //! address parsing, the multiple-`max` rule, manual-outpoint lookups
@@ -9,7 +9,7 @@
 mod common;
 
 use bitcoin::{hashes::Hash, OutPoint};
-use bwk_tx::{TxOutputSpec, TxRequest, TxRequestError};
+use bwk_tx::template::{TxOutputSpec, TxRequest, TxRequestError};
 use common::test_account_named;
 
 fn account() -> bwk_sp::account::Account {
