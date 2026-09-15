@@ -811,6 +811,13 @@ fn sign_sp_input(
     input_index: usize,
     aux_rand: &[u8; 32],
 ) -> Result<(), Error> {
+    let psbt_tweak = bwk_psbt::sp::sp_input_tweak(&psbt.inputs[input_index])
+        .map_err(|_| Error::SpSigning)?
+        .ok_or(Error::SpSigning)?;
+    if &psbt_tweak != tweak {
+        return Err(Error::SpSigning);
+    }
+
     let unsigned_tx = &psbt.unsigned_tx;
 
     // Collect all prevouts from PSBT inputs
@@ -828,9 +835,17 @@ fn sign_sp_input(
 
     // Derive signing key: b_spend + tweak
     let tweak_sk = secp256k1::SecretKey::from_slice(tweak).map_err(|_| Error::SpSigning)?;
-    let sk = b_spend
+    let mut sk = b_spend
         .add_tweak(&tweak_sk.into())
         .map_err(|_| Error::SpSigning)?;
+    let (output_key, parity) = sk.x_only_public_key(&secp);
+    let script = &prevouts[input_index].script_pubkey;
+    if !script.is_p2tr() || script.as_bytes().get(2..) != Some(output_key.serialize().as_ref()) {
+        return Err(Error::SpSigning);
+    }
+    if parity == secp256k1::Parity::Odd {
+        sk = sk.negate();
+    }
     let keypair = secp256k1::Keypair::from_secret_key(&secp, &sk);
 
     let sig = secp.sign_schnorr_with_aux_rand(&msg, &keypair, aux_rand);
