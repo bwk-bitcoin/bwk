@@ -22,7 +22,9 @@
 use std::time::Duration;
 
 use bwk_electrum::{
-    config::HEADERS_FILENAME, header_store::HeaderStore, raw_client::CertificateCheck,
+    config::HEADERS_FILENAME,
+    header_store::{HeaderAnchor, HeaderStore},
+    raw_client::CertificateCheck,
 };
 use bwk_utils::test::regtest::{
     bootstrap_electrs, generate, get_block_hash_str, get_block_height, init_logger,
@@ -47,7 +49,7 @@ fn restart_from_cache_skips_full_validation() {
             port,
             Network::Regtest,
             Some(persist_path.clone()),
-            Some(0),
+            Some(HeaderAnchor::unpinned(0)),
             CertificateCheck::Validate,
         )
         .unwrap();
@@ -92,7 +94,7 @@ fn restart_from_cache_skips_full_validation() {
     // rely on that path for "tip already correct on return". Instead we
     // use `HeaderStore::from_file` directly: it runs the same sanity
     // pipeline and never spawns a worker, exposing the on-load state.
-    let reloaded = HeaderStore::from_file(Network::Regtest, persist_path.clone()).unwrap();
+    let reloaded = HeaderStore::from_file(Network::Regtest, persist_path.clone(), None).unwrap();
     let persisted_tip = reloaded.tip().expect("persisted tip");
     assert_eq!(
         persisted_tip, expected_tip,
@@ -120,7 +122,7 @@ fn restart_from_cache_skips_full_validation() {
                 port,
                 Network::Regtest,
                 Some(persist_path.clone()),
-                Some(0),
+                Some(HeaderAnchor::unpinned(0)),
                 CertificateCheck::Validate,
             ) {
                 Ok(store) => break store,
@@ -165,7 +167,7 @@ fn deep_reorg_below_anchor_resyncs() {
         port,
         Network::Regtest,
         None,
-        Some(anchor),
+        Some(HeaderAnchor::unpinned(anchor)),
         CertificateCheck::Validate,
     )
     .unwrap();

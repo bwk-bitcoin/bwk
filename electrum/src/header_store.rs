@@ -114,9 +114,10 @@ where
     /// Set by `stop` to idle the worker without spawning a replacement. The
     /// worker checks it alongside the token and self-exits when true.
     stopped: AtomicBool,
-    /// Backfill floor remembered at `start`, reused by `restart`. `None`
-    /// until a worker is spawned.
-    worker: Mutex<Option<BackfillFloor>>,
+    /// Sparse-start anchor supplied by the consumer at construction. Read by
+    /// the reload sanity check and by every anchor append, and reused by
+    /// `restart`. `None` backfills from the server tip, unpinned.
+    anchor: Option<HeaderAnchor>,
     /// Request side of the header worker's client, kept so `stop` can close
     /// the connection instead of waiting out the worker's receive timeout.
     header_req: Mutex<Option<mpsc::Sender<HeaderRequest>>>,
@@ -227,9 +228,42 @@ pub struct MerkleProof {
     pub pos: u32,
 }
 
-#[derive(Debug)]
-struct BackfillFloor {
-    min_height: Option<u32>,
+/// Where a sparse start anchors, and what it may anchor to.
+///
+/// `bwk` ships no checkpoint data and does not know which network deserves a
+/// pin: both halves come from the consumer. `min_height` is the account
+/// birthday the backfill floor is snapped down from, and `pin` is the hash of
+/// the block at [`height`](HeaderAnchor::height), the floor that birthday
+/// resolves to.
+///
+/// A sparse anchor has no ancestors to link back to, so with `pin` set it is
+/// bound to that hash and a fabricated chain is refused. With `pin` unset the
+/// anchor is taken on proof of work alone, so a malicious server could serve a
+/// fabricated low-difficulty chain from it upward: that mode assumes an honest
+/// server for the anchor's chain context. A genesis-anchored chain is fully
+/// self-validating either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeaderAnchor {
+    pub min_height: u32,
+    pub pin: Option<BlockHash>,
+}
+
+impl HeaderAnchor {
+    /// Unpinned anchor at `min_height`, the store's behaviour before pins
+    /// existed.
+    pub fn unpinned(min_height: u32) -> Self {
+        Self {
+            min_height,
+            pin: None,
+        }
+    }
+
+    /// Height the store actually anchors at: `min_height` snapped down to a
+    /// retarget boundary, one interval lower. This is the block `pin` must be
+    /// the hash of, so a consumer looks its checkpoint up here.
+    pub fn height(&self, network: Network) -> u32 {
+        backfill_floor(Some(self.min_height), 0, network)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -296,6 +330,8 @@ pub(crate) enum MutateError {
     Persist(#[from] PersistError),
     #[error("anchor must be on an empty store at a retarget boundary")]
     BadAnchor,
+    #[error("anchor does not match the pinned checkpoint")]
+    AnchorPin,
 }
 
 #[derive(Debug)]
@@ -311,17 +347,22 @@ struct ProgressListeners {
 }
 
 impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>> {
-    pub fn new_in_memory(network: Network) -> Arc<Self> {
+    pub fn new_in_memory(network: Network, anchor: Option<HeaderAnchor>) -> Arc<Self> {
         let backend: Arc<dyn PersistenceBackend> = Arc::new(NoopBackend);
         Self::from_store(
             network,
             RamStore::empty(backend, STORE_KEY, encode_height, encode_header),
+            anchor,
         )
     }
 
     /// Backend-backed store. Loads rows through the typed store layer and
     /// starts empty if the stored chain fails to decode.
-    pub fn from_backend(network: Network, backend: Arc<dyn PersistenceBackend>) -> Arc<Self> {
+    pub fn from_backend(
+        network: Network,
+        backend: Arc<dyn PersistenceBackend>,
+        anchor: Option<HeaderAnchor>,
+    ) -> Arc<Self> {
         let store = match RamStore::open(
             backend.clone(),
             STORE_KEY,
@@ -345,21 +386,29 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
                 RamStore::empty(backend, STORE_KEY, encode_height, encode_header)
             }
         };
-        Self::from_store(network, store)
+        Self::from_store(network, store, anchor)
     }
 
     /// File-backed store. An open failure is a real environment error (not
     /// data corruption, which `from_backend` recovers from by resyncing),
     /// so it propagates rather than silently dropping persistence.
-    pub fn from_file(network: Network, path: PathBuf) -> Result<Arc<Self>, PersistError> {
+    pub fn from_file(
+        network: Network,
+        path: PathBuf,
+        anchor: Option<HeaderAnchor>,
+    ) -> Result<Arc<Self>, PersistError> {
         let backend = HeaderBackend::open(path, Header::SIZE)?;
-        Ok(Self::from_backend(network, Arc::new(backend)))
+        Ok(Self::from_backend(network, Arc::new(backend), anchor))
     }
 
     /// Test-only constructor that injects a prebuilt map without running
     /// sanity checks. Used by unit tests that build synthetic chains.
     #[cfg(any(test, feature = "test"))]
-    pub fn from_map(network: Network, map: BTreeMap<u32, [u8; Header::SIZE]>) -> Arc<Self> {
+    pub fn from_map(
+        network: Network,
+        map: BTreeMap<u32, [u8; Header::SIZE]>,
+        anchor: Option<HeaderAnchor>,
+    ) -> Arc<Self> {
         let backend: Arc<dyn PersistenceBackend> = Arc::new(NoopBackend);
         let mut store = RamStore::empty(backend, STORE_KEY, encode_height, encode_header);
         for (h, raw) in map {
@@ -377,7 +426,7 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
             progress_listeners: Mutex::new(ProgressListeners::default()),
             writer_token: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
-            worker: Mutex::new(None),
+            anchor,
             header_req: Mutex::new(None),
             merkle_req: Mutex::new(None),
             merkle: Arc::default(),
@@ -391,9 +440,10 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
     /// dedicated background worker that drives initial sync, applies
     /// incoming tip notifications, and resolves reorgs.
     ///
-    /// `path == None` yields an in-memory store. `min_height == Some(h)`
-    /// snaps the initial backfill down to the nearest 2016-block boundary
-    /// at or below `h`; `None` starts from the server-reported tip.
+    /// `path == None` yields an in-memory store. `anchor == Some(a)` snaps the
+    /// initial backfill down to the nearest 2016-block boundary at or below
+    /// `a.min_height` and binds that anchor to `a.pin` when the consumer set
+    /// one; `None` starts from the server-reported tip, unpinned.
     ///
     /// The worker thread holds a `Weak<HeaderStore>` so it exits cleanly
     /// once the last public `Arc` is dropped.
@@ -402,19 +452,19 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
         electrum_port: u16,
         network: Network,
         path: Option<PathBuf>,
-        min_height: Option<u32>,
+        anchor: Option<HeaderAnchor>,
         certificate_check: CertificateCheck,
     ) -> Result<Arc<Self>, StartError> {
         let store = match path {
-            Some(p) => Self::from_file(network, p)?,
-            None => Self::new_in_memory(network),
+            Some(p) => Self::from_file(network, p, anchor)?,
+            None => Self::new_in_memory(network, anchor),
         };
 
         // A failure to connect is surfaced to the caller rather than
         // silently returning a worker-less store: header-sync progress
         // gates wallet `Verified` state, so the caller must know the store
         // is degraded and can re-attempt.
-        store.spawn_worker(&electrum_url, electrum_port, min_height, certificate_check)?;
+        store.spawn_worker(&electrum_url, electrum_port, certificate_check)?;
         Ok(store)
     }
 
@@ -433,15 +483,15 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
         port: Option<u16>,
         network: Network,
         path: Option<PathBuf>,
-        min_height: Option<u32>,
+        anchor: Option<HeaderAnchor>,
         certificate_check: CertificateCheck,
     ) -> Result<Arc<Self>, StartError> {
         if let (Some(url), Some(port)) = (url, port) {
-            return Self::start(url, port, network, path, min_height, certificate_check);
+            return Self::start(url, port, network, path, anchor, certificate_check);
         }
         Ok(match path {
-            Some(p) => Self::from_file(network, p)?,
-            None => Self::new_in_memory(network),
+            Some(p) => Self::from_file(network, p, anchor)?,
+            None => Self::new_in_memory(network, anchor),
         })
     }
 
@@ -449,7 +499,7 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
     /// connection died. Clears the stop flag and bumps the writer token so the
     /// superseded worker self-exits and its in-flight mutations become no-ops,
     /// then spawns a fresh worker (the sole writer under the new token) reusing
-    /// the backfill floor remembered at [`start`](Self::start).
+    /// the anchor the store was built with.
     ///
     /// `certificate_check` is the caller's, not remembered: a store that opened
     /// idle never held one, and reconnecting under the default would strand a
@@ -460,24 +510,21 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
         port: u16,
         certificate_check: CertificateCheck,
     ) -> Result<(), StartError> {
-        let min_height = self.remembered_min_height();
         // Close the previous pair rather than leaving its sockets open until
         // the superseded worker times out and drops its request sender.
         self.stop();
         self.stopped.store(false, Ordering::SeqCst);
         self.writer_token.fetch_add(1, Ordering::SeqCst);
-        self.spawn_worker(&url, port, min_height, certificate_check)
+        self.spawn_worker(&url, port, certificate_check)
     }
 
-    /// Connect a fresh worker pair to `url:port` and record the backfill floor
-    /// with the writer token it was spawned under: the header worker that
-    /// drives sync and reorg resolution, plus the merkle client the validator
-    /// fetches inclusion proofs over.
+    /// Connect a fresh worker pair to `url:port` under the current writer
+    /// token: the header worker that drives sync and reorg resolution, plus the
+    /// merkle client the validator fetches inclusion proofs over.
     fn spawn_worker(
         self: &Arc<Self>,
         url: &str,
         port: u16,
-        min_height: Option<u32>,
         certificate_check: CertificateCheck,
     ) -> Result<(), StartError> {
         let client = connect(url, port, certificate_check)?;
@@ -487,15 +534,15 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
         let merkle = connect(url, port, certificate_check)?;
         let (req_tx, resp_rx) = client.listen_headers::<HeaderRequest, HeaderResponse>();
         let token = self.writer_token.load(Ordering::SeqCst);
-        *self.worker.lock().expect("poisoned") = Some(BackfillFloor { min_height });
         *self.header_req.lock().expect("poisoned") = Some(req_tx.clone());
         self.spawn_merkle_client(merkle, token);
         let weak = Arc::downgrade(self);
         let network = self.network;
+        let anchor = self.anchor;
         self.header_worker
             .lock()
             .expect("poisoned")
-            .start(move |_| run_worker(weak, network, min_height, token, req_tx, resp_rx));
+            .start(move |_| run_worker(weak, network, anchor, token, req_tx, resp_rx));
         Ok(())
     }
 
@@ -582,7 +629,7 @@ impl<S> HeaderStore<S>
 where
     S: Store<Key = u32, Value = [u8; Header::SIZE]> + Send + 'static,
 {
-    pub fn from_store(network: Network, store: S) -> Arc<Self> {
+    pub fn from_store(network: Network, store: S, anchor: Option<HeaderAnchor>) -> Arc<Self> {
         let store = Arc::new(Self {
             network,
             inner: Mutex::new(Inner {
@@ -593,7 +640,7 @@ where
             progress_listeners: Mutex::new(ProgressListeners::default()),
             writer_token: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
-            worker: Mutex::new(None),
+            anchor,
             header_req: Mutex::new(None),
             merkle_req: Mutex::new(None),
             merkle: Arc::default(),
@@ -621,7 +668,7 @@ where
             self.set_validation_state(HeaderValidationState::Valid);
             return;
         }
-        if !sanity_check(self.network, &snapshot) {
+        if !sanity_check(self.network, &snapshot, self.anchor.as_ref()) {
             // Wipe before publishing Invalid: `wait_for_replay` unparks the
             // worker the moment state leaves `Validating`, so the store must
             // already be empty when the Invalid state (and notification)
@@ -791,11 +838,9 @@ where
     /// sparse chain has no ancestors to link against, so it is anchored by
     /// PoW only rather than by full `validate_append`.
     ///
-    /// Trust model: a sparse anchor is not connected to any pinned
-    /// checkpoint, so a malicious server could serve a fabricated
-    /// low-difficulty chain from the anchor upward. Sparse-start operation
-    /// assumes an honest server for the anchor's chain context; only a
-    /// genesis-anchored chain is fully self-validating.
+    /// Trust model: `bwk` holds no checkpoint of its own, so the anchor is
+    /// only as strong as the [`HeaderAnchor::pin`] the consumer supplied. See
+    /// that type for what each mode is worth.
     #[cfg(test)]
     pub(crate) fn append_anchor(
         &self,
@@ -804,18 +849,14 @@ where
         raw: [u8; Header::SIZE],
     ) -> Result<(), MutateError> {
         let header: Header = deserialize(&raw).map_err(|_| ValidatorError::MalformedHeader)?;
-        let params = Params::new(self.network);
-        header_validator::check_pow(&params, &header)?;
-        let network = self.network;
+        validate_anchor(self.network, self.anchor.as_ref(), h, &header)?;
 
         let res = self.with_writer(token, |inner| -> Result<(), MutateError> {
-            // The reload `sanity_check` requires exactly these two invariants
-            // of a sparse anchor: the store is empty and the anchor sits on a
-            // retarget boundary. Enforce them here rather than trusting the
-            // caller, so an anchor can never leave the store in a shape a
-            // later reload would wipe.
-            let empty = inner.store.keys()?.next().is_none();
-            if !empty || h % retarget_interval(network) as u32 != 0 {
+            // The reload `sanity_check` requires an empty store as well as the
+            // boundary alignment `validate_anchor` covers. Enforce it here
+            // rather than trusting the caller, so an anchor can never leave the
+            // store in a shape a later reload would wipe.
+            if inner.store.keys()?.next().is_some() {
                 return Err(MutateError::BadAnchor);
             }
             inner.store.insert(h, raw)?;
@@ -843,6 +884,7 @@ where
             return Ok(());
         }
         let network = self.network;
+        let anchor = self.anchor;
         let res = self.with_writer(token, |inner| -> Result<(), MutateError> {
             let was_empty = inner.store.keys()?.next().is_none();
             let mut ancestors = if was_empty {
@@ -853,17 +895,13 @@ where
                 })
                 .into()
             };
-            let params = Params::new(network);
 
             for (i, raw) in raws.iter().enumerate() {
                 let h = start + i as u32;
                 let header: Header =
                     deserialize(raw).map_err(|_| ValidatorError::MalformedHeader)?;
                 if was_empty && i == 0 && h > 0 {
-                    if h % retarget_interval(network) as u32 != 0 {
-                        return Err(MutateError::BadAnchor);
-                    }
-                    header_validator::check_pow(&params, &header)?;
+                    validate_anchor(network, anchor.as_ref(), h, &header)?;
                 } else {
                     header_validator::validate_append(
                         network,
@@ -960,16 +998,6 @@ where
         if let Some(Err(e)) = self.with_writer(token, |inner| clear_inner(inner)) {
             log::error!("HeaderStore::wipe: clear failed: {e}");
         }
-    }
-
-    /// Backfill floor remembered when the worker was spawned, reused by
-    /// `restart` and by the below-floor re-sync in `resolve_reorg`.
-    fn remembered_min_height(&self) -> Option<u32> {
-        self.worker
-            .lock()
-            .expect("poisoned")
-            .as_ref()
-            .and_then(|w| w.min_height)
     }
 
     /// Lowest stored height (used by the worker to bound reorg walk-back).
@@ -1271,7 +1299,11 @@ fn decode_ancestors(
     collect_ancestors(incoming_height, max, |k| headers.get(&k).copied())
 }
 
-fn sanity_check(network: Network, headers: &BTreeMap<u32, [u8; Header::SIZE]>) -> bool {
+fn sanity_check(
+    network: Network,
+    headers: &BTreeMap<u32, [u8; Header::SIZE]>,
+    anchor: Option<&HeaderAnchor>,
+) -> bool {
     if headers.is_empty() {
         return true;
     }
@@ -1288,6 +1320,15 @@ fn sanity_check(network: Network, headers: &BTreeMap<u32, [u8; Header::SIZE]>) -
     // rather than silently validating with a partial window.
     if min != 0 && min % backfill_chunk(network) != 0 {
         return false;
+    }
+    // A persisted anchor is replayed on proof of work alone, so a fabricated
+    // one would otherwise survive a reload. When the caller pinned the height
+    // this cache is anchored at, the stored row must be that block.
+    if let Some(pin) = pin_for_height(network, anchor, min) {
+        match headers.get(&min).map(|raw| deserialize::<Header>(raw)) {
+            Some(Ok(hdr)) if hdr.block_hash() == pin => {}
+            _ => return false,
+        }
     }
     if let Some(genesis) = expected_genesis(network) {
         // The genesis row is optional: a cache may legitimately start above
@@ -1463,14 +1504,57 @@ fn snap(h: u32, network: Network) -> u32 {
 /// to a retarget boundary, then padded down by a full retarget interval so the
 /// anchor lands on the previous retarget boundary. Every retarget boundary at
 /// or above the snapped boundary then has a complete ancestor window for its
-/// difficulty check. The anchor itself is stored PoW-only (`append_anchor`),
-/// so its own retarget is skipped; the handful of headers just above the
-/// anchor keep the anchor-relative MTP relaxation, but they all sit below the
-/// account's `min_height` and are never account relevant. Saturates at zero
-/// near genesis.
+/// difficulty check. The anchor itself carries no ancestor linkage: it is
+/// bound to the consumer's [`HeaderAnchor::pin`] when there is one, and stored
+/// on proof of work alone otherwise, so its own retarget is skipped; the
+/// handful of headers just above the anchor keep the anchor-relative MTP
+/// relaxation, but they all sit below the account's `min_height` and are never
+/// account relevant. Saturates at zero near genesis.
 fn backfill_floor(min_height: Option<u32>, tip_h: u32, network: Network) -> u32 {
     let snapped = snap(min_height.unwrap_or(tip_h), network);
     snapped.saturating_sub(backfill_chunk(network))
+}
+
+/// Hash `h` is pinned to: the caller's pin when `h` is the height their anchor
+/// resolves to, `None` otherwise. A stale cache anchored at some other floor
+/// is not compared against a pin that was never meant for it.
+fn pin_for_height(network: Network, anchor: Option<&HeaderAnchor>, h: u32) -> Option<BlockHash> {
+    let anchor = anchor?;
+    if h == anchor.height(network) {
+        anchor.pin
+    } else {
+        None
+    }
+}
+
+/// Checks a header before it is anchored at `h` on an empty store: valid work,
+/// on a retarget boundary, and the caller's pinned block when they pinned this
+/// height. Without a pin the anchor rests on proof of work alone, the store's
+/// original trust model.
+///
+/// A refusal leaves nothing behind: the anchor is the first row of an empty
+/// store, so the caller inserts nothing. A fabricated anchor already on disk
+/// (an older cache, or a tampered file) is wiped by `sanity_check` on reload.
+fn validate_anchor(
+    network: Network,
+    anchor: Option<&HeaderAnchor>,
+    h: u32,
+    header: &Header,
+) -> Result<(), MutateError> {
+    header_validator::check_pow(&Params::new(network), header)?;
+    if h % retarget_interval(network) as u32 != 0 {
+        return Err(MutateError::BadAnchor);
+    }
+    if let Some(pin) = pin_for_height(network, anchor, h) {
+        if header.block_hash() != pin {
+            log::warn!(
+                "HeaderStore: anchor at {h} is {}, not the pinned {pin}",
+                header.block_hash()
+            );
+            return Err(MutateError::AnchorPin);
+        }
+    }
+    Ok(())
 }
 
 /// True when the stored range cannot be contiguously extended down to `low`
@@ -1547,7 +1631,7 @@ fn wait_for_replay(weak: &Weak<HeaderStore>, token: u64) -> bool {
 fn run_worker(
     weak: Weak<HeaderStore>,
     network: Network,
-    min_height: Option<u32>,
+    anchor: Option<HeaderAnchor>,
     token: u64,
     req_tx: mpsc::Sender<HeaderRequest>,
     resp_rx: mpsc::Receiver<HeaderResponse>,
@@ -1601,7 +1685,7 @@ fn run_worker(
             if !initial_sync(
                 &store,
                 network,
-                min_height,
+                anchor,
                 token,
                 server_tip,
                 &req_tx,
@@ -1733,7 +1817,7 @@ fn fetch_and_verify_genesis(
 fn initial_sync(
     store: &Arc<HeaderStore>,
     network: Network,
-    min_height: Option<u32>,
+    anchor: Option<HeaderAnchor>,
     token: u64,
     server_tip: (u32, [u8; Header::SIZE]),
     req_tx: &mpsc::Sender<HeaderRequest>,
@@ -1742,7 +1826,7 @@ fn initial_sync(
 ) -> bool {
     let (tip_h, _) = server_tip;
 
-    let low = backfill_floor(min_height, tip_h, network);
+    let low = backfill_floor(anchor.map(|a| a.min_height), tip_h, network);
 
     // A persisted range that cannot extend down to the wanted floor (lowered
     // birthday) or up from its tip to it (floor above the stored tip) is
@@ -1939,11 +2023,11 @@ fn find_fork_point(
             // Re-anchor from scratch so the worker self-heals instead of
             // staying dormant until the next restart. Reuse the backfill
             // floor remembered at start.
-            let min_height = store.remembered_min_height();
+            let anchor = store.anchor;
             if initial_sync(
                 store,
                 store.network,
-                min_height,
+                anchor,
                 token,
                 (incoming_h, incoming_raw),
                 req_tx,
@@ -2239,20 +2323,60 @@ mod tests {
     use crate::electrum::response::{ErrorResponse, ErrorResult};
     use miniscript::bitcoin::{
         block::{Header, Version},
-        consensus::serialize,
+        consensus::{encode::deserialize_hex, serialize},
         constants::genesis_block,
         hashes::Hash,
         params::Params,
         BlockHash, CompactTarget, TxMerkleNode,
     };
-    use std::fs;
+    use std::{fs, str::FromStr};
     use temp_dir::TempDir;
+
+    /// Taproot activation, the lowest birthday a mainnet silent-payments
+    /// account can set, and the one the pin fixtures below are built for.
+    const TEST_MIN_HEIGHT: u32 = 709_632;
+
+    /// Hash of mainnet block 707616, the anchor `TEST_MIN_HEIGHT` resolves to.
+    /// Read from mempool.space, blockstream.info and blockchain.info on
+    /// 2026-08-31, all three agreeing.
+    const TEST_ANCHOR_HASH: &str =
+        "00000000000000000002c26934496974adf77b74332c6e9ada689e0b0212a302";
+
+    /// Raw header of that same block, one consensus field per line: version,
+    /// prev hash, merkle root, time, bits, nonce. Same sources.
+    const MAINNET_ANCHOR_RAW: &str = concat!(
+        "0400a020",
+        "51f1fb78fa247329c5f4bbe6a11be379d5f4339bcdc006000000000000000000",
+        "44d4acc7214631657c93c5d667cdd6a89c18b4b40bb0c26e019b1a422cf76a3b",
+        "a2f57e61",
+        "cffe0c17",
+        "25c56a83",
+    );
 
     fn raw_header(h: &Header) -> [u8; Header::SIZE] {
         let bytes = serialize(h);
         let mut arr = [0u8; Header::SIZE];
         arr.copy_from_slice(&bytes);
         arr
+    }
+
+    fn mainnet_anchor_header() -> Header {
+        deserialize_hex(MAINNET_ANCHOR_RAW).unwrap()
+    }
+
+    fn pinned_anchor() -> HeaderAnchor {
+        HeaderAnchor {
+            min_height: TEST_MIN_HEIGHT,
+            pin: Some(BlockHash::from_str(TEST_ANCHOR_HASH).unwrap()),
+        }
+    }
+
+    /// Stands in for a fabricated anchor: a real mainnet header carrying only
+    /// minimum-difficulty work, so it clears `check_pow` (which clamps to the
+    /// network pow limit) while being anything but the pinned block. Mining a
+    /// fresh one at mainnet difficulty is not an option in a test.
+    fn forged_mainnet_anchor() -> Header {
+        genesis_block(Params::new(Network::Bitcoin)).header
     }
 
     fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut cond: F) -> bool {
@@ -2320,7 +2444,7 @@ mod tests {
     }
 
     fn store_with_chain(chain: &[Header]) -> Arc<HeaderStore> {
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         for (i, h) in chain.iter().enumerate() {
             store.insert_unchecked(i as u32, raw_header(h));
         }
@@ -2347,7 +2471,7 @@ mod tests {
         // This used to underflow (`walk_h - chunk_start`) and panic; the
         // floor guard must now make it return early without panicking.
         let chain = build_chain(20);
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         let floor = 10u32;
         for (i, h) in chain.iter().enumerate().skip(floor as usize) {
             store.insert_unchecked(i as u32, raw_header(h));
@@ -2470,7 +2594,7 @@ mod tests {
     fn worker_self_exits_when_token_superseded() {
         // A `restart` bumps the writer token; a worker still parked under the
         // old token must self-exit rather than ever subscribe or write.
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         store.set_validation_state_for_test(HeaderValidationState::Validating);
 
         let (req_tx, req_rx) = mpsc::channel::<HeaderRequest>();
@@ -2514,7 +2638,7 @@ mod tests {
 
     #[test]
     fn initial_headers_retries_error_then_accepts_batch() {
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         let (req_tx, req_rx) = mpsc::channel::<HeaderRequest>();
         let (resp_tx, resp_rx) = mpsc::channel::<HeaderResponse>();
         let raw = [1u8; Header::SIZE];
@@ -2551,7 +2675,7 @@ mod tests {
 
     #[test]
     fn initial_headers_retries_empty_then_accepts_batch() {
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         let (req_tx, req_rx) = mpsc::channel::<HeaderRequest>();
         let (resp_tx, resp_rx) = mpsc::channel::<HeaderResponse>();
         let raw = [2u8; Header::SIZE];
@@ -2582,7 +2706,7 @@ mod tests {
 
     #[test]
     fn initial_headers_retries_decode_error_then_accepts_batch() {
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         let (req_tx, req_rx) = mpsc::channel::<HeaderRequest>();
         let (resp_tx, resp_rx) = mpsc::channel::<HeaderResponse>();
         let raw = [3u8; Header::SIZE];
@@ -2613,7 +2737,7 @@ mod tests {
 
     #[test]
     fn initial_headers_timeout_waits_for_original_request() {
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         let (req_tx, req_rx) = mpsc::channel::<HeaderRequest>();
         let (resp_tx, resp_rx) = mpsc::channel::<HeaderResponse>();
         let raw = [4u8; Header::SIZE];
@@ -2639,7 +2763,7 @@ mod tests {
 
     #[test]
     fn initial_headers_stops_on_cancellation() {
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         let (req_tx, req_rx) = mpsc::channel::<HeaderRequest>();
         let (resp_tx, resp_rx) = mpsc::channel::<HeaderResponse>();
         let responder = thread::spawn(move || {
@@ -2662,7 +2786,7 @@ mod tests {
         // (no min_height, low server tip): the stale range must be wiped
         // and the sync re-anchored at 0.
         let chain = build_chain(11);
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         for (i, h) in chain.iter().enumerate().take(4) {
             store.insert_unchecked(4032 + i as u32, raw_header(h));
         }
@@ -2718,7 +2842,7 @@ mod tests {
         let ok = initial_sync(
             &store,
             Network::Regtest,
-            Some(4040),
+            Some(HeaderAnchor::unpinned(4040)),
             0,
             (2021, raw_header(&fresh[5])),
             &req_tx,
@@ -2739,7 +2863,7 @@ mod tests {
     #[test]
     fn reorg_with_no_ancestor_above_sparse_anchor_wipes_and_reanchors() {
         let old = build_chain(11);
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         for (i, h) in old.iter().enumerate() {
             store.insert_unchecked(1000 + i as u32, raw_header(h));
         }
@@ -2800,13 +2924,13 @@ mod tests {
         chain[2].prev_blockhash = BlockHash::all_zeros();
         chain[2] = mine_regtest_header(chain[2]);
         {
-            let store = HeaderStore::from_file(Network::Regtest, path.clone()).unwrap();
+            let store = HeaderStore::from_file(Network::Regtest, path.clone(), None).unwrap();
             for (i, h) in chain.iter().enumerate() {
                 store.insert_unchecked(i as u32, raw_header(h));
             }
         }
 
-        let reloaded = HeaderStore::from_file(Network::Regtest, path).unwrap();
+        let reloaded = HeaderStore::from_file(Network::Regtest, path, None).unwrap();
         assert!(wait_until(Duration::from_secs(5), || {
             matches!(
                 reloaded.validation_state(),
@@ -2824,7 +2948,7 @@ mod tests {
         typed.insert(0, raw_header(&chain[0])).unwrap();
         typed.insert(1, raw_header(&chain[1])).unwrap();
 
-        let store = HeaderStore::from_store(Network::Regtest, typed);
+        let store = HeaderStore::from_store(Network::Regtest, typed, None);
 
         assert_eq!(store.tip(), Some(1));
         assert_eq!(store.block_hash(1), Some(chain[1].block_hash()));
@@ -2866,7 +2990,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("headers.bin");
         let active_chain = build_chain(4);
-        let store = HeaderStore::from_file(Network::Regtest, path.clone()).unwrap();
+        let store = HeaderStore::from_file(Network::Regtest, path.clone(), None).unwrap();
         for (i, header) in active_chain.iter().enumerate() {
             store.insert_unchecked(i as u32, raw_header(header));
         }
@@ -2964,13 +3088,13 @@ mod tests {
         invalid[2].prev_blockhash = BlockHash::all_zeros();
         invalid[2] = mine_regtest_header(invalid[2]);
         {
-            let store = HeaderStore::from_file(Network::Regtest, path.clone()).unwrap();
+            let store = HeaderStore::from_file(Network::Regtest, path.clone(), None).unwrap();
             for (i, h) in invalid.iter().enumerate() {
                 store.insert_unchecked(i as u32, raw_header(h));
             }
         }
 
-        let store = HeaderStore::from_file(Network::Regtest, path).unwrap();
+        let store = HeaderStore::from_file(Network::Regtest, path, None).unwrap();
         assert!(wait_until(Duration::from_secs(5), || {
             matches!(store.validation_state(), HeaderValidationState::Invalid(_))
                 && store.tip().is_none()
@@ -2998,7 +3122,7 @@ mod tests {
             progress_listeners: Mutex::new(ProgressListeners::default()),
             writer_token: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
-            worker: Mutex::new(None),
+            anchor: None,
             header_req: Mutex::new(None),
             merkle_req: Mutex::new(None),
             merkle: Arc::default(),
@@ -3109,7 +3233,7 @@ mod tests {
             }
             map.insert(i as u32, raw_header(h));
         }
-        assert!(!sanity_check(Network::Regtest, &map));
+        assert!(!sanity_check(Network::Regtest, &map, None));
     }
 
     #[test]
@@ -3123,7 +3247,7 @@ mod tests {
         for (i, h) in chain.iter().enumerate() {
             map.insert(5 + i as u32, raw_header(h));
         }
-        assert!(!sanity_check(Network::Regtest, &map));
+        assert!(!sanity_check(Network::Regtest, &map, None));
     }
 
     #[test]
@@ -3138,7 +3262,135 @@ mod tests {
         for (i, h) in chain.iter().enumerate() {
             map.insert(floor + i as u32, raw_header(h));
         }
-        assert!(sanity_check(Network::Regtest, &map));
+        assert!(sanity_check(Network::Regtest, &map, None));
+    }
+
+    #[test]
+    fn anchor_height_is_the_backfill_floor() {
+        // What a consumer looks its checkpoint up at, and what the fixtures
+        // below are the block of.
+        let anchor = pinned_anchor();
+        assert_eq!(anchor.height(Network::Bitcoin), 707_616);
+        assert_eq!(
+            anchor.height(Network::Bitcoin),
+            backfill_floor(Some(TEST_MIN_HEIGHT), 0, Network::Bitcoin)
+        );
+        assert_eq!(
+            Some(mainnet_anchor_header().block_hash()),
+            anchor.pin,
+            "the raw fixture and the hash fixture must be the same block"
+        );
+    }
+
+    #[test]
+    fn pinned_anchor_is_accepted() {
+        let anchor = pinned_anchor();
+        let height = anchor.height(Network::Bitcoin);
+        let store = HeaderStore::new_in_memory(Network::Bitcoin, Some(anchor));
+        store
+            .append_batch(0, height, &[raw_header(&mainnet_anchor_header())])
+            .unwrap();
+
+        assert_eq!(store.min_height(), Some(height));
+        assert_eq!(store.block_hash(height), anchor.pin);
+    }
+
+    #[test]
+    fn fabricated_anchor_at_pin_height_is_refused() {
+        // A server that mines a low-difficulty chain from the anchor upward
+        // is caught here: the work is fine, the hash is not the pinned one.
+        let anchor = pinned_anchor();
+        let height = anchor.height(Network::Bitcoin);
+        let store = HeaderStore::new_in_memory(Network::Bitcoin, Some(anchor));
+        let err = store
+            .append_batch(0, height, &[raw_header(&forged_mainnet_anchor())])
+            .unwrap_err();
+
+        assert!(matches!(err, MutateError::AnchorPin));
+        assert_eq!(store.tip(), None);
+    }
+
+    #[test]
+    fn unpinned_anchor_rests_on_proof_of_work() {
+        // Same store, same height, same header the pinned case refuses: with
+        // no pin supplied it is taken on work alone, as before pins existed.
+        let anchor = HeaderAnchor::unpinned(TEST_MIN_HEIGHT);
+        let height = anchor.height(Network::Bitcoin);
+        let store = HeaderStore::new_in_memory(Network::Bitcoin, Some(anchor));
+        store
+            .append_batch(0, height, &[raw_header(&forged_mainnet_anchor())])
+            .unwrap();
+
+        assert_eq!(store.min_height(), Some(height));
+    }
+
+    #[test]
+    fn persisted_fabricated_anchor_is_wiped_on_reload() {
+        // The reload replays the anchor on work alone, so the pin has to be
+        // re-checked there or a fabricated chain would outlive the sync that
+        // refused it.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("headers.bin");
+        let anchor = pinned_anchor();
+        let mut map: BTreeMap<u32, [u8; Header::SIZE]> = BTreeMap::new();
+        map.insert(
+            anchor.height(Network::Bitcoin),
+            raw_header(&forged_mainnet_anchor()),
+        );
+        write_binary(&path, &map);
+
+        let store = HeaderStore::from_file(Network::Bitcoin, path, Some(anchor)).unwrap();
+
+        assert!(matches!(
+            store.validation_state(),
+            HeaderValidationState::Invalid(InvalidCause::Sanity)
+        ));
+        assert_eq!(store.tip(), None);
+    }
+
+    #[test]
+    fn persisted_pinned_anchor_survives_reload() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("headers.bin");
+        let anchor = pinned_anchor();
+        let height = anchor.height(Network::Bitcoin);
+        let mut map: BTreeMap<u32, [u8; Header::SIZE]> = BTreeMap::new();
+        map.insert(height, raw_header(&mainnet_anchor_header()));
+        write_binary(&path, &map);
+
+        let store = HeaderStore::from_file(Network::Bitcoin, path, Some(anchor)).unwrap();
+
+        assert!(wait_until(Duration::from_secs(5), || {
+            store.validation_state() == HeaderValidationState::Valid
+        }));
+        assert_eq!(store.tip(), Some(height));
+    }
+
+    #[test]
+    fn cache_at_another_floor_is_not_measured_against_the_pin() {
+        // A cache left at an older birthday's floor is not the block the pin
+        // was supplied for. `initial_sync` re-anchors it; the pin must not
+        // fail it out from under that.
+        let anchor = pinned_anchor();
+        let other = backfill_floor(Some(TEST_MIN_HEIGHT - 2016), 0, Network::Bitcoin);
+        assert_ne!(other, anchor.height(Network::Bitcoin));
+
+        let mut map: BTreeMap<u32, [u8; Header::SIZE]> = BTreeMap::new();
+        map.insert(other, raw_header(&forged_mainnet_anchor()));
+        assert!(sanity_check(Network::Bitcoin, &map, Some(&anchor)));
+    }
+
+    #[test]
+    fn genesis_anchored_chain_ignores_the_pin() {
+        let anchor = pinned_anchor();
+        let genesis = genesis_block(Params::new(Network::Bitcoin)).header;
+        let store = HeaderStore::new_in_memory(Network::Bitcoin, Some(anchor));
+        store.append(0, 0, raw_header(&genesis)).unwrap();
+        assert_eq!(store.block_hash(0), Some(genesis.block_hash()));
+
+        let mut map: BTreeMap<u32, [u8; Header::SIZE]> = BTreeMap::new();
+        map.insert(0, raw_header(&genesis));
+        assert!(sanity_check(Network::Bitcoin, &map, Some(&anchor)));
     }
 
     #[test]
@@ -3171,7 +3423,7 @@ mod tests {
             prev_hash = h.block_hash();
             map.insert(floor + i, raw_header(&h));
         }
-        let store = HeaderStore::from_map(network, map);
+        let store = HeaderStore::from_map(network, map, None);
 
         let full_window_lo = floor + header_validator::MTP_WINDOW as u32;
         for h in full_window_lo..(floor + span) {
@@ -3218,7 +3470,7 @@ mod tests {
         // The corrupt file is wiped on load; the store comes up empty.
         // (`from_file` re-persists an empty cache, so the path may exist
         // again, but it no longer carries the truncated chain.)
-        let store = HeaderStore::from_file(Network::Regtest, path.clone()).unwrap();
+        let store = HeaderStore::from_file(Network::Regtest, path.clone(), None).unwrap();
         assert_eq!(store.tip(), None);
         // Drop the store first: it holds the cache file's advisory lock, and
         // `store_from_file` reopens the same file.
@@ -3233,7 +3485,7 @@ mod tests {
 
         // A leftover legacy JSON cache (starts with '{') must be deleted.
         fs::write(&path, b"{\"0\":\"deadbeef\"}").unwrap();
-        let store = HeaderStore::from_file(Network::Regtest, path.clone()).unwrap();
+        let store = HeaderStore::from_file(Network::Regtest, path.clone(), None).unwrap();
         assert_eq!(store.tip(), None);
         // Drop the store first: it holds the cache file's advisory lock, and
         // `store_from_file` reopens the same file.
@@ -3263,7 +3515,7 @@ mod tests {
         map.insert(0, raw_header(&bogus_genesis));
         write_binary(&path, &map);
 
-        let store = HeaderStore::from_file(Network::Bitcoin, path).unwrap();
+        let store = HeaderStore::from_file(Network::Bitcoin, path, None).unwrap();
         assert_eq!(store.tip(), None);
     }
 
@@ -3277,7 +3529,7 @@ mod tests {
         map.insert(0, raw_header(&g));
         write_binary(&path, &map);
 
-        let store = HeaderStore::from_file(Network::Bitcoin, path).unwrap();
+        let store = HeaderStore::from_file(Network::Bitcoin, path, None).unwrap();
         assert_eq!(store.tip(), Some(0));
         assert_eq!(store.block_hash(0), Some(g.block_hash()));
     }
@@ -3298,7 +3550,7 @@ mod tests {
     fn missing_file_yields_empty_store() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("missing.json");
-        let store = HeaderStore::from_file(Network::Regtest, path).unwrap();
+        let store = HeaderStore::from_file(Network::Regtest, path, None).unwrap();
         assert_eq!(store.tip(), None);
     }
 
@@ -3307,7 +3559,7 @@ mod tests {
     /// would have proved stay `ConfirmedUnverified` for good.
     #[test]
     fn a_dead_merkle_client_clears_its_sender_and_reports() {
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         let (notif_tx, notif_rx) = mpsc::channel();
         store.register_notifications(notif_tx);
         let (req_tx, _req_rx) = mpsc::channel();
@@ -3335,7 +3587,7 @@ mod tests {
     /// wrongly say no proof is being fetched.
     #[test]
     fn a_superseded_merkle_forwarder_reports_nothing() {
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         let (notif_tx, notif_rx) = mpsc::channel();
         store.register_notifications(notif_tx);
         let (req_tx, _req_rx) = mpsc::channel();
@@ -3363,7 +3615,7 @@ mod tests {
     fn a_failed_merkle_fetch_reaches_the_listeners() {
         use crate::client::DecodeError;
 
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         let outcomes = store.register_merkle_outcome(ListenerId::next());
         let token = store.writer_token.load(Ordering::SeqCst);
 
@@ -3396,7 +3648,7 @@ mod tests {
     /// belongs to a different sub-account.
     #[test]
     fn a_merkle_outcome_reaches_only_its_requester() {
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         let (req_tx, req_rx) = mpsc::channel();
         store.set_merkle_sender_for_test(req_tx);
         let requester = ListenerId::next();
@@ -3440,7 +3692,7 @@ mod tests {
     /// would leave a requester holding a slot for an answer it never hears.
     #[test]
     fn an_unrequested_merkle_outcome_reaches_every_listener() {
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         let first = store.register_merkle_outcome(ListenerId::next());
         let second = store.register_merkle_outcome(ListenerId::next());
         let txid = Txid::from_byte_array([0x22; 32]);
@@ -3464,7 +3716,7 @@ mod tests {
     /// over the next connection.
     #[test]
     fn a_dead_merkle_client_fails_its_pending_fetches() {
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         let requester = ListenerId::next();
         let outcomes = store.register_merkle_outcome(requester);
         let (req_tx, _req_rx) = mpsc::channel();
@@ -3494,7 +3746,7 @@ mod tests {
     /// sharing the store never asks for its proofs again.
     #[test]
     fn an_idled_store_fails_its_pending_fetches() {
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         let requester = ListenerId::next();
         let outcomes = store.register_merkle_outcome(requester);
         let (req_tx, _req_rx) = mpsc::channel();
@@ -3515,7 +3767,7 @@ mod tests {
     /// each of its events to that channel exactly once.
     #[test]
     fn a_notification_sender_registered_once_hears_an_event_once() {
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         let (notif_tx, notif_rx) = mpsc::channel();
         store.register_notifications(notif_tx);
         let _first = store.register_merkle_outcome(ListenerId::next());
@@ -3545,7 +3797,7 @@ mod tests {
 
     #[test]
     fn register_returns_a_live_receiver() {
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         let _rx = store.register_chain_tick();
         assert_eq!(store.listeners.listener_count(), 1);
     }
@@ -3648,7 +3900,7 @@ mod tests {
             bits,
             nonce: 0,
         };
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         store.insert_unchecked(0, raw_header(&g));
 
         // Header at height 1 dated ~3h in the future.
@@ -3691,7 +3943,7 @@ mod tests {
             bits: CompactTarget::from_consensus(0x207fffff),
             nonce: 0,
         });
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         store.append_anchor(0, anchor, raw_header(&header)).unwrap();
         assert_eq!(store.tip(), Some(anchor));
         assert_eq!(store.block_hash(anchor), Some(header.block_hash()));
@@ -3717,7 +3969,7 @@ mod tests {
         };
 
         // Non-boundary height on an empty store.
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         assert!(matches!(
             store.append_anchor(0, anchor + 1, raw_at(0x22)),
             Err(MutateError::BadAnchor)
@@ -3725,7 +3977,7 @@ mod tests {
         assert_eq!(store.tip(), None);
 
         // Boundary height but the store is not empty.
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         store.append_anchor(0, anchor, raw_at(0x33)).unwrap();
         assert!(matches!(
             store.append_anchor(0, anchor * 2, raw_at(0x44)),
@@ -3748,7 +4000,7 @@ mod tests {
             bits,
             nonce: 0,
         };
-        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let store = HeaderStore::new_in_memory(Network::Regtest, None);
         let res = store.append_anchor(0, 5, raw_header(&header));
         assert!(matches!(
             res,
@@ -3796,7 +4048,7 @@ mod tests {
         for (i, h) in chain.iter().enumerate() {
             map.insert(min_stored + i as u32, raw_header(h));
         }
-        let store = HeaderStore::from_map(network, map);
+        let store = HeaderStore::from_map(network, map, None);
 
         let h = min_stored + span - 1;
         let ancestors = store.ancestors_for(h, retarget_interval(network));
@@ -3826,10 +4078,10 @@ mod tests {
         for (i, h) in chain.iter().enumerate() {
             map.insert(anchor + i as u32, raw_header(h));
         }
-        assert!(sanity_check(Network::Regtest, &map));
+        assert!(sanity_check(Network::Regtest, &map, None));
         write_binary(&path, &map);
 
-        let store = HeaderStore::from_file(Network::Regtest, path).unwrap();
+        let store = HeaderStore::from_file(Network::Regtest, path, None).unwrap();
         assert!(wait_until(Duration::from_secs(5), || {
             store.validation_state() == HeaderValidationState::Valid
         }));

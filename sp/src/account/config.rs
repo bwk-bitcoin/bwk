@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use bitcoin::{bip32::ChildNumber, Network};
+use bitcoin::{bip32::ChildNumber, BlockHash, Network};
 use bwk::{
     bwk_electrum::{config::Endpoint, raw_client::CertificateCheck},
     miniscript::{Descriptor, DescriptorPublicKey},
@@ -65,6 +65,13 @@ pub struct Config {
     pub dust_limit: Option<u64>,
     /// Block height to start scanning from (skip earlier blocks)
     pub birthday_height: Option<u32>,
+    /// Hash the header chain's sparse anchor is pinned to, supplied by the
+    /// app. See [`bwk::bwk_electrum::header_store::HeaderAnchor`]: the anchor
+    /// height is derived from the birthday, and without a pin it rests on proof
+    /// of work alone. Neither `bwk` nor `bwk-sp` ships checkpoint data, so this
+    /// stays `None` until a consumer sets it.
+    #[serde(default)]
+    pub header_anchor_pin: Option<BlockHash>,
 
     // Sub-accounts
     /// Optional descriptors for embedded standard wallets (segwit, taproot, etc.)
@@ -123,6 +130,7 @@ impl Config {
             persistence: Some(bwk::persist::PersistenceKind::default()),
             dust_limit: None,
             birthday_height: None,
+            header_anchor_pin: None,
             descriptors: Vec::new(),
         }
     }
@@ -172,6 +180,7 @@ impl Config {
             persistence: Some(bwk::persist::PersistenceKind::default()),
             dust_limit: None,
             birthday_height: None,
+            header_anchor_pin: None,
             descriptors: Vec::new(),
         })
     }
@@ -248,6 +257,18 @@ impl Config {
     /// Set the birthday height for initial scanning.
     pub fn set_birthday_height(&mut self, height: Option<u32>) {
         self.birthday_height = height;
+    }
+
+    /// Hash the header chain's sparse anchor is pinned to.
+    pub fn header_anchor_pin(&self) -> Option<BlockHash> {
+        self.header_anchor_pin
+    }
+
+    /// Pin the header chain's sparse anchor to `hash`, the block at
+    /// [`bwk::bwk_electrum::header_store::HeaderAnchor::height`] for this
+    /// config's birthday.
+    pub fn set_header_anchor_pin(&mut self, hash: Option<BlockHash>) {
+        self.header_anchor_pin = hash;
     }
 
     /// Add a default embedded BIP84 (P2WPKH) sub-account derived from this

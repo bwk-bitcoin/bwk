@@ -505,6 +505,7 @@ mod instrumented {
             sender: _sender,
             header_store: bwk::bwk_electrum::header_store::HeaderStore::new_in_memory(
                 params.network,
+                None,
             ),
         };
         // Seed one synthetic owned outpoint at the first scanned height so the spend
