@@ -12,7 +12,7 @@ keywords.workspace = true
 [features]
 default = ["ledger", "specter", "coldcard", "bitbox", "jade", "service"]
 bitbox = ["hidapi", "bitbox-api", "regex"]
-coldcard = ["dep:coldcard", "regex"]
+coldcard = ["dep:coldcard", "hidapi", "regex"]
 specter = ["serialport"]
 jade = ["serde", "serde_bytes", "serde_cbor", "serialport", "ureq"]
 ledger = ["regex", "ledger-bitcoin-client", "ledger-transport-hidapi", "ledger-apdu", "hidapi"]
