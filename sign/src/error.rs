@@ -23,6 +23,7 @@ pub enum Error {
     SigningInfo,
     InsaneTaptreeInfo,
     MixedSigningInfo,
+    PsbtV2,
     #[cfg(feature = "sp")]
     SpSigning,
 }
@@ -55,6 +56,7 @@ impl Display for Error {
                     "This input mixes segwit and taproot signing informations"
                 )
             }
+            Error::PsbtV2 => write!(f, "PSBTv2 error"),
             #[cfg(feature = "sp")]
             Error::SpSigning => write!(f, "Failed to sign SP input"),
         }
