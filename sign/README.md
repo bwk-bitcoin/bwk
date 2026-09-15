@@ -118,5 +118,8 @@ The `RequestId` and `Response` contract is honored all the same, so a caller
 written against a hardware or remote back end works unmodified against this
 one.
 
+`sign` takes raw bytes and answers in the version it was given: a PSBTv2 is
+signed as one, anything else is read as a PSBTv0.
+
 `HotManager::new` keeps everything in memory; `with_backend` persists the
 signers through a `bwk-persist` backend.
