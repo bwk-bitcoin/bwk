@@ -12,7 +12,6 @@ use std::{
 
 use common::{
     test_config, test_mnemonic, test_outpoint, test_owned_output, test_spent_output, MockBackend,
-    TempDir,
 };
 
 use bwk::bwk_electrum::{
@@ -22,6 +21,7 @@ use bwk::bwk_electrum::{
 use bwk_sp::account::{
     coin_store::SpCoinStore, config::Config, tx_store::SpTxStore, Account, AccountError,
 };
+use bwk_utils::test::temp_dir::TempDir;
 
 #[test]
 fn test_common_helpers() {

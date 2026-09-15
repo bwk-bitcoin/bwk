@@ -12,11 +12,11 @@ use std::{
 };
 
 use bitcoin::OutPoint;
-use bwk_utils::test as bwk_test;
+use bwk_utils::test::{self as bwk_test, temp_dir::TempDir};
 
 use common::{
     test_account_named, test_account_persistent_named, test_account_with_mnemonic, test_config,
-    test_mnemonic, test_outpoint, test_owned_output, TempDir, TestEnv,
+    test_mnemonic, test_outpoint, test_owned_output, TestEnv,
 };
 
 use bwk::{
@@ -736,7 +736,7 @@ fn test_concurrent_funding_during_scan(env: &mut TestEnv) {
 fn test_mempool_tx_not_counted_in_balance(env: &mut TestEnv) {
     use bwk_sign::hot_signer::HotSigner;
     use bwk_sp::account::{config::Config, Account};
-    use common::{generate_recipient_pubkey, swap_to_sp, TempDir};
+    use common::{generate_recipient_pubkey, swap_to_sp};
 
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let network = bitcoin::Network::Regtest;
@@ -1205,7 +1205,7 @@ fn test_birthday_height_skips_old_blocks(env: &mut TestEnv) {
 fn test_birthday_height_misses_earlier_outputs(env: &mut TestEnv) {
     use bwk_sign::hot_signer::HotSigner;
     use bwk_sp::account::{config::Config, Account};
-    use common::{generate_recipient_pubkey, swap_to_sp, TempDir};
+    use common::{generate_recipient_pubkey, swap_to_sp};
 
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let network = bitcoin::Network::Regtest;

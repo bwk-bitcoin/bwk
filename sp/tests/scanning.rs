@@ -11,11 +11,11 @@ use std::{
 };
 
 use bitcoin::OutPoint;
-use bwk_utils::test as bwk_test;
+use bwk_utils::test::{self as bwk_test, temp_dir::TempDir};
 
 use common::{
     test_account, test_account_named, test_account_persistent, test_account_persistent_named,
-    test_mnemonic, test_outpoint, TempDir, TestEnv,
+    test_mnemonic, test_outpoint, TestEnv,
 };
 
 use bwk::{
@@ -1677,7 +1677,7 @@ fn test_broadcast_requires_electrum_endpoint(env: &mut TestEnv) {
 fn test_sp_scan_timestamps(env: &mut TestEnv) {
     let (host, port) = env.electrum_endpoint();
 
-    let dir = common::TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
     let mut config = Config::new(
         "sp-scan-timestamps".to_string(),
         bitcoin::Network::Regtest,

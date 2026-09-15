@@ -21,7 +21,7 @@ assert_eq!(s, "abcd..mnop");
 
 ## Test Helpers (feature = "test")
 
-`corepc_node`, `miniscript` and `temp_dir::TempDir` are re-exported, so a
+`corepc_node`, `miniscript` and `temp_dir` are re-exported, so a
 consumer does not have to depend on them itself. `Client` and `Node` are
 `corepc_node` types; every node helper takes `&mut Client`.
 

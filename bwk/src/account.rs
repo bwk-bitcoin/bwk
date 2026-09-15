@@ -654,7 +654,8 @@ mod integration_tests {
         regtest::{
             self, generate, get_block_hash_str, get_block_height, invalidate_block, wait_until,
         },
-        TempDir, TestBitcoinD,
+        temp_dir::TempDir,
+        TestBitcoinD,
     };
     use miniscript::bitcoin::{
         self, bip32::ChildNumber, Address, Amount, Network, Transaction, Txid,

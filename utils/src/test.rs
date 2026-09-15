@@ -8,16 +8,18 @@ use std::{
     sync::Once,
 };
 
-pub use corepc_node::{self, Client, Node};
+pub use corepc_node;
 pub use electrsd;
 pub use miniscript;
-pub use temp_dir::TempDir;
+pub use temp_dir;
 
+use corepc_node::Client;
 use miniscript::bitcoin::{
     self, hashes::serde_macros::serde_details::SerdeHash, key::rand::random, Address, Amount,
     BlockHash, OutPoint, ScriptBuf, Transaction, TxIn, TxOut, Txid,
 };
 use rand::Rng;
+use temp_dir::TempDir;
 
 static INIT: Once = Once::new();
 

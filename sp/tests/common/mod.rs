@@ -23,7 +23,7 @@ use bitcoin::{
 };
 
 use blindbitd::BlindbitD;
-use bwk_utils::test::corepc_node;
+use bwk_utils::test::{corepc_node, temp_dir::TempDir};
 
 use bwk_sp::{
     account::config::Config,
@@ -433,8 +433,6 @@ pub fn test_spent_output(height: u32, amount: u64) -> OwnedOutput {
         },
     }
 }
-
-pub use bwk_utils::test::TempDir;
 
 // Blindbitd Helpers (Phase 10.4)
 
