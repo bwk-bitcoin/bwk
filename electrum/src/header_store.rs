@@ -420,7 +420,7 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
 
     /// Start online against `url`/`port` when both are given, or open
     /// file-backed/in-memory (idle) when no endpoint is configured. Shared
-    /// try-start-else-open branching for callers (e.g. `bwk::Account`,
+    /// try-start-else-open branching for callers (e.g. `bwk::account::Account`,
     /// `bwk_sp::Account`) that build one `HeaderStore` per config; whether an
     /// endpoint is even attempted (e.g. an "offline" config flag) is the
     /// caller's call, expressed by passing `None`.

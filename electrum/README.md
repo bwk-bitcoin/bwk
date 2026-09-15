@@ -22,7 +22,7 @@ thread: it promotes what the scanner recorded against the validated chain and
 fetches the proofs it needs through the store. `HeaderFollower` is the other
 side of that pairing, keeping a wallet's header store pointed at the endpoint
 its scanners watch. Wiring them together is the consumer's job (see
-`bwk::Account`).
+`bwk::account::Account`).
 
 **Scope:** Electrum protocol, script subscription, transaction history/fetch,
 broadcasting, the scan stores, the validated header chain and the reconcile

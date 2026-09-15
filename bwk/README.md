@@ -17,11 +17,12 @@ bwk-sign) or transaction construction (use bwk-tx).
 
 ```rust
 use bwk::{
+    account::Account,
     bwk_descriptor::descriptor::ScriptType,
     bwk_electrum::notification::{Notification, TxListenerNotif},
+    config::Config,
     miniscript::bitcoin::{bip32::ChildNumber, Network},
     persist::PersistenceKind,
-    Account, Config,
 };
 
 // An account derived from `mnemonic`, persisted as JSON under

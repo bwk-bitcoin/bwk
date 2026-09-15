@@ -5,12 +5,6 @@ pub mod log;
 pub mod profile;
 pub mod sync;
 
-pub use profile::StorageProfile;
-pub use sync::SyncEstimator;
-
-pub use account::Account;
-pub use config::Config;
-
 // Re-exports
 pub use bwk_backoff;
 pub use bwk_coin;

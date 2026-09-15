@@ -635,8 +635,8 @@ mod integration_tests {
     };
 
     use crate::{
+        account::Account,
         config::{maybe_create_dir, Config},
-        Account,
     };
     use bip39::Mnemonic;
     use bwk_coin::CoinStatus;

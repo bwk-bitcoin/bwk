@@ -41,10 +41,10 @@ use std::{sync::mpsc, thread::sleep, time::Duration};
 
 use bip39::Mnemonic;
 use bwk::{
+    account::Account,
     bwk_electrum::notification::Notification,
     config::{maybe_create_dir, Config},
     persist::PersistenceKind,
-    Account,
 };
 use bwk_coin::CoinStatus;
 use bwk_descriptor::descriptor::ScriptType;

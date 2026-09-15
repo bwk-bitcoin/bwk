@@ -1277,7 +1277,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     /// Returns a [`TxBuilder`] pre-configured with this account's coin source,
     /// change provider, and SP partial secret provider.
     ///
-    /// Usage mirrors [`bwk::Account::tx_builder()`]:
+    /// Usage mirrors [`bwk::account::Account::tx_builder()`]:
     /// ```ignore
     /// let mut builder = account.tx_builder();
     /// builder.add_output(SpRecipient::new(sp_addr, 50_000, network));

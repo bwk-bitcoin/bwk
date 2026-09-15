@@ -5,7 +5,7 @@
 //! them current. It is deliberately ignorant of the chain: it never reads a
 //! header, never verifies an inclusion proof and never promotes a claim. A
 //! consumer that only wants coin state uses it on its own; a wallet
-//! (`bwk::Account`) pairs it with a
+//! (`bwk::account::Account`) pairs it with a
 //! [`HeaderStore`](crate::header_store::HeaderStore) and reconciles the two
 //! through [`ElectrumScanner::coin_store`].
 
@@ -251,9 +251,9 @@ impl<P: ScanProfile> ElectrumScanner<P> {
     }
 
     /// The store the scan writes into, and the one door a reconciler writes
-    /// back through: `bwk::Account` locks it here to apply what it resolved
-    /// against the validated header chain (claim promotion, merkle-proof
-    /// verification, confirmation timestamps).
+    /// back through: `bwk::account::Account` locks it here to apply what it
+    /// resolved against the validated header chain (claim promotion,
+    /// merkle-proof verification, confirmation timestamps).
     pub fn coin_store(&self) -> &Arc<Mutex<CoinStore<P>>> {
         &self.coin_store
     }
