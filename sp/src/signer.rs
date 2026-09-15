@@ -255,6 +255,7 @@ mod tests {
         absolute,
         hashes::Hash,
         key::TweakedPublicKey,
+        psbt::raw::Key,
         secp256k1::{Secp256k1, SecretKey},
         transaction, Network, OutPoint, ScriptBuf, Sequence, TxOut, Txid, XOnlyPublicKey,
     };
@@ -332,6 +333,34 @@ mod tests {
 
         assert!(psbt.inputs[0].psbt.tap_key_sig.is_some());
         assert!(psbt.inputs[1].psbt.tap_key_sig.is_none());
+    }
+
+    #[test]
+    fn sign_verifies_sp_tweak() {
+        let signer = signer();
+        let psbt = empty_psbt(vec![owned_input(&signer, 1, 1)]);
+
+        let mut signed = psbt.clone();
+        signer.sign(&mut signed).unwrap();
+        assert!(signed.inputs[0].psbt.tap_key_sig.is_some());
+
+        let mut missing_tweak = psbt.clone();
+        missing_tweak.inputs[0].psbt.unknown.remove(&Key {
+            type_value: bwk_psbt::sp::PSBT_IN_SP_TWEAK,
+            key: Vec::new(),
+        });
+        signer.sign(&mut missing_tweak).unwrap();
+        assert!(missing_tweak.inputs[0].psbt.tap_key_sig.is_none());
+
+        let mut wrong_tweak = psbt.clone();
+        bwk_psbt::sp::set_sp_input_tweak(&mut wrong_tweak.inputs[0].psbt, [2; 32]);
+        signer.sign(&mut wrong_tweak).unwrap();
+        assert!(wrong_tweak.inputs[0].psbt.tap_key_sig.is_none());
+
+        let mut foreign_script = psbt;
+        foreign_script.inputs[0].psbt.witness_utxo = foreign_input(2).psbt.witness_utxo;
+        signer.sign(&mut foreign_script).unwrap();
+        assert!(foreign_script.inputs[0].psbt.tap_key_sig.is_none());
     }
 
     #[test]
