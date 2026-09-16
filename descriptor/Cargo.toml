@@ -10,5 +10,9 @@ readme.workspace = true
 
 [dependencies]
 bwk-keys.workspace = true
-miniscript.workspace = true
+miniscript = { workspace = true, features = ["serde"] }
+serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

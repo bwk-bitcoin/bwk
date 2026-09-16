@@ -1,17 +1,16 @@
 use std::collections::BTreeSet;
 
+use bwk_descriptor::descriptor::Descriptor;
 use bwk_hwi::service::{SigningDeviceMsg, SupportedDevice};
 use crossbeam::channel;
-use miniscript::{
-    bitcoin::{
-        bip32::{self, DerivationPath},
-        hashes::{sha256, Hash},
-        Psbt,
-    },
-    Descriptor, DescriptorPublicKey,
+use miniscript::bitcoin::{
+    bip32::{self, DerivationPath},
+    hashes::{sha256, Hash},
+    Psbt,
 };
 
 use crate::{
+    error::Error,
     send,
     signer::{Signer, SignerNotif},
 };
@@ -31,7 +30,7 @@ pub struct HwSigner {
     device: SupportedDevice<HwMessage>,
     id: String,
     sender: Option<channel::Sender<SignerNotif>>,
-    pub(crate) descriptors: BTreeSet<Descriptor<DescriptorPublicKey>>,
+    pub descriptors: BTreeSet<Descriptor>,
 }
 
 impl HwSigner {
@@ -52,7 +51,7 @@ impl HwSigner {
         *self.device.fingerprint()
     }
 
-    fn wallet_name(descriptor: &Descriptor<DescriptorPublicKey>) -> String {
+    fn wallet_name(descriptor: &Descriptor) -> String {
         let policy = descriptor.to_string();
         let hash = sha256::Hash::hash(policy.as_bytes());
         let bytes = hash.as_byte_array();
@@ -81,20 +80,28 @@ impl Signer for HwSigner {
         self.device.get_extended_pubkey((), &deriv);
     }
 
-    fn is_descriptor_registered(&self, descriptor: Descriptor<DescriptorPublicKey>) {
+    fn is_descriptor_registered(&self, descriptor: Descriptor) {
+        if descriptor.is_sp() {
+            send!(self, Error(Error::SpDescriptor));
+            return;
+        }
         let policy = descriptor.to_string();
         let name = Self::wallet_name(&descriptor);
         self.device.is_wallet_registered((), &name, &policy);
     }
 
-    fn register_descriptor(&mut self, descriptor: Descriptor<DescriptorPublicKey>) {
+    fn register_descriptor(&mut self, descriptor: Descriptor) {
+        if descriptor.is_sp() {
+            send!(self, Error(Error::SpDescriptor));
+            return;
+        }
         self.descriptors.insert(descriptor.clone());
         let policy = descriptor.to_string();
         let name = Self::wallet_name(&descriptor);
         self.device.register_wallet((), &name, &policy);
     }
 
-    fn sign_with_descriptor(&self, psbt: Psbt, _descriptor: Descriptor<DescriptorPublicKey>) {
+    fn sign_with_descriptor(&self, psbt: Psbt, _descriptor: Descriptor) {
         self.device.sign_tx((), psbt);
     }
 }

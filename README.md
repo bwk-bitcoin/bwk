@@ -50,7 +50,7 @@ Blindbit).
 | bwk-psbt        | PSBTv2 (BIP370), silent-payment fields (BIP375/376)   |
 | bwk-electrum    | Electrum client, scanner, scan stores, header chain   |
 | bwk-sign        | Hot signer, SigningManager                            |
-| bwk-descriptor  | Descriptor construction, SpkDerivator                 |
+| bwk-descriptor  | Miniscript and sp() descriptors, SpkDerivator         |
 | bwk-keys        | Key derivation (OXpriv, OXpub)                        |
 | bwk-p2p         | Bitcoin P2P client                                    |
 | bwk-coin        | Coin domain types shared by bwk-tx and bwk-electrum   |

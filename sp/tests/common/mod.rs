@@ -908,7 +908,13 @@ impl TestEnv {
             .unwrap();
         let height = bwk_utils::test::get_tx_height(&mut self.bitcoind.client, txid);
 
-        let descriptor = signer.descriptors().into_iter().next().unwrap();
+        let descriptor = signer
+            .descriptors()
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_miniscript()
+            .unwrap();
         Coin {
             txout,
             outpoint: OutPoint {
@@ -948,7 +954,13 @@ impl TestEnv {
             .unwrap();
         let height = bwk_utils::test::get_tx_height(&mut self.bitcoind.client, txid);
 
-        let descriptor = signer.descriptors().into_iter().next().unwrap();
+        let descriptor = signer
+            .descriptors()
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_miniscript()
+            .unwrap();
         let satisfaction = descriptor
             .clone()
             .into_single_descriptors()
