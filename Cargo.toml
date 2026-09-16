@@ -13,6 +13,7 @@ members = [
     "qr", "qr-protocol",
     "persist",
     "p2p",
+    "psbt",
     "hwi", "hwi/cli",
     "hwi/ledger-bitcoin-client", "hwi/ledger-transport-hidapi", "hwi/bitbox-api",
     "secp256k1_spscan-sys",
@@ -81,6 +82,7 @@ bwk-descriptor = { path = "descriptor" }
 bwk-persist = { path = "persist" }
 bwk-utils = { path = "utils" }
 bwk-p2p = { path = "p2p" }
+bwk-psbt = { path = "psbt" }
 bwk-qr = { path = "qr" }
 bwk-qr-protocol = { path = "qr-protocol" }
 bwk = { path = "bwk" }

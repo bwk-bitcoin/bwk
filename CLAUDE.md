@@ -46,6 +46,7 @@ tests locally. Commit messages must be single-line and follow existing style
 |                 | wallets (Electrum backend)                                  |
 | bwk-sp          | Silent Payments account orchestrator (BIP352, Blindbit)     |
 | bwk-tx          | Transaction building, coin selection, fee estimation, PSBT  |
+| bwk-psbt        | Native PSBTv2 (BIP370), silent-payment fields (BIP375/376)  |
 | bwk-electrum    | Electrum protocol client (TCP/SSL), ElectrumScanner, and    |
 |                 | the scan stores, the header chain and the reconcile pass    |
 | bwk-sign        | Hot signer, SigningManager for BIP32 key management         |
