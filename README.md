@@ -41,24 +41,26 @@ Blindbit).
 ## Crates
 
 ```
-+----------------+-------------------------------------------------------+
-| Crate          | Purpose                                               |
-+----------------+-------------------------------------------------------+
-| bwk            | Account for descriptor wallets (Electrum backend)     |
-| bwk-sp         | Silent Payments account (BIP352, Blindbit backend)    |
-| bwk-tx         | Transaction building, coin selection, PSBT            |
-| bwk-electrum   | Electrum client, scanner, scan stores, header chain   |
-| bwk-sign       | Hot signer, SigningManager                            |
-| bwk-descriptor | Descriptor construction, SpkDerivator                 |
-| bwk-keys       | Key derivation (OXpriv, OXpub)                        |
-| bwk-p2p        | Bitcoin P2P client                                    |
-| bwk-coin       | Coin domain types shared by bwk-tx and bwk-electrum   |
-| bwk-persist    | KV persistence: Store, RamStore, JSON/SQLite backends |
-| bwk-hwi        | Hardware wallet transport and device drivers          |
-| bwk-error      | In-house error derive, reached as `thiserror`         |
-| bwk-backoff    | Exponential backoff                                   |
-| bwk-utils      | Test helpers                                          |
-+----------------+-------------------------------------------------------+
++-----------------+-------------------------------------------------------+
+| Crate           | Purpose                                               |
++-----------------+-------------------------------------------------------+
+| bwk             | Account for descriptor wallets (Electrum backend)     |
+| bwk-sp          | Silent Payments account (BIP352, Blindbit backend)    |
+| bwk-tx          | Transaction building, coin selection, PSBT            |
+| bwk-electrum    | Electrum client, scanner, scan stores, header chain   |
+| bwk-sign        | Hot signer, SigningManager                            |
+| bwk-descriptor  | Descriptor construction, SpkDerivator                 |
+| bwk-keys        | Key derivation (OXpriv, OXpub)                        |
+| bwk-p2p         | Bitcoin P2P client                                    |
+| bwk-coin        | Coin domain types shared by bwk-tx and bwk-electrum   |
+| bwk-persist     | KV persistence: Store, RamStore, JSON/SQLite backends |
+| bwk-hwi         | Hardware wallet transport and device drivers          |
+| bwk-error       | In-house error derive, reached as `thiserror`         |
+| bwk-qr          | QR generation, scanning, BBQR framing                 |
+| bwk-qr-protocol | Signing-flow message codec (no_std, C binding)        |
+| bwk-backoff     | Exponential backoff                                   |
+| bwk-utils       | Test helpers                                          |
++-----------------+-------------------------------------------------------+
 ```
 
 See crate READMEs:
@@ -73,6 +75,8 @@ See crate READMEs:
 [bwk-coin](coin/README.md),
 [bwk-hwi](hwi/README.md),
 [bwk-error](error/README.md),
+[bwk-qr](qr/README.md),
+[bwk-qr-protocol](qr-protocol/README.md),
 [bwk-backoff](backoff/README.md),
 [bwk-utils](utils/README.md)
 
