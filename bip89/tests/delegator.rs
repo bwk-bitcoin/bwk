@@ -2,7 +2,7 @@ mod common;
 
 use bwk_bip89::{
     accumulator::{
-        record::{build_tree, sign_tree_root, SignedRoot},
+        record::{build_tree, sign_tree_root, RootRecord, RootSignature},
         tree::Proof,
     },
     bundle::derive_bundle,
@@ -26,8 +26,8 @@ use bwk_bip89::{
     BitcoinBackend, Error, Xpub,
 };
 use common::{
-    delegate_to_rust_bitcoin, field_key, hex_arr, hex_vec, other_template, signed_roots,
-    spend_psbt, standard_lists, wallet, FixedRng, SortedMulti, VectorBackend, Wallet,
+    delegate_to_rust_bitcoin, field_key, hex_arr, hex_vec, other_template, root_signature,
+    signed_roots, spend_psbt, standard_lists, wallet, FixedRng, SortedMulti, VectorBackend, Wallet,
     DELEGATOR_KEY, DELEGATOR_SECRET, EXTERNAL_KEY, EXTERNAL_SECRET, OWNER1_KEY, OWNER1_SECRET,
     OWNER2_SECRET,
 };
@@ -183,8 +183,12 @@ fn root_signed_by_other_key_refused() {
     let reg = register(&s.c, s.w.template.clone(), &receive, &change).unwrap();
     assert_eq!(verify_spend(&s.c, &reg, &s.psbt), Ok(31_000));
 
-    let forged_change = SignedRoot {
-        signature: change.signature,
+    let owner1_signed = root_signature(&owner1_change);
+    let forged_change = RootRecord {
+        signature: Some(RootSignature {
+            signature: root_signature(&change).signature,
+            ..owner1_signed
+        }),
         ..owner1_change
     };
     assert!(matches!(

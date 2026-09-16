@@ -117,7 +117,7 @@ Blinded signing writes a session in `bip89_blind_challenge_gen`, laid out as
 `tweak (32) || is_xonly (1)` per tweak; `bip89_blind_sign` zeroes the caller
 secret nonce.
 
-## Signed roots
+## Root records
 
 `bip89_sign_tree_root` builds the tree of the descriptor for a keychain and tree
 start and signs its root with BIP322 under the branch key of the caller `secret`.
@@ -125,9 +125,10 @@ It writes the 32-byte root, the 33-byte base key of `secret`, its 32-byte branch
 tweak, and the signature to `signature_out` with its length in `*signature_len`,
 following the entry point buffer rule above. A secret that is not a key of the
 descriptor gives `BIP89_ERR_NOT_PARTICIPANT`. A retry with a larger buffer
-builds the tree and signs again.
+builds the tree and signs again. `bip89_build_tree` gives the same root with no
+signature.
 
-A signed root crosses back as `bip89_signed_root`:
+A root crosses back as `bip89_root_record`:
 
 ```
 +---------------+----------------+---------------------------------------------+
@@ -136,21 +137,24 @@ A signed root crosses back as `bip89_signed_root`:
 | keychain      | uint32_t       | 0 receive, 1 change                         |
 | tree_start    | uint32_t       | First derivation index of the tree          |
 | root          | uint8_t[32]    | Accumulator root                            |
-| key           | uint8_t[33]    | Base key of the signer                      |
-| branch_tweak  | uint8_t[32]    | Tweak from `key` to its branch key          |
+| key           | uint8_t[33]    | Base key of the signer, ignored when there  |
+|               |                | is no signature                             |
+| branch_tweak  | uint8_t[32]    | Tweak from `key` to its branch key, ignored |
+|               |                | when there is no signature                  |
 | signature     | const uint8_t* | BIP322 signature, borrowed for the call     |
-| signature_len | size_t         | Signature length; `signature` may be null   |
-|               |                | when it is 0                                |
+| signature_len | size_t         | Signature length; 0 means the root carries  |
+|               |                | no signature and `signature` may be null    |
 +---------------+----------------+---------------------------------------------+
 ```
 
 - `bip89_register(crypto, tmpl, receive, change, out)` checks the `receive`
-  (keychain 0) and `change` (keychain 1) signed roots and writes a registration
+  (keychain 0) and `change` (keychain 1) root records and writes a registration
   handle. A key that is not a base key of the template gives
-  `BIP89_ERR_NOT_PARTICIPANT`, a failing signature `BIP89_ERR_ROOT_SIGNATURE`,
-  and a root on another keychain `BIP89_ERR_INVALID_KEYCHAIN`.
-- `bip89_registration_record_root(crypto, registration, signed_root)` records
-  the root of a keychain's next tree, checked the same way.
+  `BIP89_ERR_NOT_PARTICIPANT`, a failing signature `BIP89_ERR_ROOT_SIGNATURE`, a
+  record with no signature `BIP89_ERR_MISSING_ROOT_SIGNATURE`, and a root on
+  another keychain `BIP89_ERR_INVALID_KEYCHAIN`.
+- `bip89_registration_record_root(crypto, registration, record)` records the
+  root of a keychain's next tree, checked the same way.
 
 ## Errors
 
@@ -169,6 +173,8 @@ freed by the caller. The coordinator and spend entry points also take a nullable
 | 135 to 141 | Descriptor validation variants of `bwk_bip89::Error`:           |
 |            | NotTaproot, KeyType, Multipath, Wildcard, HardenedStep,         |
 |            | ConflictingKey, NoKeys.                                         |
+| 142        | `BIP89_ERR_MISSING_ROOT_SIGNATURE`, a root record with no       |
+|            | signature.                                                      |
 | 500        | Null pointer.                                                   |
 | 501        | Vtable with a null callback.                                    |
 | 502        | Output buffer too small; the needed length is written back.     |

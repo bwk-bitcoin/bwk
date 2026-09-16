@@ -9,7 +9,7 @@ mod common;
 use bwk_bip89::{
     accumulator::{
         branch_hash, leaf_hash,
-        record::{build_tree, root_message, template_id, SignedRoot},
+        record::{build_tree, root_message, template_id, RootRecord, RootSignature},
         root_hash,
         tree::{verify_proof, Proof, Tree, HEIGHT},
     },
@@ -158,15 +158,17 @@ fn forged_change_with_self_made_tree_is_refused() {
     let attacker_secret = [0x46; 32];
     let tid = template_id(&s.c, &s.c.template_bytes(&s.w.template));
     let message = root_message(&s.c, &tid, &root);
-    let signed = SignedRoot {
+    let record = RootRecord {
         keychain: 1,
         tree_start: 0,
         root,
-        key: s.c.base_mul(&attacker_secret).unwrap(),
-        branch_tweak: [0u8; 32],
-        signature: s.c.bip322_sign(&attacker_secret, &message).unwrap(),
+        signature: Some(RootSignature {
+            key: s.c.base_mul(&attacker_secret).unwrap(),
+            branch_tweak: [0u8; 32],
+            signature: s.c.bip322_sign(&attacker_secret, &message).unwrap(),
+        }),
     };
-    assert_eq!(s.reg.record_root(&s.c, &signed), Err(Error::NotParticipant));
+    assert_eq!(s.reg.record_root(&s.c, &record), Err(Error::NotParticipant));
 
     s.c.set_output_proof(&mut s.psbt, 1, &proof).unwrap();
     assert_eq!(s.c.output_proof(&s.psbt, 1), Ok(Some(proof)));

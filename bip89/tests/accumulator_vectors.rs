@@ -7,7 +7,10 @@ mod common;
 use bwk_bip89::{
     accumulator::{
         branch_hash, generate_tree, keys_digest, leaf_hash, leaf_nonce, policy_hash, policy_id,
-        record::{build_tree, root_message, sign_tree_root, template_id, verify_root, SignedRoot},
+        record::{
+            build_tree, root_message, sign_tree_root, template_id, verify_root, RootRecord,
+            RootSignature,
+        },
         root_hash,
         shuffle::{shuffle_key, shuffle_order, MAX_RANGE},
         tree::{verify_proof, Proof, TreeBuilder, HEIGHT},
@@ -21,7 +24,7 @@ use bwk_bip89::{
     tweak::{compute_bip32_tweak, tweak_key},
     BitcoinBackend, Bundle, Xpub,
 };
-use common::{hex_arr, hex_vec, wallet, OWNER1_SECRET};
+use common::{hex_arr, hex_vec, root_signature, wallet, OWNER1_SECRET};
 
 const PRIMITIVES_JSON: &str = include_str!("../test_vectors/accumulator/primitives.json");
 const TREE_JSON: &str = include_str!("../test_vectors/accumulator/tree.json");
@@ -389,7 +392,8 @@ fn tree() -> TreeVector {
     let tid = template_id(&c, &c.descriptor_template(d).unwrap());
     let rm = root_message(&c, &tid, &root);
 
-    let signed = sign_tree_root(&c, d, &OWNER1_SECRET, keychain, tree_start).unwrap();
+    let record = sign_tree_root(&c, d, &OWNER1_SECRET, keychain, tree_start).unwrap();
+    let signed = root_signature(&record);
     let branch_key = tweak_key(&c, &signed.key, &signed.branch_tweak).unwrap();
 
     TreeVector {
@@ -657,15 +661,17 @@ fn vectors_tree() {
     let signature = hex_vec(&vectors.signature);
     assert!(c.bip322_verify(&branch_key, &message, &signature));
 
-    let signed = SignedRoot {
+    let record = RootRecord {
         keychain: vectors.keychain,
         tree_start: vectors.tree_start,
         root: root_bytes,
-        key,
-        branch_tweak,
-        signature,
+        signature: Some(RootSignature {
+            key,
+            branch_tweak,
+            signature,
+        }),
     };
-    assert_eq!(verify_root(&c, &w.template, &signed), Ok(()));
+    assert_eq!(verify_root(&c, &w.template, &record), Ok(()));
 }
 
 #[test]

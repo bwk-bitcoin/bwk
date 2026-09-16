@@ -92,6 +92,7 @@ extern "C" {
 #define BIP89_ERR_HARDENED_STEP 139
 #define BIP89_ERR_CONFLICTING_KEY 140
 #define BIP89_ERR_NO_KEYS 141
+#define BIP89_ERR_MISSING_ROOT_SIGNATURE 142
 #define BIP89_ERR_NULL_POINTER 500
 #define BIP89_ERR_BAD_VTABLE 501
 #define BIP89_ERR_BUFFER_TOO_SMALL 502
@@ -369,12 +370,13 @@ int32_t bip89_change_output_verification(const bip89_crypto_vtable *crypto,
                                          uint8_t *valid_out, const char **err);
 
 /*
- * A root signed by one key of the descriptor, as bip89_sign_tree_root writes it: `key` is
- * the signer's base key, `branch_tweak` the tweak from it to its branch key for `keychain`,
- * and `signature` points at `signature_len` bytes, borrowed for the duration of the call
- * (may be NULL when signature_len is 0).
+ * The accumulator root of one tree, as bip89_sign_tree_root writes it: `key` is the
+ * signer's base key, `branch_tweak` the tweak from it to its branch key for `keychain`,
+ * and `signature` points at `signature_len` bytes, borrowed for the duration of the call.
+ * A signature_len of 0 means the root carries no signature; `signature` may then be NULL
+ * and `key` and `branch_tweak` are ignored.
  */
-typedef struct bip89_signed_root {
+typedef struct bip89_root_record {
     uint32_t keychain;
     uint32_t tree_start;
     uint8_t root[32];
@@ -382,26 +384,27 @@ typedef struct bip89_signed_root {
     uint8_t branch_tweak[32];
     const uint8_t *signature;
     size_t signature_len;
-} bip89_signed_root;
+} bip89_root_record;
 
 /*
  * Pin the template with the `receive` (keychain 0) and `change` (keychain 1) roots. Each
  * key must be a base key of `tmpl` (BIP89_ERR_NOT_PARTICIPANT) and each signature must
- * verify (BIP89_ERR_ROOT_SIGNATURE); a root on another keychain gives
+ * verify (BIP89_ERR_ROOT_SIGNATURE); a record with no signature gives
+ * BIP89_ERR_MISSING_ROOT_SIGNATURE and a root on another keychain
  * BIP89_ERR_INVALID_KEYCHAIN. Writes an owning handle to *out on success. The handle keeps
  * a copy of `tmpl`: its ctx must stay valid until bip89_registration_free.
  */
 int32_t bip89_register(const bip89_crypto_vtable *crypto, const bip89_template_vtable *tmpl,
-                       const bip89_signed_root *receive, const bip89_signed_root *change,
+                       const bip89_root_record *receive, const bip89_root_record *change,
                        bip89_registration **out, const char **err);
 
 /*
  * Record the root of the next tree of a keychain, once the current one is exhausted. The
- * root is checked as in bip89_register before it is recorded.
+ * record is checked as in bip89_register before its root is recorded.
  */
 int32_t bip89_registration_record_root(const bip89_crypto_vtable *crypto,
                                        bip89_registration *registration,
-                                       const bip89_signed_root *signed_root, const char **err);
+                                       const bip89_root_record *record, const char **err);
 
 /* Release a registration. A NULL pointer is a no-op. */
 void bip89_registration_free(bip89_registration *registration);

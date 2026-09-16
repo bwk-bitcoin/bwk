@@ -29,7 +29,7 @@ use core::{
 
 use bwk_bip89::{
     accumulator::{
-        record::SignedRoot,
+        record::{RootRecord, RootSignature},
         tree::{Proof, Tree},
     },
     blind::SessionContext,
@@ -222,10 +222,11 @@ pub struct FfiOwned {
     pub index: u32,
 }
 
-/// A root signed by one key of the descriptor. `signature` points at
-/// `signature_len` bytes, borrowed for the duration of the call.
+/// The accumulator root of one tree. `signature` points at `signature_len`
+/// bytes, borrowed for the duration of the call. A `signature_len` of 0 means
+/// the root carries no signature, and `key` and `branch_tweak` are ignored.
 #[repr(C)]
-pub struct FfiSignedRoot {
+pub struct FfiRootRecord {
     pub keychain: u32,
     pub tree_start: u32,
     pub root: [u8; 32],
@@ -235,18 +236,24 @@ pub struct FfiSignedRoot {
     pub signature_len: usize,
 }
 
-impl FfiSignedRoot {
+impl FfiRootRecord {
     /// # Safety
     /// `signature` must be readable for `signature_len` bytes, or null when
     /// `signature_len` is 0.
-    unsafe fn signed_root(&self) -> Result<SignedRoot, FfiError> {
-        Ok(SignedRoot {
+    unsafe fn root_record(&self) -> Result<RootRecord, FfiError> {
+        let signature = match slice(self.signature, self.signature_len)? {
+            [] => None,
+            bytes => Some(RootSignature {
+                key: self.key,
+                branch_tweak: self.branch_tweak,
+                signature: bytes.to_vec(),
+            }),
+        };
+        Ok(RootRecord {
             keychain: self.keychain,
             tree_start: self.tree_start,
             root: self.root,
-            key: self.key,
-            branch_tweak: self.branch_tweak,
-            signature: slice(self.signature, self.signature_len)?.to_vec(),
+            signature,
         })
     }
 }
@@ -328,6 +335,7 @@ fn ll_error_info(error: Error) -> (i32, &'static str) {
         Error::HardenedStep => (139, "key has a hardened derivation step\0"),
         Error::ConflictingKey => (140, "base key repeated with another chain code or path\0"),
         Error::NoKeys => (141, "descriptor has no key\0"),
+        Error::MissingRootSignature => (142, "root signature missing\0"),
     }
 }
 
@@ -1832,13 +1840,17 @@ unsafe fn sign_tree_root_inner(
     let b = VtableBackend::new(crypto)?;
     let descriptor = VtableDescriptor::new(descriptor)?;
 
-    let signed = bwk_bip89::accumulator::record::sign_tree_root(
+    let record = bwk_bip89::accumulator::record::sign_tree_root(
         &b,
         &descriptor,
         &secret,
         keychain,
         tree_start,
     )?;
+    // sign_tree_root always signs the root it builds
+    let Some(signed) = record.signature else {
+        return Err(FfiError::Ll(Error::MissingRootSignature));
+    };
     if signed.signature.len() > signature_cap {
         *signature_len = signed.signature.len();
         return Err(FfiError::BufferTooSmall);
@@ -1846,7 +1858,7 @@ unsafe fn sign_tree_root_inner(
     if signature_out.is_null() {
         return Err(FfiError::NullPointer);
     }
-    write(root_out, &signed.root);
+    write(root_out, &record.root);
     write(key_out, &signed.key);
     write(branch_tweak_out, &signed.branch_tweak);
     ptr::copy_nonoverlapping(
@@ -2075,13 +2087,13 @@ unsafe fn verify_inner<'a>(
 /// # Safety
 /// `crypto` and `tmpl` must point to sound vtables. `receive` and `change`
 /// must point to readable records whose signatures follow the rule of
-/// `FfiSignedRoot`. `out` must be writable for one pointer. `err` may be null.
+/// `FfiRootRecord`. `out` must be writable for one pointer. `err` may be null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bip89_register(
     crypto: *const CryptoVtable,
     tmpl: *const TemplateVtable,
-    receive: *const FfiSignedRoot,
-    change: *const FfiSignedRoot,
+    receive: *const FfiRootRecord,
+    change: *const FfiRootRecord,
     out: *mut *mut RegistrationHandle,
     err: *mut *const c_char,
 ) -> i32 {
@@ -2094,15 +2106,15 @@ pub unsafe extern "C" fn bip89_register(
 unsafe fn register_inner(
     crypto: *const CryptoVtable,
     tmpl: *const TemplateVtable,
-    receive: *const FfiSignedRoot,
-    change: *const FfiSignedRoot,
+    receive: *const FfiRootRecord,
+    change: *const FfiRootRecord,
     out: *mut *mut RegistrationHandle,
 ) -> Result<(), FfiError> {
     if out.is_null() || receive.is_null() || change.is_null() {
         return Err(FfiError::NullPointer);
     }
-    let receive = (*receive).signed_root()?;
-    let change = (*change).signed_root()?;
+    let receive = (*receive).root_record()?;
+    let change = (*change).root_record()?;
     let b = VtableBackend::new(crypto)?;
     let tmpl = VtableTemplate::new(tmpl)?;
 
@@ -2116,16 +2128,16 @@ unsafe fn register_inner(
 ///
 /// # Safety
 /// `crypto` must point to a sound vtable. `registration` must come from
-/// `bip89_register` and be live. `signed` must point to a readable record
-/// whose signature follows the rule of `FfiSignedRoot`. `err` may be null.
+/// `bip89_register` and be live. `record` must point to a readable record
+/// whose signature follows the rule of `FfiRootRecord`. `err` may be null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bip89_registration_record_root(
     crypto: *const CryptoVtable,
     registration: *mut RegistrationHandle,
-    signed: *const FfiSignedRoot,
+    record: *const FfiRootRecord,
     err: *mut *const c_char,
 ) -> i32 {
-    match registration_record_root_inner(crypto, registration, signed) {
+    match registration_record_root_inner(crypto, registration, record) {
         Ok(()) => BIP89_OK,
         Err(error) => fail(error, err),
     }
@@ -2134,16 +2146,16 @@ pub unsafe extern "C" fn bip89_registration_record_root(
 unsafe fn registration_record_root_inner(
     crypto: *const CryptoVtable,
     registration: *mut RegistrationHandle,
-    signed: *const FfiSignedRoot,
+    record: *const FfiRootRecord,
 ) -> Result<(), FfiError> {
-    if registration.is_null() || signed.is_null() {
+    if registration.is_null() || record.is_null() {
         return Err(FfiError::NullPointer);
     }
-    let signed = (*signed).signed_root()?;
+    let record = (*record).root_record()?;
     let b = VtableBackend::new(crypto)?;
     let registration = unsafe { &mut *registration };
 
-    registration.record_root(&b, &signed)?;
+    registration.record_root(&b, &record)?;
     Ok(())
 }
 
@@ -2359,7 +2371,7 @@ mod tests {
 
     use crate::FfiError;
 
-    const LL_ROWS: [(Error, i32, &str); 40] = [
+    const LL_ROWS: [(Error, i32, &str); 41] = [
         (Error::InvalidPoint, 100, "invalid point\0"),
         (Error::Infinity, 101, "point at infinity\0"),
         (Error::ScalarRange, 102, "scalar out of range\0"),
@@ -2428,6 +2440,7 @@ mod tests {
             "base key repeated with another chain code or path\0",
         ),
         (Error::NoKeys, 141, "descriptor has no key\0"),
+        (Error::MissingRootSignature, 142, "root signature missing\0"),
     ];
 
     const BOUNDARY_ROWS: [(FfiError, i32, &str); 4] = [
@@ -2437,8 +2450,8 @@ mod tests {
         (FfiError::IndexOutOfBounds, 503, "index out of bounds\0"),
     ];
 
-    fn all_infos() -> [(i32, &'static str); 44] {
-        let mut out = [(0, ""); 44];
+    fn all_infos() -> [(i32, &'static str); 45] {
+        let mut out = [(0, ""); 45];
         for (i, (error, code, message)) in LL_ROWS.into_iter().enumerate() {
             let info = FfiError::Ll(error).info();
             assert_eq!(info, (code, message));

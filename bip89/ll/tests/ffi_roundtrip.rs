@@ -32,12 +32,12 @@ use bwk_bip89_ll::{
     bip89_derive_bundle, bip89_input_verification, bip89_register, bip89_registration_free,
     bip89_registration_record_root, bip89_sign_tree_root, bip89_tree_free, bip89_tree_proof,
     bip89_tweak_key, bip89_unblind_signature, bip89_verify_blind_signature, CryptoVtable,
-    DescriptorVtable, FfiError, FfiOwned, FfiSignedRoot, FfiXpub, PsbtVtable, RegistrationHandle,
+    DescriptorVtable, FfiError, FfiOwned, FfiRootRecord, FfiXpub, PsbtVtable, RegistrationHandle,
     TemplateVtable, U32List, VtableBackend, VtableTemplate, BIP89_OK,
 };
 use common::{
-    hex_arr, hex_vec, signed_roots, spend_psbt, standard_lists, wallet, FixedRng, DELEGATOR_SECRET,
-    OWNER1_SECRET,
+    hex_arr, hex_vec, root_signature, signed_roots, spend_psbt, standard_lists, wallet, FixedRng,
+    DELEGATOR_SECRET, OWNER1_SECRET,
 };
 
 const G: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
@@ -792,7 +792,7 @@ fn sign_root_through_c(
     dv: &DescriptorVtable,
     secret: &[u8; 32],
     keychain: u32,
-) -> record::SignedRoot {
+) -> record::RootRecord {
     let mut root = [0u8; 32];
     let mut key = [0u8; 33];
     let mut branch_tweak = [0u8; 32];
@@ -816,26 +816,38 @@ fn sign_root_through_c(
         )
     };
     assert_eq!(rc, BIP89_OK);
-    record::SignedRoot {
+    record::RootRecord {
         keychain,
         tree_start: 0,
         root,
-        key,
-        branch_tweak,
-        signature: signature[..signature_len].to_vec(),
+        signature: Some(record::RootSignature {
+            key,
+            branch_tweak,
+            signature: signature[..signature_len].to_vec(),
+        }),
     }
 }
 
-/// The C record of `signed`, borrowing its signature.
-fn ffi_signed_root(signed: &record::SignedRoot) -> FfiSignedRoot {
-    FfiSignedRoot {
-        keychain: signed.keychain,
-        tree_start: signed.tree_start,
-        root: signed.root,
-        key: signed.key,
-        branch_tweak: signed.branch_tweak,
-        signature: signed.signature.as_ptr(),
-        signature_len: signed.signature.len(),
+/// The C record of `record`, borrowing its signature. A record with no
+/// signature crosses with a null signature of length 0.
+fn ffi_root_record(record: &record::RootRecord) -> FfiRootRecord {
+    let (key, branch_tweak, signature, signature_len) = match &record.signature {
+        Some(signed) => (
+            signed.key,
+            signed.branch_tweak,
+            signed.signature.as_ptr(),
+            signed.signature.len(),
+        ),
+        None => ([0u8; 33], [0u8; 32], core::ptr::null(), 0),
+    };
+    FfiRootRecord {
+        keychain: record.keychain,
+        tree_start: record.tree_start,
+        root: record.root,
+        key,
+        branch_tweak,
+        signature,
+        signature_len,
     }
 }
 
@@ -2122,7 +2134,7 @@ fn sign_tree_root_matches_rust() {
     };
     assert_eq!(rc, 502);
     assert_eq!(message(err), "output buffer too small");
-    assert_eq!(signature_len, expected.signature.len());
+    assert_eq!(signature_len, root_signature(&expected).signature.len());
     assert_eq!(root_out, [0xaau8; 32]);
     assert_eq!(key_out, [0xaau8; 33]);
     assert_eq!(branch_tweak_out, [0xaau8; 32]);
@@ -2677,8 +2689,8 @@ fn register_through_c() {
     let mut err: *const c_char = core::ptr::null();
 
     let [receive, change] = signed_roots(&rust_c, &w);
-    let c_receive = ffi_signed_root(&receive);
-    let c_change = ffi_signed_root(&change);
+    let c_receive = ffi_root_record(&receive);
+    let c_change = ffi_root_record(&change);
     let mut out: *mut RegistrationHandle = core::ptr::null_mut();
     let rc = unsafe { bip89_register(&v, &tv, &c_receive, &c_change, &mut out, &mut err) };
     assert_eq!(rc, BIP89_OK);
@@ -2696,13 +2708,13 @@ fn register_through_c() {
         Err(Error::InvalidKeychain)
     ));
 
-    let mut forged_signature = change.signature.clone();
+    let mut forged_signature = root_signature(&change).signature;
     // the first byte of the Schnorr signature, after the item count and its length
     forged_signature[2] ^= 0x01;
-    let forged_change = FfiSignedRoot {
+    let forged_change = FfiRootRecord {
         signature: forged_signature.as_ptr(),
         signature_len: forged_signature.len(),
-        ..ffi_signed_root(&change)
+        ..ffi_root_record(&change)
     };
     let mut out3: *mut RegistrationHandle = core::ptr::null_mut();
     let rc3 = unsafe { bip89_register(&v, &tv, &c_receive, &forged_change, &mut out3, &mut err) };
@@ -2759,8 +2771,8 @@ fn registration_record_root_through_c() {
         bip89_register(
             &v,
             &tv,
-            &ffi_signed_root(&receive),
-            &ffi_signed_root(&change),
+            &ffi_root_record(&receive),
+            &ffi_root_record(&change),
             &mut reg,
             &mut err,
         )
@@ -2768,30 +2780,36 @@ fn registration_record_root_through_c() {
     assert_eq!(rc, BIP89_OK);
 
     let next = record::sign_tree_root(&rust_c, &w.descriptor, &OWNER1_SECRET, 0, 256).unwrap();
-    let rc1 = unsafe { bip89_registration_record_root(&v, reg, &ffi_signed_root(&next), &mut err) };
+    let rc1 = unsafe { bip89_registration_record_root(&v, reg, &ffi_root_record(&next), &mut err) };
     assert_eq!(rc1, BIP89_OK);
 
-    let outsider = record::SignedRoot {
-        key: rust_c.base_mul(&[0x05u8; 32]).unwrap(),
+    let outsider = record::RootRecord {
+        signature: Some(record::RootSignature {
+            key: rust_c.base_mul(&[0x05u8; 32]).unwrap(),
+            ..root_signature(&next)
+        }),
         ..next.clone()
     };
     let rc2 =
-        unsafe { bip89_registration_record_root(&v, reg, &ffi_signed_root(&outsider), &mut err) };
+        unsafe { bip89_registration_record_root(&v, reg, &ffi_root_record(&outsider), &mut err) };
     assert_eq!(rc2, 131);
     assert_eq!(message(err), "secret key not in template");
 
-    let other_signature = record::SignedRoot {
-        signature: change.signature.clone(),
+    let other_signature = record::RootRecord {
+        signature: Some(record::RootSignature {
+            signature: root_signature(&change).signature,
+            ..root_signature(&next)
+        }),
         ..next.clone()
     };
     let rc3 = unsafe {
-        bip89_registration_record_root(&v, reg, &ffi_signed_root(&other_signature), &mut err)
+        bip89_registration_record_root(&v, reg, &ffi_root_record(&other_signature), &mut err)
     };
     assert_eq!(rc3, 121);
     assert_eq!(message(err), "invalid root signature");
 
     let rc4 = unsafe {
-        bip89_registration_record_root(&v, core::ptr::null_mut(), &ffi_signed_root(&next), &mut err)
+        bip89_registration_record_root(&v, core::ptr::null_mut(), &ffi_root_record(&next), &mut err)
     };
     assert_eq!(rc4, 500);
     let rc5 = unsafe { bip89_registration_record_root(&v, reg, core::ptr::null(), &mut err) };
@@ -2929,8 +2947,8 @@ fn spend_flow_matches_rust() {
         bip89_register(
             &v,
             &tv,
-            &ffi_signed_root(&receive),
-            &ffi_signed_root(&change),
+            &ffi_root_record(&receive),
+            &ffi_root_record(&change),
             &mut reg,
             &mut err,
         )
@@ -3059,8 +3077,8 @@ fn forged_change_refused_through_c() {
         bip89_register(
             &v,
             &tv,
-            &ffi_signed_root(&receive),
-            &ffi_signed_root(&change),
+            &ffi_root_record(&receive),
+            &ffi_root_record(&change),
             &mut reg,
             &mut err,
         )
@@ -3228,8 +3246,8 @@ fn missing_proof_index_through_c() {
         bip89_register(
             &v,
             &tv,
-            &ffi_signed_root(&receive),
-            &ffi_signed_root(&change),
+            &ffi_root_record(&receive),
+            &ffi_root_record(&change),
             &mut reg,
             &mut err,
         )
@@ -3459,8 +3477,8 @@ fn psbt_callback_failures_through_c() {
         bip89_register(
             &v,
             &tv,
-            &ffi_signed_root(&receive),
-            &ffi_signed_root(&change),
+            &ffi_root_record(&receive),
+            &ffi_root_record(&change),
             &mut reg,
             &mut err,
         )

@@ -17,6 +17,7 @@ pub enum Error {
     ProofLength,
     IndexRange,
     RootSignature,
+    MissingRootSignature,
     NotCommitted,
     MissingTweak,
     ExtraTweak,

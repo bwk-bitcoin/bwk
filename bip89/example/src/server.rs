@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use bwk_bip89::{
-    accumulator::record::SignedRoot,
+    accumulator::record::RootRecord,
     delegator::{register, sign_spend, verify_spend, Registration},
     rust_bitcoin::{
         miniscript::{
@@ -76,8 +76,8 @@ impl SigningServer {
         &mut self,
         account: u64,
         template: Descriptor<bitcoin::PublicKey>,
-        receive: &SignedRoot,
-        change: &SignedRoot,
+        receive: &RootRecord,
+        change: &RootRecord,
         max_outflow: u64,
     ) -> Result<(), Error> {
         let registration = register(&self.backend, template, receive, change)?;
@@ -92,12 +92,12 @@ impl SigningServer {
     }
 
     /// Records the root of the next tree of a keychain of `account`.
-    pub fn record_root(&mut self, account: u64, signed: &SignedRoot) -> Result<(), ServerError> {
+    pub fn record_root(&mut self, account: u64, record: &RootRecord) -> Result<(), ServerError> {
         let registered = self
             .accounts
             .get_mut(&account)
             .ok_or(ServerError::UnknownAccount(account))?;
-        registered.registration.record_root(&self.backend, signed)?;
+        registered.registration.record_root(&self.backend, record)?;
         Ok(())
     }
 

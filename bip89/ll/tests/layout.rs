@@ -7,7 +7,7 @@
 use core::mem::{align_of, offset_of, size_of};
 
 use bwk_bip89_ll::{
-    CryptoVtable, DescriptorVtable, FfiOwned, FfiSignedRoot, FfiXpub, PsbtVtable, TemplateVtable,
+    CryptoVtable, DescriptorVtable, FfiOwned, FfiRootRecord, FfiXpub, PsbtVtable, TemplateVtable,
     U32List,
 };
 
@@ -101,15 +101,15 @@ fn owned_layout() {
 }
 
 #[test]
-fn signed_root_layout() {
-    assert_eq!(size_of::<FfiSignedRoot>(), 128);
-    assert_eq!(align_of::<FfiSignedRoot>(), 8);
-    assert_eq!(offset_of!(FfiSignedRoot, keychain), 0);
-    assert_eq!(offset_of!(FfiSignedRoot, tree_start), 4);
-    assert_eq!(offset_of!(FfiSignedRoot, root), 8);
-    assert_eq!(offset_of!(FfiSignedRoot, key), 40);
-    assert_eq!(offset_of!(FfiSignedRoot, branch_tweak), 73);
+fn root_record_layout() {
+    assert_eq!(size_of::<FfiRootRecord>(), 128);
+    assert_eq!(align_of::<FfiRootRecord>(), 8);
+    assert_eq!(offset_of!(FfiRootRecord, keychain), 0);
+    assert_eq!(offset_of!(FfiRootRecord, tree_start), 4);
+    assert_eq!(offset_of!(FfiRootRecord, root), 8);
+    assert_eq!(offset_of!(FfiRootRecord, key), 40);
+    assert_eq!(offset_of!(FfiRootRecord, branch_tweak), 73);
     // 105 is padded to the next 8-byte boundary for the pointer
-    assert_eq!(offset_of!(FfiSignedRoot, signature), 112);
-    assert_eq!(offset_of!(FfiSignedRoot, signature_len), 120);
+    assert_eq!(offset_of!(FfiRootRecord, signature), 112);
+    assert_eq!(offset_of!(FfiRootRecord, signature_len), 120);
 }

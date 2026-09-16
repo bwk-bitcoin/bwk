@@ -11,7 +11,7 @@ use alloc::{vec, vec::Vec};
 
 use crate::{
     accumulator::{
-        record::{verify_root, SignedRoot},
+        record::{verify_root, RootRecord},
         tree::verify_proof,
     },
     backend::{BitcoinBackend, Rng},
@@ -31,13 +31,13 @@ pub struct Registration<B: BitcoinBackend> {
 
 /// Registers `template` with the root of the receive tree (keychain 0) and of
 /// the change tree (keychain 1). A template with no base keys is `Template`;
-/// a root on another keychain is `InvalidKeychain`. Both roots must pass
-/// `verify_root` before they are recorded.
+/// a root on another keychain is `InvalidKeychain`. Both records must pass
+/// `verify_root` before their roots are recorded.
 pub fn register<B: BitcoinBackend>(
     b: &B,
     template: B::Template,
-    receive: &SignedRoot,
-    change: &SignedRoot,
+    receive: &RootRecord,
+    change: &RootRecord,
 ) -> Result<Registration<B>, Error> {
     let base_keys = b.template_base_keys(&template);
     if base_keys.is_empty() {
@@ -57,10 +57,10 @@ pub fn register<B: BitcoinBackend>(
 
 impl<B: BitcoinBackend> Registration<B> {
     /// Records the root of the next tree of a keychain, once the current one
-    /// is exhausted. The root must pass `verify_root` first.
-    pub fn record_root(&mut self, b: &B, signed: &SignedRoot) -> Result<(), Error> {
-        verify_root(b, &self.template, signed)?;
-        self.roots.push(signed.root);
+    /// is exhausted. The record must pass `verify_root` first.
+    pub fn record_root(&mut self, b: &B, record: &RootRecord) -> Result<(), Error> {
+        verify_root(b, &self.template, record)?;
+        self.roots.push(record.root);
         Ok(())
     }
 }

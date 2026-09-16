@@ -5,7 +5,10 @@ use std::collections::HashMap;
 use bwk_bip89::{
     accumulator::{
         branch_hash, generate_tree, keys_digest, leaf_hash, leaf_nonce, policy_hash, policy_id,
-        record::{build_tree, root_message, sign_tree_root, template_id, verify_root, SignedRoot},
+        record::{
+            build_tree, root_message, sign_tree_root, template_id, verify_root, RootRecord,
+            RootSignature,
+        },
         root_hash,
         shuffle::{invert, shuffle_key, shuffle_order, SHUFFLE_TAG},
         tree::{
@@ -27,8 +30,8 @@ use bwk_bip89::{
     BitcoinBackend, Bundle, Entry, Error, Sha256Engine, Xpub,
 };
 use common::{
-    hex_arr, other_template, tpub, wallet, SliceDescriptor, VectorBackend, OWNER1_CHAIN_CODE,
-    OWNER1_KEY, OWNER1_SECRET, OWNER2_SECRET,
+    hex_arr, other_template, root_signature, tpub, wallet, SliceDescriptor, VectorBackend,
+    OWNER1_CHAIN_CODE, OWNER1_KEY, OWNER1_SECRET, OWNER2_SECRET,
 };
 
 fn tagged(tag: &[u8], data: &[u8]) -> [u8; 32] {
@@ -747,10 +750,11 @@ fn root_signature_roundtrip() {
     let w = wallet();
     let d = &w.descriptor;
 
-    let signed = sign_tree_root(&c, d, &OWNER1_SECRET, 0, 0).unwrap();
-    assert_eq!(signed.keychain, 0);
-    assert_eq!(signed.tree_start, 0);
-    assert_eq!(signed.root, hex_arr::<32>(ROOT_0_0));
+    let record = sign_tree_root(&c, d, &OWNER1_SECRET, 0, 0).unwrap();
+    assert_eq!(record.keychain, 0);
+    assert_eq!(record.tree_start, 0);
+    assert_eq!(record.root, hex_arr::<32>(ROOT_0_0));
+    let signed = root_signature(&record);
     assert_eq!(signed.key, hex_arr::<33>(OWNER1_KEY));
 
     let owner1 = tpub(
@@ -765,11 +769,11 @@ fn root_signature_roundtrip() {
         Ok(receive_branch.public_key.serialize())
     );
 
-    assert_eq!(verify_root(&c, &w.template, &signed), Ok(()));
+    assert_eq!(verify_root(&c, &w.template, &record), Ok(()));
 
-    let mut flipped = signed;
+    let mut flipped = record;
     // the first byte of the Schnorr signature, after the item count and its length
-    flipped.signature[2] ^= 1;
+    flipped.signature.as_mut().unwrap().signature[2] ^= 1;
     assert_eq!(
         verify_root(&c, &w.template, &flipped),
         Err(Error::RootSignature)
@@ -782,23 +786,31 @@ fn root_signature_wrong_key_fails() {
     let w = wallet();
     let d = &w.descriptor;
 
-    let signed = sign_tree_root(&c, d, &OWNER1_SECRET, 0, 0).unwrap();
+    let record = sign_tree_root(&c, d, &OWNER1_SECRET, 0, 0).unwrap();
     let other = sign_tree_root(&c, d, &OWNER2_SECRET, 0, 0).unwrap();
     assert_eq!(verify_root(&c, &w.template, &other), Ok(()));
 
-    let other_key = SignedRoot {
-        key: other.key,
-        branch_tweak: other.branch_tweak,
-        ..signed.clone()
+    let signed = root_signature(&record);
+    let other_signed = root_signature(&other);
+    let other_key = RootRecord {
+        signature: Some(RootSignature {
+            key: other_signed.key,
+            branch_tweak: other_signed.branch_tweak,
+            ..signed.clone()
+        }),
+        ..record.clone()
     };
     assert_eq!(
         verify_root(&c, &w.template, &other_key),
         Err(Error::RootSignature)
     );
 
-    let other_signature = SignedRoot {
-        signature: other.signature,
-        ..signed
+    let other_signature = RootRecord {
+        signature: Some(RootSignature {
+            signature: other_signed.signature,
+            ..signed
+        }),
+        ..record
     };
     assert_eq!(
         verify_root(&c, &w.template, &other_signature),
@@ -819,15 +831,17 @@ fn root_signature_non_participant_key_fails() {
 
     let tid = template_id(&c, &c.template_bytes(&w.template));
     let root: [u8; 32] = hex_arr(ROOT_0_0);
-    let outsider = SignedRoot {
+    let outsider = RootRecord {
         keychain: 0,
         tree_start: 0,
         root,
-        key: c.base_mul(&OTHER_SECRET).unwrap(),
-        branch_tweak: [0u8; 32],
-        signature: c
-            .bip322_sign(&OTHER_SECRET, &root_message(&c, &tid, &root))
-            .unwrap(),
+        signature: Some(RootSignature {
+            key: c.base_mul(&OTHER_SECRET).unwrap(),
+            branch_tweak: [0u8; 32],
+            signature: c
+                .bip322_sign(&OTHER_SECRET, &root_message(&c, &tid, &root))
+                .unwrap(),
+        }),
     };
     assert_eq!(
         verify_root(&c, &w.template, &outsider),
@@ -859,10 +873,14 @@ fn root_signature_forged_branch_tweak_fails() {
 
     let receive = sign_tree_root(&c, d, &OWNER1_SECRET, 0, 0).unwrap();
     let change = sign_tree_root(&c, d, &OWNER1_SECRET, 1, 0).unwrap();
-    assert_ne!(receive.branch_tweak, change.branch_tweak);
+    let signed = root_signature(&receive);
+    assert_ne!(signed.branch_tweak, root_signature(&change).branch_tweak);
 
-    let change_tweak = SignedRoot {
-        branch_tweak: change.branch_tweak,
+    let change_tweak = RootRecord {
+        signature: Some(RootSignature {
+            branch_tweak: root_signature(&change).branch_tweak,
+            ..signed.clone()
+        }),
         ..receive.clone()
     };
     assert_eq!(
@@ -873,11 +891,14 @@ fn root_signature_forged_branch_tweak_fails() {
     // without the owner1 secret, a forger only holds the secret of its tweak
     let forged_tweak = [0x41; 32];
     let tid = template_id(&c, &c.template_bytes(&w.template));
-    let forged = SignedRoot {
-        branch_tweak: forged_tweak,
-        signature: c
-            .bip322_sign(&forged_tweak, &root_message(&c, &tid, &receive.root))
-            .unwrap(),
+    let forged = RootRecord {
+        signature: Some(RootSignature {
+            branch_tweak: forged_tweak,
+            signature: c
+                .bip322_sign(&forged_tweak, &root_message(&c, &tid, &receive.root))
+                .unwrap(),
+            ..signed
+        }),
         ..receive
     };
     assert_eq!(

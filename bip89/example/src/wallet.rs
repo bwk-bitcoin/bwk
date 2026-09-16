@@ -6,7 +6,7 @@ use std::str::{self, FromStr};
 
 use bwk_bip89::{
     accumulator::{
-        record::{build_tree, sign_tree_root, SignedRoot},
+        record::{build_tree, sign_tree_root, RootRecord},
         tree::Tree,
     },
     bundle::derive_bundle,
@@ -97,7 +97,7 @@ impl Wallet {
     /// server to register. Builds both proof trees.
     pub fn registration(
         &mut self,
-    ) -> Result<(Descriptor<bitcoin::PublicKey>, SignedRoot, SignedRoot), ExampleError> {
+    ) -> Result<(Descriptor<bitcoin::PublicKey>, RootRecord, RootRecord), ExampleError> {
         // the backend gives the template as its canonical string only
         let bytes = self.backend.descriptor_template(&self.descriptor)?;
         let template = Descriptor::<bitcoin::PublicKey>::from_str(str::from_utf8(&bytes)?)?;
@@ -108,7 +108,7 @@ impl Wallet {
 
     /// Builds and keeps the proof tree of `keychain` at `tree_start`, and
     /// returns its root signed with the wallet key.
-    pub fn add_tree(&mut self, keychain: u32, tree_start: u32) -> Result<SignedRoot, ExampleError> {
+    pub fn add_tree(&mut self, keychain: u32, tree_start: u32) -> Result<RootRecord, ExampleError> {
         let secret = self.keypair.secret_key().secret_bytes();
         let signed = sign_tree_root(
             &self.backend,

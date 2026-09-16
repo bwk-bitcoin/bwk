@@ -153,15 +153,17 @@ template to run the BIP89 verification vectors.
 
 - **Signing key holder.** `accumulator::record::sign_tree_root(b, d, secret,
   keychain, tree_start)` builds the tree itself and signs its root with BIP322
-  under the branch key of `secret` for `keychain`. The `SignedRoot` it returns
-  carries the keychain, tree start, root, base key, branch tweak and signature. A
-  secret that is not a key of `d` is `NotParticipant`.
+  under the branch key of `secret` for `keychain`. The `RootRecord` it returns
+  carries the keychain, tree start and root, with a `RootSignature` holding the
+  base key, the branch tweak and the signature. A secret that is not a key of `d`
+  is `NotParticipant`. `accumulator::record::tree_root(b, d, keychain,
+  tree_start)` builds the same tree and returns its root with no signature.
 - **Coordinator.** `accumulator::record::build_tree` builds the proof trees, and
   `coordinator::prepare(b, d, trees, inputs, outputs, psbt)` writes bundles, and
   for each owned output the proof from the first tree that covers it (`NoTree`
   otherwise), into the PSBT through the backend setters.
 - **Delegator.** `delegator::register(b, template, receive, change)` checks the
-  receive (keychain 0) and change (keychain 1) signed roots with
+  receive (keychain 0) and change (keychain 1) root records with
   `accumulator::record::verify_root` and records the template and both roots in a
   `Registration`. `Registration::record_root` records the root of a keychain's
   next tree the same way. Any base key of the template is accepted as signer:
