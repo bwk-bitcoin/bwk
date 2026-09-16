@@ -1,4 +1,6 @@
 #[cfg(feature = "test")]
+pub mod mock_manager;
+#[cfg(feature = "test")]
 pub mod test;
 
 #[cfg(target_os = "android")]

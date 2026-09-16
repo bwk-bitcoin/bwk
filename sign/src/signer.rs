@@ -21,12 +21,10 @@ pub enum SignerNotif {
     Signed(bip32::Fingerprint, Psbt),
     Error(bip32::Fingerprint, Error),
     Manager(signing_manager::Error),
-    #[cfg(all(feature = "hwi", not(target_os = "android")))]
-    DeviceUpdate,
 }
 
 /// This trait implement features that are available when the signer is connected.
-pub trait Signer: Send {
+pub trait Signer: Send + Sync {
     /// Initialyse the signer with a new channel, in return the signer
     /// must return a [`SignerNotif::Info`] notification to the newly
     /// registered channel.
@@ -70,4 +68,16 @@ macro_rules! send {
             }
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::signer::Signer;
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn signer_trait_is_send_and_sync() {
+        assert_send_sync::<Box<dyn Signer>>();
+    }
 }

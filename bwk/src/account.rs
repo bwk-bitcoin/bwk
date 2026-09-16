@@ -11,7 +11,9 @@ use bwk_electrum::{
     history::{AccountHistory, TxContribution},
     notification::Notification,
     open,
-    profile::{DefaultBackend, RamProfile, ReopenStatuses},
+    profile::{
+        DefaultBackend, OpenScanFromBackend, RamProfile, ReopenStatuses, ScanProfile, ScanStores,
+    },
     reconcile::Reconciler,
     scanner::ElectrumScanner,
 };
@@ -19,15 +21,12 @@ use bwk_persist::{
     backend::PersistenceBackend,
     config_store::{ConfigStore, NoopConfigStore},
 };
-use bwk_sign::signing_manager::SigningManager;
+use bwk_sign::signing_manager::HotManager;
 use bwk_tx::{recipient::ChangeRecipientProvider, tx_builder::TxBuilder};
 
 use miniscript::bitcoin::{self, Txid};
 
-use crate::{
-    config::Config,
-    profile::{OpenFromBackend, StorageProfile, Stores},
-};
+use crate::config::Config;
 
 /// A descriptor wallet: one [`ElectrumScanner`] watching the descriptor, one
 /// [`HeaderStore`] validating the chain, and the reconciliation between them.
@@ -36,13 +35,13 @@ use crate::{
 /// header store validates the chain and fetches inclusion proofs over its own
 /// connection. This type owns both, plus the signers, and runs the pass that
 /// promotes what the scanner recorded into verified state.
-pub struct Account<P: StorageProfile = RamProfile<DefaultBackend>> {
+pub struct Account<P: ScanProfile = RamProfile<DefaultBackend>> {
     scanner: ElectrumScanner<P>,
     /// Validated header chain, this account's own or one shared across
     /// accounts. The reconcile thread reads it on every chain-tip advance and
     /// fetches its merkle proofs through it.
     headers: HeaderFollower<P>,
-    signing_manager: SigningManager<P::SignerStore>,
+    signing_manager: HotManager,
     /// Wallet-level half of [`Config`]; the scanner owns the rest.
     mnemonic: Option<String>,
     sender: mpsc::Sender<Notification>,
@@ -59,7 +58,7 @@ pub struct Account<P: StorageProfile = RamProfile<DefaultBackend>> {
     reconciler: Reconciler<P>,
 }
 
-impl<P: StorageProfile> std::fmt::Debug for Account<P> {
+impl<P: ScanProfile> std::fmt::Debug for Account<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Account").finish()
     }
@@ -71,7 +70,7 @@ fn default_config_store() -> Arc<dyn ConfigStore<Config>> {
 
 // Generic constructors over any profile that knows how to open its
 // store bundle from a single `Arc<dyn PersistenceBackend>`.
-impl<P: OpenFromBackend> Account<P> {
+impl<P: OpenScanFromBackend> Account<P> {
     /// Creates a new `Account` instance with the given configuration.
     ///
     /// Opens the profile's stores against whatever backend the config
@@ -187,20 +186,10 @@ impl<P: OpenFromBackend> Account<P> {
             )?,
         };
         let backend: Arc<dyn PersistenceBackend> = config.scanner.build_backend()?;
-        // Hot-signer material must not land on the SQLite DB; route the
-        // SignerStore slot through a NoopBackend in that case.
-        let secrets_backend: Arc<dyn PersistenceBackend> = if matches!(
-            config.scanner.persistence,
-            Some(bwk_persist::PersistenceKind::Sqlite)
-        ) {
-            Arc::new(bwk_persist::backend::noop::NoopBackend)
-        } else {
-            backend.clone()
-        };
         let reopen_backend = backend.clone();
         let reopen_statuses: ReopenStatuses<P> =
             Arc::new(move || P::open_statuses(reopen_backend.clone()));
-        let stores = <P as OpenFromBackend>::open(backend, secrets_backend)?;
+        let stores = <P as OpenScanFromBackend>::open(backend)?;
         Ok(Self::from_stores(
             config,
             headers,
@@ -216,14 +205,14 @@ impl<P: OpenFromBackend> Account<P> {
         headers: HeaderFollower<P>,
         sender: mpsc::Sender<Notification>,
         config_store: Arc<dyn ConfigStore<Config>>,
-        stores: Stores<P>,
+        stores: ScanStores<P>,
         reopen_statuses: Option<ReopenStatuses<P>>,
     ) -> Self {
         let Config {
             scanner: scanner_config,
             mnemonic,
         } = config;
-        let mut signing_manager = SigningManager::from_store(stores.signers);
+        let mut signing_manager = HotManager::new();
         if let Some(mnemo) = mnemonic.clone() {
             signing_manager.new_bip32_signer_from_mnemonic(scanner_config.network, mnemo);
             signing_manager.register_bip32_descriptor(scanner_config.descriptor.clone());
@@ -233,12 +222,8 @@ impl<P: OpenFromBackend> Account<P> {
         // accounts would otherwise report the same event to this channel as
         // many times as it has reconcilers on it.
         headers.store().register_notifications(sender.clone());
-        let scanner = ElectrumScanner::from_stores(
-            scanner_config,
-            sender.clone(),
-            stores.scan,
-            reopen_statuses,
-        );
+        let scanner =
+            ElectrumScanner::from_stores(scanner_config, sender.clone(), stores, reopen_statuses);
         let reconciler = Reconciler::spawn(&scanner, headers.store().clone(), sender.clone());
         let mut account = Account {
             scanner,
@@ -274,7 +259,7 @@ impl<P: OpenFromBackend> Account<P> {
     }
 }
 
-impl<P: StorageProfile> Account<P> {
+impl<P: ScanProfile> Account<P> {
     /// Push the current config to the configured [`ConfigStore`].
     ///
     /// Under [`bwk_persist::PersistenceKind::Sqlite`] the saved view has
@@ -286,13 +271,13 @@ impl<P: StorageProfile> Account<P> {
         }
     }
 
-    fn signing_manager(&self) -> &SigningManager<P::SignerStore> {
+    fn signing_manager(&self) -> &HotManager {
         &self.signing_manager
     }
 }
 
 // Non (b)locking API
-impl<P: StorageProfile> Account<P> {
+impl<P: ScanProfile> Account<P> {
     /// The scanner this account watches its descriptor with.
     pub fn scanner(&self) -> &ElectrumScanner<P> {
         &self.scanner
@@ -317,12 +302,8 @@ impl<P: StorageProfile> Account<P> {
         }
     }
 
-    pub fn sign(&self, psbt: String) {
-        self.signing_manager().sign(psbt);
-    }
-
     pub fn sign_psbt(&self, psbt: &mut bitcoin::Psbt) {
-        self.signing_manager().sign_psbt(psbt);
+        self.signing_manager().sign_with_all_hot_signers(psbt);
     }
 
     /// Returns master xprivs from all BIP32 hot signers, keyed by fingerprint.
@@ -332,7 +313,7 @@ impl<P: StorageProfile> Account<P> {
 }
 
 // Locking API
-impl<P: StorageProfile> Account<P> {
+impl<P: ScanProfile> Account<P> {
     pub fn tx_builder(&self) -> TxBuilder {
         let tip_updater = ChangeTipUpdater::new(self.scanner.coin_store().clone());
         let change_provider = Box::new(ChangeRecipientProvider::new_with_updater(
@@ -349,15 +330,15 @@ impl<P: StorageProfile> Account<P> {
     }
 }
 
-impl<P: StorageProfile> AccountHistory for Account<P> {
+impl<P: ScanProfile> AccountHistory for Account<P> {
     fn tx_contributions(&self) -> BTreeMap<Txid, TxContribution> {
         self.scanner.tx_contributions()
     }
 }
 
-// Electrum specific implementation. Bound to `OpenFromBackend`, which pins the
+// Electrum specific implementation. Bound to `OpenScanFromBackend`, which pins the
 // header store to the concrete backend-backed one the worker drives.
-impl<P: OpenFromBackend> Account<P> {
+impl<P: OpenScanFromBackend> Account<P> {
     /// Sets the Electrum server URL and port for the account.
     pub fn set_electrum(&mut self, url: String, port: String) {
         if let Ok(port) = port.parse::<u16>() {
@@ -436,8 +417,8 @@ mod tests {
     use super::*;
     use bip39::Mnemonic;
     use bwk_descriptor::descriptor::ScriptType;
-    use bwk_persist::{storage::Store, PersistenceKind};
-    use bwk_sign::hot_signer::HotSigner;
+    use bwk_persist::{config_store::FileConfigStore, storage::Store, PersistenceKind};
+    use bwk_sign::{hot_signer::HotSigner, manager::SigningManager};
     use miniscript::{
         bitcoin::{
             bip32::{ChildNumber, DerivationPath},
@@ -447,6 +428,8 @@ mod tests {
     };
     use std::{path::PathBuf, str::FromStr};
     use temp_dir::TempDir;
+
+    use crate::config::CONFIG_FILENAME;
 
     fn persisted_offline_config(dir: &TempDir, look_ahead: u32) -> Config {
         let mnemonic = Mnemonic::generate(12).unwrap();
@@ -659,6 +642,64 @@ mod tests {
             wallet_descriptor.to_string(),
             account.scanner().descriptor_str()
         );
+    }
+
+    #[test]
+    fn no_signer_file_is_written() {
+        let temp = TempDir::new().unwrap();
+        let mnemonic = Mnemonic::generate(12).unwrap().to_string();
+
+        let cfg = Config::new(
+            Some(mnemonic),
+            "alice".to_string(),
+            Network::Regtest,
+            ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
+            temp.path().to_path_buf(),
+            "wallet".to_string(),
+            Some(PersistenceKind::Json),
+        )
+        .unwrap();
+
+        let account_dir = cfg.scanner.account_dir();
+        let config_store: Arc<dyn ConfigStore<Config>> = Arc::new(FileConfigStore::<Config>::new(
+            account_dir.join(CONFIG_FILENAME),
+        ));
+        let account: Account = Account::with_config_store(cfg.clone(), config_store);
+        account.persist_config();
+        drop(account);
+
+        assert!(
+            !account_dir.join("signers.json").exists(),
+            "no signer file should ever be written, hot signers are in-memory only"
+        );
+    }
+
+    #[test]
+    fn mnemonic_still_yields_a_hot_signer() {
+        // bwk has no persistence path for signer material; the config's
+        // mnemonic must still yield a derived, in-memory hot signer.
+        let mnemonic = Mnemonic::generate(12).unwrap();
+        let dir = TempDir::new().unwrap();
+        let mut config = Config::new(
+            Some(mnemonic.to_string()),
+            "acct".to_string(),
+            Network::Regtest,
+            ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
+            dir.path().to_path_buf(),
+            ".bwk".to_string(),
+            Some(PersistenceKind::Json),
+        )
+        .unwrap();
+        config.scanner.set_stay_offline(true);
+        let account: Account = Account::new(config);
+
+        let expected_fingerprint =
+            HotSigner::new_from_mnemonics(Network::Regtest, &mnemonic.to_string())
+                .unwrap()
+                .fingerprint();
+        let signers = account.signing_manager().signers();
+        assert_eq!(signers.len(), 1);
+        assert_eq!(signers[0].fingerprint, expected_fingerprint);
     }
 }
 
@@ -1430,6 +1471,7 @@ mod sqlite_signer_exclusion {
     use bip39::Mnemonic;
     use bwk_descriptor::descriptor::ScriptType;
     use bwk_persist::{config_store::FileConfigStore, PersistenceKind};
+    use bwk_sign::manager::SigningManager;
     use miniscript::bitcoin::{bip32::ChildNumber, Network};
     use temp_dir::TempDir;
 
@@ -1528,5 +1570,34 @@ mod sqlite_signer_exclusion {
             on_disk.contains(&unique),
             "mnemonic must appear in config.json under JSON mode (default)"
         );
+    }
+
+    #[test]
+    fn sqlite_account_opens_without_a_secrets_backend() {
+        // With no signer store, the SQLite path needs no special case: opening
+        // must succeed and the mnemonic must still yield a derived hot signer.
+        let temp = TempDir::new().unwrap();
+        let mnemonic = Mnemonic::generate(12).unwrap().to_string();
+
+        let mut cfg = Config::new(
+            Some(mnemonic.clone()),
+            "alice".to_string(),
+            Network::Regtest,
+            ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
+            temp.path().to_path_buf(),
+            "wallet".to_string(),
+            Some(PersistenceKind::Sqlite),
+        )
+        .unwrap();
+        cfg.scanner.set_stay_offline(true);
+
+        let account: Account = Account::new(cfg);
+        let expected_fingerprint =
+            bwk_sign::hot_signer::HotSigner::new_from_mnemonics(Network::Regtest, &mnemonic)
+                .unwrap()
+                .fingerprint();
+        let signers = account.signing_manager().signers();
+        assert_eq!(signers.len(), 1);
+        assert_eq!(signers[0].fingerprint, expected_fingerprint);
     }
 }
