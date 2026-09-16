@@ -1,0 +1,25 @@
+{
+  "vectors": [
+    {
+      "name": "signing_request",
+      "description": "Signing request with one DESCRIPTOR (alias \"main\", FORM 0x01 descriptor wpkh([00000000/84h/1h/0h]xpub/0/*), POR of 4 bytes of 0x5a), a 19-byte PSBT holding an empty version 2 transaction, and WANT_KIND present and set to 0x02 (signatures only).",
+      "direction": "request",
+      "hex": "4249505858580104000101046d61696e01012277706b68285b30303030303030302f3834682f31682f30685d787075622f302f2a2901045a5a5a5a1370736274ff01000a02000000000000000000000102",
+      "decode_only": false
+    },
+    {
+      "name": "signing_response_psbt",
+      "description": "Signing ok response of KIND 0x01, carrying back the same 19-byte PSBT.",
+      "direction": "response",
+      "hex": "42495058585801840001011370736274ff01000a0200000000000000000000",
+      "decode_only": false
+    },
+    {
+      "name": "signing_response_signatures",
+      "description": "Signing ok response of KIND 0x02 with one signature of every SIG_KIND: input 0 SIG_KIND 0x01 (segwit) with a 33-byte compressed key and a 71-byte signature, input 1 SIG_KIND 0x02 (tapkey) with a 64-byte signature, input 2 SIG_KIND 0x03 (taptree) with a 32-byte x-only key, a 32-byte leaf hash and a 65-byte signature.",
+      "direction": "response",
+      "hex": "42495058585801840001020300000000010339a36013301597daef41fbe593a02cc513d0b55527ec2df1050e2e8ff49c85c247303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303000000001024001010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101000000020302020202020202020202020202020202020202020202020202020202020202020303030303030303030303030303030303030303030303030303030303030303410404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404",
+      "decode_only": false
+    }
+  ]
+}
