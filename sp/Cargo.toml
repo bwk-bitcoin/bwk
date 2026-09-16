@@ -87,7 +87,6 @@ bitcoin_hashes = { workspace = true }
 
 # Silent Payments support
 bech32 = { workspace = true }
-bimap = { workspace = true }
 
 # Serialization
 serde = { workspace = true, features = ["derive"] }
