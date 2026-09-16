@@ -41,13 +41,18 @@ The wallet is the BIP89 delegatee, the coordinator and the root signing key hold
 once. The server is the delegator: it gives the wallet a bare public key and never
 sees a chain code. It accepts any base key of the template as root signer, as
 `register` does; which keys a real service requires is its contract with its users.
-The spending limit is the only policy of the example, and shows what the verified
-outflow is for.
+
+The example has two policies. The spending limit shows what the verified outflow is
+for. The root policy, pinned at registration, says whether the server accepts roots
+that carry no signature: a server on `AllowUnsigned` trusts the setup channel the
+roots came over instead of a signature.
 
 ## Scenario
 
-Account 1 has a limit of 50000 sats, fee included. Every spend pays a p2tr of a fixed
-external key, with a fee of 1000 sats, and sends the rest to the next change index.
+Account 1 has a limit of 50000 sats, fee included, and requires a root signature.
+Account 2 shares its template and limit but takes unsigned roots. Every spend pays a
+p2tr of a fixed external key, with a fee of 1000 sats, and sends the rest to the next
+change index.
 
 ```
 +------+--------------------------------------------------+---------------------------+
@@ -57,7 +62,7 @@ external key, with a fee of 1000 sats, and sends the rest to the next change ind
 |      | its descriptor on it.                            |                           |
 | 2    | The wallet signs the receive and change roots at | Account 1 registered      |
 |      | tree start 0, the server registers them with the |                           |
-|      | template.                                        |                           |
+|      | template, requiring a root signature.            |                           |
 | 3    | The wallet receives 100000 sats at receive index | Funding script printed    |
 |      | 0.                                               |                           |
 | 4    | Honest spend of 30000 sats.                      | Signed, outflow 31000,    |
@@ -69,6 +74,9 @@ external key, with a fee of 1000 sats, and sends the rest to the next change ind
 | 7    | The wallet signs the receive tree at 256, the    | Signed, outflow 31000     |
 |      | server records it, the wallet receives 100000    |                           |
 |      | sats at receive index 300 and spends 30000.      |                           |
+| 8    | The same template is registered as account 2     | Signed, outflow 31000     |
+|      | with unsigned receive and change roots, funded   |                           |
+|      | at receive index 1 and spent.                    |                           |
 +------+--------------------------------------------------+---------------------------+
 ```
 

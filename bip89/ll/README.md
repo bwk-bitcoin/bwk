@@ -147,12 +147,17 @@ A root crosses back as `bip89_root_record`:
 +---------------+----------------+---------------------------------------------+
 ```
 
-- `bip89_register(crypto, tmpl, receive, change, out)` checks the `receive`
-  (keychain 0) and `change` (keychain 1) root records and writes a registration
-  handle. A key that is not a base key of the template gives
-  `BIP89_ERR_NOT_PARTICIPANT`, a failing signature `BIP89_ERR_ROOT_SIGNATURE`, a
-  record with no signature `BIP89_ERR_MISSING_ROOT_SIGNATURE`, and a root on
-  another keychain `BIP89_ERR_INVALID_KEYCHAIN`.
+- `bip89_register(crypto, tmpl, policy, receive, change, out)` checks the
+  `receive` (keychain 0) and `change` (keychain 1) root records and writes a
+  registration handle. A key that is not a base key of the template gives
+  `BIP89_ERR_NOT_PARTICIPANT`, a failing signature `BIP89_ERR_ROOT_SIGNATURE`,
+  and a root on another keychain `BIP89_ERR_INVALID_KEYCHAIN`.
+- `policy` is `BIP89_ROOT_POLICY_REQUIRE_SIGNATURE` (0), where a record with no
+  signature gives `BIP89_ERR_MISSING_ROOT_SIGNATURE`, or
+  `BIP89_ROOT_POLICY_ALLOW_UNSIGNED` (1), where such a record is accepted;
+  anything else gives `BIP89_ERR_INVALID_ROOT_POLICY`. A signature that is there
+  is verified under either policy. The policy is pinned at registration and
+  governs every later root.
 - `bip89_registration_record_root(crypto, registration, record)` records the
   root of a keychain's next tree, checked the same way.
 
@@ -174,11 +179,12 @@ freed by the caller. The coordinator and spend entry points also take a nullable
 |            | NotTaproot, KeyType, Multipath, Wildcard, HardenedStep,         |
 |            | ConflictingKey, NoKeys.                                         |
 | 142        | `BIP89_ERR_MISSING_ROOT_SIGNATURE`, a root record with no       |
-|            | signature.                                                      |
+|            | signature where the registration requires one.                  |
 | 500        | Null pointer.                                                   |
 | 501        | Vtable with a null callback.                                    |
 | 502        | Output buffer too small; the needed length is written back.     |
 | 503        | Index out of bounds.                                            |
+| 504        | Root policy outside the `BIP89_ROOT_POLICY_*` values.           |
 +------------+-----------------------------------------------------------------+
 ```
 

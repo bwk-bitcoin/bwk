@@ -44,6 +44,12 @@ extern "C" {
 /* Length of one tweaked pair record: base key (33) then tweaked key (33). */
 #define BIP89_TWEAKED_PAIR_LEN 66
 
+/* Root policy of a registration: a root with no signature is refused. */
+#define BIP89_ROOT_POLICY_REQUIRE_SIGNATURE 0
+
+/* Root policy of a registration: a root may come with no signature. */
+#define BIP89_ROOT_POLICY_ALLOW_UNSIGNED 1
+
 /*
  * Error code ranges (all negative-free int32; 0 is success):
  *   100 to 199 protocol errors, one to one with bwk_bip89::Error
@@ -97,6 +103,7 @@ extern "C" {
 #define BIP89_ERR_BAD_VTABLE 501
 #define BIP89_ERR_BUFFER_TOO_SMALL 502
 #define BIP89_ERR_INDEX_OUT_OF_BOUNDS 503
+#define BIP89_ERR_INVALID_ROOT_POLICY 504
 
 /*
  * The crypto primitives you supply. `ctx` is passed back to every callback so
@@ -387,20 +394,25 @@ typedef struct bip89_root_record {
 } bip89_root_record;
 
 /*
- * Pin the template with the `receive` (keychain 0) and `change` (keychain 1) roots. Each
- * key must be a base key of `tmpl` (BIP89_ERR_NOT_PARTICIPANT) and each signature must
- * verify (BIP89_ERR_ROOT_SIGNATURE); a record with no signature gives
- * BIP89_ERR_MISSING_ROOT_SIGNATURE and a root on another keychain
- * BIP89_ERR_INVALID_KEYCHAIN. Writes an owning handle to *out on success. The handle keeps
- * a copy of `tmpl`: its ctx must stay valid until bip89_registration_free.
+ * Pin the template and `policy` with the `receive` (keychain 0) and `change` (keychain 1)
+ * roots. Each key must be a base key of `tmpl` (BIP89_ERR_NOT_PARTICIPANT) and each
+ * signature must verify (BIP89_ERR_ROOT_SIGNATURE); a root on another keychain gives
+ * BIP89_ERR_INVALID_KEYCHAIN. `policy` is one of the BIP89_ROOT_POLICY_* values, anything
+ * else gives BIP89_ERR_INVALID_ROOT_POLICY; a record with no signature gives
+ * BIP89_ERR_MISSING_ROOT_SIGNATURE under BIP89_ROOT_POLICY_REQUIRE_SIGNATURE and is
+ * accepted under BIP89_ROOT_POLICY_ALLOW_UNSIGNED. Writes an owning handle to *out on
+ * success. The handle keeps a copy of `tmpl`: its ctx must stay valid until
+ * bip89_registration_free.
  */
 int32_t bip89_register(const bip89_crypto_vtable *crypto, const bip89_template_vtable *tmpl,
-                       const bip89_root_record *receive, const bip89_root_record *change,
-                       bip89_registration **out, const char **err);
+                       uint32_t policy, const bip89_root_record *receive,
+                       const bip89_root_record *change, bip89_registration **out,
+                       const char **err);
 
 /*
  * Record the root of the next tree of a keychain, once the current one is exhausted. The
- * record is checked as in bip89_register before its root is recorded.
+ * record is checked as in bip89_register, under the policy pinned at registration, before
+ * its root is recorded.
  */
 int32_t bip89_registration_record_root(const bip89_crypto_vtable *crypto,
                                        bip89_registration *registration,

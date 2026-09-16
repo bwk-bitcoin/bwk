@@ -1,17 +1,18 @@
-//! The delegator pins the template and the accumulator roots at registration
-//! and never uses a template or root from a signing request. An output is
-//! owned only when its bundle rebuilds its script and is committed under a
-//! recorded root, signed by a base key of the template when it was recorded:
+//! The delegator pins the template, the accumulator roots and its root policy
+//! at registration, and never uses a template, root or policy from a signing
+//! request. An output is owned only when its bundle rebuilds its script and is
+//! committed under a root that passed the pinned policy when it was recorded:
 //! `ChangeOutputVerification` alone accepts forged tweaks, since it cannot
-//! tell a genuine tweak from any other scalar. Verification here applies to
-//! the non-blinded mode only; in blinded mode the delegator sees no
-//! transaction, script or bundle.
+//! tell a genuine tweak from any other scalar. A delegator that registers under
+//! `AllowUnsigned` trusts the authenticated setup channel the roots came over
+//! instead of a signature. Verification here applies to the non-blinded mode
+//! only; in blinded mode the delegator sees no transaction, script or bundle.
 
 use alloc::{vec, vec::Vec};
 
 use crate::{
     accumulator::{
-        record::{verify_root, RootRecord},
+        record::{verify_root, RootPolicy, RootRecord},
         tree::verify_proof,
     },
     backend::{BitcoinBackend, Rng},
@@ -22,20 +23,23 @@ use crate::{
     Error,
 };
 
-/// A delegator's pinned template and its recorded accumulator roots.
+/// A delegator's pinned template, root policy and recorded accumulator roots.
 pub struct Registration<B: BitcoinBackend> {
     template: B::Template,
+    policy: RootPolicy,
     base_keys: Vec<[u8; 33]>,
     roots: Vec<[u8; 32]>,
 }
 
-/// Registers `template` with the root of the receive tree (keychain 0) and of
-/// the change tree (keychain 1). A template with no base keys is `Template`;
-/// a root on another keychain is `InvalidKeychain`. Both records must pass
-/// `verify_root` before their roots are recorded.
+/// Registers `template` under `policy` with the root of the receive tree
+/// (keychain 0) and of the change tree (keychain 1). A template with no base
+/// keys is `Template`; a root on another keychain is `InvalidKeychain`. Both
+/// records must pass `verify_root` under `policy` before their roots are
+/// recorded.
 pub fn register<B: BitcoinBackend>(
     b: &B,
     template: B::Template,
+    policy: RootPolicy,
     receive: &RootRecord,
     change: &RootRecord,
 ) -> Result<Registration<B>, Error> {
@@ -46,10 +50,11 @@ pub fn register<B: BitcoinBackend>(
     if receive.keychain != 0 || change.keychain != 1 {
         return Err(Error::InvalidKeychain);
     }
-    verify_root(b, &template, receive)?;
-    verify_root(b, &template, change)?;
+    verify_root(b, &template, receive, policy)?;
+    verify_root(b, &template, change, policy)?;
     Ok(Registration {
         template,
+        policy,
         base_keys,
         roots: vec![receive.root, change.root],
     })
@@ -57,9 +62,10 @@ pub fn register<B: BitcoinBackend>(
 
 impl<B: BitcoinBackend> Registration<B> {
     /// Records the root of the next tree of a keychain, once the current one
-    /// is exhausted. The record must pass `verify_root` first.
+    /// is exhausted. The record must pass `verify_root` first, under the policy
+    /// pinned at registration: a caller cannot relax it for one tree.
     pub fn record_root(&mut self, b: &B, record: &RootRecord) -> Result<(), Error> {
-        verify_root(b, &self.template, record)?;
+        verify_root(b, &self.template, record, self.policy)?;
         self.roots.push(record.root);
         Ok(())
     }

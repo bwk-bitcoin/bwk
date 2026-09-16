@@ -2,7 +2,7 @@ mod common;
 
 use bwk_bip89::{
     accumulator::{
-        record::{build_tree, sign_tree_root, RootRecord, RootSignature},
+        record::{build_tree, sign_tree_root, tree_root, RootPolicy, RootRecord, RootSignature},
         tree::Proof,
     },
     bundle::derive_bundle,
@@ -27,9 +27,9 @@ use bwk_bip89::{
 };
 use common::{
     delegate_to_rust_bitcoin, field_key, hex_arr, hex_vec, other_template, root_signature,
-    signed_roots, spend_psbt, standard_lists, wallet, FixedRng, SortedMulti, VectorBackend, Wallet,
-    DELEGATOR_KEY, DELEGATOR_SECRET, EXTERNAL_KEY, EXTERNAL_SECRET, OWNER1_KEY, OWNER1_SECRET,
-    OWNER2_SECRET,
+    signed_roots, spend_psbt, standard_lists, unsigned_roots, wallet, FixedRng, SortedMulti,
+    VectorBackend, Wallet, DELEGATOR_KEY, DELEGATOR_SECRET, EXTERNAL_KEY, EXTERNAL_SECRET,
+    OWNER1_KEY, OWNER1_SECRET, OWNER2_SECRET,
 };
 
 const LEAF_0_5: &str = "207c17af83390bb0de2146733fe837d30cd68b4c16a22f75edbc2b2fe8a580ee";
@@ -56,7 +56,14 @@ fn setup() -> Setup {
     prepare(&c, &w.descriptor, &trees, &inputs, &outputs, &mut psbt).unwrap();
 
     let [receive, change] = signed_roots(&c, &w);
-    let reg = register(&c, w.template.clone(), &receive, &change).unwrap();
+    let reg = register(
+        &c,
+        w.template.clone(),
+        RootPolicy::RequireSignature,
+        &receive,
+        &change,
+    )
+    .unwrap();
 
     Setup { c, w, psbt, reg }
 }
@@ -180,7 +187,14 @@ fn root_signed_by_other_key_refused() {
     let s = setup();
     let [receive, owner1_change] = signed_roots(&s.c, &s.w);
     let change = sign_tree_root(&s.c, &s.w.descriptor, &OWNER2_SECRET, 1, 0).unwrap();
-    let reg = register(&s.c, s.w.template.clone(), &receive, &change).unwrap();
+    let reg = register(
+        &s.c,
+        s.w.template.clone(),
+        RootPolicy::RequireSignature,
+        &receive,
+        &change,
+    )
+    .unwrap();
     assert_eq!(verify_spend(&s.c, &reg, &s.psbt), Ok(31_000));
 
     let owner1_signed = root_signature(&owner1_change);
@@ -192,7 +206,13 @@ fn root_signed_by_other_key_refused() {
         ..owner1_change
     };
     assert!(matches!(
-        register(&s.c, s.w.template.clone(), &receive, &forged_change),
+        register(
+            &s.c,
+            s.w.template.clone(),
+            RootPolicy::RequireSignature,
+            &receive,
+            &forged_change
+        ),
         Err(Error::RootSignature)
     ));
 }
@@ -202,9 +222,90 @@ fn root_for_other_template_refused() {
     let s = setup();
     let [receive, change] = signed_roots(&s.c, &s.w);
     assert!(matches!(
-        register(&s.c, other_template(), &receive, &change),
+        register(
+            &s.c,
+            other_template(),
+            RootPolicy::RequireSignature,
+            &receive,
+            &change
+        ),
         Err(Error::RootSignature)
     ));
+}
+
+#[test]
+fn unsigned_roots_follow_the_registered_policy() {
+    let s = setup();
+    let [receive, change] = unsigned_roots(&s.c, &s.w);
+    assert!(matches!(
+        register(
+            &s.c,
+            s.w.template.clone(),
+            RootPolicy::RequireSignature,
+            &receive,
+            &change
+        ),
+        Err(Error::MissingRootSignature)
+    ));
+
+    let reg = register(
+        &s.c,
+        s.w.template.clone(),
+        RootPolicy::AllowUnsigned,
+        &receive,
+        &change,
+    )
+    .unwrap();
+    assert_eq!(verify_spend(&s.c, &reg, &s.psbt), Ok(31_000));
+}
+
+#[test]
+fn invalid_signature_refused_when_unsigned_roots_are_allowed() {
+    let s = setup();
+    let [receive, change] = signed_roots(&s.c, &s.w);
+    let mut forged = change;
+    // the first byte of the Schnorr signature, after the item count and its length
+    forged.signature.as_mut().unwrap().signature[2] ^= 1;
+    assert!(matches!(
+        register(
+            &s.c,
+            s.w.template.clone(),
+            RootPolicy::AllowUnsigned,
+            &receive,
+            &forged
+        ),
+        Err(Error::RootSignature)
+    ));
+}
+
+#[test]
+fn record_root_follows_the_registered_policy() {
+    let s = setup();
+    let [receive, change] = signed_roots(&s.c, &s.w);
+    let next = tree_root(&s.c, &s.w.descriptor, 0, 256).unwrap();
+
+    let mut strict = register(
+        &s.c,
+        s.w.template.clone(),
+        RootPolicy::RequireSignature,
+        &receive,
+        &change,
+    )
+    .unwrap();
+    assert_eq!(
+        strict.record_root(&s.c, &next),
+        Err(Error::MissingRootSignature)
+    );
+
+    let mut lax = register(
+        &s.c,
+        s.w.template.clone(),
+        RootPolicy::AllowUnsigned,
+        &receive,
+        &change,
+    )
+    .unwrap();
+    assert_eq!(lax.record_root(&s.c, &next), Ok(()));
 }
 
 #[test]
@@ -460,7 +561,14 @@ fn nothing_to_sign_refused() {
     let s = setup();
     let no_leaves = NoLeaves(RustBitcoin::new());
     let [receive, change] = signed_roots(&s.c, &s.w);
-    let reg = register(&no_leaves, s.w.template.clone(), &receive, &change).unwrap();
+    let reg = register(
+        &no_leaves,
+        s.w.template.clone(),
+        RootPolicy::RequireSignature,
+        &receive,
+        &change,
+    )
+    .unwrap();
     assert_eq!(verify_spend(&no_leaves, &reg, &s.psbt), Ok(31_000));
 
     let mut psbt = s.psbt;
@@ -477,7 +585,13 @@ fn register_rejects_swapped_keychains_and_empty_template() {
     let s = setup();
     let [receive, change] = signed_roots(&s.c, &s.w);
     assert!(matches!(
-        register(&s.c, s.w.template.clone(), &change, &receive),
+        register(
+            &s.c,
+            s.w.template.clone(),
+            RootPolicy::RequireSignature,
+            &change,
+            &receive
+        ),
         Err(Error::InvalidKeychain)
     ));
     let empty = SortedMulti {
@@ -485,8 +599,21 @@ fn register_rejects_swapped_keychains_and_empty_template() {
         keys: Vec::new(),
     };
     assert!(matches!(
-        register(&VectorBackend::default(), empty, &receive, &change),
+        register(
+            &VectorBackend::default(),
+            empty,
+            RootPolicy::RequireSignature,
+            &receive,
+            &change
+        ),
         Err(Error::Template)
     ));
-    assert!(register(&s.c, s.w.template.clone(), &receive, &change).is_ok());
+    assert!(register(
+        &s.c,
+        s.w.template.clone(),
+        RootPolicy::RequireSignature,
+        &receive,
+        &change
+    )
+    .is_ok());
 }

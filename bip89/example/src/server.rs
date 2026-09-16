@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use bwk_bip89::{
-    accumulator::record::RootRecord,
+    accumulator::record::{RootPolicy, RootRecord},
     delegator::{register, sign_spend, verify_spend, Registration},
     rust_bitcoin::{
         miniscript::{
@@ -69,18 +69,19 @@ impl SigningServer {
     }
 
     /// Records the template and the receive and change roots of `account`,
-    /// once `register` has checked both root signatures. Any base key of the
-    /// template is accepted as root signer, as `register` does: which keys a
+    /// once `register` has checked both records under `policy`. Any base key of
+    /// the template is accepted as root signer, as `register` does: which keys a
     /// real service requires is its contract with its users.
     pub fn register(
         &mut self,
         account: u64,
         template: Descriptor<bitcoin::PublicKey>,
+        policy: RootPolicy,
         receive: &RootRecord,
         change: &RootRecord,
         max_outflow: u64,
     ) -> Result<(), Error> {
-        let registration = register(&self.backend, template, receive, change)?;
+        let registration = register(&self.backend, template, policy, receive, change)?;
         self.accounts.insert(
             account,
             Account {

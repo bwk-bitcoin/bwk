@@ -29,7 +29,7 @@ use core::{
 
 use bwk_bip89::{
     accumulator::{
-        record::{RootRecord, RootSignature},
+        record::{RootPolicy, RootRecord, RootSignature},
         tree::{Proof, Tree},
     },
     blind::SessionContext,
@@ -41,6 +41,8 @@ use bwk_bip89::{
 
 pub const BIP89_OK: i32 = 0;
 pub const BIP89_HASH_STATE_LEN: usize = 256;
+pub const BIP89_ROOT_POLICY_REQUIRE_SIGNATURE: u32 = 0;
+pub const BIP89_ROOT_POLICY_ALLOW_UNSIGNED: u32 = 1;
 
 pub type HashInitFn = unsafe extern "C" fn(ctx: *mut c_void, state: *mut u8);
 pub type HashUpdateFn =
@@ -276,6 +278,7 @@ pub enum FfiError {
     BadVtable,
     BufferTooSmall,
     IndexOutOfBounds,
+    InvalidRootPolicy,
     Ll(Error),
 }
 
@@ -287,6 +290,7 @@ impl FfiError {
             FfiError::BadVtable => (501, "vtable has a null callback\0"),
             FfiError::BufferTooSmall => (502, "output buffer too small\0"),
             FfiError::IndexOutOfBounds => (503, "index out of bounds\0"),
+            FfiError::InvalidRootPolicy => (504, "invalid root policy\0"),
             FfiError::Ll(error) => ll_error_info(*error),
         }
     }
@@ -2079,25 +2083,37 @@ unsafe fn verify_inner<'a>(
     Ok(())
 }
 
-/// Pins `tmpl` with the `receive` (keychain 0) and `change` (keychain 1)
-/// roots, each checked against a base key of `tmpl` first. Writes an owning
-/// handle to `*out` on success only. The handle keeps a copy of the template
-/// vtable, so its `ctx` must stay valid until `bip89_registration_free`.
+/// The `RootPolicy` of a `BIP89_ROOT_POLICY_*` value.
+fn root_policy(policy: u32) -> Result<RootPolicy, FfiError> {
+    match policy {
+        BIP89_ROOT_POLICY_REQUIRE_SIGNATURE => Ok(RootPolicy::RequireSignature),
+        BIP89_ROOT_POLICY_ALLOW_UNSIGNED => Ok(RootPolicy::AllowUnsigned),
+        _ => Err(FfiError::InvalidRootPolicy),
+    }
+}
+
+/// Pins `tmpl` and `policy` with the `receive` (keychain 0) and `change`
+/// (keychain 1) roots, each checked against a base key of `tmpl` first. Writes
+/// an owning handle to `*out` on success only. The handle keeps a copy of the
+/// template vtable, so its `ctx` must stay valid until
+/// `bip89_registration_free`.
 ///
 /// # Safety
-/// `crypto` and `tmpl` must point to sound vtables. `receive` and `change`
-/// must point to readable records whose signatures follow the rule of
-/// `FfiRootRecord`. `out` must be writable for one pointer. `err` may be null.
+/// `crypto` and `tmpl` must point to sound vtables. `policy` must be a
+/// `BIP89_ROOT_POLICY_*` value. `receive` and `change` must point to readable
+/// records whose signatures follow the rule of `FfiRootRecord`. `out` must be
+/// writable for one pointer. `err` may be null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bip89_register(
     crypto: *const CryptoVtable,
     tmpl: *const TemplateVtable,
+    policy: u32,
     receive: *const FfiRootRecord,
     change: *const FfiRootRecord,
     out: *mut *mut RegistrationHandle,
     err: *mut *const c_char,
 ) -> i32 {
-    match register_inner(crypto, tmpl, receive, change, out) {
+    match register_inner(crypto, tmpl, policy, receive, change, out) {
         Ok(()) => BIP89_OK,
         Err(error) => fail(error, err),
     }
@@ -2106,6 +2122,7 @@ pub unsafe extern "C" fn bip89_register(
 unsafe fn register_inner(
     crypto: *const CryptoVtable,
     tmpl: *const TemplateVtable,
+    policy: u32,
     receive: *const FfiRootRecord,
     change: *const FfiRootRecord,
     out: *mut *mut RegistrationHandle,
@@ -2113,18 +2130,20 @@ unsafe fn register_inner(
     if out.is_null() || receive.is_null() || change.is_null() {
         return Err(FfiError::NullPointer);
     }
+    let policy = root_policy(policy)?;
     let receive = (*receive).root_record()?;
     let change = (*change).root_record()?;
     let b = VtableBackend::new(crypto)?;
     let tmpl = VtableTemplate::new(tmpl)?;
 
-    let registration = bwk_bip89::delegator::register(&b, tmpl, &receive, &change)?;
+    let registration = bwk_bip89::delegator::register(&b, tmpl, policy, &receive, &change)?;
     *out = Box::into_raw(Box::new(registration));
     Ok(())
 }
 
 /// Records the root of the next tree of a keychain in `registration`, once
-/// checked against a base key of its template.
+/// checked against a base key of its template, under the policy pinned at
+/// `bip89_register`.
 ///
 /// # Safety
 /// `crypto` must point to a sound vtable. `registration` must come from
@@ -2443,15 +2462,16 @@ mod tests {
         (Error::MissingRootSignature, 142, "root signature missing\0"),
     ];
 
-    const BOUNDARY_ROWS: [(FfiError, i32, &str); 4] = [
+    const BOUNDARY_ROWS: [(FfiError, i32, &str); 5] = [
         (FfiError::NullPointer, 500, "null pointer\0"),
         (FfiError::BadVtable, 501, "vtable has a null callback\0"),
         (FfiError::BufferTooSmall, 502, "output buffer too small\0"),
         (FfiError::IndexOutOfBounds, 503, "index out of bounds\0"),
+        (FfiError::InvalidRootPolicy, 504, "invalid root policy\0"),
     ];
 
-    fn all_infos() -> [(i32, &'static str); 45] {
-        let mut out = [(0, ""); 45];
+    fn all_infos() -> [(i32, &'static str); 46] {
+        let mut out = [(0, ""); 46];
         for (i, (error, code, message)) in LL_ROWS.into_iter().enumerate() {
             let info = FfiError::Ll(error).info();
             assert_eq!(info, (code, message));

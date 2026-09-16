@@ -9,7 +9,7 @@ mod common;
 use bwk_bip89::{
     accumulator::{
         branch_hash, leaf_hash,
-        record::{build_tree, root_message, template_id, RootRecord, RootSignature},
+        record::{build_tree, root_message, template_id, RootPolicy, RootRecord, RootSignature},
         root_hash,
         tree::{verify_proof, Proof, Tree, HEIGHT},
     },
@@ -45,7 +45,14 @@ fn honest() -> Setup {
     prepare(&c, &w.descriptor, &trees, &inputs, &outputs, &mut psbt).unwrap();
 
     let [receive, change] = signed_roots(&c, &w);
-    let reg = register(&c, w.template.clone(), &receive, &change).unwrap();
+    let reg = register(
+        &c,
+        w.template.clone(),
+        RootPolicy::RequireSignature,
+        &receive,
+        &change,
+    )
+    .unwrap();
     assert_eq!(verify_spend(&c, &reg, &psbt), Ok(31_000));
 
     Setup {

@@ -6,7 +6,7 @@ use std::str::{self, FromStr};
 
 use bwk_bip89::{
     accumulator::{
-        record::{build_tree, sign_tree_root, RootRecord},
+        record::{build_tree, sign_tree_root, tree_root, RootRecord},
         tree::Tree,
     },
     bundle::derive_bundle,
@@ -124,6 +124,22 @@ impl Wallet {
             tree_start,
         )?);
         Ok(signed)
+    }
+
+    /// The root of the tree of `keychain` at `tree_start` with no signature,
+    /// for a server that registers under `AllowUnsigned`. The tree itself is
+    /// already kept by `add_tree`.
+    pub fn unsigned_root(
+        &self,
+        keychain: u32,
+        tree_start: u32,
+    ) -> Result<RootRecord, ExampleError> {
+        Ok(tree_root(
+            &self.backend,
+            &self.descriptor,
+            keychain,
+            tree_start,
+        )?)
     }
 
     pub fn receive_script(&self, index: u32) -> Result<ScriptBuf, ExampleError> {

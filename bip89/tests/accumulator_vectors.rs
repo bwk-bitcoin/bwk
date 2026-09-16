@@ -8,8 +8,8 @@ use bwk_bip89::{
     accumulator::{
         branch_hash, generate_tree, keys_digest, leaf_hash, leaf_nonce, policy_hash, policy_id,
         record::{
-            build_tree, root_message, sign_tree_root, template_id, verify_root, RootRecord,
-            RootSignature,
+            build_tree, root_message, sign_tree_root, template_id, verify_root, RootPolicy,
+            RootRecord, RootSignature,
         },
         root_hash,
         shuffle::{shuffle_key, shuffle_order, MAX_RANGE},
@@ -671,7 +671,10 @@ fn vectors_tree() {
             signature,
         }),
     };
-    assert_eq!(verify_root(&c, &w.template, &record), Ok(()));
+    assert_eq!(
+        verify_root(&c, &w.template, &record, RootPolicy::RequireSignature),
+        Ok(())
+    );
 }
 
 #[test]

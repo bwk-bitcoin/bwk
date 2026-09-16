@@ -3,7 +3,7 @@
 use std::str::FromStr;
 
 use bwk_bip89::{
-    accumulator::record::{sign_tree_root, RootRecord, RootSignature},
+    accumulator::record::{sign_tree_root, tree_root, RootRecord, RootSignature},
     coordinator::Owned,
     rust_bitcoin::{
         miniscript::{
@@ -461,6 +461,14 @@ pub fn signed_roots(c: &RustBitcoin, w: &Wallet) -> [RootRecord; 2] {
     [
         sign_tree_root(c, &w.descriptor, &OWNER1_SECRET, 0, 0).unwrap(),
         sign_tree_root(c, &w.descriptor, &OWNER1_SECRET, 1, 0).unwrap(),
+    ]
+}
+
+/// The receive and change roots at tree start 0, with no signature.
+pub fn unsigned_roots(c: &RustBitcoin, w: &Wallet) -> [RootRecord; 2] {
+    [
+        tree_root(c, &w.descriptor, 0, 0).unwrap(),
+        tree_root(c, &w.descriptor, 1, 0).unwrap(),
     ]
 }
 

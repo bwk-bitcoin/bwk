@@ -6,8 +6,8 @@ use bwk_bip89::{
     accumulator::{
         branch_hash, generate_tree, keys_digest, leaf_hash, leaf_nonce, policy_hash, policy_id,
         record::{
-            build_tree, root_message, sign_tree_root, template_id, verify_root, RootRecord,
-            RootSignature,
+            build_tree, root_message, sign_tree_root, template_id, tree_root, verify_root,
+            RootPolicy, RootRecord, RootSignature,
         },
         root_hash,
         shuffle::{invert, shuffle_key, shuffle_order, SHUFFLE_TAG},
@@ -769,14 +769,43 @@ fn root_signature_roundtrip() {
         Ok(receive_branch.public_key.serialize())
     );
 
-    assert_eq!(verify_root(&c, &w.template, &record), Ok(()));
+    assert_eq!(
+        verify_root(&c, &w.template, &record, RootPolicy::RequireSignature),
+        Ok(())
+    );
 
     let mut flipped = record;
     // the first byte of the Schnorr signature, after the item count and its length
     flipped.signature.as_mut().unwrap().signature[2] ^= 1;
     assert_eq!(
-        verify_root(&c, &w.template, &flipped),
+        verify_root(&c, &w.template, &flipped, RootPolicy::RequireSignature),
         Err(Error::RootSignature)
+    );
+    assert_eq!(
+        verify_root(&c, &w.template, &flipped, RootPolicy::AllowUnsigned),
+        Err(Error::RootSignature)
+    );
+}
+
+#[test]
+fn unsigned_root_follows_policy() {
+    let c = RustBitcoin::new();
+    let w = wallet();
+    let d = &w.descriptor;
+
+    let record = tree_root(&c, d, 0, 0).unwrap();
+    assert_eq!(record.keychain, 0);
+    assert_eq!(record.tree_start, 0);
+    assert_eq!(record.root, hex_arr::<32>(ROOT_0_0));
+    assert_eq!(record.signature, None);
+
+    assert_eq!(
+        verify_root(&c, &w.template, &record, RootPolicy::RequireSignature),
+        Err(Error::MissingRootSignature)
+    );
+    assert_eq!(
+        verify_root(&c, &w.template, &record, RootPolicy::AllowUnsigned),
+        Ok(())
     );
 }
 
@@ -788,7 +817,10 @@ fn root_signature_wrong_key_fails() {
 
     let record = sign_tree_root(&c, d, &OWNER1_SECRET, 0, 0).unwrap();
     let other = sign_tree_root(&c, d, &OWNER2_SECRET, 0, 0).unwrap();
-    assert_eq!(verify_root(&c, &w.template, &other), Ok(()));
+    assert_eq!(
+        verify_root(&c, &w.template, &other, RootPolicy::RequireSignature),
+        Ok(())
+    );
 
     let signed = root_signature(&record);
     let other_signed = root_signature(&other);
@@ -801,7 +833,7 @@ fn root_signature_wrong_key_fails() {
         ..record.clone()
     };
     assert_eq!(
-        verify_root(&c, &w.template, &other_key),
+        verify_root(&c, &w.template, &other_key, RootPolicy::RequireSignature),
         Err(Error::RootSignature)
     );
 
@@ -813,7 +845,12 @@ fn root_signature_wrong_key_fails() {
         ..record
     };
     assert_eq!(
-        verify_root(&c, &w.template, &other_signature),
+        verify_root(
+            &c,
+            &w.template,
+            &other_signature,
+            RootPolicy::RequireSignature
+        ),
         Err(Error::RootSignature)
     );
 }
@@ -844,7 +881,7 @@ fn root_signature_non_participant_key_fails() {
         }),
     };
     assert_eq!(
-        verify_root(&c, &w.template, &outsider),
+        verify_root(&c, &w.template, &outsider, RootPolicy::RequireSignature),
         Err(Error::NotParticipant)
     );
 }
@@ -862,7 +899,10 @@ fn root_signature_other_template_fails() {
 
     let signed = sign_tree_root(&c, d, &OWNER1_SECRET, 0, 0).unwrap();
 
-    assert_eq!(verify_root(&c, &other, &signed), Err(Error::RootSignature));
+    assert_eq!(
+        verify_root(&c, &other, &signed, RootPolicy::RequireSignature),
+        Err(Error::RootSignature)
+    );
 }
 
 #[test]
@@ -884,7 +924,7 @@ fn root_signature_forged_branch_tweak_fails() {
         ..receive.clone()
     };
     assert_eq!(
-        verify_root(&c, &w.template, &change_tweak),
+        verify_root(&c, &w.template, &change_tweak, RootPolicy::RequireSignature),
         Err(Error::RootSignature)
     );
 
@@ -902,7 +942,7 @@ fn root_signature_forged_branch_tweak_fails() {
         ..receive
     };
     assert_eq!(
-        verify_root(&c, &w.template, &forged),
+        verify_root(&c, &w.template, &forged, RootPolicy::RequireSignature),
         Err(Error::RootSignature)
     );
 }
@@ -915,6 +955,7 @@ fn sign_tree_root_root_equals_build_tree_root() {
 
     let root_0_0: [u8; 32] = hex_arr(ROOT_0_0);
     assert_eq!(build_tree(&c, d, 0, 0).unwrap().root, root_0_0);
+    assert_eq!(tree_root(&c, d, 0, 0).unwrap().root, root_0_0);
     assert_eq!(
         sign_tree_root(&c, d, &OWNER1_SECRET, 0, 0).unwrap().root,
         root_0_0
@@ -933,6 +974,7 @@ fn sign_tree_root_root_equals_build_tree_root() {
         sign_tree_root(&c, d, &OWNER1_SECRET, 2, 0),
         Err(Error::InvalidKeychain)
     );
+    assert_eq!(tree_root(&c, d, 2, 0), Err(Error::InvalidKeychain));
     assert_eq!(
         sign_tree_root(&c, d, &[0u8; 32], 0, 0),
         Err(Error::SecretKey)

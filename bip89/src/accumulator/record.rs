@@ -3,7 +3,9 @@
 //! BIP322, for the single-key taproot address of the signer's branch key on the
 //! tree's keychain, so the delegator checks it against a base key of the
 //! template it holds. The signed message binds the template id, so a root for
-//! another wallet under the same key is refused.
+//! another wallet under the same key is refused. Whether a root may come with
+//! no signature at all is the delegator's `RootPolicy`; a signature that is
+//! there is verified under either policy.
 
 use alloc::vec::Vec;
 
@@ -55,6 +57,16 @@ pub struct RootSignature {
     pub branch_tweak: [u8; 32],
     /// BIP322 simple signature for the taproot address of the branch key.
     pub signature: Vec<u8>,
+}
+
+/// What a delegator accepts as a root record, pinned at registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootPolicy {
+    /// A root with no signature is refused.
+    RequireSignature,
+    /// A root may come with no signature; a signature that is there is still
+    /// verified.
+    AllowUnsigned,
 }
 
 /// Builds the tree of `d` for `keychain` and `tree_start` with `NullTreeBuilder`
@@ -131,26 +143,38 @@ pub fn build_tree<B: BitcoinBackend>(
     )
 }
 
-/// Checks the signature of `record` as a BIP322 signature over
-/// `root_message(template_id, root)` for the taproot address of its key plus
-/// its branch tweak. A record with no signature is `MissingRootSignature`; a
-/// key that is not a base key of `template` is `NotParticipant`; a failing
-/// signature is `RootSignature`.
+/// Checks `record` against `template` under `policy`. A signature is always
+/// verified: a key that is not a base key of `template` is `NotParticipant`,
+/// a failing signature is `RootSignature`. A record with no signature is
+/// `MissingRootSignature` under `RequireSignature` and accepted under
+/// `AllowUnsigned`.
 pub fn verify_root<B: BitcoinBackend>(
     c: &B,
     template: &B::Template,
     record: &RootRecord,
+    policy: RootPolicy,
 ) -> Result<(), Error> {
-    let signature = record
-        .signature
-        .as_ref()
-        .ok_or(Error::MissingRootSignature)?;
+    match (&record.signature, policy) {
+        (Some(signature), _) => verify_signature(c, template, &record.root, signature),
+        (None, RootPolicy::AllowUnsigned) => Ok(()),
+        (None, RootPolicy::RequireSignature) => Err(Error::MissingRootSignature),
+    }
+}
+
+/// Checks `signature` as a BIP322 signature over `root_message(template_id,
+/// root)` for the taproot address of its key plus its branch tweak.
+fn verify_signature<B: BitcoinBackend>(
+    c: &B,
+    template: &B::Template,
+    root: &[u8; 32],
+    signature: &RootSignature,
+) -> Result<(), Error> {
     c.template_base_keys(template)
         .binary_search(&signature.key)
         .map_err(|_| Error::NotParticipant)?;
     let branch_key = tweak_key(c, &signature.key, &signature.branch_tweak)?;
     let tid = template_id(c, &c.template_bytes(template));
-    let message = root_message(c, &tid, &record.root);
+    let message = root_message(c, &tid, root);
     if c.bip322_verify(&branch_key, &message, &signature.signature) {
         Ok(())
     } else {

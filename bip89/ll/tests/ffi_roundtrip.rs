@@ -8,7 +8,7 @@ use core::ffi::{c_char, c_void, CStr};
 
 use bwk_bip89::{
     accumulator::{
-        record,
+        record::{self, RootPolicy},
         tree::{Proof, Tree},
     },
     bip340, blind,
@@ -34,10 +34,11 @@ use bwk_bip89_ll::{
     bip89_tweak_key, bip89_unblind_signature, bip89_verify_blind_signature, CryptoVtable,
     DescriptorVtable, FfiError, FfiOwned, FfiRootRecord, FfiXpub, PsbtVtable, RegistrationHandle,
     TemplateVtable, U32List, VtableBackend, VtableTemplate, BIP89_OK,
+    BIP89_ROOT_POLICY_ALLOW_UNSIGNED, BIP89_ROOT_POLICY_REQUIRE_SIGNATURE,
 };
 use common::{
-    hex_arr, hex_vec, root_signature, signed_roots, spend_psbt, standard_lists, wallet, FixedRng,
-    DELEGATOR_SECRET, OWNER1_SECRET,
+    hex_arr, hex_vec, root_signature, signed_roots, spend_psbt, standard_lists, unsigned_roots,
+    wallet, FixedRng, DELEGATOR_SECRET, OWNER1_SECRET,
 };
 
 const G: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
@@ -2110,7 +2111,10 @@ fn sign_tree_root_matches_rust() {
     let rust_c = RustBitcoin::new();
     let expected = record::sign_tree_root(&rust_c, &w.descriptor, &OWNER1_SECRET, 1, 0).unwrap();
     assert_eq!(signed, expected);
-    assert_eq!(record::verify_root(&rust_c, &w.template, &signed), Ok(()));
+    assert_eq!(
+        record::verify_root(&rust_c, &w.template, &signed, RootPolicy::RequireSignature),
+        Ok(())
+    );
 
     let mut root_out = [0xaau8; 32];
     let mut key_out = [0xaau8; 33];
@@ -2692,19 +2696,45 @@ fn register_through_c() {
     let c_receive = ffi_root_record(&receive);
     let c_change = ffi_root_record(&change);
     let mut out: *mut RegistrationHandle = core::ptr::null_mut();
-    let rc = unsafe { bip89_register(&v, &tv, &c_receive, &c_change, &mut out, &mut err) };
+    let rc = unsafe {
+        bip89_register(
+            &v,
+            &tv,
+            BIP89_ROOT_POLICY_REQUIRE_SIGNATURE,
+            &c_receive,
+            &c_change,
+            &mut out,
+            &mut err,
+        )
+    };
     assert_eq!(rc, BIP89_OK);
     assert!(!out.is_null());
     unsafe { bip89_registration_free(out) };
     unsafe { bip89_registration_free(core::ptr::null_mut()) };
 
     let mut out2: *mut RegistrationHandle = core::ptr::null_mut();
-    let rc2 = unsafe { bip89_register(&v, &tv, &c_change, &c_receive, &mut out2, &mut err) };
+    let rc2 = unsafe {
+        bip89_register(
+            &v,
+            &tv,
+            BIP89_ROOT_POLICY_REQUIRE_SIGNATURE,
+            &c_change,
+            &c_receive,
+            &mut out2,
+            &mut err,
+        )
+    };
     assert_eq!(rc2, 117);
     assert_eq!(message(err), "invalid keychain");
     assert!(out2.is_null());
     assert!(matches!(
-        delegator::register(&rust_c, tpl.clone(), &change, &receive),
+        delegator::register(
+            &rust_c,
+            tpl.clone(),
+            RootPolicy::RequireSignature,
+            &change,
+            &receive
+        ),
         Err(Error::InvalidKeychain)
     ));
 
@@ -2717,7 +2747,17 @@ fn register_through_c() {
         ..ffi_root_record(&change)
     };
     let mut out3: *mut RegistrationHandle = core::ptr::null_mut();
-    let rc3 = unsafe { bip89_register(&v, &tv, &c_receive, &forged_change, &mut out3, &mut err) };
+    let rc3 = unsafe {
+        bip89_register(
+            &v,
+            &tv,
+            BIP89_ROOT_POLICY_REQUIRE_SIGNATURE,
+            &c_receive,
+            &forged_change,
+            &mut out3,
+            &mut err,
+        )
+    };
     assert_eq!(rc3, 121);
     assert_eq!(message(err), "invalid root signature");
     assert!(out3.is_null());
@@ -2725,14 +2765,34 @@ fn register_through_c() {
     let mut tv_zero = template_vtable(&mut tpl_ctx);
     tv_zero.base_keys = Some(zero_base_keys);
     let mut out4: *mut RegistrationHandle = core::ptr::null_mut();
-    let rc4 = unsafe { bip89_register(&v, &tv_zero, &c_receive, &c_change, &mut out4, &mut err) };
+    let rc4 = unsafe {
+        bip89_register(
+            &v,
+            &tv_zero,
+            BIP89_ROOT_POLICY_REQUIRE_SIGNATURE,
+            &c_receive,
+            &c_change,
+            &mut out4,
+            &mut err,
+        )
+    };
     assert_eq!(rc4, 116);
     assert_eq!(message(err), "template rejected or callback failed");
 
     let mut tv_desc = template_vtable(&mut tpl_ctx);
     tv_desc.base_keys = Some(descending_base_keys);
     let mut out5: *mut RegistrationHandle = core::ptr::null_mut();
-    let rc5 = unsafe { bip89_register(&v, &tv_desc, &c_receive, &c_change, &mut out5, &mut err) };
+    let rc5 = unsafe {
+        bip89_register(
+            &v,
+            &tv_desc,
+            BIP89_ROOT_POLICY_REQUIRE_SIGNATURE,
+            &c_receive,
+            &c_change,
+            &mut out5,
+            &mut err,
+        )
+    };
     assert_eq!(rc5, 116);
     assert_eq!(message(err), "template rejected or callback failed");
 
@@ -2740,6 +2800,7 @@ fn register_through_c() {
         bip89_register(
             &v,
             &tv,
+            BIP89_ROOT_POLICY_REQUIRE_SIGNATURE,
             &c_receive,
             &c_change,
             core::ptr::null_mut(),
@@ -2750,9 +2811,78 @@ fn register_through_c() {
     assert_eq!(message(err), "null pointer");
 
     let mut out7: *mut RegistrationHandle = core::ptr::null_mut();
-    let rc7 = unsafe { bip89_register(&v, &tv, core::ptr::null(), &c_change, &mut out7, &mut err) };
+    let rc7 = unsafe {
+        bip89_register(
+            &v,
+            &tv,
+            BIP89_ROOT_POLICY_REQUIRE_SIGNATURE,
+            core::ptr::null(),
+            &c_change,
+            &mut out7,
+            &mut err,
+        )
+    };
     assert_eq!(rc7, 500);
     assert!(out7.is_null());
+
+    let mut out8: *mut RegistrationHandle = core::ptr::null_mut();
+    let rc8 = unsafe { bip89_register(&v, &tv, 2, &c_receive, &c_change, &mut out8, &mut err) };
+    assert_eq!(rc8, 504);
+    assert_eq!(message(err), "invalid root policy");
+    assert!(out8.is_null());
+}
+
+#[test]
+fn register_unsigned_roots_through_c() {
+    let w = wallet();
+    let rust_c = RustBitcoin::new();
+    let mut tpl_ctx = TplCtx::new(&w.template);
+    let tv = template_vtable(&mut tpl_ctx);
+    let mut ctx = test_ctx();
+    let v = vtable(&mut ctx);
+    let mut err: *const c_char = core::ptr::null();
+
+    let [receive, change] = unsigned_roots(&rust_c, &w);
+    let c_receive = ffi_root_record(&receive);
+    let c_change = ffi_root_record(&change);
+    assert!(c_receive.signature.is_null());
+    assert_eq!(c_receive.signature_len, 0);
+
+    let mut out: *mut RegistrationHandle = core::ptr::null_mut();
+    let rc = unsafe {
+        bip89_register(
+            &v,
+            &tv,
+            BIP89_ROOT_POLICY_REQUIRE_SIGNATURE,
+            &c_receive,
+            &c_change,
+            &mut out,
+            &mut err,
+        )
+    };
+    assert_eq!(rc, 142);
+    assert_eq!(message(err), "root signature missing");
+    assert!(out.is_null());
+
+    let rc2 = unsafe {
+        bip89_register(
+            &v,
+            &tv,
+            BIP89_ROOT_POLICY_ALLOW_UNSIGNED,
+            &c_receive,
+            &c_change,
+            &mut out,
+            &mut err,
+        )
+    };
+    assert_eq!(rc2, BIP89_OK);
+    assert!(!out.is_null());
+
+    let next = record::tree_root(&rust_c, &w.descriptor, 0, 256).unwrap();
+    let rc3 = unsafe { bip89_registration_record_root(&v, out, &ffi_root_record(&next), &mut err) };
+    assert_eq!(rc3, BIP89_OK);
+
+    unsafe { bip89_registration_free(out) };
 }
 
 #[test]
@@ -2771,6 +2901,7 @@ fn registration_record_root_through_c() {
         bip89_register(
             &v,
             &tv,
+            BIP89_ROOT_POLICY_REQUIRE_SIGNATURE,
             &ffi_root_record(&receive),
             &ffi_root_record(&change),
             &mut reg,
@@ -2841,8 +2972,14 @@ fn spend_flow_matches_rust() {
     )
     .unwrap();
     let [receive_rust, change_rust] = signed_roots(&rust_c, &w);
-    let reg_rust =
-        delegator::register(&rust_c, w.template.clone(), &receive_rust, &change_rust).unwrap();
+    let reg_rust = delegator::register(
+        &rust_c,
+        w.template.clone(),
+        RootPolicy::RequireSignature,
+        &receive_rust,
+        &change_rust,
+    )
+    .unwrap();
     assert_eq!(
         delegator::verify_spend(&rust_c, &reg_rust, &psbt_rust),
         Ok(31_000)
@@ -2947,6 +3084,7 @@ fn spend_flow_matches_rust() {
         bip89_register(
             &v,
             &tv,
+            BIP89_ROOT_POLICY_REQUIRE_SIGNATURE,
             &ffi_root_record(&receive),
             &ffi_root_record(&change),
             &mut reg,
@@ -3077,6 +3215,7 @@ fn forged_change_refused_through_c() {
         bip89_register(
             &v,
             &tv,
+            BIP89_ROOT_POLICY_REQUIRE_SIGNATURE,
             &ffi_root_record(&receive),
             &ffi_root_record(&change),
             &mut reg,
@@ -3246,6 +3385,7 @@ fn missing_proof_index_through_c() {
         bip89_register(
             &v,
             &tv,
+            BIP89_ROOT_POLICY_REQUIRE_SIGNATURE,
             &ffi_root_record(&receive),
             &ffi_root_record(&change),
             &mut reg,
@@ -3477,6 +3617,7 @@ fn psbt_callback_failures_through_c() {
         bip89_register(
             &v,
             &tv,
+            BIP89_ROOT_POLICY_REQUIRE_SIGNATURE,
             &ffi_root_record(&receive),
             &ffi_root_record(&change),
             &mut reg,

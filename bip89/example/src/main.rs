@@ -4,6 +4,7 @@
 use std::str::{FromStr, Utf8Error};
 
 use bwk_bip89::{
+    accumulator::record::RootPolicy,
     rust_bitcoin::{
         miniscript::{
             self,
@@ -28,17 +29,20 @@ use rand::{rngs::ThreadRng, RngCore};
 
 use crate::{
     server::{ServerError, SigningServer},
-    wallet::{Wallet, CHANGE_OUTPUT, RECEIVE},
+    wallet::{Wallet, CHANGE, CHANGE_OUTPUT, RECEIVE},
 };
 
 mod server;
 mod wallet;
 
 const ACCOUNT: u64 = 1;
+/// The account registered with roots that carry no signature.
+const UNSIGNED_ACCOUNT: u64 = 2;
 /// Largest outflow, fee included, the server signs for the account.
 const LIMIT: u64 = 50_000;
 const FUNDING: u64 = 100_000;
 const FUNDING_INDEX: u32 = 0;
+const UNSIGNED_FUNDING_INDEX: u32 = 1;
 const AMOUNT: u64 = 30_000;
 const OVER_LIMIT_AMOUNT: u64 = 60_000;
 const FEE: u64 = 1_000;
@@ -173,7 +177,14 @@ fn main() -> Result<(), ExampleError> {
     );
 
     let (template, receive, change) = wallet.registration()?;
-    server.register(ACCOUNT, template.clone(), &receive, &change, LIMIT)?;
+    server.register(
+        ACCOUNT,
+        template.clone(),
+        RootPolicy::RequireSignature,
+        &receive,
+        &change,
+        LIMIT,
+    )?;
     println!("2. account {ACCOUNT} registered, template {template}, limit {LIMIT} sats");
 
     let funding = OutPoint {
@@ -224,12 +235,34 @@ fn main() -> Result<(), ExampleError> {
         vout: 0,
     };
     wallet.receive(funding, NEXT_TREE_INDEX, FUNDING);
-    let psbt = wallet.spend(external, AMOUNT, FEE)?;
+    let psbt = wallet.spend(external.clone(), AMOUNT, FEE)?;
     let (signed, outflow) = server.sign(ACCOUNT, &psbt, &mut rng)?;
     let tx = wallet.finalize(&signed)?;
     println!(
         "7. receive tree at {NEXT_TREE_START} recorded, receive index {NEXT_TREE_INDEX} \
          spent: outflow {outflow} sats, txid {}",
+        tx.compute_txid()
+    );
+
+    server.register(
+        UNSIGNED_ACCOUNT,
+        template,
+        RootPolicy::AllowUnsigned,
+        &wallet.unsigned_root(RECEIVE, 0)?,
+        &wallet.unsigned_root(CHANGE, 0)?,
+        LIMIT,
+    )?;
+    let funding = OutPoint {
+        txid: Txid::from_byte_array([0x03; 32]),
+        vout: 0,
+    };
+    wallet.receive(funding, UNSIGNED_FUNDING_INDEX, FUNDING);
+    let psbt = wallet.spend(external, AMOUNT, FEE)?;
+    let (signed, outflow) = server.sign(UNSIGNED_ACCOUNT, &psbt, &mut rng)?;
+    let tx = wallet.finalize(&signed)?;
+    println!(
+        "8. account {UNSIGNED_ACCOUNT} registered with unsigned roots, receive index \
+         {UNSIGNED_FUNDING_INDEX} spent: outflow {outflow} sats, txid {}",
         tx.compute_txid()
     );
 

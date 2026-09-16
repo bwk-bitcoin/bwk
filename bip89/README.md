@@ -162,13 +162,16 @@ template to run the BIP89 verification vectors.
   `coordinator::prepare(b, d, trees, inputs, outputs, psbt)` writes bundles, and
   for each owned output the proof from the first tree that covers it (`NoTree`
   otherwise), into the PSBT through the backend setters.
-- **Delegator.** `delegator::register(b, template, receive, change)` checks the
-  receive (keychain 0) and change (keychain 1) root records with
-  `accumulator::record::verify_root` and records the template and both roots in a
-  `Registration`. `Registration::record_root` records the root of a keychain's
-  next tree the same way. Any base key of the template is accepted as signer:
-  which keys a delegator requires is its policy with its users, left to the
-  consumer. `delegator::verify_spend` checks each owned output's proof against
+- **Delegator.** `delegator::register(b, template, policy, receive, change)`
+  checks the receive (keychain 0) and change (keychain 1) root records with
+  `accumulator::record::verify_root` and records the template, the policy and
+  both roots in a `Registration`. `Registration::record_root` records the root of
+  a keychain's next tree the same way, under the policy pinned at registration.
+  `RootPolicy::RequireSignature` refuses a record with no signature,
+  `RootPolicy::AllowUnsigned` takes it and leaves the delegator trusting the
+  authenticated setup channel instead; a signature that is there is verified
+  either way. Any base key of the template is accepted as signer: which keys a
+  delegator requires is its policy with its users, left to the consumer. `delegator::verify_spend` checks each owned output's proof against
   any recorded root and returns the outflow including the fee;
   `delegator::sign_spend` verifies, then adds BIP340 script path signatures.
 
