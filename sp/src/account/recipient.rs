@@ -4,7 +4,7 @@
 //! Uses newtype wrappers to satisfy the orphan rule.
 
 use crate::{
-    core::utils::common::SilentPaymentAddress,
+    core::{utils::common::SilentPaymentAddress, SpVersion},
     receiver::{
         bitcoin::{key::TapTweak, script::PushBytesBuf, ScriptBuf, TxOut, Weight},
         RecipientAddress,
@@ -83,9 +83,11 @@ impl RecipientProvider for SpRecipient {
         // Fallback: single-output independent derivation (k=0).
         // For multi-output transactions, derive_sp_scripts() should have
         // already set precomputed_script with the correct k value.
-        let pubkeys =
-            crate::core::sending::generate_recipient_pubkeys(vec![self.address], partial_secret)
-                .expect("failed to generate SP recipient pubkeys");
+        let pubkeys = crate::core::sending::generate_recipient_pubkeys(
+            vec![self.address],
+            partial_secret.into(),
+        )
+        .expect("failed to generate SP recipient pubkeys");
 
         let output_pubkeys = pubkeys
             .get(&self.address)
@@ -188,9 +190,11 @@ impl RecipientProvider for SpRecipientAddress {
                     .partial_secret
                     .expect("SP output requires partial_secret");
 
-                let pubkeys =
-                    crate::core::sending::generate_recipient_pubkeys(vec![*sp], partial_secret)
-                        .expect("failed to generate SP recipient pubkeys");
+                let pubkeys = crate::core::sending::generate_recipient_pubkeys(
+                    vec![*sp],
+                    partial_secret.into(),
+                )
+                .expect("failed to generate SP recipient pubkeys");
 
                 let output_pubkeys = pubkeys.get(sp).expect("missing pubkey for SP address");
 
@@ -419,8 +423,9 @@ fn batch_derive_sp_scripts(
         } = output.psbt_output_info()
         {
             let sp_network = to_sp_network(output.network());
-            let addr = SilentPaymentAddress::new(scan_pubkey, spend_pubkey, sp_network, 0)
-                .expect("valid SP address from psbt_output_info");
+            let addr =
+                SilentPaymentAddress::new(scan_pubkey, spend_pubkey, sp_network, SpVersion::V0)
+                    .expect("valid SP address from psbt_output_info");
             sp_addresses.push(addr);
             sp_indices.push(i);
         }
@@ -431,9 +436,11 @@ fn batch_derive_sp_scripts(
     }
 
     // Single call with all addresses: BIP352 k-counter increments per scan-key group
-    let pubkey_map =
-        crate::core::sending::generate_recipient_pubkeys(sp_addresses.clone(), partial_secret)
-            .expect("failed to generate SP recipient pubkeys");
+    let pubkey_map = crate::core::sending::generate_recipient_pubkeys(
+        sp_addresses.clone(),
+        partial_secret.into(),
+    )
+    .expect("failed to generate SP recipient pubkeys");
 
     // Assign the correct pubkey to each output using per-address counters
     let mut counters: HashMap<SilentPaymentAddress, usize> = HashMap::new();
@@ -542,7 +549,7 @@ impl<P: crate::profile::SpStorageProfile + Send + Sync + 'static> SpPartialSecre
         let mut outpoints = Vec::with_capacity(inputs.len());
 
         for coin in inputs {
-            outpoints.push((coin.outpoint.txid.to_string(), coin.outpoint.vout));
+            outpoints.push(coin.outpoint);
 
             match &coin.spend_info {
                 CoinSpendInfo::Sp { tweak, .. } => {
@@ -575,6 +582,7 @@ impl<P: crate::profile::SpStorageProfile + Send + Sync + 'static> SpPartialSecre
 
         drop(store);
         crate::core::sending::calculate_partial_secret(&input_keys, &outpoints)
+            .map(|partial_secret| *partial_secret.as_inner())
             .map_err(|_| TxError::SpPartialSecret)
     }
 
@@ -640,7 +648,7 @@ impl SpPartialSecretProvider for Account {
         let mut outpoints = Vec::with_capacity(inputs.len());
 
         for coin in inputs {
-            outpoints.push((coin.outpoint.txid.to_string(), coin.outpoint.vout));
+            outpoints.push(coin.outpoint);
 
             match &coin.spend_info {
                 CoinSpendInfo::Sp { tweak, .. } => {
@@ -670,6 +678,7 @@ impl SpPartialSecretProvider for Account {
         }
 
         crate::core::sending::calculate_partial_secret(&input_keys, &outpoints)
+            .map(|partial_secret| *partial_secret.as_inner())
             .map_err(|_| TxError::SpPartialSecret)
     }
 
@@ -703,7 +712,7 @@ mod tests {
         let secp = Secp256k1::new();
         let scan = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[1u8; 32]).unwrap());
         let spend = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[2u8; 32]).unwrap());
-        SilentPaymentAddress::new(scan, spend, network, 0).unwrap()
+        SilentPaymentAddress::new(scan, spend, network, SpVersion::V0).unwrap()
     }
 
     /// A minimal TxBuilder bound to `network` (SP change provider only).

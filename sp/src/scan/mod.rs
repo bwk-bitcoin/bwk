@@ -188,12 +188,12 @@ fn candidate_tweak_chunk() -> usize {
 pub(crate) fn script_to_secret_map(
     sp_receiver: &SpReceiver,
     tweak_data_vec: Vec<PublicKey>,
-) -> Result<HashMap<[u8; 34], PublicKey>, receiver::error::Error> {
+) -> Result<HashMap<[u8; 34], crate::core::SharedSecret>, receiver::error::Error> {
     let b_scan = &sp_receiver.get_scan_key();
 
     // ECDH per tweak, then SPK derivation. Only reached on a filter match;
     // sequential within the block, as the scan parallelizes across blocks.
-    let shared_secrets: Vec<PublicKey> = tweak_data_vec
+    let shared_secrets: Vec<crate::core::SharedSecret> = tweak_data_vec
         .into_iter()
         .map(|tweak| crate::core::receiving::calculate_ecdh_shared_secret(&tweak, b_scan))
         .collect();
@@ -201,7 +201,7 @@ pub(crate) fn script_to_secret_map(
     let items: Result<Vec<_>, receiver::error::Error> = shared_secrets
         .into_iter()
         .map(|secret| {
-            let spks = sp_receiver.receiver.get_spks_from_shared_secret(&secret)?;
+            let spks = sp_receiver.receiver.get_spks_from_shared_secret(secret)?;
             Ok((secret, spks.into_values()))
         })
         .collect();
@@ -845,7 +845,7 @@ fn scan_utxos(
     url: &str,
     sp_receiver: &SpReceiver,
     blkheight: Height,
-    secrets_map: HashMap<[u8; 34], bitcoin::secp256k1::PublicKey>,
+    secrets_map: HashMap<[u8; 34], crate::core::SharedSecret>,
 ) -> Result<Vec<(Option<Label>, UtxoData, bitcoin::secp256k1::Scalar)>, receiver::error::Error> {
     let utxos = blindbit::utxos(agent, url, blkheight)?;
     let mut txmap: HashMap<Txid, Vec<UtxoData>> = HashMap::new();
@@ -884,7 +884,7 @@ fn scan_utxos(
 
         let ours = sp_receiver
             .receiver
-            .scan_transaction(secret, output_keys?)?;
+            .scan_transaction(*secret, &output_keys?)?;
 
         for utxo in utxos {
             if !utxo.scriptpubkey.is_p2tr() || utxo.spent {
