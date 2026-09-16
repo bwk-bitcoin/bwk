@@ -411,11 +411,6 @@ use std::sync::Mutex;
 
 use bwk_coin::{Coin, CoinSource, CoinSpendInfo, CoinStatus};
 
-use bitcoin::{
-    bip32::{Fingerprint, Xpriv},
-    secp256k1::{All, Secp256k1},
-};
-
 /// Taproot keyspend satisfaction weight in WU (1 Schnorr signature = 66 WU)
 const TR_KEYSPEND_SATISFACTION_WEIGHT: u64 = 66;
 
@@ -451,7 +446,6 @@ impl<P: SpStorageProfile + Send + Sync + 'static> CoinSource for SpCoinSource<P>
                 label: None,
                 satisfaction_size: TR_KEYSPEND_SATISFACTION_WEIGHT,
                 spend_info: CoinSpendInfo::Sp {
-                    derivation: bitcoin::bip32::DerivationPath::default(),
                     tweak: *entry.tweak(),
                 },
             })
@@ -482,79 +476,6 @@ impl<P: SpStorageProfile + Send + Sync + 'static> CoinSource for MergedCoinSourc
         let mut coins = self.sp_source.spendable_coins();
         for source in &self.bip32_sources {
             coins.extend(source.spendable_coins());
-        }
-        coins
-    }
-}
-
-// KeyedBip32Source (enriches BIP32 coins with secret keys for SP partial secret)
-
-/// A [`CoinSource`] wrapper that populates the ephemeral `secret_key` field on
-/// BIP32 coins so that [`SpPartialSecretProvider`] can compute the partial
-/// secret when sending to SP addresses with mixed inputs.
-pub struct KeyedBip32Source {
-    inner: Box<dyn CoinSource>,
-    xprivs: BTreeMap<Fingerprint, Xpriv>,
-    secp: Secp256k1<All>,
-}
-
-impl KeyedBip32Source {
-    pub fn new(inner: Box<dyn CoinSource>, xprivs: BTreeMap<Fingerprint, Xpriv>) -> Self {
-        Self {
-            inner,
-            xprivs,
-            secp: Secp256k1::new(),
-        }
-    }
-
-    /// Derive the secret key for a BIP32 coin using its PSBT input derivation info.
-    fn populate_secret_key(&self, coin: &mut Coin) {
-        if !coin.is_bip32() {
-            return;
-        }
-
-        let psbt_input = match coin.to_psbt_input() {
-            Ok(inp) => inp,
-            Err(_) => return,
-        };
-
-        // Try segwit bip32_derivation first, then taproot tap_key_origins
-        let derived_key = if !psbt_input.bip32_derivation.is_empty() {
-            psbt_input.bip32_derivation.values().find_map(|(fg, path)| {
-                let xpriv = self.xprivs.get(fg)?;
-                xpriv
-                    .derive_priv(&self.secp, path)
-                    .ok()
-                    .map(|k| k.private_key)
-            })
-        } else if !psbt_input.tap_key_origins.is_empty() {
-            psbt_input
-                .tap_key_origins
-                .values()
-                .find_map(|(_, (fg, path))| {
-                    let xpriv = self.xprivs.get(fg)?;
-                    xpriv
-                        .derive_priv(&self.secp, path)
-                        .ok()
-                        .map(|k| k.private_key)
-                })
-        } else {
-            None
-        };
-
-        if let (Some(sk), CoinSpendInfo::Bip32 { secret_key, .. }) =
-            (derived_key, &mut coin.spend_info)
-        {
-            *secret_key = Some(sk);
-        }
-    }
-}
-
-impl CoinSource for KeyedBip32Source {
-    fn spendable_coins(&self) -> Vec<Coin> {
-        let mut coins = self.inner.spendable_coins();
-        for coin in &mut coins {
-            self.populate_secret_key(coin);
         }
         coins
     }

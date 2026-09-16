@@ -306,6 +306,7 @@ pub fn test_config(temp_dir: &std::path::Path) -> Config {
         "https://blindbit.test.example.com".to_string(),
         temp_dir.to_path_buf(),
     )
+    .unwrap()
     .with_persistence(None)
 }
 
@@ -319,6 +320,7 @@ pub fn test_account(url: &str) -> bwk_sp::account::Account {
         url.to_string(),
         std::path::PathBuf::from("/unused"),
     )
+    .unwrap()
     .with_persistence(None);
     bwk_sp::account::Account::new(config).expect("create test account")
 }
@@ -343,6 +345,7 @@ pub fn test_account_with_mnemonic(
         url.to_string(),
         std::path::PathBuf::from("/unused"),
     )
+    .unwrap()
     .with_persistence(None);
     bwk_sp::account::Account::new(config).expect("create test account")
 }
@@ -368,6 +371,7 @@ pub fn test_account_persistent_named(
         url.to_string(),
         dir.path().to_path_buf(),
     )
+    .unwrap()
     .with_persistence(Some(bwk::persist::PersistenceKind::Json));
     let account = bwk_sp::account::Account::new(config.clone()).expect("create test account");
     (account, config, dir)
@@ -929,7 +933,6 @@ impl TestEnv {
             spend_info: CoinSpendInfo::Bip32 {
                 coin_path: (KeyChain::Receive, 0),
                 descriptor,
-                secret_key: None,
             },
         }
     }
@@ -986,7 +989,6 @@ impl TestEnv {
             spend_info: CoinSpendInfo::Bip32 {
                 coin_path: (KeyChain::Receive, 0),
                 descriptor,
-                secret_key: None,
             },
         }
     }

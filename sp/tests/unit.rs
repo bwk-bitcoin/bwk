@@ -14,12 +14,19 @@ use common::{
     test_config, test_mnemonic, test_outpoint, test_owned_output, test_spent_output, MockBackend,
 };
 
+use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 use bwk::bwk_electrum::{
     label_store::{LabelKey, LabelStore},
     notification::{Notification, SpNotification},
 };
-use bwk_sp::account::{
-    coin_store::SpCoinStore, config::Config, tx_store::SpTxStore, Account, AccountError,
+use bwk_sp::{
+    account::{
+        coin_store::SpCoinStore, config::Config, tx_store::SpTxStore, Account, AccountError,
+    },
+    bwk_sign::bwk_descriptor::{
+        sp_descriptor::SpDescriptor,
+        sp_key::{SpKey, SpScanKey, SpSpendKey},
+    },
 };
 use bwk_utils::test::temp_dir::TempDir;
 
@@ -65,72 +72,22 @@ fn test_mock_backend_failure() {
 
 // Account Construction Tests
 
-/// Test that Account::new fails when neither mnemonic nor scan_sk is provided.
+/// Test that Config::new fails with an invalid mnemonic.
 #[test]
-fn test_account_new_invalid_no_keys() {
-    let dir = TempDir::new().unwrap();
-
-    // Create config with no mnemonic and no scan_sk
-    let mut config = Config::new(
-        "no-keys".to_string(),
-        bitcoin::Network::Signet,
-        test_mnemonic().to_string(),
-        "https://blindbit.example.com".to_string(),
-        dir.path().to_path_buf(),
-    )
-    .with_persistence(None);
-
-    // Remove the mnemonic
-    config.mnemonic = None;
-    config.scan_sk = None;
-
-    let result = Account::new(config);
-    match result {
-        Err(AccountError::MissingKeys) => {}
-        Err(other) => panic!("expected MissingKeys error, got {other:?}"),
-        Ok(_) => panic!("expected error, got Ok"),
-    }
-}
-
-/// Test that Account::new fails with an invalid mnemonic.
-#[test]
-fn test_account_new_invalid_bad_mnemonic() {
-    let dir = TempDir::new().unwrap();
-
-    let config = Config::new(
+fn test_config_new_invalid_bad_mnemonic() {
+    let result = Config::new(
         "bad-mnemonic".to_string(),
         bitcoin::Network::Signet,
         "invalid mnemonic words that are not valid".to_string(),
         "https://blindbit.example.com".to_string(),
-        dir.path().to_path_buf(),
-    )
-    .with_persistence(None);
-
-    let result = Account::new(config);
-    match result {
-        Err(AccountError::InvalidMnemonic(_)) => {}
-        Err(other) => panic!("expected InvalidMnemonic error, got {other:?}"),
-        Ok(_) => panic!("expected error, got Ok"),
-    }
-}
-
-/// Test that Account::new fails with invalid hex scan_sk.
-#[test]
-fn test_account_new_invalid_bad_hex_key() {
-    let dir = TempDir::new().unwrap();
-
-    // Use Config::from_keys with invalid hex
-    let result = Config::from_keys(
-        "bad-hex".to_string(),
-        bitcoin::Network::Signet,
-        "not_valid_hex_at_all_should_fail_validation".to_string(),
-        "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".to_string(),
-        "https://blindbit.example.com".to_string(),
-        dir.path().to_path_buf(),
+        std::path::PathBuf::from("/tmp/bwk-sp-test-bad-mnemonic"),
     );
 
-    // Config::from_keys should fail with invalid hex
-    assert!(result.is_err());
+    match result {
+        Err(bwk_sp::account::config::ConfigError::Signer(_)) => {}
+        Err(other) => panic!("expected Signer error, got {other:?}"),
+        Ok(_) => panic!("expected error, got Ok"),
+    }
 }
 
 /// Test that Account::new fails with an empty blindbit_url.
@@ -145,6 +102,7 @@ fn test_account_new_invalid_empty_url() {
         String::new(), // Empty URL
         dir.path().to_path_buf(),
     )
+    .unwrap()
     .with_persistence(None);
 
     let result = Account::new(config);
@@ -256,52 +214,65 @@ fn test_config_for_hot_key_signing() {
 
     // A config with mnemonic should enable signing
     assert!(config.mnemonic.is_some());
-    assert!(config.scan_sk.is_none());
 }
 
-/// Test that Config with scan_sk and public spend_key would NOT enable signing.
+/// Test that Config from a watch-only `sp(scan_priv,spend_pub)` descriptor
+/// would NOT enable signing.
 #[test]
 fn test_config_for_signing_device_watch_only() {
     let dir = TempDir::new().unwrap();
+    let secp = Secp256k1::new();
+    let descriptor = SpDescriptor::Packed {
+        origin: None,
+        key: SpKey::Scan(SpScanKey {
+            scan_key: SecretKey::from_slice(&[0x01; 32]).unwrap(),
+            spend_key: PublicKey::from_secret_key(
+                &secp,
+                &SecretKey::from_slice(&[0x02; 32]).unwrap(),
+            ),
+            network: bitcoin::NetworkKind::Test,
+        }),
+    };
 
-    // Create config with scan_sk and a PUBLIC spend_key (66 hex chars = 33 bytes)
-    let config = Config::from_keys(
+    let config = Config::from_descriptor(
         "watch-only".to_string(),
         bitcoin::Network::Signet,
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
-        "02fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".to_string(),
+        descriptor,
         "https://blindbit.example.com".to_string(),
         dir.path().to_path_buf(),
-    )
-    .expect("valid config");
+    );
 
-    // This config has no mnemonic and spend_key is public
+    // This config has no mnemonic and the descriptor is watch-only
     assert!(config.mnemonic.is_none());
-    assert!(config.scan_sk.is_some());
-    assert!(config.spend_key.is_some());
+    assert!(config.descriptor.is_watch_only(&secp).unwrap());
 }
 
-/// Test that Config with scan_sk and secret spend_key WOULD enable signing.
+/// Test that Config from a hot `sp(scan_priv,spend_priv)` descriptor WOULD
+/// enable signing.
 #[test]
 fn test_config_for_signing_device_hot() {
     let dir = TempDir::new().unwrap();
+    let secp = Secp256k1::new();
+    let descriptor = SpDescriptor::Packed {
+        origin: None,
+        key: SpKey::Spend(SpSpendKey {
+            scan_key: SecretKey::from_slice(&[0x01; 32]).unwrap(),
+            spend_key: SecretKey::from_slice(&[0x02; 32]).unwrap(),
+            network: bitcoin::NetworkKind::Test,
+        }),
+    };
 
-    // Create config with scan_sk and a SECRET spend_key (64 hex chars = 32 bytes)
-    let config = Config::from_keys(
+    let config = Config::from_descriptor(
         "signing-device-hot".to_string(),
         bitcoin::Network::Signet,
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
-        "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".to_string(),
+        descriptor,
         "https://blindbit.example.com".to_string(),
         dir.path().to_path_buf(),
-    )
-    .expect("valid config");
+    );
 
-    // This config has secret spend_key (64 chars = 32 bytes)
+    // This config has no mnemonic but the descriptor carries a spend secret key
     assert!(config.mnemonic.is_none());
-    assert!(config.scan_sk.is_some());
-    assert!(config.spend_key.is_some());
-    assert_eq!(config.spend_key.as_ref().unwrap().len(), 64);
+    assert!(!config.descriptor.is_watch_only(&secp).unwrap());
 }
 
 // Transaction Building Tests

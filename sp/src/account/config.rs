@@ -8,13 +8,36 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use bitcoin::{bip32::ChildNumber, Network};
+use bitcoin::{bip32::ChildNumber, secp256k1::Secp256k1, Network, NetworkKind};
 use bwk::bwk_electrum::{config::Endpoint, raw_client::CertificateCheck};
 use bwk_sign::{
-    bwk_descriptor::{self, descriptor::Descriptor},
+    bwk_descriptor::{
+        self,
+        descriptor::Descriptor,
+        sp_descriptor::SpDescriptor,
+        sp_key::{SpKey, SpSpendKey},
+    },
     hot_signer::HotSigner,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::receiver;
+
+mod sp_descriptor_serde {
+    use std::str::FromStr;
+
+    use bwk_sign::bwk_descriptor::sp_descriptor::SpDescriptor;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(descriptor: &SpDescriptor, s: S) -> Result<S::Ok, S::Error> {
+        descriptor.to_string().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<SpDescriptor, D::Error> {
+        let s = String::deserialize(d)?;
+        SpDescriptor::from_str(&s).map_err(serde::de::Error::custom)
+    }
+}
 
 /// Default filename a [`bwk::persist::config_store::FileConfigStore`] uses for an
 /// SP account's config. Consumers are free to choose another path
@@ -32,13 +55,15 @@ pub struct Config {
     /// Bitcoin network (mainnet, testnet, signet, regtest)
     pub network: Network,
 
-    // Keys (one of mnemonic or scan_sk must be set)
-    /// BIP39 mnemonic phrase (for hot wallet)
+    // Keys
+    /// BIP39 mnemonic phrase (for hot wallet). Construction parameter only;
+    /// never persisted.
+    #[serde(skip)]
     pub mnemonic: Option<String>,
-    /// Hex-encoded scan secret key (for signing device mode)
-    pub scan_sk: Option<String>,
-    /// Hex-encoded spend key (secret or public, depending on mode)
-    pub spend_key: Option<String>,
+    /// BIP392 `sp()` descriptor holding the scan key and spend key; the sole
+    /// source of truth for this account's silent-payment key material.
+    #[serde(with = "sp_descriptor_serde")]
+    pub descriptor: SpDescriptor,
 
     // Backend
     /// Blindbit server URL for chain data
@@ -55,9 +80,7 @@ pub struct Config {
     /// Which backend keeps this account's data, `None` for in-memory only.
     ///
     /// `Json`: byte-for-byte compatible with the pre-backend layout.
-    /// `Sqlite`: single `account.sqlite` file per account; signer material
-    /// (mnemonic / scan_sk / spend_key) is stripped from everything written
-    /// to disk and must be re-supplied on the next run.
+    /// `Sqlite`: single `account.sqlite` file per account.
     pub persistence: Option<bwk::persist::PersistenceKind>,
 
     // Scanning
@@ -82,8 +105,8 @@ pub struct SubAccountConfig {
     ///
     /// When absent, [`Account`](crate::account::Account) uses the parent SP
     /// config's mnemonic. This field is only needed for externally supplied
-    /// sub-account mnemonics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// sub-account mnemonics. Construction parameter only; never persisted.
+    #[serde(skip)]
     pub mnemonic: Option<String>,
     /// Electrum server this sub-account watches (offline while unset), and the
     /// certificate policy to reach it under. Its own: a policy the SP account
@@ -104,69 +127,25 @@ impl Config {
     /// Create a new Config from a mnemonic phrase.
     ///
     /// This is the standard constructor for hot wallets where the mnemonic
-    /// is stored in memory.
+    /// is stored in memory. Derives the account's `sp()` descriptor from the
+    /// mnemonic at the BIP352 paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Signer`] if the mnemonic is invalid.
     pub fn new(
         account_name: String,
         network: Network,
         mnemonic: String,
         blindbit_url: String,
         data_dir: PathBuf,
-    ) -> Self {
-        Self {
-            account_name,
-            network,
-            mnemonic: Some(mnemonic),
-            scan_sk: None,
-            spend_key: None,
-            blindbit_url,
-            endpoint: Endpoint::default(),
-            data_dir,
-            persistence: Some(bwk::persist::PersistenceKind::default()),
-            dust_limit: None,
-            birthday_height: None,
-            descriptors: Vec::new(),
-        }
-    }
-
-    /// Create a new Config from raw keys.
-    ///
-    /// This constructor is used for signing device mode where only the
-    /// scan secret key is available locally, and the spend key may be
-    /// either a secret key (hot) or public key (watch-only).
-    ///
-    /// # Errors
-    ///
-    /// Returns a key-validation error if:
-    /// - `scan_sk` is not exactly 64 hex characters ([`ConfigError::ScanSkLength`])
-    /// - `spend_key` is not exactly 64 or 66 hex characters ([`ConfigError::SpendKeyLength`])
-    /// - Either key contains invalid hex characters ([`ConfigError::ScanSkHex`] /
-    ///   [`ConfigError::SpendKeyHex`])
-    pub fn from_keys(
-        account_name: String,
-        network: Network,
-        scan_sk: String,
-        spend_key: String,
-        blindbit_url: String,
-        data_dir: PathBuf,
     ) -> Result<Self, ConfigError> {
-        // Validate scan_sk is valid hex (64 chars = 32 bytes secret key)
-        if scan_sk.len() != 64 {
-            return Err(ConfigError::ScanSkLength);
-        }
-        hex::decode(&scan_sk).map_err(ConfigError::ScanSkHex)?;
-
-        // Validate spend_key is valid hex (64 chars = secret key, 66 chars = compressed pubkey)
-        if spend_key.len() != 64 && spend_key.len() != 66 {
-            return Err(ConfigError::SpendKeyLength);
-        }
-        hex::decode(&spend_key).map_err(ConfigError::SpendKeyHex)?;
-
+        let descriptor = Self::derive_descriptor(network, &mnemonic)?;
         Ok(Self {
             account_name,
             network,
-            mnemonic: None,
-            scan_sk: Some(scan_sk),
-            spend_key: Some(spend_key),
+            mnemonic: Some(mnemonic),
+            descriptor,
             blindbit_url,
             endpoint: Endpoint::default(),
             data_dir,
@@ -177,10 +156,57 @@ impl Config {
         })
     }
 
+    /// Create a new watch-only Config from an already-parsed BIP392 `sp()`
+    /// descriptor.
+    ///
+    /// This is the constructor for watch-only wallets: a descriptor such as
+    /// `sp(scan_priv,spend_pub)` carries every key the account needs, with no
+    /// mnemonic and no spend secret key held in memory.
+    pub fn from_descriptor(
+        account_name: String,
+        network: Network,
+        descriptor: SpDescriptor,
+        blindbit_url: String,
+        data_dir: PathBuf,
+    ) -> Self {
+        Self {
+            account_name,
+            network,
+            mnemonic: None,
+            descriptor,
+            blindbit_url,
+            endpoint: Endpoint::default(),
+            data_dir,
+            persistence: Some(bwk::persist::PersistenceKind::default()),
+            dust_limit: None,
+            birthday_height: None,
+            descriptors: Vec::new(),
+        }
+    }
+
+    fn derive_descriptor(network: Network, mnemonic: &str) -> Result<SpDescriptor, ConfigError> {
+        let signer =
+            HotSigner::new_from_mnemonics(network, mnemonic).map_err(ConfigError::Signer)?;
+        let account = ChildNumber::from_hardened_idx(0).expect("hardcoded account index");
+        Ok(SpDescriptor::Packed {
+            origin: None,
+            key: SpKey::Spend(SpSpendKey {
+                scan_key: signer.private_key_at(&receiver::scan_path(network, account)),
+                spend_key: signer.private_key_at(&receiver::spend_path(network, account)),
+                network: NetworkKind::from(network),
+            }),
+        })
+    }
+
     // Sanitization
 
     /// Sanitize all config values, clamping or fixing invalid fields.
-    pub fn sanitize(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::MnemonicDescriptorMismatch`] if a mnemonic is
+    /// set and it does not derive this config's `sp()` descriptor.
+    pub fn sanitize(&mut self) -> Result<(), ConfigError> {
         // Birthday height
         let min = self.min_birthday_height();
         match self.birthday_height {
@@ -188,6 +214,39 @@ impl Config {
             None => self.birthday_height = Some(min),
             _ => {}
         }
+
+        self.check_mnemonic_matches_descriptor()
+    }
+
+    /// Verify that `self.mnemonic`, when present, derives the same BIP352
+    /// scan and spend keys as `self.descriptor`. Watch-only configs (no
+    /// mnemonic) are always valid.
+    fn check_mnemonic_matches_descriptor(&self) -> Result<(), ConfigError> {
+        let Some(mnemonic) = self.mnemonic.as_deref() else {
+            return Ok(());
+        };
+
+        let signer =
+            HotSigner::new_from_mnemonics(self.network, mnemonic).map_err(ConfigError::Signer)?;
+        let account = ChildNumber::from_hardened_idx(0).expect("hardcoded account index");
+        let secp = Secp256k1::new();
+
+        let derived_scan = signer.private_key_at(&receiver::scan_path(self.network, account));
+        let derived_spend = signer.private_key_at(&receiver::spend_path(self.network, account));
+
+        let expected_scan = self
+            .descriptor
+            .scan_secret_key(&secp)
+            .map_err(ConfigError::Descriptor)?;
+        let expected_spend_pk = self
+            .descriptor
+            .spend_public_key(&secp)
+            .map_err(ConfigError::Descriptor)?;
+
+        if derived_scan != expected_scan || derived_spend.public_key(&secp) != expected_spend_pk {
+            return Err(ConfigError::MnemonicDescriptorMismatch);
+        }
+        Ok(())
     }
 
     /// Returns the minimum valid birthday height for this config's network.
@@ -338,23 +397,12 @@ impl Config {
 
     /// Select the backend that keeps this account's data, `None` for
     /// in-memory only (builder pattern).
-    ///
-    /// Under [`bwk::persist::PersistenceKind::Sqlite`], signer material
-    /// (mnemonic / scan_sk / spend_key) is stripped from everything
-    /// written to disk and must be re-supplied on the next run.
     pub fn with_persistence(mut self, persistence: Option<bwk::persist::PersistenceKind>) -> Self {
         self.persistence = persistence;
         self
     }
 
-    /// Whether this config is configured to keep signer material out of
-    /// on-disk writes.
-    pub fn excludes_signer_data(&self) -> bool {
-        matches!(
-            self.persistence,
-            Some(bwk::persist::PersistenceKind::Sqlite)
-        )
-    } // Path helpers
+    // Path helpers
 
     /// Returns the account-specific data directory.
     ///
@@ -371,28 +419,6 @@ impl Config {
         fs::remove_dir_all(&dir)
             .map_err(|e| ConfigError::Io(format!("failed to remove {}: {}", dir.display(), e)))
     }
-
-    /// View of this config that's safe to persist to disk.
-    ///
-    /// Under [`bwk::persist::PersistenceKind::Sqlite`] all signer
-    /// material (mnemonic, scan_sk, spend_key) is stripped so it never
-    /// lands on disk; under [`bwk::persist::PersistenceKind::Json`]
-    /// (default) the config is returned unchanged. Used by `Account`
-    /// when handing config to a [`bwk::persist::config_store::ConfigStore`].
-    pub fn for_persistence(&self) -> Config {
-        if self.excludes_signer_data() {
-            let mut stripped = self.clone();
-            stripped.mnemonic = None;
-            stripped.scan_sk = None;
-            stripped.spend_key = None;
-            for descriptor in &mut stripped.descriptors {
-                descriptor.mnemonic = None;
-            }
-            stripped
-        } else {
-            self.clone()
-        }
-    }
 }
 
 /// Errors that can occur when loading or parsing Config.
@@ -402,14 +428,6 @@ pub enum ConfigError {
     Io(String),
     #[error("parse error: {0}")]
     Parse(String),
-    #[error("scan_sk must be 64 hex chars")]
-    ScanSkLength,
-    #[error("spend_key must be 64 or 66 hex chars")]
-    SpendKeyLength,
-    #[error("scan_sk is not valid hex: {0}")]
-    ScanSkHex(hex::FromHexError),
-    #[error("spend_key is not valid hex: {0}")]
-    SpendKeyHex(hex::FromHexError),
     #[error("missing mnemonic")]
     MissingMnemonic,
     #[error("signer error: {0}")]
@@ -418,22 +436,147 @@ pub enum ConfigError {
     DescriptorPath(#[source] bwk_descriptor::descriptor::Error),
     #[error("derivator error: {0}")]
     Derivator(#[source] bwk_descriptor::derivator::Error),
+    #[error("descriptor error: {0}")]
+    Descriptor(#[source] bwk_descriptor::sp_descriptor::Error),
+    #[error("mnemonic does not derive the configured sp() descriptor")]
+    MnemonicDescriptorMismatch,
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{path::Path, str::FromStr};
+
+    use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+
     use super::*;
     use crate::account::mnemonic_probe;
-    use std::path::Path;
+
+    const MISMATCHED_MNEMONIC: &str =
+        "legal winner thank year wave sausage worth useful legal winner thank yellow";
+
+    const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+        abandon abandon abandon about";
 
     fn test_config() -> Config {
         Config::new(
             "alice".to_string(),
             Network::Signet,
-            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string(),
+            TEST_MNEMONIC.to_string(),
             "https://blindbit.example.com".to_string(),
             PathBuf::from("/tmp/bwk-test"),
         )
+        .unwrap()
+    }
+
+    fn watch_only_descriptor() -> SpDescriptor {
+        let secp = Secp256k1::new();
+        SpDescriptor::Packed {
+            origin: None,
+            key: SpKey::Scan(bwk_descriptor::sp_key::SpScanKey {
+                scan_key: SecretKey::from_slice(&[0x11; 32]).unwrap(),
+                spend_key: PublicKey::from_secret_key(
+                    &secp,
+                    &SecretKey::from_slice(&[0x22; 32]).unwrap(),
+                ),
+                network: NetworkKind::Test,
+            }),
+        }
+    }
+
+    /// Build the `sp(scan_priv,spend_priv)` split form of the descriptor
+    /// for `mnemonic`, so the spend key is a secret rather than a packed key.
+    fn split_descriptor_from_mnemonic(network: Network, mnemonic: &str) -> SpDescriptor {
+        let signer = HotSigner::new_from_mnemonics(network, mnemonic).unwrap();
+        let account = ChildNumber::from_hardened_idx(0).unwrap();
+        let scan_sk = signer.private_key_at(&receiver::scan_path(network, account));
+        let spend_sk = signer.private_key_at(&receiver::spend_path(network, account));
+        let network_kind = NetworkKind::from(network);
+        let scan_wif = bitcoin::PrivateKey::new(scan_sk, network_kind).to_wif();
+        let spend_wif = bitcoin::PrivateKey::new(spend_sk, network_kind).to_wif();
+        SpDescriptor::from_str(&format!("sp({scan_wif},{spend_wif})")).unwrap()
+    }
+
+    #[test]
+    fn sanitize_accepts_matching_pair() {
+        let mut config = test_config();
+        assert!(config.sanitize().is_ok());
+    }
+
+    #[test]
+    fn sanitize_accepts_watch_only() {
+        let mut config = Config::from_descriptor(
+            "watch".to_string(),
+            Network::Signet,
+            watch_only_descriptor(),
+            "https://blindbit.example.com".to_string(),
+            PathBuf::from("/tmp/bwk-test"),
+        );
+
+        assert!(config.sanitize().is_ok());
+    }
+
+    #[test]
+    fn sanitize_rejects_mismatched_mnemonic() {
+        let mut config = test_config();
+        config.mnemonic = Some(MISMATCHED_MNEMONIC.to_string());
+
+        assert!(matches!(
+            config.sanitize(),
+            Err(ConfigError::MnemonicDescriptorMismatch)
+        ));
+    }
+
+    #[test]
+    fn sanitize_accepts_signer_form_descriptor() {
+        let network = Network::Signet;
+        let descriptor = split_descriptor_from_mnemonic(network, TEST_MNEMONIC);
+        let mut config = Config::from_descriptor(
+            "alice".to_string(),
+            network,
+            descriptor,
+            "https://blindbit.example.com".to_string(),
+            PathBuf::from("/tmp/bwk-test"),
+        );
+        config.mnemonic = Some(TEST_MNEMONIC.to_string());
+
+        assert!(config.sanitize().is_ok());
+    }
+
+    #[test]
+    fn sanitize_rejects_wrong_network_derivation() {
+        let mut config = Config::new(
+            "alice".to_string(),
+            Network::Regtest,
+            TEST_MNEMONIC.to_string(),
+            "https://blindbit.example.com".to_string(),
+            PathBuf::from("/tmp/bwk-test"),
+        )
+        .unwrap();
+        config.network = Network::Bitcoin;
+
+        assert!(matches!(
+            config.sanitize(),
+            Err(ConfigError::MnemonicDescriptorMismatch)
+        ));
+    }
+
+    #[test]
+    fn mismatch_error_hides_mnemonic_words() {
+        let mut config = test_config();
+        config.mnemonic = Some(MISMATCHED_MNEMONIC.to_string());
+        let err = config.sanitize().unwrap_err();
+        mnemonic_probe::assert_no_word_leak(&err, TEST_MNEMONIC);
+        mnemonic_probe::assert_no_word_leak(&err, MISMATCHED_MNEMONIC);
+
+        let mut unknown_config = test_config();
+        unknown_config.mnemonic = Some(mnemonic_probe::UNKNOWN_MNEMONIC.to_string());
+        let err = unknown_config.sanitize().unwrap_err();
+        mnemonic_probe::assert_no_word_leak(&err, mnemonic_probe::UNKNOWN_MNEMONIC);
+
+        let mut checksum_config = test_config();
+        checksum_config.mnemonic = Some(mnemonic_probe::BAD_CHECKSUM_MNEMONIC.to_string());
+        let err = checksum_config.sanitize().unwrap_err();
+        mnemonic_probe::assert_no_word_leak(&err, mnemonic_probe::BAD_CHECKSUM_MNEMONIC);
     }
 
     #[test]
@@ -443,8 +586,7 @@ mod tests {
         assert_eq!(config.account_name, "alice");
         assert_eq!(config.network, Network::Signet);
         assert!(config.mnemonic.is_some());
-        assert!(config.scan_sk.is_none());
-        assert!(config.spend_key.is_none());
+        assert!(!config.descriptor.is_watch_only(&Secp256k1::new()).unwrap());
         assert_eq!(config.blindbit_url, "https://blindbit.example.com");
         assert_eq!(config.data_dir, PathBuf::from("/tmp/bwk-test"));
         assert!(config.persistence.is_some()); // Default is on
@@ -558,14 +700,13 @@ mod tests {
         let mut config = test_config();
         config.add_default_segwit_sub_account().unwrap();
         let descriptor_str = config.descriptors[0].descriptor.to_string();
+        let sp_descriptor_str = config.descriptor.to_string();
 
         let json = format!(
             r#"{{
                 "account_name": "alice",
                 "network": "signet",
-                "mnemonic": null,
-                "scan_sk": null,
-                "spend_key": null,
+                "descriptor": "{sp_descriptor_str}",
                 "blindbit_url": "https://blindbit.example.com",
                 "certificate_check": "validate",
                 "data_dir": "/tmp/bwk-test",
@@ -592,15 +733,13 @@ mod tests {
 
     #[test]
     fn test_default_sub_account_helpers_require_mnemonic() {
-        let mut config = Config::from_keys(
+        let mut config = Config::from_descriptor(
             "bob".to_string(),
             Network::Bitcoin,
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
-            "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".to_string(),
+            watch_only_descriptor(),
             "https://blindbit.example.com".to_string(),
             PathBuf::from("/tmp/bwk-test"),
-        )
-        .expect("valid keys");
+        );
 
         assert!(matches!(
             config.add_default_segwit_sub_account(),
@@ -668,98 +807,40 @@ mod tests {
     }
 
     #[test]
-    fn test_config_from_keys_valid() {
-        let config = Config::from_keys(
-            "bob".to_string(),
-            Network::Bitcoin,
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
-            "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".to_string(),
-            "https://blindbit.example.com".to_string(),
-            PathBuf::from("/tmp/bwk-test"),
-        )
-        .expect("valid keys");
-
-        assert_eq!(config.account_name, "bob");
-        assert_eq!(config.network, Network::Bitcoin);
-        assert!(config.mnemonic.is_none());
-        assert!(config.scan_sk.is_some());
-        assert!(config.spend_key.is_some());
-        assert!(config.persistence.is_some());
-    }
-
-    #[test]
-    fn test_config_from_keys_with_pubkey() {
-        // 66 hex chars = compressed public key (33 bytes)
-        let config = Config::from_keys(
+    fn from_descriptor_needs_no_mnemonic() {
+        let descriptor = watch_only_descriptor();
+        let config = Config::from_descriptor(
             "watch".to_string(),
             Network::Signet,
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
-            "02fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".to_string(),
+            descriptor.clone(),
             "https://blindbit.example.com".to_string(),
             PathBuf::from("/tmp/bwk-test"),
-        )
-        .expect("valid keys with pubkey");
+        );
+
+        assert!(config.mnemonic.is_none());
+        let roundtrip: SpDescriptor = config.descriptor.to_string().parse().unwrap();
+        assert_eq!(roundtrip, descriptor);
+    }
+
+    #[test]
+    fn new_derives_descriptor_from_mnemonic() {
+        let network = Network::Signet;
+        let signer = HotSigner::new_from_mnemonics(network, TEST_MNEMONIC).unwrap();
+        let account = ChildNumber::from_hardened_idx(0).unwrap();
+        let expected_scan = signer.private_key_at(&receiver::scan_path(network, account));
+        let expected_spend = signer.private_key_at(&receiver::spend_path(network, account));
+        let secp = Secp256k1::new();
+
+        let config = test_config();
 
         assert_eq!(
-            config.spend_key,
-            Some("02fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".to_string())
+            config.descriptor.scan_secret_key(&secp).unwrap(),
+            expected_scan
         );
-    }
-
-    #[test]
-    fn test_config_from_keys_scan_sk_wrong_length() {
-        let result = Config::from_keys(
-            "bob".to_string(),
-            Network::Bitcoin,
-            "0123456789abcdef".to_string(), // Too short (16 chars instead of 64)
-            "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".to_string(),
-            "https://blindbit.example.com".to_string(),
-            PathBuf::from("/tmp/bwk-test"),
+        assert_eq!(
+            config.descriptor.spend_public_key(&secp).unwrap(),
+            PublicKey::from_secret_key(&secp, &expected_spend)
         );
-
-        assert!(matches!(result, Err(ConfigError::ScanSkLength)));
-    }
-
-    #[test]
-    fn test_config_from_keys_scan_sk_invalid_hex() {
-        let result = Config::from_keys(
-            "bob".to_string(),
-            Network::Bitcoin,
-            "zzzz456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(), // Invalid hex
-            "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".to_string(),
-            "https://blindbit.example.com".to_string(),
-            PathBuf::from("/tmp/bwk-test"),
-        );
-
-        assert!(matches!(result, Err(ConfigError::ScanSkHex(_))));
-    }
-
-    #[test]
-    fn test_config_from_keys_spend_key_wrong_length() {
-        let result = Config::from_keys(
-            "bob".to_string(),
-            Network::Bitcoin,
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
-            "fedcba98765432".to_string(), // Too short (14 chars instead of 64 or 66)
-            "https://blindbit.example.com".to_string(),
-            PathBuf::from("/tmp/bwk-test"),
-        );
-
-        assert!(matches!(result, Err(ConfigError::SpendKeyLength)));
-    }
-
-    #[test]
-    fn test_config_from_keys_spend_key_invalid_hex() {
-        let result = Config::from_keys(
-            "bob".to_string(),
-            Network::Bitcoin,
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
-            "ggggba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".to_string(), // Invalid hex
-            "https://blindbit.example.com".to_string(),
-            PathBuf::from("/tmp/bwk-test"),
-        );
-
-        assert!(matches!(result, Err(ConfigError::SpendKeyHex(_))));
     }
 
     #[test]
@@ -767,10 +848,11 @@ mod tests {
         let config = Config::new(
             "alice".to_string(),
             Network::Signet,
-            "test mnemonic".to_string(),
+            TEST_MNEMONIC.to_string(),
             "https://blindbit.example.com".to_string(),
             PathBuf::from("/tmp/test"),
-        );
+        )
+        .unwrap();
 
         assert_eq!(config.account_dir(), Path::new("/tmp/test/alice"));
         assert_eq!(
@@ -788,7 +870,8 @@ mod tests {
 
         assert_eq!(config.account_name, loaded.account_name);
         assert_eq!(config.network, loaded.network);
-        assert_eq!(config.mnemonic, loaded.mnemonic);
+        assert!(loaded.mnemonic.is_none());
+        assert_eq!(config.descriptor, loaded.descriptor);
         assert_eq!(config.blindbit_url, loaded.blindbit_url);
         assert_eq!(config.data_dir, loaded.data_dir);
         assert_eq!(config.persistence, loaded.persistence);
@@ -840,19 +923,21 @@ mod tests {
         let config = Config::new(
             "test-account".to_string(),
             Network::Signet,
-            "test mnemonic phrase".to_string(),
+            TEST_MNEMONIC.to_string(),
             "https://blindbit.example.com".to_string(),
             temp_dir.clone(),
-        );
+        )
+        .unwrap();
 
         let store: FileConfigStore<Config> =
             FileConfigStore::new(config.account_dir().join(CONFIG_FILENAME));
-        store.save(&config.for_persistence()).unwrap();
+        store.save(&config).unwrap();
         let loaded = store.load().unwrap().expect("config persisted");
 
         assert_eq!(config.account_name, loaded.account_name);
         assert_eq!(config.network, loaded.network);
-        assert_eq!(config.mnemonic, loaded.mnemonic);
+        assert!(loaded.mnemonic.is_none());
+        assert_eq!(config.descriptor, loaded.descriptor);
         assert_eq!(config.blindbit_url, loaded.blindbit_url);
         assert_eq!(config.persistence, loaded.persistence);
 
@@ -869,60 +954,37 @@ mod tests {
     }
 
     #[test]
-    fn test_for_persistence_under_sqlite_strips_all_signer_material() {
-        let unique_mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string();
-        let unique_scan_sk =
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
-        let unique_spend_key =
-            "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".to_string();
-
-        let mut config = Config::new(
-            "alice".to_string(),
-            Network::Signet,
-            unique_mnemonic.clone(),
-            "https://blindbit.example.com".to_string(),
-            PathBuf::from("/tmp"),
-        );
-        config.scan_sk = Some(unique_scan_sk.clone());
-        config.spend_key = Some(unique_spend_key.clone());
-        config
-            .add_segwit_sub_account_from_mnemonic(&unique_mnemonic)
-            .expect("external sub-account");
-        config.persistence = Some(bwk::persist::PersistenceKind::Sqlite);
-
-        let view = config.for_persistence();
-        assert!(view.mnemonic.is_none());
-        assert!(view.scan_sk.is_none());
-        assert!(view.spend_key.is_none());
-        assert!(view.descriptors.iter().all(|sub| sub.mnemonic.is_none()));
-
-        let serialized = serde_json::to_string_pretty(&view).unwrap();
-        for needle in [&unique_mnemonic, &unique_scan_sk, &unique_spend_key] {
-            assert!(
-                !serialized.contains(needle),
-                "{needle:?} must not appear in serialized form under SQLite mode: {serialized}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_for_persistence_under_json_preserves_mnemonic() {
-        let unique_mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string();
+    fn mnemonic_never_serialized() {
         let config = Config::new(
             "alice".to_string(),
             Network::Signet,
-            unique_mnemonic.clone(),
+            TEST_MNEMONIC.to_string(),
             "https://blindbit.example.com".to_string(),
             PathBuf::from("/tmp"),
-        );
+        )
+        .unwrap();
 
-        let view = config.for_persistence();
-        assert_eq!(view.mnemonic, Some(unique_mnemonic.clone()));
-
-        let serialized = serde_json::to_string_pretty(&view).unwrap();
+        let serialized = serde_json::to_string_pretty(&config).unwrap();
         assert!(
-            serialized.contains(&unique_mnemonic),
-            "mnemonic must appear under default JSON mode"
+            !serialized.contains(TEST_MNEMONIC),
+            "mnemonic must never appear in serialized form: {serialized}"
+        );
+        assert!(serialized.contains(&config.descriptor.to_string()));
+    }
+
+    #[test]
+    fn sub_account_mnemonic_never_serialized() {
+        let mut config = test_config();
+        let sub_account_mnemonic =
+            "legal winner thank year wave sausage worth useful legal winner thank yellow";
+        config
+            .add_segwit_sub_account_from_mnemonic(sub_account_mnemonic)
+            .unwrap();
+
+        let serialized = serde_json::to_string_pretty(&config).unwrap();
+        assert!(
+            !serialized.contains(sub_account_mnemonic),
+            "sub-account mnemonic must never appear in serialized form: {serialized}"
         );
     }
 
@@ -959,8 +1021,8 @@ mod tests {
         assert!(msg.contains("invalid json"));
 
         // Test a key-validation error variant
-        let err = ConfigError::ScanSkLength;
+        let err = ConfigError::MissingMnemonic;
         let msg = err.to_string();
-        assert!(msg.contains("scan_sk must be 64 hex chars"));
+        assert!(msg.contains("missing mnemonic"));
     }
 }

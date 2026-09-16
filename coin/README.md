@@ -34,7 +34,7 @@ impl CoinSource for MyStore {
 - `CoinStatus`: unconfirmed, confirmed but not yet proven by a merkle branch
   (`ConfirmedUnverified`), confirmed, being spent, spent.
 - `CoinSpendInfo`: how the coin is spent. `Bip32` carries the keychain, index
-  and descriptor, `Sp` carries the BIP352 derivation and tweak.
+  and descriptor, `Sp` carries the BIP352 tweak.
 - `CoinSourceKind`: what kind of output the coin is (silent payment, segwit,
   taproot, other).
 - `KeyChain`: receive, change, or a custom index.

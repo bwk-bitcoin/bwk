@@ -153,16 +153,18 @@ fn test_config_persistence_roundtrip(_env: &mut TestEnv) {
         "https://blindbit.example.com".to_string(),
         dir.path().to_path_buf(),
     )
+    .unwrap()
     .with_persistence(Some(bwk::persist::PersistenceKind::Json));
 
     let store: FileConfigStore<Config> =
         FileConfigStore::new(config.account_dir().join(CONFIG_FILENAME));
-    store.save(&config.for_persistence()).expect("save");
+    store.save(&config).unwrap();
 
     let loaded = store.load().expect("load").expect("config persisted");
     assert_eq!(loaded.account_name, config.account_name);
     assert_eq!(loaded.network, config.network);
-    assert_eq!(loaded.mnemonic, config.mnemonic);
+    assert!(loaded.mnemonic.is_none());
+    assert_eq!(loaded.descriptor, config.descriptor);
     assert_eq!(loaded.blindbit_url, config.blindbit_url);
 }
 
@@ -481,6 +483,7 @@ fn test_scan_handles_network_error(_env: &mut TestEnv) {
         "http://invalid.local:12345".to_string(), // Invalid URL - will fail
         dir.path().to_path_buf(),
     )
+    .unwrap()
     .with_persistence(None);
 
     // Account creation may fail or scan may fail - verify error handling is graceful
@@ -752,7 +755,8 @@ fn test_mempool_tx_not_counted_in_balance(env: &mut TestEnv) {
         mnemonic_str.to_string(),
         env.bbd.url(),
         dir.path().to_path_buf(),
-    );
+    )
+    .unwrap();
     let mut account = Account::new(config).expect("create account");
 
     // 5. Create taproot signer for funding
@@ -1156,6 +1160,7 @@ fn test_birthday_height_skips_old_blocks(env: &mut TestEnv) {
         env.bbd.url(),
         dir.path().to_path_buf(),
     )
+    .unwrap()
     .with_persistence(None);
     config.set_birthday_height(Some(birthday_height));
 
@@ -1243,6 +1248,7 @@ fn test_birthday_height_misses_earlier_outputs(env: &mut TestEnv) {
         env.bbd.url(),
         dir.path().to_path_buf(),
     )
+    .unwrap()
     .with_persistence(None);
     let temp_account = Account::new(config).expect("create temp account");
     let sp_address = temp_account.sp_address();
@@ -1292,6 +1298,7 @@ fn test_birthday_height_misses_earlier_outputs(env: &mut TestEnv) {
         env.bbd.url(),
         dir.path().to_path_buf(),
     )
+    .unwrap()
     .with_persistence(None);
     config.set_birthday_height(Some(birthday_height));
 
@@ -1474,6 +1481,7 @@ fn test_dust_limit_filters_small_outputs(env: &mut TestEnv) {
         backend.clone(),
         dir.path().to_path_buf(),
     )
+    .unwrap()
     .with_persistence(None);
     config.set_dust_limit(Some(1000));
     let mut account = bwk_sp::account::Account::new(config).expect("create account");
@@ -1703,6 +1711,7 @@ fn test_sp_address_deterministic(env: &mut TestEnv) {
         backend.clone(),
         dir1.path().to_path_buf(),
     )
+    .unwrap()
     .with_persistence(None);
 
     let account1 = bwk_sp::account::Account::new(config1).unwrap();
@@ -1716,6 +1725,7 @@ fn test_sp_address_deterministic(env: &mut TestEnv) {
         backend,
         dir2.path().to_path_buf(),
     )
+    .unwrap()
     .with_persistence(None);
 
     let account2 = bwk_sp::account::Account::new(config2).unwrap();
@@ -1741,6 +1751,7 @@ fn test_sp_address_different_per_mnemonic(env: &mut TestEnv) {
         backend.clone(),
         dir1.path().to_path_buf(),
     )
+    .unwrap()
     .with_persistence(None);
 
     let account1 = bwk_sp::account::Account::new(config1).unwrap();
@@ -1757,6 +1768,7 @@ fn test_sp_address_different_per_mnemonic(env: &mut TestEnv) {
         backend,
         dir2.path().to_path_buf(),
     )
+    .unwrap()
     .with_persistence(None);
 
     let account2 = bwk_sp::account::Account::new(config2).unwrap();
@@ -1879,6 +1891,7 @@ fn test_concurrent_scan_and_read(env: &mut TestEnv) {
         env.bbd.url(),
         std::path::PathBuf::from("/unused"),
     )
+    .unwrap()
     .with_persistence(None);
     config.set_birthday_height(Some(env.next_scan_height()));
     let mut account = bwk_sp::account::Account::new(config).expect("create test account");
@@ -2015,6 +2028,7 @@ fn test_scanner_with_concurrent_api_calls(env: &mut TestEnv) {
         env.bbd.url(),
         std::path::PathBuf::from("/unused"),
     )
+    .unwrap()
     .with_persistence(None);
     config.set_birthday_height(Some(env.next_scan_height()));
     let mut account = bwk_sp::account::Account::new(config).expect("create test account");
