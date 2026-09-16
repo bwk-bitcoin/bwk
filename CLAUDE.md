@@ -85,7 +85,9 @@ Account (bwk/src/account.rs)
 ├── HeaderFollower (holds the HeaderStore: validated header chain, two
 │   Electrum connections of its own, one for the header worker and one
 │   for the merkle-proof client, and keeps it on the scanner's endpoint)
-├── HotManager (hot signers)
+├── signing managers attached by name (a hot one when the config carries a
+│   mnemonic), each with a thread pumping its answers into the notification
+│   channel
 └── Reconciler (bwk-electrum, its own thread: promotes what the scanner
     recorded against the header chain, verifies proofs)
 ```
@@ -107,7 +109,8 @@ Account (sp/src/account/mod.rs)
 ├── ElectrumScanner per sub-account descriptor (bwk-electrum)
 ├── HeaderStore (validated header chain, shared by every scanner)
 ├── Reconciler per scanner (promotes its scan against the header chain)
-└── HotManager (hot signers for the sub-account descriptors)
+└── signing managers attached by name (a hot one for the sub-account
+    descriptors when the config carries a mnemonic)
 ```
 
 ### Transaction Building (`bwk-tx`)
@@ -129,8 +132,9 @@ Key traits:
 ### Notification Pattern
 
 Both Account types use `mpsc::channel<Notification>` for async events
-(connection status, new coins, scan progress). Call `account.receiver()` to
-take the receiver.
+(connection status, new coins, scan progress, and the answers of every
+attached signing manager under `Notification::Signer`). Call
+`account.receiver()` to take the receiver.
 
 ## Features
 

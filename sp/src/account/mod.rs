@@ -27,25 +27,23 @@ use {
         },
         blindbit::{self, InfoResponse},
         core::utils::common::SilentPaymentAddress,
-        receiver::{bip39, SpReceiver},
+        receiver::SpReceiver,
         scan::{state::ScanState, ScanRuntimeConfig, ScanRuntimeConfigError},
-        signer::{self, SpSigner},
     },
     bitcoin::{
         hashes::Hash,
-        key::TapTweak,
-        secp256k1::{Keypair, PublicKey, Secp256k1, SecretKey, XOnlyPublicKey},
-        sighash::SighashCache,
+        secp256k1::{PublicKey, Secp256k1, XOnlyPublicKey},
         Amount, Network, OutPoint, ScriptBuf, TxOut, Txid,
     },
     bwk::{
+        account::{AttachedManager, CachedSigner, HotManagerHandle},
         bwk_electrum::{
             coin_store::SpendRecorder,
             config::{Endpoint, ScannerConfig},
             header_follower::HeaderFollower,
             header_store::HeaderStore,
             label_store::{LabelKey, LabelStore},
-            notification::{Notification, SpNotification},
+            notification::{Notification, SignerNotification, SpNotification},
             profile::{DefaultBackend, RamProfile},
             raw_client::CertificateCheck,
             reconcile::Reconciler,
@@ -53,12 +51,21 @@ use {
         },
         persist::config_store::{ConfigStore, NoopConfigStore},
     },
-    bwk_sign::{bwk_descriptor, signing_manager::HotManager},
+    bwk_sign::{
+        bwk_descriptor::{self, descriptor::Descriptor},
+        identity::{SignerId, SignerInfo},
+        manager::{self, SigningManager},
+        protocol::RequestId,
+        signing_manager::HotManager,
+    },
+    crossbeam::channel,
     miniscript::psbt::PsbtExt,
     std::{
         collections::{BTreeMap, BTreeSet},
-        str::FromStr,
-        sync::{atomic::AtomicBool, mpsc, Arc, Mutex},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc, Arc, Mutex,
+        },
         thread::{self, JoinHandle},
     },
 };
@@ -80,8 +87,6 @@ type Stores = (
 /// Errors that can occur in Account operations.
 #[derive(Debug, thiserror::Error)]
 pub enum AccountError {
-    #[error("mnemonic required to sign")]
-    MissingKeys,
     #[error("blindbit_url is required")]
     MissingBlindbitUrl,
     #[error("invalid sub-account mnemonic: {0}")]
@@ -97,20 +102,10 @@ pub enum AccountError {
     // String is deliberate: foreign backend errors are surfaced as text, not typed.
     #[error("network error: {0}")]
     Network(String),
-    #[error("signing failed: no keys")]
-    NoKeys,
     #[error("scanner already running")]
     ScannerAlreadyRunning,
     #[error("failed to finalize psbt: {0:?}")]
     Finalize(Vec<miniscript::psbt::Error>),
-    #[error("signing error: {0}")]
-    Signing(crate::receiver::error::Error),
-    #[error("failed to generate aux randomness: {0}")]
-    AuxRand(getrandom::Error),
-    #[error("sighash computation failed: {0}")]
-    Sighash(bitcoin::sighash::TaprootError),
-    #[error("invalid input tweak: {0}")]
-    Tweak(bitcoin::secp256k1::Error),
     #[error("no electrum endpoint configured")]
     NoElectrumEndpoint,
     #[error("broadcast error: {0}")]
@@ -131,7 +126,24 @@ pub enum AccountError {
     SilentPayment(#[from] crate::core::error::Error),
     #[error("psbtv2 error")]
     PsbtV2,
+    #[error("failed to decode psbt")]
+    PsbtDecode,
+    #[error("{0}")]
+    Bip375(String),
+    #[error("signing manager {0} is already attached")]
+    ManagerAlreadyAttached(String),
+    #[error("no signer with that id")]
+    UnknownSigner,
+    #[error("signer is not ready")]
+    SignerNotReady,
+    #[error("signing error: {0}")]
+    Signing(#[from] manager::Error),
 }
+
+/// Well-known name of the hot manager an `Account` attaches for the signers
+/// its mnemonics yield.
+#[cfg(feature = "mnemonic")]
+const HOT_MANAGER_NAME: &str = "hot";
 
 #[cfg(feature = "mnemonic")]
 struct SpendAnalysis {
@@ -159,53 +171,27 @@ struct BroadcastWorker<P: crate::profile::SpStorageProfile> {
     sender: mpsc::Sender<Notification>,
 }
 
+/// Maps a [`bwk::account::dispatch`] error onto this crate's
+/// [`AccountError`]. Dispatch only ever produces `UnknownSigner`,
+/// `SignerNotReady` or `Signing`: attaching belongs to another call path.
+#[cfg(feature = "mnemonic")]
+fn dispatch_error(e: bwk::account::Error) -> AccountError {
+    match e {
+        bwk::account::Error::UnknownSigner => AccountError::UnknownSigner,
+        bwk::account::Error::SignerNotReady => AccountError::SignerNotReady,
+        bwk::account::Error::Signing(e) => AccountError::Signing(e),
+        bwk::account::Error::ManagerAlreadyAttached => {
+            unreachable!("signing dispatch never attaches a manager")
+        }
+    }
+}
+
 #[cfg(feature = "mnemonic")]
 fn p2tr_output_key(script: &ScriptBuf) -> Option<XOnlyPublicKey> {
     script
         .is_p2tr()
         .then(|| XOnlyPublicKey::from_slice(&script.as_bytes()[2..34]).ok())
         .flatten()
-}
-
-/// Derives a BIP32 input's secret key from `xprivs`, tap-tweaking it when the
-/// prevout is P2TR (the scanner's tweak is always taken against the tweaked
-/// output key, so the SP share must be computed from the same key).
-#[cfg(feature = "mnemonic")]
-fn bip32_secret_key(
-    input: &bitcoin::psbt::Input,
-    xprivs: &BTreeMap<bitcoin::bip32::Fingerprint, bitcoin::bip32::Xpriv>,
-    secp: &Secp256k1<bitcoin::secp256k1::All>,
-) -> Option<SecretKey> {
-    let sk = if !input.bip32_derivation.is_empty() {
-        input.bip32_derivation.values().find_map(|(fg, path)| {
-            xprivs
-                .get(fg)?
-                .derive_priv(secp, path)
-                .ok()
-                .map(|k| k.private_key)
-        })
-    } else if !input.tap_key_origins.is_empty() {
-        input.tap_key_origins.values().find_map(|(_, (fg, path))| {
-            xprivs
-                .get(fg)?
-                .derive_priv(secp, path)
-                .ok()
-                .map(|k| k.private_key)
-        })
-    } else {
-        None
-    }?;
-
-    let is_p2tr = input
-        .witness_utxo
-        .as_ref()
-        .is_some_and(|utxo| utxo.script_pubkey.is_p2tr());
-    if is_p2tr {
-        let keypair = Keypair::from_secret_key(secp, &sk);
-        Some(keypair.tap_tweak(secp, None).to_keypair().secret_key())
-    } else {
-        Some(sk)
-    }
 }
 
 #[cfg(feature = "mnemonic")]
@@ -455,13 +441,25 @@ pub struct Account<
     pub(crate) scanner_stop: Arc<AtomicBool>,
     /// Sub-accounts use the default bwk RAM profile, independent of sp's P.
     sub_accounts: Vec<SubAccount>,
-    /// Hot signers for the BIP32 sub-accounts. The scanners only watch
-    /// descriptors, so the wallet keeps the signing side here, once for the
-    /// whole account.
-    signing_manager: HotManager,
     /// The validated header chain this account promotes its scanners against,
     /// and the endpoint it follows.
     headers: HeaderFollower<RamProfile<DefaultBackend>>,
+    /// BIP32 master fingerprint derived from the construction-time mnemonic,
+    /// if one was supplied. Cached so nothing downstream needs to reach a
+    /// master xpriv to learn it.
+    mnemonic_fingerprint: Option<bitcoin::bip32::Fingerprint>,
+    /// Signing managers attached to this account, keyed by caller-supplied
+    /// name. See [`Account::attach_signing_manager`].
+    managers: BTreeMap<String, AttachedManager>,
+    /// Cache of every signer reachable through `managers`, keyed by its
+    /// unique [`SignerId`]. Seeded on attach, dropped on detach, kept
+    /// current by each manager's pump thread.
+    signers: Arc<Mutex<BTreeMap<SignerId, CachedSigner>>>,
+    /// Handle to the attached hot manager. The scanners only watch
+    /// descriptors, so the signers their mnemonics yield live here, once for
+    /// the whole account, and a sub-account added later seeds its own: the
+    /// `SigningManager` trait cannot add a signer.
+    hot: Option<Arc<Mutex<HotManager>>>,
 }
 
 #[cfg(feature = "mnemonic")]
@@ -584,9 +582,12 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
 
         // One scanner per configured sub-account descriptor, all reporting on
         // this account's channel, plus the signers they cannot hold themselves.
-        // In memory: every sub-signer is re-derivable from a mnemonic the
+        // In memory: every signer is re-derivable from a mnemonic the
         // persisted config already carries.
-        let mut signing_manager = HotManager::new();
+        let mut hot_manager = HotManager::new();
+        if let Some(mnemonic) = config.mnemonic.clone() {
+            hot_manager.new_bip32_signer_from_mnemonic(config.network, mnemonic);
+        }
         let mut scanners = Vec::with_capacity(config.descriptors.len());
         for (i, sub_cfg) in config.descriptors.iter().enumerate() {
             let name = format!("{}-sub-{}", config.account_name, i);
@@ -610,7 +611,7 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
             )?);
             if let Some(mnemonic) = sub_cfg.mnemonic.clone().or_else(|| config.mnemonic.clone()) {
                 register_sub_signer(
-                    &mut signing_manager,
+                    &mut hot_manager,
                     config.network,
                     &mnemonic,
                     sub_cfg.descriptor.clone(),
@@ -657,7 +658,12 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
             })
             .collect();
 
-        Ok(Account {
+        let mnemonic_fingerprint = config
+            .mnemonic
+            .as_deref()
+            .and_then(|mnemonic| crate::receiver::mnemonic_fingerprint(mnemonic, config.network));
+
+        let mut account = Account {
             sp_receiver,
             agent,
             coin_store,
@@ -673,9 +679,19 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
             broadcast_handle: None,
             scanner_stop: Arc::new(AtomicBool::new(false)),
             sub_accounts,
-            signing_manager,
             headers,
-        })
+            mnemonic_fingerprint,
+            managers: BTreeMap::new(),
+            signers: Arc::new(Mutex::new(BTreeMap::new())),
+            hot: None,
+        };
+        // Registration of the account's own descriptor stays consumer-driven,
+        // so none is pushed here. Watch-only construction with no keyed
+        // sub-account attaches nothing.
+        if !hot_manager.signers().is_empty() {
+            account.attach_hot_manager(hot_manager)?;
+        }
+        Ok(account)
     }
 
     /// Create account from mnemonic (convenience constructor).
@@ -926,12 +942,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         mnemonic: Option<String>,
     ) -> Result<(), AccountError> {
         if let Some(mnemonic) = mnemonic {
-            register_sub_signer(
-                &mut self.signing_manager,
-                self.config.network,
-                &mnemonic,
-                scanner.wallet_descriptor(),
-            )?;
+            self.seed_sub_signer(&mnemonic, scanner.wallet_descriptor())?;
         }
         // Spawned first: the reconciler registers for the scan ticks, so a
         // scan started before it would fire them at nobody.
@@ -964,27 +975,272 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         self.sub_accounts.iter_mut().map(|sub| &mut sub.scanner)
     }
 
-    /// Every BIP32 master xpriv this wallet can sign with: the silent-payments
-    /// key plus every sub-account hot signer.
-    pub fn master_xprivs(&self) -> BTreeMap<bitcoin::bip32::Fingerprint, bitcoin::bip32::Xpriv> {
-        let mut xprivs = self.signing_manager.master_xprivs();
-        if let Some((fg, xpriv)) = self.sp_master_xpriv() {
-            xprivs.insert(fg, xpriv);
-        }
-        xprivs
+    /// Seeds a sub-account's hot signer into the hot manager, attaching one
+    /// when a watch-only account has none yet.
+    fn seed_sub_signer(
+        &mut self,
+        mnemonic: &str,
+        descriptor: bwk_sign::bwk_descriptor::descriptor::Descriptor,
+    ) -> Result<(), AccountError> {
+        let Some(hot) = self.hot.clone() else {
+            let mut hot_manager = HotManager::new();
+            register_sub_signer(&mut hot_manager, self.config.network, mnemonic, descriptor)?;
+            return self.attach_hot_manager(hot_manager);
+        };
+        register_sub_signer(
+            &mut hot.lock().expect("poisoned"),
+            self.config.network,
+            mnemonic,
+            descriptor,
+        )?;
+        self.refresh_signers();
+        let _ = self.sender.send(
+            SignerNotification::Signers(bwk::account::signers_snapshot(&self.signers)).into(),
+        );
+        Ok(())
     }
 
-    /// Derive the BIP32 master xpriv from this account's mnemonic, if available.
-    pub(crate) fn sp_master_xpriv(
+    // Signing managers
+
+    fn attach_hot_manager(&mut self, hot_manager: HotManager) -> Result<(), AccountError> {
+        let hot = Arc::new(Mutex::new(hot_manager));
+        self.attach_signing_manager(HOT_MANAGER_NAME, Box::new(HotManagerHandle(hot.clone())))?;
+        self.hot = Some(hot);
+        Ok(())
+    }
+
+    /// Attach a manager to this silent-payment account, next to the hot
+    /// manager holding the signers of every sub-account.
+    ///
+    /// Non-blocking: this only subscribes to the manager's response channel
+    /// and spawns its pump thread, it never registers a descriptor, requests
+    /// an xpub, or polls for devices.
+    ///
+    /// Refuses a duplicate `name` rather than replacing the existing
+    /// manager.
+    pub fn attach_signing_manager(
+        &mut self,
+        name: &str,
+        mut manager: Box<dyn SigningManager>,
+    ) -> Result<(), AccountError> {
+        if self.managers.contains_key(name) {
+            return Err(AccountError::ManagerAlreadyAttached(name.to_string()));
+        }
+        let (tx, rx) = channel::unbounded();
+        manager.subscribe(tx);
+        let stop = Arc::new(AtomicBool::new(false));
+        // Bytes cross untouched from the manager; a deserialization failure is
+        // itself a verification failure, not a panic.
+        let verifier: bwk::account::PsbtVerifier = Arc::new(|bytes: &[u8]| {
+            let psbt = bwk_psbt::PsbtV2::deserialize(bytes).map_err(|e| e.to_string())?;
+            bip375::verify_signed(&psbt).map_err(|e| e.to_string())
+        });
+        let pump = bwk::account::spawn_pump(
+            name.to_string(),
+            rx,
+            self.sender.clone(),
+            stop.clone(),
+            self.signers.clone(),
+            Some(verifier),
+        );
+        // A synchronous read of what the manager already knows, not a
+        // request, so it does not violate the non-blocking rule.
+        let initial = manager.signers();
+        bwk::account::replace_manager_signers(&self.signers, name, initial);
+        self.managers.insert(
+            name.to_string(),
+            AttachedManager {
+                manager,
+                stop,
+                pump: Some(pump),
+            },
+        );
+        let _ = self.sender.send(
+            SignerNotification::ManagerAttached {
+                manager: name.to_string(),
+            }
+            .into(),
+        );
+        let _ = self.sender.send(
+            SignerNotification::Signers(bwk::account::signers_snapshot(&self.signers)).into(),
+        );
+        Ok(())
+    }
+
+    /// Detaches the manager registered under `name`, stopping its pump
+    /// thread and dropping its signers from the cache. Returns whether a
+    /// manager was actually removed.
+    pub fn detach_signing_manager(&mut self, name: &str) -> bool {
+        let Some(mut attached) = self.managers.remove(name) else {
+            return false;
+        };
+        if name == HOT_MANAGER_NAME {
+            self.hot = None;
+        }
+        attached.stop.store(true, Ordering::Relaxed);
+        drop(attached.manager);
+        if let Some(pump) = attached.pump.take() {
+            let _ = pump.join();
+        }
+        self.signers
+            .lock()
+            .expect("poisoned")
+            .retain(|_, entry| entry.manager != name);
+        let _ = self.sender.send(
+            SignerNotification::ManagerDetached {
+                manager: name.to_string(),
+            }
+            .into(),
+        );
+        let _ = self.sender.send(
+            SignerNotification::Signers(bwk::account::signers_snapshot(&self.signers)).into(),
+        );
+        true
+    }
+
+    /// Names of every currently attached signing manager.
+    pub fn signing_manager_names(&self) -> Vec<String> {
+        self.managers.keys().cloned().collect()
+    }
+
+    /// Every signer reachable through an attached manager, from the local
+    /// cache. Synchronous and never touches a device.
+    pub fn signers(&self) -> Vec<SignerInfo> {
+        self.signers
+            .lock()
+            .expect("poisoned")
+            .values()
+            .map(|cached| cached.info.clone())
+            .collect()
+    }
+
+    /// The cached identity of one signer, if it is currently known.
+    pub fn signer(&self, id: &SignerId) -> Option<SignerInfo> {
+        self.signers
+            .lock()
+            .expect("poisoned")
+            .get(id)
+            .map(|cached| cached.info.clone())
+    }
+
+    /// Re-reads `signers()` from every attached manager and refreshes the
+    /// cache. Synchronous and cheap: it only reads what each manager already
+    /// holds, it never sends a request to a device.
+    pub fn refresh_signers(&self) {
+        for (name, attached) in self.managers.iter() {
+            let list = attached.manager.signers();
+            bwk::account::replace_manager_signers(&self.signers, name, list);
+        }
+    }
+
+    /// Turns device discovery on and off on every attached manager.
+    pub fn set_signer_polling(&mut self, enabled: bool) {
+        for attached in self.managers.values_mut() {
+            attached.manager.set_polling(enabled);
+        }
+    }
+
+    /// Routes a `&self` [`SigningManager`] operation to the manager owning
+    /// `signer_id`, through [`bwk::account::dispatch`].
+    fn dispatch<F>(&self, signer_id: &SignerId, f: F) -> Result<RequestId, AccountError>
+    where
+        F: FnOnce(&dyn SigningManager) -> Result<RequestId, manager::Error>,
+    {
+        bwk::account::dispatch(&self.managers, &self.signers, signer_id, f).map_err(dispatch_error)
+    }
+
+    /// Routes a `&mut self` [`SigningManager`] operation (`init`,
+    /// `register_descriptor`) to the manager owning `signer_id`. See
+    /// [`Account::dispatch`].
+    fn dispatch_mut<F>(&mut self, signer_id: &SignerId, f: F) -> Result<RequestId, AccountError>
+    where
+        F: FnOnce(&mut dyn SigningManager) -> Result<RequestId, manager::Error>,
+    {
+        bwk::account::dispatch_mut(&mut self.managers, &self.signers, signer_id, f)
+            .map_err(dispatch_error)
+    }
+
+    /// Initializes the signer, e.g. an unlock or pairing handshake. Returns
+    /// immediately; the result arrives later as a notification.
+    pub fn init_signer(&mut self, signer_id: &SignerId) -> Result<RequestId, AccountError> {
+        self.dispatch_mut(signer_id, |manager| manager.init(signer_id))
+    }
+
+    /// Requests the signer's info payload. Returns immediately; the result
+    /// arrives later as a notification.
+    pub fn signer_info(&self, signer_id: &SignerId) -> Result<RequestId, AccountError> {
+        self.dispatch(signer_id, |manager| manager.info(signer_id))
+    }
+
+    /// Requests an xpub at `path` from the signer. Returns immediately; the
+    /// result arrives later as a notification. Never asks for an on-device
+    /// display confirmation: bwk-sp has no surface to drive one.
+    pub fn signer_xpub(
         &self,
-    ) -> Option<(bitcoin::bip32::Fingerprint, bitcoin::bip32::Xpriv)> {
-        let mnemonic_str = self.config.mnemonic.as_ref()?;
-        let mnemonic = bip39::Mnemonic::from_str(mnemonic_str).ok()?;
-        let seed = mnemonic.to_seed("");
-        let xpriv = bitcoin::bip32::Xpriv::new_master(self.config.network, &seed).ok()?;
-        let secp = Secp256k1::new();
-        let fg = xpriv.fingerprint(&secp);
-        Some((fg, xpriv))
+        signer_id: &SignerId,
+        path: bitcoin::bip32::DerivationPath,
+    ) -> Result<RequestId, AccountError> {
+        self.dispatch(signer_id, |manager| {
+            manager.get_xpub(signer_id, path, false)
+        })
+    }
+
+    /// Asks the signer whether `descriptor` is already registered. Returns
+    /// immediately; the result arrives later as a notification.
+    pub fn is_descriptor_registered(
+        &self,
+        signer_id: &SignerId,
+        descriptor: Descriptor,
+    ) -> Result<RequestId, AccountError> {
+        self.dispatch(signer_id, |manager| {
+            manager.is_descriptor_registered(signer_id, descriptor)
+        })
+    }
+
+    /// Registers `descriptor` with the signer. Consumer-driven: nothing in
+    /// `bwk-sp` calls this on the consumer's behalf. Returns immediately; the
+    /// result arrives later as a notification.
+    pub fn register_descriptor(
+        &mut self,
+        signer_id: &SignerId,
+        descriptor: Descriptor,
+    ) -> Result<RequestId, AccountError> {
+        self.dispatch_mut(signer_id, |manager| {
+            manager.register_descriptor(signer_id, descriptor)
+        })
+    }
+
+    /// Asks the signer to sign `psbt` against `descriptor`. Non-blocking: the
+    /// bytes cross untouched, never parsed, never stored, and the result
+    /// arrives later as a notification. A transaction mixing silent-payment
+    /// and BIP32 inputs needs several calls, one descriptor at a time; this
+    /// method never loops over descriptors itself.
+    pub fn sign(
+        &self,
+        signer_id: &SignerId,
+        descriptor: Descriptor,
+        psbt: Vec<u8>,
+    ) -> Result<RequestId, AccountError> {
+        self.dispatch(signer_id, |manager| {
+            manager.sign(signer_id, descriptor, psbt)
+        })
+    }
+
+    /// Sends an opaque, manager-defined request to the signer. Returns
+    /// immediately; the result arrives later as a notification.
+    pub fn signer_raw(
+        &self,
+        signer_id: &SignerId,
+        request: Vec<u8>,
+    ) -> Result<RequestId, AccountError> {
+        self.dispatch(signer_id, |manager| manager.raw(signer_id, request))
+    }
+
+    /// The BIP32 master fingerprint derived from this account's
+    /// construction-time mnemonic, if one was supplied. Cached at
+    /// construction; the account never reaches a master xpriv to answer this.
+    pub fn mnemonic_fingerprint(&self) -> Option<bitcoin::bip32::Fingerprint> {
+        self.mnemonic_fingerprint
     }
 
     /// Stop every sub-account scan, its reconcile pass, and the header
@@ -1258,15 +1514,6 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     }
     // Transaction Building
 
-    /// Check if this account can sign transactions.
-    ///
-    /// Returns true only if a mnemonic was supplied at construction time; the
-    /// wallet no longer holds a spend secret key of its own. A later task
-    /// replaces this with a check against a configured signer list.
-    pub fn can_sign(&self) -> bool {
-        self.config.mnemonic.is_some()
-    }
-
     /// Returns a [`TxBuilder`] pre-configured with this account's coin source
     /// and change provider. Building never needs a private key: a
     /// silent-payment output is left unscripted for a signer (see
@@ -1278,7 +1525,8 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     /// builder.add_output(SpRecipient::new(sp_addr, 50_000, network));
     /// builder.feerate(1000);
     /// let mut psbt = builder.generate_v2()?;
-    /// account.sign_and_finalize_v2(&mut psbt)?;
+    /// // Hand `psbt` to a signer (see `crate::signer::SpSigner`), then:
+    /// account.finalize(&psbt.serialize()?)?;
     /// ```
     pub fn tx_builder(&self) -> bwk_tx::tx_builder::TxBuilder {
         let change_addr = self.sp_receiver.receiver.get_change_address();
@@ -1295,7 +1543,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
             .collect();
         let merged_source = Box::new(MergedCoinSource::new(sp_source, bip32_sources));
 
-        let key_source = self.sp_master_xpriv().map(|(fingerprint, _)| {
+        let key_source = self.mnemonic_fingerprint.map(|fingerprint| {
             (
                 fingerprint,
                 crate::receiver::spend_path(
@@ -1311,106 +1559,25 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
             .sp_updater(Box::new(updater))
     }
 
-    /// Sign all inputs in a PSBT, both SP and BIP32 (segwit/taproot).
+    /// Finalizes an already-signed PSBT into a broadcast-ready transaction.
     ///
-    /// 1. Signs SP inputs using `b_spend + tweak` (no taproot tweak).
-    /// 2. Signs BIP32 inputs with the wallet's hot signers.
+    /// Accepts either shape: PSBTv2 bytes for a transaction with a
+    /// silent-payment input or output, plain PSBTv0 bytes otherwise. A v0
+    /// PSBT cannot carry BIP375 fields, so it is never upgraded to v2 or run
+    /// through the verifier; it is extracted directly.
     ///
-    /// # Errors
-    /// * `AccountError::NoKeys` if this account has no spend secret key
-    /// * `AccountError::Transaction` on signing failure
-    pub fn sign_psbt(&self, psbt: &mut bitcoin::Psbt) -> Result<(), AccountError> {
-        // Sign SP inputs
-        if self.can_sign() {
-            self.sign_sp_inputs(psbt)?;
+    /// The account is stateless: it holds no record of a PSBT it verified
+    /// earlier, so a v2 PSBT is re-verified here, on these bytes, every time.
+    /// Verification failing means the signer malfunctioned or lied about the
+    /// destination, and there is no way to finalize past that.
+    pub fn finalize(&self, psbt: &[u8]) -> Result<bitcoin::Transaction, AccountError> {
+        if let Ok(psbt) = bwk_psbt::PsbtV2::deserialize(psbt) {
+            bip375::verify_signed(&psbt)?;
+            let mut v0 = psbt.into_bitcoin_psbt().map_err(|_| AccountError::PsbtV2)?;
+            return Self::extract(&mut v0);
         }
-
-        self.signing_manager.sign_with_all_hot_signers(psbt);
-
-        Ok(())
-    }
-
-    /// Sign all inputs and finalize the PSBT into a broadcast-ready transaction.
-    ///
-    /// 1. Signs SP inputs (`b_spend + tweak`).
-    /// 2. Signs BIP32 inputs with the wallet's hot signers.
-    /// 3. Finalizes all inputs (builds witnesses) and extracts the transaction.
-    pub fn sign_and_finalize(
-        &self,
-        psbt: &mut bitcoin::Psbt,
-    ) -> Result<bitcoin::Transaction, AccountError> {
-        self.sign_psbt(psbt)?;
-        Self::finalize(psbt)
-    }
-
-    /// Signs and finalizes a native PSBTv2 into a broadcast-ready
-    /// transaction, bridging this account's mnemonic-derived keys into
-    /// [`SpSigner`] for the silent-payment side. Temporary: once signing
-    /// fully moves behind the BIP375 signer role, this collapses into
-    /// [`SpSigner::sign`] plus the existing BIP32 signing loop.
-    pub fn sign_and_finalize_v2(
-        &self,
-        psbt: &mut bwk_psbt::PsbtV2,
-    ) -> Result<bitcoin::Transaction, AccountError> {
-        let mnemonic = self
-            .config
-            .mnemonic
-            .as_ref()
-            .ok_or(AccountError::MissingKeys)?;
-
-        self.add_bip32_sp_shares(psbt)?;
-
-        let signer = SpSigner::from_mnemonic(
-            mnemonic,
-            self.config.network,
-            bitcoin::bip32::ChildNumber::from_hardened_idx(0).expect("zero"),
-        )
-        .map_err(|_| AccountError::NoKeys)?;
-        signer.sign(psbt).map_err(|_| AccountError::PsbtV2)?;
-
-        let mut bitcoin_psbt = psbt
-            .clone()
-            .into_bitcoin_psbt()
-            .map_err(|_| AccountError::PsbtV2)?;
-        self.signing_manager
-            .sign_with_all_hot_signers(&mut bitcoin_psbt);
-        Self::finalize(&mut bitcoin_psbt)
-    }
-
-    /// Writes per-input BIP375 ECDH shares/proofs for eligible BIP32 inputs
-    /// the sub-accounts control, using their own xprivs.
-    ///
-    /// [`SpSigner`] only holds `b_spend`, so a transaction mixing BIP32 and
-    /// silent-payment inputs needs this too: `combined_share` requires every
-    /// eligible input's contribution, and the BIP32 ones are outside
-    /// `SpSigner`'s reach.
-    fn add_bip32_sp_shares(&self, psbt: &mut bwk_psbt::PsbtV2) -> Result<(), AccountError> {
-        let scan_keys = bip375::scan_keys(psbt)?;
-        if scan_keys.is_empty() {
-            return Ok(());
-        }
-        let xprivs = self.signing_manager.master_xprivs();
-        let secp = Secp256k1::new();
-        let mut aux_rand = [0u8; 32];
-        getrandom::getrandom(&mut aux_rand).map_err(AccountError::AuxRand)?;
-
-        for input in &mut psbt.inputs {
-            if bwk_psbt::sp::sp_input_tweak(&input.psbt)
-                .map_err(|_| AccountError::PsbtV2)?
-                .is_some()
-            {
-                continue; // an SP-owned input: SpSigner handles it
-            }
-            let Some(sk) = bip32_secret_key(&input.psbt, &xprivs, &secp) else {
-                continue;
-            };
-            if bip375::eligible_input_pubkey(input)?.is_none() {
-                continue;
-            }
-            signer::write_input_ecdh_share(&mut input.psbt, &scan_keys, sk, aux_rand, &secp)
-                .ok_or(AccountError::PsbtV2)?;
-        }
-        Ok(())
+        let mut v0 = bitcoin::Psbt::deserialize(psbt).map_err(|_| AccountError::PsbtDecode)?;
+        Self::extract(&mut v0)
     }
 
     /// Broadcast a signed spend in the background. Completion is reported via
@@ -1486,71 +1653,15 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
             .collect()
     }
 
-    /// Finalize a signed PSBT into a broadcast-ready transaction.
-    fn finalize(psbt: &mut bitcoin::Psbt) -> Result<bitcoin::Transaction, AccountError> {
+    /// Finalizes the witnesses of an already-verified, signed PSBT and
+    /// extracts the resulting transaction.
+    fn extract(psbt: &mut bitcoin::Psbt) -> Result<bitcoin::Transaction, AccountError> {
         let secp = bitcoin::secp256k1::Secp256k1::verification_only();
         PsbtExt::finalize_mut(psbt, &secp).map_err(AccountError::Finalize)?;
         Ok(psbt.clone().extract_tx_unchecked_fee_rate())
     }
 
-    /// Sign only the SP inputs in a PSBT.
-    ///
-    /// For each input whose outpoint is found in this account's coin store,
-    /// computes the signing key (`b_spend + tweak`) and produces a Schnorr
-    /// signature stored in `tap_key_sig`.
-    ///
-    /// Source: adapted from cygnet3/spdk's silent-payment input signing.
-    /// See `sp/NOTICE`.
-    fn sign_sp_inputs(&self, psbt: &mut bitcoin::Psbt) -> Result<(), AccountError> {
-        let mnemonic = self.config.mnemonic.as_ref().ok_or(AccountError::NoKeys)?;
-        let signer = SpSigner::from_mnemonic(
-            mnemonic,
-            self.config.network,
-            bitcoin::bip32::ChildNumber::from_hardened_idx(0).expect("zero"),
-        )
-        .map_err(|_| AccountError::NoKeys)?;
-        let b_spend = signer.b_spend();
-
-        let secp = Secp256k1::new();
-
-        let prevouts: Vec<bitcoin::TxOut> = psbt
-            .inputs
-            .iter()
-            .map(|input| {
-                input
-                    .witness_utxo
-                    .clone()
-                    .expect("PSBT input must have witness_utxo")
-            })
-            .collect();
-
-        let mut cache = SighashCache::new(&psbt.unsigned_tx);
-        let coin_store = self.coin_store.lock().expect("poisoned");
-
-        let mut aux_rand = [0u8; 32];
-        getrandom::getrandom(&mut aux_rand).map_err(AccountError::AuxRand)?;
-
-        for (i, input) in psbt.unsigned_tx.input.iter().enumerate() {
-            let Some(entry) = coin_store.get(&input.previous_output) else {
-                // Not an SP input, skip
-                continue;
-            };
-
-            let tweak = SecretKey::from_slice(entry.tweak()).map_err(AccountError::Tweak)?;
-            let Some(sk) =
-                signer::reconstruct_signing_key(b_spend, tweak, &prevouts[i].script_pubkey, &secp)
-            else {
-                continue;
-            };
-
-            let signature =
-                signer::sign_taproot_key_spend(&mut cache, &prevouts, i, &sk, &secp, &aux_rand)
-                    .map_err(AccountError::Sighash)?;
-            psbt.inputs[i].tap_key_sig = Some(signature);
-        }
-
-        Ok(())
-    } // Persistence
+    // Persistence
 
     /// Persist all stores to disk.
     ///
@@ -1743,6 +1854,10 @@ impl<P: crate::profile::SpStorageProfile> Drop for Account<P> {
         if let Some(handle) = self.broadcast_handle.take() {
             let _ = handle.join();
         }
+        let names: Vec<String> = self.managers.keys().cloned().collect();
+        for name in names {
+            self.detach_signing_manager(&name);
+        }
         self.persist();
     }
 }
@@ -1833,15 +1948,23 @@ pub(crate) mod mnemonic_probe {
 #[cfg(all(test, feature = "mnemonic"))]
 mod tests {
     use super::*;
-    use crate::receiver::OwnedOutput;
+    use crate::{
+        account::recipient::SpRecipient,
+        receiver::OwnedOutput,
+        signer::{sign_taproot_key_spend, SpSigner},
+    };
     use bitcoin::{
         absolute::Height,
         bip32::{Xpriv, Xpub},
         hashes::hash160,
-        secp256k1::Parity,
+        key::{TapTweak, TweakedPublicKey},
+        secp256k1::{Parity, Scalar, SecretKey},
+        sighash::SighashCache,
+        transaction, TxIn, Witness,
     };
-    use bwk::bwk_electrum::raw_client::CertificateCheck;
-    use std::path::PathBuf;
+    use bwk::{account::test_support::StubManager, bwk_electrum::raw_client::CertificateCheck};
+    use bwk_sign::{identity::SignerState, protocol::Response};
+    use std::{path::PathBuf, str::FromStr};
 
     fn test_config() -> Config {
         Config::new(
@@ -1878,9 +2001,6 @@ mod tests {
 
         let err = AccountError::Network("network error".to_string());
         assert!(err.to_string().contains("network error"));
-
-        let err = AccountError::NoKeys;
-        assert!(err.to_string().contains("no keys"));
 
         let err = AccountError::ScannerAlreadyRunning;
         assert!(err.to_string().contains("already running"));
@@ -2707,7 +2827,7 @@ mod tests {
             Ok(Some(tweak))
         );
 
-        let (fingerprint, _) = account.sp_master_xpriv().unwrap();
+        let fingerprint = account.mnemonic_fingerprint().unwrap();
         let expected_path = crate::receiver::spend_path(
             account.network(),
             bitcoin::bip32::ChildNumber::from_hardened_idx(0).unwrap(),
@@ -2768,6 +2888,688 @@ mod tests {
             Ok(None)
         );
         psbt.validate().unwrap();
+    }
+
+    #[test]
+    fn account_exposes_no_signing_surface() {
+        let watch_only_config = Config::from_descriptor(
+            "watch-only-no-signing".to_string(),
+            Network::Signet,
+            test_config().descriptor,
+            "https://blindbit.example.com".to_string(),
+            PathBuf::from("/tmp/bwk-sp-account-watch-only-no-signing-test"),
+        )
+        .with_persistence(None);
+        let account = Account::new(watch_only_config).unwrap();
+
+        let spk = fake_tr_spk(30);
+        let outpoint = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x30; 32]),
+            vout: 0,
+        };
+        account
+            .coin_store
+            .lock()
+            .expect("poisoned")
+            .insert(outpoint, fake_sp_owned(spk, 30));
+
+        let mut builder = account.tx_builder().feerate(1_000);
+        builder.add_output(external_v2_recipient());
+        let psbt = builder.generate_v2().unwrap();
+
+        // No signer ever touched this PSBT: the account cannot produce a
+        // spendable transaction on its own.
+        assert!(account.finalize(&psbt.serialize().unwrap()).is_err());
+    }
+
+    #[test]
+    fn attach_then_detach_stops_the_pump() {
+        let mut account = Account::new(test_config()).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(calls, captured_sender);
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+        assert!(account
+            .signing_manager_names()
+            .contains(&"stub".to_string()));
+
+        assert!(account.detach_signing_manager("stub"));
+        assert!(!account
+            .signing_manager_names()
+            .contains(&"stub".to_string()));
+        assert!(!account.detach_signing_manager("stub"));
+    }
+
+    #[test]
+    fn watch_only_account_attaches_no_manager() {
+        let watch_only_config = Config::from_descriptor(
+            "watch-only-no-manager".to_string(),
+            Network::Signet,
+            test_config().descriptor,
+            "https://blindbit.example.com".to_string(),
+            PathBuf::from("/tmp/bwk-sp-account-watch-only-no-manager-test"),
+        )
+        .with_persistence(None);
+        let account = Account::new(watch_only_config).unwrap();
+
+        assert!(account.signing_manager_names().is_empty());
+    }
+
+    #[test]
+    fn mnemonic_account_attaches_a_hot_manager() {
+        let account = Account::new(test_config()).unwrap();
+
+        assert_eq!(account.signing_manager_names().len(), 1);
+        assert!(!account.signers().is_empty());
+    }
+
+    #[test]
+    fn attach_registers_nothing() {
+        let mut account = Account::new(test_config()).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let stub = StubManager::new(calls.clone(), Arc::new(Mutex::new(None)));
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert!(calls.contains(&"subscribe".to_string()));
+        assert!(calls.contains(&"signers".to_string()));
+        assert!(!calls.contains(&"register_descriptor".to_string()));
+        assert!(!calls.contains(&"get_xpub".to_string()));
+    }
+
+    #[test]
+    fn sub_account_signer_joins_the_hot_manager() {
+        let mut account = Account::new(test_config()).unwrap();
+        let (sub, mnemonic) = build_offline_segwit_sub("sub-segwit-0");
+        let fingerprint = bwk_sign::hot_signer::HotSigner::new_from_mnemonics(
+            bitcoin::Network::Regtest,
+            &mnemonic,
+        )
+        .unwrap()
+        .fingerprint();
+
+        account.add_sub_account(sub, Some(mnemonic)).unwrap();
+
+        assert_eq!(
+            account.signing_manager_names(),
+            vec![HOT_MANAGER_NAME.to_string()]
+        );
+        assert!(account
+            .signers()
+            .iter()
+            .any(|info| info.fingerprint == fingerprint));
+    }
+
+    #[test]
+    fn watch_only_account_attaches_a_sub_account_signer() {
+        let watch_only_config = Config::from_descriptor(
+            "watch-only-sub-signer".to_string(),
+            Network::Signet,
+            test_config().descriptor,
+            "https://blindbit.example.com".to_string(),
+            PathBuf::from("/tmp/bwk-sp-account-watch-only-sub-signer-test"),
+        )
+        .with_persistence(None);
+        let mut account = Account::new(watch_only_config).unwrap();
+        let (sub, mnemonic) = build_offline_segwit_sub("sub-segwit-0");
+
+        account.add_sub_account(sub, Some(mnemonic)).unwrap();
+
+        assert_eq!(
+            account.signing_manager_names(),
+            vec![HOT_MANAGER_NAME.to_string()]
+        );
+        assert_eq!(account.signers().len(), 1);
+    }
+
+    fn signer_info(id: &str, fingerprint: [u8; 4], state: SignerState) -> SignerInfo {
+        SignerInfo::new(
+            SignerId::new(id),
+            bitcoin::bip32::Fingerprint::from(fingerprint),
+            "wallet".to_string(),
+            state,
+        )
+    }
+
+    #[test]
+    fn sign_forwards_bytes_untouched() {
+        let mut account = Account::new(test_config()).unwrap();
+        let a = signer_info("signer-1", [1, 1, 1, 1], SignerState::Ready);
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)))
+            .with_signers(vec![a.clone()]);
+        let last_sign = stub.last_sign();
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let descriptor: Descriptor = test_config().descriptor.into();
+        account
+            .sign(&a.id, descriptor.clone(), vec![0xde, 0xad, 0xbe, 0xef])
+            .unwrap();
+
+        let (signer, sent_descriptor, bytes) = last_sign.lock().unwrap().clone().unwrap();
+        assert_eq!(signer, a.id);
+        assert_eq!(sent_descriptor, descriptor);
+        assert!(sent_descriptor.is_sp());
+        assert_eq!(bytes, vec![0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn sign_returns_without_waiting() {
+        let mut account = Account::new(test_config()).unwrap();
+        let a = signer_info("signer-1", [1, 1, 1, 1], SignerState::Ready);
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)))
+            .with_signers(vec![a.clone()]);
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        // The stub records the call and never sends a `Response` on its
+        // channel; if `sign` waited for one instead of returning the queued
+        // `RequestId` straight away, this call would hang.
+        let descriptor: Descriptor = test_config().descriptor.into();
+        account.sign(&a.id, descriptor, vec![1, 2, 3]).unwrap();
+    }
+
+    #[test]
+    fn sign_rejects_unknown_signer() {
+        let mut account = Account::new(test_config()).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let stub = StubManager::new(calls.clone(), Arc::new(Mutex::new(None)));
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let unknown = SignerId::new("does-not-exist");
+        let descriptor: Descriptor = test_config().descriptor.into();
+        let result = account.sign(&unknown, descriptor, vec![1]);
+        assert!(matches!(result, Err(AccountError::UnknownSigner)));
+        assert!(!calls.lock().unwrap().contains(&"sign".to_string()));
+    }
+
+    #[test]
+    fn sign_rejects_locked_signer() {
+        let mut account = Account::new(test_config()).unwrap();
+        let locked = signer_info("locked-1", [2, 2, 2, 2], SignerState::Locked);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let stub = StubManager::new(calls.clone(), Arc::new(Mutex::new(None)))
+            .with_signers(vec![locked.clone()]);
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let descriptor: Descriptor = test_config().descriptor.into();
+        let result = account.sign(&locked.id, descriptor, vec![1]);
+        assert!(matches!(result, Err(AccountError::SignerNotReady)));
+        assert!(!calls.lock().unwrap().contains(&"sign".to_string()));
+    }
+
+    #[test]
+    fn register_descriptor_is_consumer_driven() {
+        let mut account = Account::new(test_config()).unwrap();
+        let a = signer_info("signer-1", [3, 3, 3, 3], SignerState::Ready);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let stub = StubManager::new(calls.clone(), Arc::new(Mutex::new(None)))
+            .with_signers(vec![a.clone()]);
+        let last_register = stub.last_register_descriptor();
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        assert!(!calls
+            .lock()
+            .unwrap()
+            .contains(&"register_descriptor".to_string()));
+
+        let descriptor: Descriptor = test_config().descriptor.into();
+        account
+            .register_descriptor(&a.id, descriptor.clone())
+            .unwrap();
+
+        let seen = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| *c == "register_descriptor")
+            .count();
+        assert_eq!(seen, 1);
+        let (signer, sent) = last_register.lock().unwrap().clone().unwrap();
+        assert_eq!(signer, a.id);
+        assert_eq!(sent, descriptor);
+    }
+
+    #[test]
+    fn manager_notifications_reach_the_sp_channel() {
+        let mut account = Account::new(test_config()).unwrap();
+        let receiver = account.receiver().unwrap();
+
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), captured_sender.clone());
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let sender = captured_sender.lock().unwrap().clone().unwrap();
+        sender
+            .send(Response::SignersChanged { signers: vec![] })
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for notification"
+            );
+            match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(Notification::Signer(_)) => break,
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Builds a fully completed, verifiable BIP375 PSBT (one eligible p2tr
+    /// input, one silent-payment output with its script, share and DLEQ
+    /// proof already filled in) and returns its serialized bytes. The scan
+    /// and spend keys are throwaway and unrelated to any account: verifying
+    /// them needs no account state.
+    fn completed_sp_psbt_bytes() -> Vec<u8> {
+        let secp = Secp256k1::new();
+        let even_secret = |byte: u8| -> SecretKey {
+            let secret = SecretKey::from_slice(&[byte; 32]).unwrap();
+            let (_, parity) = secret.x_only_public_key(&secp);
+            if parity == Parity::Odd {
+                secret.negate()
+            } else {
+                secret
+            }
+        };
+        let input_secret = even_secret(5);
+        let input_pubkey = PublicKey::from_secret_key(&secp, &input_secret);
+        let scan_key = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[6; 32]).unwrap());
+        let spend_key =
+            PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[7; 32]).unwrap());
+
+        let mut output = bitcoin::psbt::Output::default();
+        bwk_psbt::sp::set_sp_v0_output(&mut output, scan_key, spend_key, None);
+
+        let (xonly, _) = input_pubkey.x_only_public_key();
+        let input = bwk_psbt::Input {
+            previous_output: OutPoint::null(),
+            sequence: bitcoin::Sequence::MAX,
+            required_time_lock_time: None,
+            required_height_lock_time: None,
+            psbt: bitcoin::psbt::Input {
+                witness_utxo: Some(TxOut {
+                    value: Amount::from_sat(10_000),
+                    script_pubkey: ScriptBuf::new_p2tr_tweaked(
+                        TweakedPublicKey::dangerous_assume_tweaked(xonly),
+                    ),
+                }),
+                ..Default::default()
+            },
+        };
+
+        let mut psbt = bwk_psbt::PsbtV2 {
+            tx_version: bitcoin::transaction::Version::TWO,
+            fallback_lock_time: Some(bitcoin::absolute::LockTime::ZERO),
+            tx_modifiable: None,
+            xpub: Default::default(),
+            proprietary: Default::default(),
+            unknown: Default::default(),
+            inputs: vec![input],
+            outputs: vec![bwk_psbt::Output {
+                amount: Amount::from_sat(1_000),
+                script_pubkey: None,
+                psbt: output,
+            }],
+        };
+
+        let share = scan_key
+            .mul_tweak(&secp, &Scalar::from(input_secret))
+            .unwrap();
+        let proof = crate::core::dleq::generate_proof(
+            input_secret,
+            scan_key,
+            [3; 32],
+            bip375::generator(),
+            None,
+        )
+        .unwrap();
+        bwk_psbt::sp::set_sp_global_ecdh_share_v2(&mut psbt, scan_key, share);
+        bwk_psbt::sp::set_sp_global_dleq_v2(&mut psbt, scan_key, *proof.as_bytes());
+
+        bip375::complete_output_scripts(&mut psbt).unwrap();
+        psbt.serialize().unwrap()
+    }
+
+    fn recv_signer_notification_matching(
+        receiver: &mpsc::Receiver<Notification>,
+        pred: impl Fn(&SignerNotification) -> bool,
+    ) -> SignerNotification {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for a matching signer notification"
+            );
+            match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(Notification::Signer(n)) if pred(&n) => return n,
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    #[test]
+    fn verified_psbt_reaches_the_consumer() {
+        let mut account = Account::new(test_config()).unwrap();
+        let receiver = account.receiver().unwrap();
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), captured_sender.clone());
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+        let sender = captured_sender.lock().unwrap().clone().unwrap();
+
+        let bytes = completed_sp_psbt_bytes();
+        sender
+            .send(Response::Signed {
+                request: RequestId::new(1),
+                signer: SignerId::new("s1"),
+                psbt: bytes.clone(),
+            })
+            .unwrap();
+
+        match recv_signer_notification_matching(&receiver, |n| {
+            matches!(n, SignerNotification::PsbtVerified { .. })
+        }) {
+            SignerNotification::PsbtVerified { psbt, .. } => assert_eq!(psbt, bytes),
+            other => panic!("expected PsbtVerified, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failed_verification_withholds_bytes() {
+        let mut account = Account::new(test_config()).unwrap();
+        let receiver = account.receiver().unwrap();
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), captured_sender.clone());
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+        let sender = captured_sender.lock().unwrap().clone().unwrap();
+
+        let mut psbt = bwk_psbt::PsbtV2::deserialize(&completed_sp_psbt_bytes()).unwrap();
+        let other_key = PublicKey::from_secret_key(
+            &Secp256k1::new(),
+            &SecretKey::from_slice(&[9; 32]).unwrap(),
+        );
+        psbt.outputs[0].script_pubkey = Some(ScriptBuf::new_op_return(
+            other_key.x_only_public_key().0.serialize(),
+        ));
+        let tampered = psbt.serialize().unwrap();
+
+        sender
+            .send(Response::Signed {
+                request: RequestId::new(2),
+                signer: SignerId::new("s1"),
+                psbt: tampered,
+            })
+            .unwrap();
+
+        match recv_signer_notification_matching(&receiver, |n| {
+            matches!(n, SignerNotification::PsbtVerificationFailed { .. })
+        }) {
+            SignerNotification::PsbtVerificationFailed { reason, .. } => {
+                assert!(!reason.is_empty())
+            }
+            other => panic!("expected PsbtVerificationFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn undecodable_bytes_fail_verification() {
+        let mut account = Account::new(test_config()).unwrap();
+        let receiver = account.receiver().unwrap();
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), captured_sender.clone());
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+        let sender = captured_sender.lock().unwrap().clone().unwrap();
+
+        sender
+            .send(Response::Signed {
+                request: RequestId::new(3),
+                signer: SignerId::new("s1"),
+                psbt: vec![0xff; 8],
+            })
+            .unwrap();
+
+        match recv_signer_notification_matching(&receiver, |n| {
+            matches!(n, SignerNotification::PsbtVerificationFailed { .. })
+        }) {
+            SignerNotification::PsbtVerificationFailed { reason, .. } => {
+                assert!(!reason.is_empty())
+            }
+            other => panic!("expected PsbtVerificationFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finalize_extracts_signed_tx() {
+        let account = Account::new(test_config()).unwrap();
+        let mnemonic = account.get_config().mnemonic.clone().unwrap();
+        let secp = Secp256k1::new();
+        let network = account.network();
+        let signing_signer = SpSigner::from_mnemonic(
+            &mnemonic,
+            network,
+            bitcoin::bip32::ChildNumber::from_hardened_idx(0).unwrap(),
+        )
+        .unwrap();
+
+        // Build a script whose output key actually reconstructs from
+        // `b_spend + tweak`, so `SpSigner::sign` can find and sign it.
+        let tweak = SecretKey::from_slice(&[31u8; 32]).unwrap();
+        let candidate = signing_signer.b_spend().add_tweak(&tweak.into()).unwrap();
+        let (x_only, _) = candidate.public_key(&secp).x_only_public_key();
+        let spk = bitcoin::ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(
+            x_only,
+        ));
+        let outpoint = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x31; 32]),
+            vout: 0,
+        };
+        account
+            .coin_store
+            .lock()
+            .expect("poisoned")
+            .insert(outpoint, fake_sp_owned(spk, 31));
+
+        let mut builder = account.tx_builder().feerate(1_000);
+        builder.add_output(external_v2_recipient());
+        let unsigned_psbt = builder.generate_v2().unwrap();
+
+        // Sign two independent copies of the same unsigned PSBT: the
+        // Schnorr signature is randomized per call, but the unsigned tx (and
+        // so the txid, which excludes witness data) must stay identical.
+        let sign_and_finalize = || {
+            let mut psbt = unsigned_psbt.clone();
+            signing_signer.sign(&mut psbt).unwrap();
+            account.finalize(&psbt.serialize().unwrap()).unwrap()
+        };
+        let tx1 = sign_and_finalize();
+        let tx2 = sign_and_finalize();
+
+        let sp_index = tx1
+            .input
+            .iter()
+            .position(|input| input.previous_output == outpoint)
+            .unwrap();
+        assert!(!tx1.input[sp_index].witness.is_empty());
+        assert_eq!(tx1.compute_txid(), tx2.compute_txid());
+    }
+
+    /// Builds an account plus a fully completed and signed PSBTv2 self-send:
+    /// one silent-payment input, one silent-payment output, shares, DLEQ
+    /// proof, output script and `tap_key_sig` all in place, `tx_modifiable`
+    /// frozen.
+    fn completed_sp_psbt() -> (Account, bwk_psbt::PsbtV2) {
+        let account = Account::new(test_config()).unwrap();
+        let mnemonic = account.get_config().mnemonic.clone().unwrap();
+        let secp = Secp256k1::new();
+        let network = account.network();
+        let signing_signer = SpSigner::from_mnemonic(
+            &mnemonic,
+            network,
+            bitcoin::bip32::ChildNumber::from_hardened_idx(0).unwrap(),
+        )
+        .unwrap();
+
+        let tweak = SecretKey::from_slice(&[41u8; 32]).unwrap();
+        let candidate = signing_signer.b_spend().add_tweak(&tweak.into()).unwrap();
+        let (x_only, _) = candidate.public_key(&secp).x_only_public_key();
+        let spk = bitcoin::ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(
+            x_only,
+        ));
+        let outpoint = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x41; 32]),
+            vout: 0,
+        };
+        account
+            .coin_store
+            .lock()
+            .expect("poisoned")
+            .insert(outpoint, fake_sp_owned(spk, 41));
+
+        let mut builder = account.tx_builder().feerate(1_000);
+        builder.add_output(SpRecipient::new(account.sp_address(), 1_000, network));
+        let mut psbt = builder.generate_v2().unwrap();
+        signing_signer.sign(&mut psbt).unwrap();
+        (account, psbt)
+    }
+
+    #[test]
+    fn finalize_extracts_a_verified_tx() {
+        let (account, psbt) = completed_sp_psbt();
+
+        let tx = account.finalize(&psbt.serialize().unwrap()).unwrap();
+
+        assert!(tx.input.iter().any(|input| !input.witness.is_empty()));
+    }
+
+    #[test]
+    fn finalize_rejects_a_tampered_script() {
+        let secp = Secp256k1::new();
+        let other_key =
+            PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[9u8; 32]).unwrap());
+        let (account, mut psbt) = completed_sp_psbt();
+        let output = psbt
+            .outputs
+            .iter_mut()
+            .find(|o| o.script_pubkey.is_some())
+            .unwrap();
+        output.script_pubkey = Some(bitcoin::ScriptBuf::new_p2tr_tweaked(
+            other_key.x_only_public_key().0.dangerous_assume_tweaked(),
+        ));
+
+        let result = account.finalize(&psbt.serialize().unwrap());
+
+        assert!(matches!(result, Err(AccountError::Bip375(_))));
+    }
+
+    #[test]
+    fn finalize_rejects_a_bad_proof() {
+        let (account, mut psbt) = completed_sp_psbt();
+        let scan_key = *bip375::scan_keys(&psbt).unwrap().iter().next().unwrap();
+        let mut proof = bwk_psbt::sp::sp_global_dleq_v2(&psbt, scan_key)
+            .unwrap()
+            .unwrap();
+        proof[0] ^= 0xff;
+        bwk_psbt::sp::set_sp_global_dleq_v2(&mut psbt, scan_key, proof);
+
+        let result = account.finalize(&psbt.serialize().unwrap());
+
+        assert!(matches!(result, Err(AccountError::Bip375(_))));
+    }
+
+    #[test]
+    fn finalize_rejects_an_unsigned_psbt() {
+        let (account, mut psbt) = completed_sp_psbt();
+        for input in &mut psbt.inputs {
+            input.psbt.tap_key_sig = None;
+        }
+
+        let result = account.finalize(&psbt.serialize().unwrap());
+
+        assert!(matches!(result, Err(AccountError::Finalize(_))));
+    }
+
+    #[test]
+    fn finalize_rejects_undecodable_bytes() {
+        let account = Account::new(test_config()).unwrap();
+
+        let result = account.finalize(&[0xff; 8]);
+
+        assert!(matches!(result, Err(AccountError::PsbtDecode)));
+    }
+
+    #[test]
+    fn finalize_accepts_a_non_sp_transaction() {
+        let secp = Secp256k1::new();
+        let raw_sk = SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let (_, parity) = raw_sk.x_only_public_key(&secp);
+        let sk = if parity == Parity::Odd {
+            raw_sk.negate()
+        } else {
+            raw_sk
+        };
+        let (x_only, _) = sk.x_only_public_key(&secp);
+        let spk = bitcoin::ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(
+            x_only,
+        ));
+        let prevout = TxOut {
+            value: Amount::from_sat(10_000),
+            script_pubkey: spk,
+        };
+        let outpoint = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x51; 32]),
+            vout: 0,
+        };
+        let tx = bitcoin::Transaction {
+            version: transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(9_000),
+                script_pubkey: ScriptBuf::new_op_return([]),
+            }],
+        };
+        let mut v0 = bitcoin::Psbt::from_unsigned_tx(tx.clone()).unwrap();
+        v0.inputs[0].witness_utxo = Some(prevout.clone());
+
+        let mut cache = SighashCache::new(&tx);
+        let aux_rand = [0u8; 32];
+        let signature =
+            sign_taproot_key_spend(&mut cache, &[prevout], 0, &sk, &secp, &aux_rand).unwrap();
+        v0.inputs[0].tap_key_sig = Some(signature);
+
+        let account = Account::new(test_config()).unwrap();
+
+        let result_tx = account.finalize(&v0.serialize()).unwrap();
+
+        assert!(!result_tx.input[0].witness.is_empty());
     }
 }
 

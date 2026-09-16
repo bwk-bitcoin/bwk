@@ -84,6 +84,17 @@ pub fn derive_spend_key(
         .map(|k| k.private_key)
 }
 
+/// Derives the BIP32 master fingerprint from `mnemonic`, without handing back
+/// any private key material. Lets a consumer cache a [`bip32::Fingerprint`]
+/// for BIP376 key-origin metadata without ever holding a master xpriv.
+#[cfg(feature = "mnemonic")]
+pub fn mnemonic_fingerprint(mnemonic: &str, network: Network) -> Option<bip32::Fingerprint> {
+    let mnemonic = bip39::Mnemonic::from_str(mnemonic).ok()?;
+    let seed = mnemonic.to_seed("");
+    let master = bip32::Xpriv::new_master(network, &seed).ok()?;
+    Some(master.fingerprint(&Secp256k1::new()))
+}
+
 // Blockchain data fetched via the blindbit transport.
 
 pub struct BlockData {

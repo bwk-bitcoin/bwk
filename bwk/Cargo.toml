@@ -24,6 +24,7 @@ bwk-sign = { workspace = true, default-features = false, features = ["sp"] }
 bwk-utils.workspace = true
 bwk-coin.workspace = true
 bwk-tx.workspace = true
+crossbeam.workspace = true
 
 miniscript.workspace = true
 serde.workspace = true

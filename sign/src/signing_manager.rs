@@ -194,14 +194,6 @@ impl HotManager {
         }
     }
 
-    /// Returns master xprivs from all BIP32 hot signers, keyed by fingerprint.
-    pub fn master_xprivs(&self) -> BTreeMap<bip32::Fingerprint, bip32::Xpriv> {
-        self.bip32_signers
-            .values()
-            .map(|signer| (signer.fingerprint(), signer.master_xpriv()))
-            .collect()
-    }
-
     fn require_subscriber(&self) -> Result<channel::Sender<Response>, manager::Error> {
         self.subscriber.clone().ok_or(manager::Error::NoSubscriber)
     }
