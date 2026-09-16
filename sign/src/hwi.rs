@@ -1,45 +1,53 @@
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
+use bwk_descriptor::descriptor::Descriptor;
 use bwk_hwi::service::{SigningDeviceMsg, SupportedDevice};
 use crossbeam::channel;
-use miniscript::{
-    bitcoin::{
-        bip32::{self, DerivationPath},
-        hashes::{sha256, Hash},
-        Psbt,
-    },
-    Descriptor, DescriptorPublicKey,
+use miniscript::bitcoin::{
+    bip32::{self, DerivationPath},
+    hashes::{sha256, Hash},
+    Psbt,
 };
 
 use crate::{
+    error::Error,
+    protocol::RequestId,
     send,
     signer::{Signer, SignerNotif},
 };
 
 #[derive(Debug, Clone)]
 pub enum HwMessage {
-    Device(SigningDeviceMsg),
+    Device(SigningDeviceMsg<RequestId>),
 }
 
-impl From<SigningDeviceMsg> for HwMessage {
-    fn from(msg: SigningDeviceMsg) -> Self {
+impl From<SigningDeviceMsg<RequestId>> for HwMessage {
+    fn from(msg: SigningDeviceMsg<RequestId>) -> Self {
         HwMessage::Device(msg)
     }
 }
 
 pub struct HwSigner {
-    device: SupportedDevice<HwMessage>,
+    device: SupportedDevice<HwMessage, RequestId>,
     id: String,
     sender: Option<channel::Sender<SignerNotif>>,
-    pub(crate) descriptors: BTreeSet<Descriptor<DescriptorPublicKey>>,
+    /// The [`Signer`] trait predates the [`RequestId`]-carrying protocol and
+    /// its methods take no request id, so the id to use for the next
+    /// dispatch is stashed here right before the call.
+    request: AtomicU64,
+    pub descriptors: BTreeSet<Descriptor>,
 }
 
 impl HwSigner {
-    pub fn new(device: SupportedDevice<HwMessage>, id: String) -> Self {
+    pub fn new(device: SupportedDevice<HwMessage, RequestId>, id: String) -> Self {
         Self {
             device,
             id,
             sender: None,
+            request: AtomicU64::new(0),
             descriptors: BTreeSet::new(),
         }
     }
@@ -52,7 +60,15 @@ impl HwSigner {
         *self.device.fingerprint()
     }
 
-    fn wallet_name(descriptor: &Descriptor<DescriptorPublicKey>) -> String {
+    pub fn set_request(&self, request: RequestId) {
+        self.request.store(request.as_u64(), Ordering::SeqCst);
+    }
+
+    fn request(&self) -> RequestId {
+        RequestId::new(self.request.load(Ordering::SeqCst))
+    }
+
+    fn wallet_name(descriptor: &Descriptor) -> String {
         let policy = descriptor.to_string();
         let hash = sha256::Hash::hash(policy.as_bytes());
         let bytes = hash.as_byte_array();
@@ -78,23 +94,32 @@ impl Signer for HwSigner {
     }
 
     fn get_xpub(&self, deriv: DerivationPath, _display: bool) {
-        self.device.get_extended_pubkey((), &deriv);
+        self.device.get_extended_pubkey(self.request(), &deriv);
     }
 
-    fn is_descriptor_registered(&self, descriptor: Descriptor<DescriptorPublicKey>) {
+    fn is_descriptor_registered(&self, descriptor: Descriptor) {
+        if descriptor.is_sp() {
+            send!(self, Error(Error::SpDescriptor));
+            return;
+        }
         let policy = descriptor.to_string();
         let name = Self::wallet_name(&descriptor);
-        self.device.is_wallet_registered((), &name, &policy);
+        self.device
+            .is_wallet_registered(self.request(), &name, &policy);
     }
 
-    fn register_descriptor(&mut self, descriptor: Descriptor<DescriptorPublicKey>) {
+    fn register_descriptor(&mut self, descriptor: Descriptor) {
+        if descriptor.is_sp() {
+            send!(self, Error(Error::SpDescriptor));
+            return;
+        }
         self.descriptors.insert(descriptor.clone());
         let policy = descriptor.to_string();
         let name = Self::wallet_name(&descriptor);
-        self.device.register_wallet((), &name, &policy);
+        self.device.register_wallet(self.request(), &name, &policy);
     }
 
-    fn sign_with_descriptor(&self, psbt: Psbt, _descriptor: Descriptor<DescriptorPublicKey>) {
-        self.device.sign_tx((), psbt);
+    fn sign_with_descriptor(&self, psbt: Psbt, _descriptor: Descriptor) {
+        self.device.sign_tx(self.request(), psbt);
     }
 }

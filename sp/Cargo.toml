@@ -53,6 +53,21 @@ name = "unit"
 path = "tests/unit.rs"
 required-features = ["mnemonic"]
 
+[[test]]
+name = "watch_only"
+path = "tests/watch_only.rs"
+required-features = ["mnemonic"]
+
+[[test]]
+name = "signer_round_trip"
+path = "tests/signer_round_trip.rs"
+required-features = ["mnemonic"]
+
+[[test]]
+name = "verification_failure"
+path = "tests/verification_failure.rs"
+required-features = ["mnemonic"]
+
 [features]
 default = ["mnemonic"]
 # Enable usage of bip39 mnemonics.
@@ -77,6 +92,7 @@ bwk-utils = { workspace = true, features = ["ureq"] }
 bwk-sign = { workspace = true, default-features = false, features = ["sp"] }
 bwk-coin = { workspace = true }
 bwk-tx = { workspace = true }
+bwk-psbt = { workspace = true }
 secp256k1_spscan-sys = { workspace = true }
 
 # Bitcoin
@@ -87,7 +103,6 @@ bitcoin_hashes = { workspace = true }
 
 # Silent Payments support
 bech32 = { workspace = true }
-bimap = { workspace = true }
 
 # Serialization
 serde = { workspace = true, features = ["derive"] }
@@ -134,3 +149,4 @@ bwk-utils = { workspace = true, features = ["test"] }
 bwk-sign = { workspace = true, features = ["test"] }
 bip39 = { workspace = true }
 libc = { workspace = true }
+base64ct = { workspace = true, features = ["alloc"] }

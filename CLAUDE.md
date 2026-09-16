@@ -39,31 +39,34 @@ tests locally. Commit messages must be single-line and follow existing style
 ## Workspace Crates
 
 ```
-+----------------+-------------------------------------------------------------+
-| Crate          | Purpose                                                     |
-+----------------+-------------------------------------------------------------+
-| bwk            | Main library - Account orchestrator for descriptor-based    |
-|                | wallets (Electrum backend)                                  |
-| bwk-sp         | Silent Payments account orchestrator (BIP352, Blindbit)     |
-| bwk-tx         | Transaction building, coin selection, fee estimation, PSBT  |
-| bwk-electrum   | Electrum protocol client (TCP/SSL), ElectrumScanner, and    |
-|                | the scan stores, the header chain and the reconcile pass    |
-| bwk-sign       | Hot signer, SigningManager for BIP32 key management         |
-| bwk-descriptor | Miniscript descriptor handling, SpkDerivator                |
-| bwk-keys       | Key derivation utilities (OXpriv, OXpub, KeyDerivator)      |
-| bwk-p2p        | Bitcoin P2P network client, DNS seed resolution             |
-| bwk-coin       | Coin domain types shared by bwk-tx and bwk-electrum         |
-| bwk-persist    | KV persistence: Store, RamStore, JSON/SQLite backends       |
-| bwk-hwi        | Hardware wallet transport and device drivers                |
-| bwk-error      | In-house derive for error impls, reached as `thiserror`     |
-| bwk-backoff    | Exponential backoff utility                                 |
-| bwk-utils      | Test helpers (behind `test` feature)                        |
-+----------------+-------------------------------------------------------------+
++-----------------+-------------------------------------------------------------+
+| Crate           | Purpose                                                     |
++-----------------+-------------------------------------------------------------+
+| bwk             | Main library - Account orchestrator for descriptor-based    |
+|                 | wallets (Electrum backend)                                  |
+| bwk-sp          | Silent Payments account orchestrator (BIP352, Blindbit)     |
+| bwk-tx          | Transaction building, coin selection, fee estimation, PSBT  |
+| bwk-psbt        | Native PSBTv2 (BIP370), silent-payment fields (BIP375/376)  |
+| bwk-electrum    | Electrum protocol client (TCP/SSL), ElectrumScanner, and    |
+|                 | the scan stores, the header chain and the reconcile pass    |
+| bwk-sign        | Signers and signing managers: hot, hardware, remote         |
+| bwk-descriptor  | Miniscript and sp() descriptor handling, SpkDerivator       |
+| bwk-keys        | Key derivation utilities (OXpriv, OXpub, KeyDerivator)      |
+| bwk-p2p         | Bitcoin P2P network client, DNS seed resolution             |
+| bwk-coin        | Coin domain types shared by bwk-tx and bwk-electrum         |
+| bwk-persist     | KV persistence: Store, RamStore, JSON/SQLite backends       |
+| bwk-hwi         | Hardware wallet transport and device drivers                |
+| bwk-error       | In-house derive for error impls, reached as `thiserror`     |
+| bwk-qr          | QR generation, scanning, BBQR framing                       |
+| bwk-qr-protocol | Signing-flow message codec (no_std, no deps, C binding)     |
+| bwk-backoff     | Exponential backoff utility                                 |
+| bwk-utils       | Test helpers (behind `test` feature)                        |
++-----------------+-------------------------------------------------------------+
 ```
 
 See crate READMEs for usage examples:
 - [bwk/README.md](bwk/README.md): Account, stores, address generation
-- [sign/README.md](sign/README.md): SigningManager, Signer trait
+- [sign/README.md](sign/README.md): SigningManager trait, HotManager, Signer trait
 - [descriptor/README.md](descriptor/README.md): SpkDerivator, descriptor helpers
 - [electrum/README.md](electrum/README.md): Electrum client modes
 - [coin/README.md](coin/README.md): coin domain types
@@ -82,7 +85,9 @@ Account (bwk/src/account.rs)
 ├── HeaderFollower (holds the HeaderStore: validated header chain, two
 │   Electrum connections of its own, one for the header worker and one
 │   for the merkle-proof client, and keeps it on the scanner's endpoint)
-├── SigningManager (hot signers)
+├── signing managers attached by name (a hot one when the config carries a
+│   mnemonic), each with a thread pumping its answers into the notification
+│   channel
 └── Reconciler (bwk-electrum, its own thread: promotes what the scanner
     recorded against the header chain, verifies proofs)
 ```
@@ -104,7 +109,8 @@ Account (sp/src/account/mod.rs)
 ├── ElectrumScanner per sub-account descriptor (bwk-electrum)
 ├── HeaderStore (validated header chain, shared by every scanner)
 ├── Reconciler per scanner (promotes its scan against the header chain)
-└── SigningManager (hot signers for the sub-account descriptors)
+└── signing managers attached by name (a hot one for the sub-account
+    descriptors when the config carries a mnemonic)
 ```
 
 ### Transaction Building (`bwk-tx`)
@@ -113,7 +119,7 @@ TxBuilder
 ├── RecipientProvider trait - outputs (Recipient, SpRecipient, change providers)
 ├── CoinSource trait - input selection
 ├── coin_selection module - weighted random selection algorithm
-└── TxTemplate -> Psbt via generate()
+└── TxTemplate -> Psbt via generate(), PsbtV2 via generate_v2()
 ```
 
 Key traits:
@@ -126,8 +132,9 @@ Key traits:
 ### Notification Pattern
 
 Both Account types use `mpsc::channel<Notification>` for async events
-(connection status, new coins, scan progress). Call `account.receiver()` to
-take the receiver.
+(connection status, new coins, scan progress, and the answers of every
+attached signing manager under `Notification::Signer`). Call
+`account.receiver()` to take the receiver.
 
 ## Features
 
@@ -145,8 +152,9 @@ take the receiver.
 Integration tests require the `test` feature flag which enables:
 - `bwk-electrum/test`: Test-only store constructors and accessors (synthetic
   header chains, tx-entry and validation-state setters)
-- `bwk-utils/test`: Test helpers (funding_tx, corepc_node utilities, and the
-  shared regtest harness in `utils/src/test/regtest.rs`)
+- `bwk-utils/test`: Test helpers (funding_tx, corepc_node utilities, the
+  shared regtest harness in `utils/src/test/regtest.rs`, and the mock remote
+  signing manager in `utils/src/mock_manager.rs`)
 - `bwk-sign/test`: Test signer constructors
 - `bwk-tx/test`: TxBuilder test methods (fund_with_bitcoind, mark_tx_mined)
 - `bwk-persist/test`: Test-only accessors on the backends (on-disk paths)

@@ -37,6 +37,7 @@ bwk-backoff.workspace = true
 bwk-coin.workspace = true
 bwk-descriptor.workspace = true
 bwk-persist.workspace = true
+bwk-sign.workspace = true
 bwk-utils.workspace = true
 thiserror.workspace = true
 
@@ -49,7 +50,6 @@ native-tls = { workspace = true, features = ["vendored"] }
 bwk-utils = { workspace = true, features = ["test"] }
 hex_lit.workspace = true
 temp-dir.workspace = true
-bwk-sign.workspace = true
 bwk-tx.workspace = true
 electrsd.workspace = true
 # The sibling test features this crate's own tests reach for, so it builds them

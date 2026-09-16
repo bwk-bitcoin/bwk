@@ -9,9 +9,9 @@ generation, transaction history, and labels. Handles background sync with
 Electrum server and emits notifications on state changes.
 
 **Scope:** Account lifecycle, pairing an `ElectrumScanner` with a `HeaderStore`
-and reconciling them, signer management, change address management. The stores
-and the sync thread live in bwk-electrum. Does NOT handle signing itself (use
-bwk-sign) or transaction construction (use bwk-tx).
+and reconciling them, attaching signing managers, change address management.
+The stores and the sync thread live in bwk-electrum. Does NOT handle signing
+itself (use bwk-sign) or transaction construction (use bwk-tx).
 
 ## Usage
 
@@ -137,6 +137,32 @@ index N, if N >= generated_tip, the tip advances and new addresses get watched.
 Uses `ChangeTipUpdater` to increment change_generated_tip on each
 `create_script()` call. The index is stored in a `Cell` so `psbt_output_info()`
 can return correct BIP32 derivation path.
+
+## Signing
+
+An account does not sign, it routes. `attach_signing_manager(name, manager)`
+takes any `bwk_sign::manager::SigningManager` under a caller-chosen name and
+starts a thread forwarding that manager's answers into the account's
+notification channel. `detach_signing_manager(name)` stops that thread and
+drops the manager, and `signing_manager_names()` lists what is attached. A
+config carrying a mnemonic gets a hot manager attached at construction, under
+the name `hot`.
+
+`signers()` returns every signer cached across every attached manager and
+`signer(id)` one of them. `refresh_signers()` asks each manager for a fresh
+roster, and `set_signer_polling(enabled)` turns device discovery on and off on
+all of them at once.
+
+`init_signer`, `signer_info`, `signer_xpub`, `is_descriptor_registered`,
+`register_descriptor`, `sign` and `signer_raw` each take a `SignerId`, resolve
+which manager owns it and return the `RequestId` that manager minted. An
+unknown id, or a signer that is not ready, is refused before any manager is
+touched. None of them blocks or returns a result: the answer comes back as a
+notification.
+
+Those answers arrive as `Notification::Signer(SignerNotification)`: a manager
+attached or detached, the account-wide signer list, the result of each request
+tagged with its `RequestId` and `SignerId`, and errors no request asked for.
 
 ## Features
 

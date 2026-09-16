@@ -4,9 +4,7 @@
 //! below both `bwk-electrum` and `bwk-tx` rather than inside either.
 
 use miniscript::{
-    bitcoin::{
-        self, absolute, bip32::DerivationPath, key::rand, psbt, Psbt, ScriptBuf, TxIn, Witness,
-    },
+    bitcoin::{self, absolute, key::rand, psbt, Psbt, ScriptBuf, TxIn, Witness},
     psbt::PsbtExt,
     DefiniteDescriptorKey, Descriptor, DescriptorPublicKey,
 };
@@ -79,16 +77,9 @@ pub enum CoinSpendInfo {
     Bip32 {
         coin_path: (KeyChain, u32),
         descriptor: Descriptor<DescriptorPublicKey>,
-        /// Ephemeral secret key for SP partial secret computation.
-        /// Never persisted, only populated at tx-building time.
-        #[serde(skip)]
-        secret_key: Option<bitcoin::secp256k1::SecretKey>,
     },
     /// Silent Payment coin (BIP352)
-    Sp {
-        derivation: DerivationPath,
-        tweak: [u8; 32],
-    },
+    Sp { tweak: [u8; 32] },
 }
 
 /// High-level source/classification for a wallet coin.
@@ -167,9 +158,8 @@ impl Coin {
             CoinSpendInfo::Bip32 {
                 coin_path,
                 descriptor,
-                ..
             } => self.spk_to_psbt_input(*coin_path, descriptor),
-            CoinSpendInfo::Sp { .. } => self.sp_to_psbt_input(),
+            CoinSpendInfo::Sp { tweak } => self.sp_to_psbt_input(*tweak),
         }
     }
 
@@ -208,13 +198,13 @@ impl Coin {
         Ok(dummy_psbt.inputs[0].clone())
     }
 
-    fn sp_to_psbt_input(&self) -> Result<psbt::Input, Error> {
-        // For SP coins, we create a basic PSBT input with witness_utxo
-        // The actual signing will be handled by the SP signer which uses the tweak
-        Ok(psbt::Input {
+    fn sp_to_psbt_input(&self, tweak: [u8; 32]) -> Result<psbt::Input, Error> {
+        let mut input = psbt::Input {
             witness_utxo: Some(self.txout.clone()),
             ..Default::default()
-        })
+        };
+        bwk_psbt::sp::set_sp_input_tweak(&mut input, tweak);
+        Ok(input)
     }
 }
 
@@ -325,7 +315,6 @@ mod tests {
             spend_info: CoinSpendInfo::Bip32 {
                 coin_path: (KeyChain::Receive, 0),
                 descriptor: bip32_descriptor(),
-                secret_key: None,
             },
         }
     }
@@ -343,13 +332,30 @@ mod tests {
             status: CoinStatus::Confirmed,
             label: None,
             satisfaction_size: 0,
-            spend_info: CoinSpendInfo::Sp {
-                derivation: DerivationPath::default(),
-                tweak: [0u8; 32],
-            },
+            spend_info: CoinSpendInfo::Sp { tweak: [0u8; 32] },
         };
 
         assert_eq!(coin.source(), CoinSourceKind::SilentPayment);
+    }
+
+    #[test]
+    fn silent_payment_input_has_tweak() {
+        let coin = Coin {
+            txout: bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::new(),
+            },
+            outpoint: bitcoin::OutPoint::null(),
+            height: Some(1),
+            sequence: bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
+            status: CoinStatus::Confirmed,
+            label: None,
+            satisfaction_size: 0,
+            spend_info: CoinSpendInfo::Sp { tweak: [9u8; 32] },
+        };
+
+        let input = coin.to_psbt_input().unwrap();
+        assert_eq!(bwk_psbt::sp::sp_input_tweak(&input), Ok(Some([9u8; 32])));
     }
 
     #[test]
@@ -370,5 +376,13 @@ mod tests {
         assert_eq!(bip32_coin(p2wpkh).source(), CoinSourceKind::Segwit);
         assert_eq!(bip32_coin(p2tr).source(), CoinSourceKind::Taproot);
         assert_eq!(bip32_coin(ScriptBuf::new()).source(), CoinSourceKind::Other);
+    }
+
+    #[test]
+    fn bip32_coin_round_trips_through_serde() {
+        let coin = bip32_coin(ScriptBuf::new());
+        let json = serde_json::to_string(&coin).unwrap();
+        let decoded: Coin = serde_json::from_str(&json).unwrap();
+        assert_eq!(coin, decoded);
     }
 }

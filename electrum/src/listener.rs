@@ -467,7 +467,7 @@ mod tests {
     fn bare_coin_store() -> (Arc<Mutex<CoinStore>>, SpkDerivator) {
         let (descriptor, _) = throwaway_descriptor();
         let config = ScannerConfig::new(
-            descriptor,
+            descriptor.into(),
             PathBuf::default(),
             String::new(),
             "bare".into(),

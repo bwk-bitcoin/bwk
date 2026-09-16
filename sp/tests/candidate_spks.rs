@@ -7,6 +7,7 @@ use bwk_sp::core::{
     receiving::{calculate_ecdh_shared_secret, Label, Receiver},
     secp256k1::{rand, PublicKey, Secp256k1, SecretKey},
     utils::common::Network,
+    SpVersion,
 };
 
 #[test]
@@ -21,8 +22,14 @@ fn candidate_spks_match_get_spks_from_shared_secret() {
 
     // change label (index 0) plus a couple extra labels.
     let change_label = Label::new(scan_key, 0);
-    let mut receiver =
-        Receiver::new(0, scan_pubkey, spend_pubkey, change_label, Network::Regtest).unwrap();
+    let mut receiver = Receiver::new(
+        SpVersion::V0,
+        scan_pubkey,
+        spend_pubkey,
+        change_label,
+        Network::Regtest,
+    )
+    .unwrap();
     receiver.add_label(Label::new(scan_key, 1)).unwrap();
     receiver.add_label(Label::new(scan_key, 2)).unwrap();
 
@@ -41,7 +48,7 @@ fn candidate_spks_match_get_spks_from_shared_secret() {
 
         let shared_secret = calculate_ecdh_shared_secret(&tweak, &scan_key);
         let reference: HashSet<[u8; 34]> = receiver
-            .get_spks_from_shared_secret(&shared_secret)
+            .get_spks_from_shared_secret(shared_secret)
             .unwrap()
             .into_values()
             .collect();
