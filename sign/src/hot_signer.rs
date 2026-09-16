@@ -15,6 +15,7 @@ use bwk_keys::{
     derivator::KeyDerivator,
     keys::{OXpriv, OXpub},
 };
+use bwk_psbt::PsbtV2;
 use miniscript::{
     bitcoin::{bip32::ChildNumber, hashes::Hash, key::TapTweak},
     psbt::PsbtExt,
@@ -321,12 +322,32 @@ impl HotSigner {
         }
     }
 
+    pub fn sign_v2(
+        &self,
+        psbt: &mut PsbtV2,
+        descriptor: &Descriptor<DescriptorPublicKey>,
+    ) -> Result<(), Error> {
+        let mut v0 = validated_v0(psbt)?;
+        self.inner_sign(&mut v0, descriptor)?;
+        set_v0_maps(psbt, v0);
+        psbt.tx_modifiable = Some(bwk_psbt::TxModifiable::none());
+        Ok(())
+    }
+
     pub fn finalize(
         &self,
         psbt: &mut Psbt,
     ) -> Result<bitcoin::Transaction, Vec<miniscript::psbt::Error>> {
         PsbtExt::finalize_mut(psbt, self.secp())?;
         Ok(Psbt::extract_tx_unchecked_fee_rate(psbt.clone()))
+    }
+
+    pub fn finalize_v2(&self, psbt: &mut PsbtV2) -> Result<bitcoin::Transaction, Error> {
+        let mut v0 = validated_v0(psbt)?;
+        PsbtExt::finalize_mut(&mut v0, self.secp()).map_err(|_| Error::SigningInfo)?;
+        let tx = Psbt::extract_tx_unchecked_fee_rate(v0.clone());
+        set_v0_maps(psbt, v0);
+        Ok(tx)
     }
 
     pub fn inner_sign(
@@ -811,6 +832,13 @@ fn sign_sp_input(
     input_index: usize,
     aux_rand: &[u8; 32],
 ) -> Result<(), Error> {
+    let psbt_tweak = bwk_psbt::sp::sp_input_tweak(&psbt.inputs[input_index])
+        .map_err(|_| Error::SpSigning)?
+        .ok_or(Error::SpSigning)?;
+    if &psbt_tweak != tweak {
+        return Err(Error::SpSigning);
+    }
+
     let unsigned_tx = &psbt.unsigned_tx;
 
     // Collect all prevouts from PSBT inputs
@@ -828,9 +856,17 @@ fn sign_sp_input(
 
     // Derive signing key: b_spend + tweak
     let tweak_sk = secp256k1::SecretKey::from_slice(tweak).map_err(|_| Error::SpSigning)?;
-    let sk = b_spend
+    let mut sk = b_spend
         .add_tweak(&tweak_sk.into())
         .map_err(|_| Error::SpSigning)?;
+    let (output_key, parity) = sk.x_only_public_key(&secp);
+    let script = &prevouts[input_index].script_pubkey;
+    if !script.is_p2tr() || script.as_bytes().get(2..) != Some(output_key.serialize().as_ref()) {
+        return Err(Error::SpSigning);
+    }
+    if parity == secp256k1::Parity::Odd {
+        sk = sk.negate();
+    }
     let keypair = secp256k1::Keypair::from_secret_key(&secp, &sk);
 
     let sig = secp.sign_schnorr_with_aux_rand(&msg, &keypair, aux_rand);
@@ -843,6 +879,32 @@ fn sign_sp_input(
     psbt.inputs[input_index].tap_key_sig = Some(signature);
 
     Ok(())
+}
+
+fn has_sp_output(psbt: &PsbtV2) -> Result<bool, Error> {
+    psbt.outputs
+        .iter()
+        .try_fold(false, |found, output| {
+            bwk_psbt::sp::sp_v0_output(&output.psbt).map(|info| found || info.is_some())
+        })
+        .map_err(|_| Error::PsbtV2)
+}
+
+fn validated_v0(psbt: &PsbtV2) -> Result<Psbt, Error> {
+    if has_sp_output(psbt)? {
+        return Err(Error::PsbtV2);
+    }
+    psbt.validate().map_err(|_| Error::PsbtV2)?;
+    psbt.clone().into_bitcoin_psbt().map_err(|_| Error::PsbtV2)
+}
+
+fn set_v0_maps(psbt: &mut PsbtV2, v0: Psbt) {
+    for (input, v0_input) in psbt.inputs.iter_mut().zip(v0.inputs) {
+        input.psbt = v0_input;
+    }
+    for (output, v0_output) in psbt.outputs.iter_mut().zip(v0.outputs) {
+        output.psbt = v0_output;
+    }
 }
 
 /// Converts a tuple containing an account type and an index into a derivation path.
@@ -1057,6 +1119,150 @@ mod tests {
 
         // signature was added
         assert!(!psbt.inputs[0].partial_sigs.is_empty());
+    }
+
+    #[test]
+    fn sign_v2_clears_modifiable_flags() {
+        let network = Network::Regtest;
+        let signer = new_signer(network);
+        let derivation_path = DerivationPath::from_str("m/84'/0'/0'/0").unwrap();
+        let descriptor = wpkh(signer.xpub(&derivation_path));
+        let derivator = SpkDerivator::new(descriptor.clone(), network).unwrap();
+        let mut psbt = base_psbt();
+        let deriv = (false, 0);
+        let derivation_path = deriv_path(&deriv).unwrap();
+        psbt.inputs[0].bip32_derivation.insert(
+            signer.public_key_at(&derivation_path),
+            (signer.fingerprint(), derivation_path),
+        );
+        let mut missing_witness = PsbtV2::from_bitcoin_psbt(psbt.clone()).unwrap();
+        assert_eq!(
+            signer.sign_v2(&mut missing_witness, &descriptor),
+            Err(Error::MissingWitnessUtxo)
+        );
+
+        psbt.inputs[0].witness_utxo = Some(bitcoin::TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: derivator.receive_spk_at(deriv.1),
+        });
+        let mut psbt = PsbtV2::from_bitcoin_psbt(psbt).unwrap();
+        psbt.tx_modifiable = Some(
+            bwk_psbt::TxModifiable::try_from(
+                bwk_psbt::TxModifiable::INPUTS | bwk_psbt::TxModifiable::OUTPUTS,
+            )
+            .unwrap(),
+        );
+        signer.sign_v2(&mut psbt, &descriptor).unwrap();
+
+        assert_eq!(psbt.tx_modifiable.unwrap().bits(), 0);
+        assert!(!psbt.inputs[0].psbt.partial_sigs.is_empty());
+    }
+
+    #[test]
+    fn sign_v2_rejects_unverified_silent_payment_output() {
+        let network = Network::Regtest;
+        let signer = new_signer(network);
+        let account_path = DerivationPath::from_str("m/84'/0'/0'/0").unwrap();
+        let descriptor = wpkh(signer.xpub(&account_path));
+        let derivator = SpkDerivator::new(descriptor.clone(), network).unwrap();
+        let derivation_path = deriv_path(&(false, 0)).unwrap();
+        let secp = secp256k1::Secp256k1::new();
+        let attacker = secp256k1::PublicKey::from_secret_key(
+            &secp,
+            &secp256k1::SecretKey::from_slice(&[8; 32]).unwrap(),
+        );
+        let attacker_script =
+            ScriptBuf::new_p2tr_tweaked(attacker.x_only_public_key().0.dangerous_assume_tweaked());
+        let mut psbt = base_psbt();
+        psbt.unsigned_tx.output[0].script_pubkey = attacker_script;
+        let pubkey = signer.public_key_at(&derivation_path);
+        psbt.inputs[0]
+            .bip32_derivation
+            .insert(pubkey, (signer.fingerprint(), derivation_path));
+        psbt.inputs[0].witness_utxo = Some(bitcoin::TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: derivator.receive_spk_at(0),
+        });
+        let mut psbt = PsbtV2::from_bitcoin_psbt(psbt).unwrap();
+        let scan_key = secp256k1::PublicKey::from_secret_key(
+            &secp,
+            &secp256k1::SecretKey::from_slice(&[9; 32]).unwrap(),
+        );
+        let spend_key = secp256k1::PublicKey::from_secret_key(
+            &secp,
+            &secp256k1::SecretKey::from_slice(&[10; 32]).unwrap(),
+        );
+        bwk_psbt::sp::set_sp_v0_output(&mut psbt.outputs[0].psbt, scan_key, spend_key, None);
+        psbt.tx_modifiable = Some(bwk_psbt::TxModifiable::none());
+
+        let result = signer.sign_v2(&mut psbt, &descriptor);
+
+        assert_eq!(
+            (result, psbt.inputs[0].psbt.partial_sigs.is_empty()),
+            (Err(Error::PsbtV2), true)
+        );
+    }
+
+    #[test]
+    fn sign_v2_rejects_foreign_taproot_without_mutating() {
+        let network = Network::Regtest;
+        let signer = new_signer(network);
+        let foreign = new_signer(network);
+        let account_path = DerivationPath::from_str("m/86'/0'/0'/0").unwrap();
+        let descriptor = tr(signer.xpub(&account_path));
+        let derivator = SpkDerivator::new(descriptor.clone(), network).unwrap();
+        let deriv = deriv_path(&(false, 0)).unwrap();
+        let internal_key = signer.public_key_at(&deriv).x_only_public_key().0;
+        let mut psbt = base_psbt();
+        psbt.inputs[0].witness_utxo = Some(bitcoin::TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: derivator.receive_spk_at(0),
+        });
+        psbt.inputs[0].tap_internal_key = Some(internal_key);
+        psbt.inputs[0]
+            .tap_key_origins
+            .insert(internal_key, (Vec::new(), (foreign.fingerprint(), deriv)));
+
+        let mut psbt = PsbtV2::from_bitcoin_psbt(psbt).unwrap();
+        psbt.tx_modifiable =
+            Some(bwk_psbt::TxModifiable::try_from(bwk_psbt::TxModifiable::INPUTS).unwrap());
+        let before = psbt.clone();
+
+        assert_eq!(
+            signer.sign_v2(&mut psbt, &descriptor),
+            Err(Error::SigningInfo)
+        );
+        assert_eq!(psbt, before);
+    }
+
+    #[test]
+    fn sign_v2_rejects_mixed_metadata() {
+        let network = Network::Regtest;
+        let signer = new_signer(network);
+        let account_path = DerivationPath::from_str("m/86'/0'/0'/0").unwrap();
+        let descriptor = tr(signer.xpub(&account_path));
+        let derivator = SpkDerivator::new(descriptor.clone(), network).unwrap();
+        let deriv = deriv_path(&(false, 0)).unwrap();
+        let pubkey = signer.public_key_at(&deriv);
+        let internal_key = pubkey.x_only_public_key().0;
+        let mut psbt = base_psbt();
+        psbt.inputs[0].witness_utxo = Some(bitcoin::TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: derivator.receive_spk_at(0),
+        });
+        psbt.inputs[0]
+            .bip32_derivation
+            .insert(pubkey, (signer.fingerprint(), deriv.clone()));
+        psbt.inputs[0].tap_internal_key = Some(internal_key);
+        psbt.inputs[0]
+            .tap_key_origins
+            .insert(internal_key, (Vec::new(), (signer.fingerprint(), deriv)));
+        let mut psbt = PsbtV2::from_bitcoin_psbt(psbt).unwrap();
+
+        assert_eq!(
+            signer.sign_v2(&mut psbt, &descriptor),
+            Err(Error::MixedSigningInfo)
+        );
     }
 
     // Notification Signer tests
