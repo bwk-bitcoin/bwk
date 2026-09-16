@@ -6,6 +6,8 @@
 //! - Stores for coins, transactions, labels, and scan state
 //! - Background scanning thread for continuous blockchain monitoring
 
+#[cfg(feature = "mnemonic")]
+pub mod bip375;
 pub mod coin_store;
 pub mod config;
 pub mod recipient;
@@ -137,6 +139,8 @@ pub enum AccountError {
     InputNotOwned(OutPoint),
     #[error("silent payment derivation failed: {0}")]
     SilentPayment(#[from] crate::core::error::Error),
+    #[error("psbtv2 error")]
+    PsbtV2,
 }
 
 #[cfg(feature = "mnemonic")]
