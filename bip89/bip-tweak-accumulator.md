@@ -17,10 +17,10 @@
 This proposal lets a BIP89 delegator reject derivation tweaks that do not belong
 to the wallet. A signing device holding a key of the descriptor commits, in
 Merkle trees whose leaves are blinded commitments, to the delegation bundles of
-the wallet's derivation indexes, one tree per keychain, and signs each tree root
-with a BIP322 signature by that key. The roots are recorded with the delegator
-at registration, after their signatures are verified, and are not carried in
-each spend. Whenever the delegator is asked to treat a transaction output as
+the wallet's derivation indexes, one tree per keychain, and MAY sign each tree
+root with a BIP322 signature by that key. The roots are recorded with the
+delegator at registration, after any signature they carry is verified, and are
+not carried in each spend. Whenever the delegator is asked to treat a transaction output as
 owned by the wallet, change or receive (self-send), the bundle for that output
 comes with a membership proof, and the delegator verifies it against a recorded
 root. A forged tweak has no leaf and is refused. Revealing a bundle reveals
@@ -284,8 +284,8 @@ The following requirements each apply to every implementation:
 
 ### Root signature
 
-A root is signed by one key of the descriptor, with a BIP322 simple signature
-for the single-key taproot address of that key's branch key.
+A root that is signed is signed by one key of the descriptor, with a BIP322
+simple signature for the single-key taproot address of that key's branch key.
 
 For a key expression whose extended public key `xpub` has base key `P` and
 chain code `c`, with secret key `p` for `P`, the branch path, branch tweak and
@@ -308,31 +308,33 @@ signature = bip322_sign_simple(tr(K), root_message, p + t_branch)
 The BIP322 message is the 32 bytes of `root_message`. The signature is the
 BIP322 simple signature: the consensus-serialized witness stack.
 
-The signed root record carries:
+The root record carries:
 
 ```
-signed_root = { keychain,
+root_record = { keychain,
                 tree_start,
                 root: 32 bytes,
-                key: P, 33 bytes,
-                branch_tweak: t_branch, 32 bytes,
-                signature }
+                signature: optional { key: P, 33 bytes,
+                                      branch_tweak: t_branch, 32 bytes,
+                                      signature } }
 ```
 
 `keychain` and `tree_start` identify the tree and are not covered by the
-signature.
-
-The signing key holder builds and signs one tree per keychain: receive
-(keychain `0`) and change (keychain `1`). The signing key holder MUST build the
-tree itself, from the descriptor it holds, before signing its root. It MUST NOT
-sign a root computed by another party. The signing key holder MAY sign new
-trees at any time; the delegator uses a new root only once it is recorded (see
+signature. The signature is optional: a record without one carries the root
+alone, and whether a delegator accepts such a record is its policy (see
 [Registration](#registration)).
 
-### Verifying a signed root
+The signing key holder builds one tree per keychain: receive (keychain `0`) and
+change (keychain `1`). It MUST build the tree itself, from the descriptor it
+holds. It MUST NOT sign, or hand over for registration, a root computed by
+another party. The signing key holder MAY build new trees at any time; the
+delegator uses a new root only once it is recorded (see
+[Registration](#registration)).
 
-A signed root is verified against a template `D`. The verifier refuses it
-unless all of the following hold:
+### Verifying a root signature
+
+A root record that carries a signature is verified against a template `D`. The
+verifier refuses it unless all of the following hold:
 
 1. `key` MUST be a base key of `D`.
 2. `branch_tweak` MUST be below the curve order, and
@@ -348,18 +350,29 @@ requires it.
 ### Registration
 
 When the descriptor is registered with the delegator, the delegator receives
-the signed root of a receive tree (keychain `0`) and the signed root of a
-change tree (keychain `1`). It verifies both (see
-[Verifying a signed root](#verifying-a-signed-root)) against the template and
-records:
+the root record of a receive tree (keychain `0`) and the root record of a
+change tree (keychain `1`), and records:
 
 ```
 registration = { template D, receive accumulator root, change accumulator root }
 ```
 
-The delegator MUST NOT record a root whose verification fails. The delegator
-MUST obtain the registration over the same authenticated setup channel it uses
-to accept the template.
+The delegator MUST NOT record a root whose record carries a signature that
+fails to verify (see
+[Verifying a root signature](#verifying-a-root-signature)).
+
+Whether the delegator records a root whose record carries no signature is its
+policy. From a signature it gets the statement that a key holder of the wallet
+built the tree; without one, the setup channel carries that statement alone, so
+a delegator MUST NOT accept an unsigned root unless it trusts that channel to
+carry the roots with the same authority it carries the template.
+
+The delegator MUST obtain the registration over the same authenticated setup
+channel it uses to accept the template.
+
+The delegator MUST fix the policy at registration and MUST apply it to every
+later root of the same registration, so a root recorded later is never less
+authenticated than the ones registration accepted.
 
 Which keys of the descriptor a delegator accepts as root signers is policy
 outside this proposal, agreed between the cosigning service and its users.
@@ -372,9 +385,9 @@ After registration, the delegator MUST use the recorded template and roots for
 every verification and MUST NOT use a template or root supplied with a signing
 request. A changed template requires a new registration.
 
-When the tree of a keychain is exhausted, a signing key holder signs the next
-tree for that keychain. The delegator verifies its signed root and records the
-root with the account the same way.
+When the tree of a keychain is exhausted, a signing key holder builds the next
+tree for that keychain. The delegator checks its record under the policy it
+fixed at registration and records the root with the account the same way.
 
 ### Proof format and verification
 
@@ -407,8 +420,8 @@ bytes, for a total of 289 bytes, serialized in that order.
 ### Proof against recorded roots
 
 A spend carries, for each owned output, only the 289-byte proof of its bundle.
-The root and its signature are not carried: the delegator verified the signed
-root when it recorded the root.
+The root and its signature are not carried: the delegator checked the record
+when it recorded the root.
 
 A proof verifies against any root recorded with the account:
 `verify_recorded(bundle, proof, registration)` succeeds when
@@ -544,12 +557,22 @@ accepted for this registration; the delegator already knows the template, so
 binding it leaks nothing. The keychain and tree start are not bound. The
 delegator does not need them to verify a proof.
 
-**Accumulators recorded at registration.** The delegator verifies each signed
-root once, when the root is recorded, rather than on every spend. A spend then
+**Accumulators recorded at registration.** The delegator checks each root
+record once, when the root is recorded, rather than on every spend. A spend then
 carries only the proof, and a host cannot supply a root of its own: a proof
 verifies against recorded roots only. When a tree is exhausted a signing key
-holder signs the next one for that keychain, and the delegator records it the
+holder builds the next one for that keychain, and the delegator records it the
 same way.
+
+**The signature is optional.** The registration travels over the authenticated
+setup channel that carries the template, and a delegator that trusts that
+channel for the template can trust it for the roots. Some signing devices have
+no BIP322 support, and requiring a signature would keep them out. What a
+delegator gives up by accepting an unsigned root is the proof that a key holder
+of the wallet, and not the coordinator, built the tree: the guarantee then rests
+on the setup channel alone. The choice is the delegator's, and it is fixed at
+registration so a later root is never recorded under a weaker rule than the
+wallet was registered with.
 
 **The signing key holder builds the tree.** A root is only as trustworthy as the
 bundles hashed into it. A device that signed a root computed by the coordinator
@@ -588,6 +611,10 @@ non-interchangeable by construction.
 - A compromised key that the delegator's policy accepts as a root signer lets
   an attacker sign a root over forged bundles. Choosing which keys are
   acceptable signers is the delegator's policy.
+- A delegator that accepts unsigned roots has no statement from a key holder
+  that a tree is theirs, so anything that can write on the setup channel can
+  register a root over forged bundles. The setup channel carries the whole
+  guarantee there.
 - A template substituted on the setup channel remains out of scope: the
   registration channel carries the same trust as the BIP89 setup.
 - A delegator that verifies bundles but does not implement this proposal
@@ -609,9 +636,9 @@ ignores the unknown proprietary fields.
 The reference implementation is the `bwk-bip89` crate of this repository.
 Hash primitives and tree generation are in `accumulator/mod.rs`. The
 shuffle order is in `accumulator/shuffle.rs`. Proofs and the tree builders
-are in `accumulator/tree.rs`. Root signing and verification are in
-`accumulator/record.rs`. Registration and verification on the delegator side
-are in `delegator.rs`. BIP322 signing and verification are in
+are in `accumulator/tree.rs`. Root records, their signature and the root policy
+are in `accumulator/record.rs`. Registration and verification on the delegator
+side are in `delegator.rs`. BIP322 signing and verification are in
 `rust_bitcoin/mod.rs`, and the PSBT fields are in `rust_bitcoin/psbt.rs`.
 
 It MUST be the source of the test vectors below; vectors MUST NOT be
