@@ -55,6 +55,9 @@ tests locally. Commit messages must be single-line and follow existing style
 | bwk-coin       | Coin domain types shared by bwk-tx and bwk-electrum         |
 | bwk-persist    | KV persistence: Store, RamStore, JSON/SQLite backends       |
 | bwk-hwi        | Hardware wallet transport and device drivers                |
+| bwk-bip89      | BIP89 chain code delegation and tweak accumulator,          |
+|                | generic over BitcoinBackend, rust-bitcoin backend           |
+| bwk-bip89-ll   | C ABI over BitcoinBackend vtables                           |
 | bwk-error      | In-house derive for error impls, reached as `thiserror`     |
 | bwk-backoff    | Exponential backoff utility                                 |
 | bwk-utils      | Test helpers (behind `test` feature)                        |
@@ -67,6 +70,7 @@ See crate READMEs for usage examples:
 - [descriptor/README.md](descriptor/README.md): SpkDerivator, descriptor helpers
 - [electrum/README.md](electrum/README.md): Electrum client modes
 - [coin/README.md](coin/README.md): coin domain types
+- [bip89/README.md](bip89/README.md): BIP89 chain code delegation, tweak accumulator
 - [error/README.md](error/README.md): the in-house error derive
 
 ## Architecture

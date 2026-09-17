@@ -14,6 +14,7 @@ members = [
     "hwi", "hwi/cli",
     "hwi/ledger-bitcoin-client", "hwi/ledger-transport-hidapi", "hwi/bitbox-api",
     "secp256k1_spscan-sys",
+    "bip89", "bip89/ll", "bip89/cabi", "bip89/example",
 ]
 
 [workspace.package]
@@ -31,6 +32,7 @@ bwk-hwi = { path = "hwi", default-features = false }
 base64ct = "=1.6.0"
 url = "=2.5.2"
 bip39 = "2.2.0"
+bip322 = "0.0.12"
 bitcoin = { version = "0.32", features = ["serde"] }
 bitcoin_slices = "0.8.0"
 hex = "0.4"
@@ -78,6 +80,8 @@ bwk-persist = { path = "persist" }
 bwk-utils = { path = "utils" }
 bwk-p2p = { path = "p2p" }
 bwk = { path = "bwk" }
+bwk-bip89 = { path = "bip89", default-features = false }
+bwk-bip89-ll = { path = "bip89/ll" }
 # bwk-error is the in-house derive. Aliasing the package as `thiserror` is deliberate,
 # not an oversight: error definitions across the tree keep reading `thiserror::Error`,
 # so the switch is a one-line manifest change instead of a rename touching every error
