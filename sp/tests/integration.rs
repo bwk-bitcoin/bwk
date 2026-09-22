@@ -352,28 +352,18 @@ fn test_reorg_handling(env: &mut TestEnv) {
         )
         .expect("generate address");
     // The original funding coins are back in the wallet, send them elsewhere.
-    // invalidateblock re-credits the orphaned inputs asynchronously, so under load
-    // the send can briefly hit -6 "Insufficient funds"; retry until it is funded
-    // instead of failing the test on that race.
-    let send_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        match env.bitcoind.client.call::<String>(
+    // invalidateblock re-credits the orphaned inputs asynchronously;
+    // internally calls `syncwithvalidationinterfacequeue`.
+    env.bitcoind
+        .client
+        .call::<String>(
             "sendtoaddress",
             &[
-                serde_json::Value::String(new_addr.clone()),
+                serde_json::Value::String(new_addr),
                 serde_json::Value::from(0.05), // Less than original to avoid issues
             ],
-        ) {
-            Ok(_) => break,
-            Err(e) => {
-                assert!(
-                    std::time::Instant::now() < send_deadline,
-                    "send to different address: {e:?}"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-        }
-    }
+        )
+        .unwrap();
 
     // 13. Mine new blocks on alternate chain
     env.mine(5);
