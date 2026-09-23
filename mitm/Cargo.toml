@@ -1,0 +1,25 @@
+[package]
+name = "bwk-mitm"
+version = "0.0.1"
+readme.workspace = true
+license-file.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+
+[[bin]]
+name = "bwk-mitm"
+path = "src/main.rs"
+
+[dependencies]
+bwk-backoff = { workspace = true }
+native-tls.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
+log.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
