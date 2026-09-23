@@ -11,6 +11,7 @@ members = [
     "keys", "utils", "sign", "descriptor", "tx",
     "persist",
     "p2p",
+    "mitm",
     "hwi", "hwi/cli",
     "hwi/ledger-bitcoin-client", "hwi/ledger-transport-hidapi", "hwi/bitbox-api",
     "secp256k1_spscan-sys",
