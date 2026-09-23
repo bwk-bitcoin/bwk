@@ -9,6 +9,10 @@ authors.workspace = true
 repository.workspace = true
 keywords.workspace = true
 
+[[bin]]
+name = "bwk-mitm"
+path = "src/main.rs"
+
 [dependencies]
 bwk-backoff = { workspace = true }
 native-tls.workspace = true
