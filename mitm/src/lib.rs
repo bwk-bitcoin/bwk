@@ -4,6 +4,7 @@ pub mod attribute;
 pub mod error;
 pub mod metrics;
 pub mod proxy;
+pub mod report;
 pub mod trace;
 
 use std::{net::SocketAddr, sync::Arc};
