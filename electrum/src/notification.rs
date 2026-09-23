@@ -1,5 +1,12 @@
 //! Events the scanner reports, and the errors it surfaces.
 
+use std::collections::BTreeMap;
+
+use bwk_sign::{
+    bwk_keys::keys::OXpub,
+    identity::{SignerId, SignerInfo},
+    protocol::RequestId,
+};
 #[cfg(feature = "sp")]
 use miniscript::bitcoin::OutPoint;
 use miniscript::bitcoin::Txid;
@@ -29,8 +36,80 @@ pub enum Notification {
     /// A merkle proof failed verification, or the header store itself
     /// failed validation; the affected entry was refused promotion.
     ValidationFailed(ValidationFailure),
+    Signer(SignerNotification),
     #[cfg(feature = "sp")]
     Sp(SpNotification),
+}
+
+/// Results and events from every attached signing manager. Not feature
+/// gated: every account has managers, even a watch-only one with none
+/// attached.
+#[derive(Debug)]
+pub enum SignerNotification {
+    ManagerAttached {
+        manager: String,
+    },
+    ManagerDetached {
+        manager: String,
+    },
+    Signers(Vec<SignerInfo>),
+    Initialized {
+        request: RequestId,
+        signer: SignerId,
+    },
+    Info {
+        request: RequestId,
+        signer: SignerId,
+        info: BTreeMap<String, String>,
+    },
+    Xpub {
+        request: RequestId,
+        signer: SignerId,
+        xpub: OXpub,
+    },
+    DescriptorIsRegistered {
+        request: RequestId,
+        signer: SignerId,
+        registered: bool,
+    },
+    DescriptorRegistered {
+        request: RequestId,
+        signer: SignerId,
+        registered: bool,
+    },
+    /// The bytes may or may not be fully signed: an updated PSBT is simply
+    /// recorded, not combined or verified here. Emitted when no verifier is
+    /// installed on the pump (e.g. `bwk::account::Account`, which has no
+    /// BIP375 validator).
+    PsbtUpdated {
+        request: RequestId,
+        signer: SignerId,
+        psbt: Vec<u8>,
+    },
+    /// A signed PSBT that passed the installed verifier.
+    PsbtVerified {
+        request: RequestId,
+        signer: SignerId,
+        psbt: Vec<u8>,
+    },
+    /// A signed PSBT that failed the installed verifier. Deliberately carries
+    /// no PSBT bytes: a signer-tampered PSBT must not be routable into
+    /// finalize by a consumer that missed the reason.
+    PsbtVerificationFailed {
+        request: RequestId,
+        signer: SignerId,
+        reason: String,
+    },
+    Raw {
+        request: RequestId,
+        signer: SignerId,
+        payload: Vec<u8>,
+    },
+    Error {
+        request: Option<RequestId>,
+        signer: Option<SignerId>,
+        message: String,
+    },
 }
 
 /// Silent Payments notification variants (behind `sp` feature).
@@ -87,6 +166,12 @@ impl From<TxListenerNotif> for Notification {
 impl From<SpNotification> for Notification {
     fn from(sp: SpNotification) -> Self {
         Notification::Sp(sp)
+    }
+}
+
+impl From<SignerNotification> for Notification {
+    fn from(n: SignerNotification) -> Self {
+        Notification::Signer(n)
     }
 }
 

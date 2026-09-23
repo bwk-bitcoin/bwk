@@ -2,7 +2,6 @@ pub mod account;
 pub mod config;
 #[cfg(feature = "logger")]
 pub mod log;
-pub mod profile;
 pub mod sync;
 
 // Re-exports

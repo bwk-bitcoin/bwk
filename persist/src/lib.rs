@@ -94,15 +94,6 @@ pub const COINS_STORE_KEY: &str = "coins";
 /// Logical store name for the bwk-sp (silent-payment) transaction store.
 pub const TXS_STORE_KEY: &str = "txs";
 
-/// Logical store name for hot-signer material (BIP32 mnemonics +
-/// per-signer descriptor sets), keyed by signer fingerprint.
-///
-/// Under [`PersistenceKind::Sqlite`] the `Account` constructor opens
-/// this store against [`NoopBackend`] so secrets never reach the
-/// SQLite DB; under JSON the store is a sibling of `transactions.json`,
-/// `labels.json`, etc.
-pub const SIGNERS_STORE_KEY: &str = "signers";
-
 /// Logical store name for the bwk validated header chain.
 ///
 /// The header chain uses a binary fixed-record cache keyed by block height.
@@ -123,7 +114,6 @@ pub const KNOWN_STORES: &[&str] = &[
     STATUSES_STORE_KEY,
     COINS_STORE_KEY,
     TXS_STORE_KEY,
-    SIGNERS_STORE_KEY,
     HEADERS_STORE_KEY,
 ];
 
@@ -216,5 +206,18 @@ mod tests {
         assert_eq!(sqlite, "\"sqlite\"");
         let back: PersistenceKind = serde_json::from_str(&json).unwrap();
         assert_eq!(back, PersistenceKind::Json);
+    }
+
+    #[test]
+    fn signers_store_name_is_rejected() {
+        // bwk has no persistence path for signer material; "signers" must
+        // be genuinely gone from KNOWN_STORES, not merely unused.
+        let backend = NoopBackend;
+        assert_eq!(
+            backend.validate_store_name("signers"),
+            Err(PersistError::UnknownStore {
+                found: "signers".to_string()
+            })
+        );
     }
 }

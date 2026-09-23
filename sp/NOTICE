@@ -12,6 +12,10 @@ The BIP352 send and receive test vectors in
 tests/resources/send_and_receive_test_vectors.json are the public BIP352
 test-vector fixture also used by rust-silentpayments and SPDK.
 
+The BIP374 DLEQ proof code is ported as part of the SPDK
+silent-payment implementation. Its tests use the public BIP374 test
+vectors.
+
 The SPDK and rust-silentpayments code is MIT licensed:
 
 MIT License
