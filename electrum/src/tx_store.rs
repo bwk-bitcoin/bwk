@@ -34,12 +34,17 @@ pub fn decode_entry(bytes: &[u8]) -> Result<TxEntry, PersistError> {
 ///
 /// Tracks the progression from "not seen in any block" to "server claims
 /// inclusion at height H" to "we have a verified merkle proof of
-/// inclusion at height H". Block hash is carried on the confirmed variants
-/// so consumers can reason about which chain the claim or proof refers to.
+/// inclusion at height H". Variants are ordered by increasing trust. Block
+/// hash is carried on the variants naming a block, so consumers can reason
+/// about which chain the claim or proof refers to.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Inclusion {
     /// Mempool tx, or no inclusion info yet.
     Unconfirmed,
+    /// The server reported inclusion at `height`, and there is no validated
+    /// chain to check it against, so there is no block hash and no proof.
+    /// Weaker than `ConfirmedUnverified`, which at least names the block.
+    ReportedAt { height: u32 },
     /// Server reported inclusion at `height` in the block identified by
     /// `block_hash`, but we haven't proved it via a merkle branch yet.
     /// Named to mirror [`CoinStatus::ConfirmedUnverified`].
@@ -59,17 +64,19 @@ impl Inclusion {
     pub fn height(&self) -> Option<u32> {
         match self {
             Inclusion::Unconfirmed | Inclusion::VerifyFailed { .. } => None,
-            Inclusion::ConfirmedUnverified { height, .. } | Inclusion::Verified { height, .. } => {
-                Some(*height)
-            }
+            Inclusion::ReportedAt { height }
+            | Inclusion::ConfirmedUnverified { height, .. }
+            | Inclusion::Verified { height, .. } => Some(*height),
         }
     }
 
-    /// Block hash, if confirmed. `VerifyFailed` is not trusted as confirmed,
-    /// so it yields `None`.
+    /// Block hash, if known. `ReportedAt` names no block, and `VerifyFailed`
+    /// is not trusted as confirmed, so both yield `None`.
     pub fn block_hash(&self) -> Option<BlockHash> {
         match self {
-            Inclusion::Unconfirmed | Inclusion::VerifyFailed { .. } => None,
+            Inclusion::Unconfirmed
+            | Inclusion::ReportedAt { .. }
+            | Inclusion::VerifyFailed { .. } => None,
             Inclusion::ConfirmedUnverified { block_hash, .. }
             | Inclusion::Verified { block_hash, .. } => Some(*block_hash),
         }
@@ -423,6 +430,9 @@ mod tests {
         let e = entry_with(Inclusion::Unconfirmed);
         assert_eq!(e.height(), None);
 
+        let e = entry_with(Inclusion::ReportedAt { height: 21 });
+        assert_eq!(e.height(), Some(21));
+
         let e = entry_with(Inclusion::ConfirmedUnverified {
             height: 42,
             block_hash: dummy_block_hash(),
@@ -445,6 +455,9 @@ mod tests {
     #[test]
     fn block_hash_accessor_matches_variant() {
         let e = entry_with(Inclusion::Unconfirmed);
+        assert_eq!(e.block_hash(), None);
+
+        let e = entry_with(Inclusion::ReportedAt { height: 21 });
         assert_eq!(e.block_hash(), None);
 
         let hash = dummy_block_hash();
@@ -474,6 +487,15 @@ mod tests {
         let v = Inclusion::Unconfirmed;
         let s = serde_json::to_string(&v).unwrap();
         assert_eq!(s, "\"Unconfirmed\"");
+        let back: Inclusion = serde_json::from_str(&s).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn inclusion_json_round_trip_reported_at() {
+        let v = Inclusion::ReportedAt { height: 12_345 };
+        let s = serde_json::to_string(&v).unwrap();
+        assert_eq!(s, "{\"ReportedAt\":{\"height\":12345}}");
         let back: Inclusion = serde_json::from_str(&s).unwrap();
         assert_eq!(v, back);
     }

@@ -48,6 +48,13 @@ impl<P: ScanProfile> Reconciler<P> {
         header_store: Arc<HeaderStore<P::HeaderStore>>,
         notification: mpsc::Sender<Notification>,
     ) -> Self {
+        // Before the scan can report a height: from here on the store queues
+        // its claims for this pass instead of stamping them `ReportedAt`.
+        scanner
+            .coin_store()
+            .lock()
+            .expect("poisoned")
+            .set_reconciler_promotes();
         let mut reconciler = Reconciler {
             coin_store: scanner.coin_store().clone(),
             scan_listeners: scanner.scan_listeners(),
@@ -103,9 +110,11 @@ impl<P: ScanProfile> Reconciler<P> {
     /// Re-queue a merkle fetch for every `ConfirmedUnverified` entry when the
     /// merkle client is (re)connected, covering entries stranded while it was
     /// down; it bypasses the in-flight guard, so a fetch that died with the old
-    /// client is asked again.
-    pub fn requeue_confirmed_unverified(&self) {
-        requeue_confirmed_unverified(&self.coin_store, &self.header_store, self.merkle_id);
+    /// client is asked again. `ReportedAt` entries, which a scan that ran
+    /// before this pass existed stamped without queueing anything, go back into
+    /// the claim queue on the way.
+    pub fn requeue_unverified_claims(&self) {
+        requeue_unverified_claims(&self.coin_store, &self.header_store, self.merkle_id);
     }
 }
 
@@ -142,7 +151,7 @@ fn reconcile<P: ScanProfile>(
 ) {
     // Entries left ConfirmedUnverified by a previous run have no fetch in
     // flight any more; ask for their proofs again.
-    requeue_confirmed_unverified(&coin_store, &header_store, merkle_id);
+    requeue_unverified_claims(&coin_store, &header_store, merkle_id);
     stamp_confirmation_times(&coin_store, &header_store);
 
     let mut backoff = Backoff::new_ms(IDLE_BACKOFF_MS);
@@ -479,17 +488,18 @@ fn queue_merkle_fetches<P: ScanProfile>(
     }
 }
 
-/// Body of [`Reconciler::requeue_confirmed_unverified`], also run at thread
+/// Body of [`Reconciler::requeue_unverified_claims`], also run at thread
 /// start where the two stores are held directly.
-fn requeue_confirmed_unverified<P: ScanProfile>(
+fn requeue_unverified_claims<P: ScanProfile>(
     coin_store: &Mutex<CoinStore<P>>,
     header_store: &HeaderStore<P::HeaderStore>,
     merkle_id: ListenerId,
 ) {
-    let to_fetch = coin_store
-        .lock()
-        .expect("poisoned")
-        .confirmed_unverified_claims();
+    let to_fetch = {
+        let mut store = coin_store.lock().expect("poisoned");
+        store.requeue_reported_claims();
+        store.confirmed_unverified_claims()
+    };
     queue_merkle_fetches::<P>(header_store, merkle_id, to_fetch);
 }
 
@@ -518,14 +528,16 @@ mod tests {
         label_store::LabelStore,
         notification::{Notification, ValidationFailure},
         reconcile::{
-            drain_ticks, handle_merkle_outcome, handle_tx_merkle, on_chain_update, Reconciler,
+            drain_ticks, handle_merkle_outcome, handle_tx_merkle, on_chain_update,
+            requeue_unverified_claims, Reconciler,
         },
         scanner::ElectrumScanner,
         tx_store::{Inclusion, TxStore},
     };
 
     // Build a bare `CoinStore` (no listener thread) for testing the
-    // CTA helpers directly.
+    // CTA helpers directly. Promotion is the reconciler's, as after a
+    // `Reconciler::spawn`, since that is the pass these helpers belong to.
     fn bare_coin_store() -> (Arc<Mutex<CoinStore>>, SpkDerivator) {
         let (notif_sender, _notif_recv) = mpsc::channel();
         let mnemo = Mnemonic::generate(12).unwrap();
@@ -553,6 +565,7 @@ mod tests {
             label_store,
             account_store,
         )));
+        coin_store.lock().unwrap().set_reconciler_promotes();
         (coin_store, derivator)
     }
 
@@ -1562,6 +1575,13 @@ mod tests {
         let (req_tx, req_rx) = mpsc::channel::<CoinRequest>();
         header_store.set_merkle_sender_for_test(req_tx);
 
+        // Spawned before the fold, as every caller does, so the reported height
+        // is queued as a claim rather than stamped on the entry.
+        let (notif_tx, _notif_rx) = mpsc::channel();
+        let scan_listeners = scanner.scan_listeners();
+        let _reconciler = Reconciler::spawn(&scanner, header_store, notif_tx);
+        assert_eq!(scan_listeners.listener_count(), 1);
+
         // Fold the tx the way the listener does: history first, then its bytes.
         {
             let mut store = scanner.coin_store().lock().unwrap();
@@ -1572,10 +1592,6 @@ mod tests {
             store.handle_txs_response(vec![tx]);
         }
 
-        let (notif_tx, _notif_rx) = mpsc::channel();
-        let scan_listeners = scanner.scan_listeners();
-        let _reconciler = Reconciler::spawn(&scanner, header_store, notif_tx);
-        assert_eq!(scan_listeners.listener_count(), 1);
         assert!(
             matches!(req_rx.try_recv(), Err(TryRecvError::Empty)),
             "the claim must sit until a tick wakes the pass"
@@ -1592,6 +1608,66 @@ mod tests {
                 assert_eq!(height, h);
             }
             other => panic!("expected GetTxMerkle for the promoted claim, got {other:?}"),
+        }
+    }
+
+    // A scan that ran before any reconciler existed stamped its heights onto
+    // the entries and queued nothing, so those entries are invisible to the
+    // claim resolver. The startup/reconnect requeue is what hands them back.
+    #[test]
+    fn a_requeue_promotes_entries_stamped_before_the_pass_existed() {
+        use crate::{header_store::HeaderStore, tx_store::TxEntry};
+
+        let (coin_store, _derivator) = bare_coin_store();
+
+        let tx = funding_tx(bitcoin::ScriptBuf::new(), 0.1);
+        let txid = tx.compute_txid();
+        let h: u32 = 6;
+
+        let (map, hash_at_h) = build_header_map(h + 1);
+        let header_store = HeaderStore::from_map(Network::Regtest, map);
+        let (req_tx, req_rx) = mpsc::channel::<CoinRequest>();
+        header_store.set_merkle_sender_for_test(req_tx);
+
+        {
+            let mut store = coin_store.lock().unwrap();
+            let tx_store = store.tx_store_mut();
+            tx_store.update(TxEntry::for_test(tx));
+            tx_store.update_inclusion(&txid, Inclusion::ReportedAt { height: h });
+            assert!(store.pending_claims_snapshot().is_empty());
+        }
+
+        let merkle_id = ListenerId::next();
+        requeue_unverified_claims(&coin_store, &header_store, merkle_id);
+        {
+            let snapshot = coin_store.lock().unwrap().pending_claims_snapshot();
+            assert!(
+                snapshot.get(&h).map(|s| s.contains(&txid)).unwrap_or(false),
+                "the stamped entry was not re-queued: {snapshot:?}",
+            );
+        }
+
+        let (notif_tx, _notif_rx) = mpsc::channel();
+        on_chain_update(&coin_store, &header_store, &notif_tx, merkle_id);
+
+        {
+            let mut store = coin_store.lock().unwrap();
+            let entry = store.tx_store_mut().get(&txid).unwrap();
+            assert_eq!(
+                entry.inclusion(),
+                &Inclusion::ConfirmedUnverified {
+                    height: h,
+                    block_hash: hash_at_h,
+                },
+                "the re-queued claim was not promoted",
+            );
+        }
+        match req_rx.try_recv() {
+            Ok(CoinRequest::GetTxMerkle { txid: t, height }) => {
+                assert_eq!(t, txid);
+                assert_eq!(height, h);
+            }
+            other => panic!("expected GetTxMerkle for the re-queued claim, got {other:?}"),
         }
     }
 
