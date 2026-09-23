@@ -757,12 +757,12 @@ mod tests {
         ));
     }
 
-    /// A tx the server reported confirmed but the chain has not promoted yet
-    /// must surface as `ConfirmedUnverified` at the reported height, so the
-    /// payment does not read as unconfirmed while its proof is pending.
+    /// A tx the server reported confirmed but no chain has checked must
+    /// surface as `ConfirmedUnverified` at the reported height, so the payment
+    /// does not read as unconfirmed while nothing verifies it.
     #[cfg(feature = "test")]
     #[test]
-    fn payment_history_projects_pending_claim_as_confirmed_unverified() {
+    fn payment_history_projects_reported_height_as_confirmed_unverified() {
         use crate::{coin_store::ClaimAt, tx_store::Inclusion};
         use bwk_utils::test::funding_tx;
 
@@ -786,7 +786,7 @@ mod tests {
             .into_iter()
             .find(|entry| entry.txid() == txid)
             .expect("tx entry");
-        assert!(matches!(tx_entry.inclusion(), Inclusion::Unconfirmed));
+        assert_eq!(tx_entry.inclusion(), &Inclusion::ReportedAt { height: 1 });
 
         let payment = scanner
             .payment_history()

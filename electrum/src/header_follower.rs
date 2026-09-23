@@ -147,7 +147,7 @@ impl<P: OpenScanFromBackend> HeaderFollower<P> {
         // The merkle client is a fresh connection: whatever was queued on the
         // dead one never gets an answer, so ask again.
         for reconciler in reconcilers {
-            reconciler.requeue_confirmed_unverified();
+            reconciler.requeue_unverified_claims();
         }
     }
 

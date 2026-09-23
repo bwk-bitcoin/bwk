@@ -172,10 +172,18 @@ where
                         scan_listeners.notify(());
                     }
                     CoinResponse::Txs(txs) => {
-                        coin_store
-                            .lock()
-                            .expect("poisoned")
-                            .handle_txs_response(txs);
+                        let mut store = coin_store.lock().expect("poisoned");
+                        // A landing tx can carry a height the history already
+                        // reported, stamped from the pending claim. Flush it or
+                        // the next start refetches the whole history to relearn it.
+                        let stamped = store.handle_txs_response(txs);
+                        if stamped {
+                            store.tx_store_mut().persist();
+                        }
+                        drop(store);
+                        if stamped {
+                            let _ = notification.send(Notification::PaymentHistoryUpdated);
+                        }
                         scan_listeners.notify(());
                     }
                     CoinResponse::TxMerkle { txid, height, .. } => {
@@ -380,13 +388,17 @@ fn handle_history_response_msg<P: ScanProfile>(
     {
         return signal_stopped(request, notification);
     }
-    let pending_changed = store.record_reported_heights(&outcome.reported);
-    if outcome.height_updated {
+    // Without a reconciler `record_reported_heights` writes the height onto the
+    // tx itself, so its outcome has to drive the flush and the regeneration too,
+    // or the coin keeps a stale status and the height dies with the process.
+    let reported_changed = store.record_reported_heights(&outcome.reported);
+    let changed = reported_changed || outcome.height_updated;
+    if changed {
         store.tx_store_mut().persist();
         store.generate();
     }
     drop(store);
-    if pending_changed || outcome.height_updated {
+    if changed {
         let _ = notification.send(Notification::PaymentHistoryUpdated);
     }
     ControlFlow::Continue(())
@@ -399,6 +411,10 @@ fn handle_history_response_msg<P: ScanProfile>(
 /// without this a tx already confirmed at some height would stay Unconfirmed
 /// until an unrelated status change. The server re-reports the height, which
 /// `record_reported_heights` turns back into a claim.
+///
+/// A tx whose height is already recorded is not in that set, so this costs one
+/// `History` per spk that genuinely has nothing confirmed yet, not one per spk
+/// that owns a coin.
 fn refresh_unconfirmed_history<P: ScanProfile>(
     coin_store: &Mutex<CoinStore<P>>,
     electrum_req: &mpsc::Sender<CoinRequest>,
@@ -712,17 +728,16 @@ mod tests {
         // NOTE: coin_store already have the tx it should not ask it
         assert!(matches!(mock.request.try_recv(), Err(TryRecvError::Empty)));
 
-        // The server reports inclusion at height 1. `insert_history`
-        // resets the entry to `Unconfirmed`, then `record_reported_heights`
-        // queues the claim in `pending_claims`. The scan never promotes it:
-        // that is the reconciler's job, against the validated chain. The
-        // derived coin height therefore stays None and the status stays
-        // Unconfirmed.
+        // The server reports inclusion at height 1. `insert_history` resets the
+        // entry to `Unconfirmed`, then `record_reported_heights` stamps it
+        // `ReportedAt`: no reconciler runs here, so nothing would ever promote a
+        // queued claim. The height is the server's, unchecked, which is what
+        // ConfirmedUnverified means.
         let mut coins = mock.coins();
         assert_eq!(coins.len(), 1);
         let coin = coins.pop_first().unwrap().1;
-        assert_eq!(coin.height(), None);
-        assert_eq!(coin.status(), CoinStatus::Unconfirmed);
+        assert_eq!(coin.height(), Some(1));
+        assert_eq!(coin.status(), CoinStatus::ConfirmedUnverified);
         (tx_0, mock)
     }
 
@@ -830,9 +845,8 @@ mod tests {
         // change drives `insert_history` to reset the entry to
         // `Inclusion::Unconfirmed` (this is the demotion path, owned by
         // history, not by the reconciler). `record_reported_heights` then
-        // queues the claim at height 2, and the scan stops there, so the
-        // entry stays Unconfirmed and the derived coin height is None.
-        assert_eq!(coin.height(), None);
+        // re-stamps it at the new height, with no reconciler to defer to.
+        assert_eq!(coin.height(), Some(2));
     }
 
     // After a restart `pending_claims` (a non-persisted cache) is empty while a

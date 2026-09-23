@@ -28,7 +28,11 @@ impl From<&Inclusion> for CoinStatus {
             // A failed merkle proof is not trusted as confirmed: surface it as
             // unconfirmed so it is never counted spendable-as-confirmed.
             Inclusion::Unconfirmed | Inclusion::VerifyFailed { .. } => CoinStatus::Unconfirmed,
-            Inclusion::ConfirmedUnverified { .. } => CoinStatus::ConfirmedUnverified,
+            // A server-reported height is a confirmation nothing has checked,
+            // which is exactly what ConfirmedUnverified means.
+            Inclusion::ReportedAt { .. } | Inclusion::ConfirmedUnverified { .. } => {
+                CoinStatus::ConfirmedUnverified
+            }
             Inclusion::Verified { .. } => CoinStatus::Confirmed,
         }
     }
@@ -72,7 +76,9 @@ impl From<&Inclusion> for PaymentStatus {
     fn from(inclusion: &Inclusion) -> Self {
         match inclusion {
             Inclusion::Unconfirmed => Self::Unconfirmed,
-            Inclusion::ConfirmedUnverified { .. } => Self::ConfirmedUnverified,
+            Inclusion::ReportedAt { .. } | Inclusion::ConfirmedUnverified { .. } => {
+                Self::ConfirmedUnverified
+            }
             Inclusion::Verified { .. } => Self::Verified,
             Inclusion::VerifyFailed { .. } => Self::VerifyFailed,
         }
@@ -204,13 +210,19 @@ pub struct CoinStore<P: ScanProfile = RamProfile<DefaultBackend>> {
     notification: mpsc::Sender<Notification>,
     /// Pending claims indexed by server-reported height. A txid lands
     /// here when the server reports it at height H but the HeaderStore
-    /// doesn't yet have a header at H; the next CTA resolves it.
+    /// doesn't yet have a header at H (the next CTA resolves it), or when
+    /// its bytes have not arrived yet (`handle_txs_response` resolves it).
     pending_claims: BTreeMap<u32, BTreeSet<Txid>>,
     /// Claims with a `GetTxMerkle` fetch in flight, so a chain tick does not
     /// re-queue a proof already being fetched (fetch-storm guard). Cleared
     /// when the response lands (`clear_merkle_in_flight`) or the entry leaves
     /// `ConfirmedUnverified`. In-memory runtime state, never persisted.
     merkle_in_flight: BTreeSet<ClaimAt>,
+    /// A [`Reconciler`](crate::reconcile::Reconciler) owns claim promotion for
+    /// this store, so a server-reported height is queued in `pending_claims`
+    /// instead of being written straight to the tx. False until
+    /// [`set_reconciler_promotes`](Self::set_reconciler_promotes) is called.
+    reconciler_promotes: bool,
 }
 
 #[derive(Debug, Default)]
@@ -350,7 +362,15 @@ impl<P: ScanProfile> CoinStore<P> {
             derivator,
             pending_claims: BTreeMap::new(),
             merkle_in_flight: BTreeSet::new(),
+            reconciler_promotes: false,
         }
+    }
+
+    /// Hand claim promotion to a reconciler. Called by
+    /// [`Reconciler::spawn`](crate::reconcile::Reconciler::spawn), before the
+    /// scan it is paired with can report a single height.
+    pub(crate) fn set_reconciler_promotes(&mut self) {
+        self.reconciler_promotes = true;
     }
 
     /// Stamp every confirmed, un-timestamped tx with its confirming block time,
@@ -639,10 +659,16 @@ impl<P: ScanProfile> CoinStore<P> {
     ///
     /// # Parameters
     /// - `txs`: A vector of Bitcoin transactions received.
-    pub fn handle_txs_response(&mut self, txs: Vec<bitcoin::Transaction>) {
+    ///
+    /// # Returns
+    /// Whether a queued claim was stamped onto a landed tx, so the caller
+    /// persists the tx store instead of leaving the height in RAM.
+    pub fn handle_txs_response(&mut self, txs: Vec<bitcoin::Transaction>) -> bool {
+        let mut landed = Vec::with_capacity(txs.len());
         // iter over updates & populate where the transaction is required
         for new_tx in txs {
             let new_txid = new_tx.compute_txid();
+            landed.push(new_txid);
             for Update { txs, .. } in &mut self.updates {
                 txs.iter_mut().for_each(|(txid, tx)| {
                     if (*txid == new_txid) && tx.is_none() {
@@ -669,8 +695,54 @@ impl<P: ScanProfile> CoinStore<P> {
                 .collect();
         } // <- release &mut tx_store
 
+        let stamped = self.stamp_landed_claims(&landed);
+
         // re-generate coin store from tx store
         self.generate();
+        stamped
+    }
+
+    /// Drain the pending claim of every just-landed tx, stamping the
+    /// server-reported height onto its fresh entry.
+    ///
+    /// `record_reported_heights` queues a claim when the history names a height
+    /// for a tx whose bytes are still in flight. With a reconciler that queue is
+    /// drained by `resolve_pending_claims` against the validated chain, so this
+    /// is a no-op; without one this is the only place the entry ever exists
+    /// while the claim is still queued.
+    fn stamp_landed_claims(&mut self, landed: &[Txid]) -> bool {
+        if self.reconciler_promotes {
+            return false;
+        }
+        let mut stamped = false;
+        for txid in landed {
+            let Some(height) = self.pending_claim_height(txid) else {
+                continue;
+            };
+            // The bytes can land while the update they belong to is still
+            // incomplete: no entry yet, so keep the claim for a later pass.
+            let Some(inclusion) = self.tx_store.get(txid).map(|e| e.inclusion().clone()) else {
+                continue;
+            };
+            let promote = match inclusion {
+                Inclusion::Unconfirmed => true,
+                Inclusion::ReportedAt { height: current } => current != height,
+                // Already promoted or terminally resolved: never demote.
+                Inclusion::ConfirmedUnverified { .. }
+                | Inclusion::Verified { .. }
+                | Inclusion::VerifyFailed { .. } => false,
+            };
+            self.remove_pending_claim(ClaimAt {
+                txid: *txid,
+                height,
+            });
+            if promote {
+                self.tx_store
+                    .update_inclusion(txid, Inclusion::ReportedAt { height });
+                stamped = true;
+            }
+        }
+        stamped
     }
 
     /// Record a just-broadcast transaction as unconfirmed and rebuild the coin
@@ -1107,13 +1179,18 @@ impl<P: ScanProfile> CoinStore<P> {
         to_fetch.push(claim);
     }
 
-    /// Queue every server-reported `(txid, height)` claim in
-    /// `pending_claims`. The scanner has no view of the validated chain, so
-    /// promotion is left to the reconciler's
-    /// [`resolve_pending_claims`](Self::resolve_pending_claims) pass. Returns
-    /// whether the queue changed.
+    /// Record every server-reported `(txid, height)` claim.
+    ///
+    /// With a reconciler the claim is queued in `pending_claims` and promotion
+    /// is left to its
+    /// [`resolve_pending_claims`](Self::resolve_pending_claims) pass, against
+    /// the validated chain. Without one the height is written straight to the
+    /// tx as [`Inclusion::ReportedAt`], or, when its bytes have not landed yet,
+    /// queued for [`handle_txs_response`](Self::handle_txs_response) to stamp.
+    /// Returns whether anything changed.
     pub fn record_reported_heights(&mut self, reported: &[ClaimAt]) -> bool {
         let before = self.pending_claims.clone();
+        let mut stamped = false;
         for &ClaimAt { txid, height } in reported {
             // `reported` carries EVERY confirmed tx in each scripthash history,
             // not just the ones whose height changed. This pass is promote-only:
@@ -1138,15 +1215,41 @@ impl<P: ScanProfile> CoinStore<P> {
             self.prune_pending_claim(ClaimAt { txid, height });
 
             match current {
-                // Unconfirmed, or the tx bytes have not landed yet.
-                Some(Inclusion::Unconfirmed) | None => {
-                    self.insert_pending_claim(ClaimAt { txid, height });
+                Some(Inclusion::Unconfirmed | Inclusion::ReportedAt { .. }) => {
+                    if self.reconciler_promotes {
+                        self.insert_pending_claim(ClaimAt { txid, height });
+                    } else {
+                        self.tx_store
+                            .update_inclusion(&txid, Inclusion::ReportedAt { height });
+                        stamped = true;
+                    }
                 }
-                // Already ConfirmedUnverified or Verified: never demote here.
-                Some(_) => {}
+                // The tx bytes have not landed yet, so there is no entry to
+                // stamp. Queue the claim whichever side owns promotion: with a
+                // reconciler `resolve_pending_claims` drains it, without one
+                // `handle_txs_response` does once the bytes arrive. Dropping it
+                // here costs a full history refetch on the next run just to
+                // relearn a height the server already reported.
+                None => self.insert_pending_claim(ClaimAt { txid, height }),
+                // Already promoted or terminally resolved: never demote here.
+                Some(Inclusion::ConfirmedUnverified { .. })
+                | Some(Inclusion::Verified { .. })
+                | Some(Inclusion::VerifyFailed { .. }) => {}
             }
         }
-        before != self.pending_claims
+        before != self.pending_claims || stamped
+    }
+
+    /// Queue every [`Inclusion::ReportedAt`] entry as a pending claim, so a
+    /// reconciler spawned after the scan that stamped them can promote them
+    /// against the validated chain: they were written straight to the tx and
+    /// queued nowhere.
+    pub fn requeue_reported_claims(&mut self) {
+        for (txid, inclusion) in self.snapshot_inclusions() {
+            if let Inclusion::ReportedAt { height } = inclusion {
+                self.insert_pending_claim(ClaimAt { txid, height });
+            }
+        }
     }
 
     /// Re-queue the merkle fetch of every still-`ConfirmedUnverified` entry
@@ -1219,7 +1322,9 @@ impl<P: ScanProfile> CoinStore<P> {
                         }
                     }
                 }
-                Inclusion::Unconfirmed => {}
+                // A ReportedAt entry names no block to compare against; it is
+                // re-queued as a claim and promoted by resolve_pending_claims.
+                Inclusion::Unconfirmed | Inclusion::ReportedAt { .. } => {}
             }
         }
         ChainUpdateOutcome { to_fetch, changed }
@@ -1265,7 +1370,7 @@ impl<P: ScanProfile> CoinStore<P> {
                             height: *h,
                         });
                     }
-                    Some(Inclusion::Unconfirmed) if header_ready => {
+                    Some(Inclusion::Unconfirmed | Inclusion::ReportedAt { .. }) if header_ready => {
                         if let Some(hash) = hash {
                             Self::promote_claim(
                                 &mut self.tx_store,
@@ -1294,7 +1399,7 @@ impl<P: ScanProfile> CoinStore<P> {
                     }
                     // Present but not yet confirmable (no header at this height
                     // yet): leave the claim queued for a later pass.
-                    Some(Inclusion::Unconfirmed) => {}
+                    Some(Inclusion::Unconfirmed | Inclusion::ReportedAt { .. }) => {}
                 }
             }
         }
@@ -1329,6 +1434,10 @@ impl<P: ScanProfile> CoinStore<P> {
     /// `History` refresh: `pending_claims` is an in-memory cache that a
     /// restart wipes, so without re-reporting these spks a tx already
     /// confirmed at some height would stay Unconfirmed forever.
+    ///
+    /// `Inclusion::ReportedAt` is deliberately excluded: its height survives a
+    /// restart, so refreshing it would re-fetch the whole history of every
+    /// confirmed coin on every start.
     pub fn spks_with_unconfirmed_txs(&self) -> Vec<ScriptBuf> {
         let unconfirmed: BTreeSet<Txid> = self
             .tx_store
@@ -1938,11 +2047,17 @@ mod tests {
         assert_eq!(state.unconfirmed_balance, 0);
     }
 
-    // Regression: a tx queued in pending_claims that falls back to the
-    // mempool must be dropped from the queue, so syncing its header does not
-    // re-promote it at the stale height.
     #[test]
-    fn demoted_tx_is_not_repromoted_from_stale_pending_claim() {
+    fn reported_inclusion_yields_confirmed_unverified_status() {
+        assert_eq!(
+            status_for_inclusion(Inclusion::ReportedAt { height: 100 }),
+            CoinStatus::ConfirmedUnverified
+        );
+    }
+
+    /// A one-block chain at `height`, enough for `resolve_pending_claims` to
+    /// find a tip and a block hash there.
+    fn header_store_at(height: u32) -> Arc<HeaderStore> {
         use miniscript::bitcoin::{
             block::{Header, Version},
             consensus::serialize,
@@ -1950,7 +2065,236 @@ mod tests {
             CompactTarget, TxMerkleNode,
         };
 
+        let hdr = Header {
+            version: Version::ONE,
+            prev_blockhash: bitcoin::BlockHash::all_zeros(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 0,
+            bits: CompactTarget::from_consensus(0x207fffff),
+            nonce: 0,
+        };
+        let raw: [u8; Header::SIZE] = serialize(&hdr).try_into().unwrap();
+        HeaderStore::from_map(bitcoin::Network::Regtest, BTreeMap::from([(height, raw)]))
+    }
+
+    /// With no reconciler nothing would ever drain a pending claim, so the
+    /// server-reported height goes straight onto the tx and the coin reads
+    /// confirmed-but-unchecked.
+    #[test]
+    fn a_reported_height_without_a_reconciler_stamps_the_tx() {
         let (mut cs, deriv) = build_coin_store();
+        let spk = deriv.receive_spk_at(2);
+        let tx = funding_tx(spk.clone(), 0.5);
+        let txid = tx.compute_txid();
+        cs.tx_store.update(crate::tx_store::TxEntry::for_test(tx));
+
+        let height = 200u32;
+        cs.update_spk_history(spk.clone(), vec![(txid, Some(height as u64))]);
+        assert!(cs.record_reported_heights(&[ClaimAt { txid, height }]));
+
+        assert_eq!(
+            cs.tx_store.get(&txid).unwrap().inclusion(),
+            &Inclusion::ReportedAt { height }
+        );
+        assert!(cs.pending_claims_snapshot().is_empty());
+
+        cs.generate();
+        let coins = cs.coins();
+        assert_eq!(coins.len(), 1);
+        assert_eq!(
+            coins.into_iter().next().unwrap().1.status(),
+            CoinStatus::ConfirmedUnverified
+        );
+    }
+
+    /// Regression for the endless refetch: a `ReportedAt` height survives a
+    /// restart, so its spk must stay out of the reconnect refresh set. Leave it
+    /// in and every spk owning a confirmed coin gets its whole history fetched
+    /// again on every start.
+    #[test]
+    fn a_reported_spk_is_not_refreshed_on_reconnect() {
+        let (mut cs, deriv) = build_coin_store();
+        let reported_spk = deriv.receive_spk_at(2);
+        let mempool_spk = deriv.receive_spk_at(3);
+
+        let reported = funding_tx(reported_spk.clone(), 0.5);
+        let reported_txid = reported.compute_txid();
+        let mempool = funding_tx(mempool_spk.clone(), 0.5);
+        let mempool_txid = mempool.compute_txid();
+        cs.tx_store
+            .update(crate::tx_store::TxEntry::for_test(reported));
+        cs.tx_store
+            .update(crate::tx_store::TxEntry::for_test(mempool));
+
+        let height = 200u32;
+        cs.update_spk_history(reported_spk, vec![(reported_txid, Some(height as u64))]);
+        cs.update_spk_history(mempool_spk.clone(), vec![(mempool_txid, None)]);
+        cs.record_reported_heights(&[ClaimAt {
+            txid: reported_txid,
+            height,
+        }]);
+        cs.generate();
+
+        assert_eq!(cs.spks_with_unconfirmed_txs(), vec![mempool_spk]);
+    }
+
+    /// Drive a first-scan history that reports `height` for a tx whose bytes
+    /// have not arrived yet, leaving the claim queued and the store entry absent.
+    fn report_before_the_tx_lands(
+        cs: &mut CoinStore,
+        spk: ScriptBuf,
+        tx: &bitcoin::Transaction,
+        height: u32,
+    ) {
+        let txid = tx.compute_txid();
+        let outcome =
+            cs.handle_history_response(BTreeMap::from([(spk, vec![(txid, Some(height as u64))])]));
+        assert_eq!(outcome.missing_txs, vec![txid]);
+        assert!(cs.tx_store.get(&txid).is_none());
+        assert!(cs.record_reported_heights(&outcome.reported));
+        assert!(cs
+            .pending_claims_snapshot()
+            .get(&height)
+            .is_some_and(|set| set.contains(&txid)));
+    }
+
+    /// Regression for the second-run refetch: on a first scan the history
+    /// reports a height before the tx bytes arrive, so there is no entry to
+    /// stamp. The claim must outlive the `Txs` round trip and be stamped when
+    /// the bytes land, or the next run refetches every spk history just to
+    /// relearn a height the server already reported.
+    #[test]
+    fn a_claim_queued_before_its_tx_is_stamped_on_landing() {
+        let (mut cs, deriv) = build_coin_store();
+        let spk = deriv.receive_spk_at(2);
+        let tx = funding_tx(spk.clone(), 0.5);
+        let txid = tx.compute_txid();
+        let height = 200u32;
+        report_before_the_tx_lands(&mut cs, spk, &tx, height);
+
+        assert!(cs.handle_txs_response(vec![tx]));
+        assert_eq!(
+            cs.tx_store.get(&txid).unwrap().inclusion(),
+            &Inclusion::ReportedAt { height }
+        );
+        assert!(cs.pending_claims_snapshot().is_empty());
+
+        let coins = cs.coins();
+        assert_eq!(coins.len(), 1);
+        assert_eq!(
+            coins.into_iter().next().unwrap().1.status(),
+            CoinStatus::ConfirmedUnverified
+        );
+    }
+
+    /// The spk of a tx stamped on landing must stay out of the reconnect
+    /// refresh set: leaving it in is exactly the full-history refetch this
+    /// whole path exists to avoid.
+    #[test]
+    fn a_spk_stamped_on_landing_is_not_refreshed_on_reconnect() {
+        let (mut cs, deriv) = build_coin_store();
+        let spk = deriv.receive_spk_at(2);
+        let tx = funding_tx(spk.clone(), 0.5);
+        let height = 200u32;
+        report_before_the_tx_lands(&mut cs, spk, &tx, height);
+        cs.handle_txs_response(vec![tx]);
+
+        assert!(cs.spks_with_unconfirmed_txs().is_empty());
+    }
+
+    /// The landing tx must not short-circuit the reconciler: with one, the
+    /// claim stays queued for `resolve_pending_claims` to promote against the
+    /// validated chain.
+    #[test]
+    fn a_claim_queued_before_its_tx_stays_for_the_reconciler() {
+        let (mut cs, deriv) = build_coin_store();
+        cs.set_reconciler_promotes();
+        let spk = deriv.receive_spk_at(2);
+        let tx = funding_tx(spk.clone(), 0.5);
+        let txid = tx.compute_txid();
+        let height = 200u32;
+        report_before_the_tx_lands(&mut cs, spk, &tx, height);
+
+        assert!(!cs.handle_txs_response(vec![tx]));
+        assert_eq!(
+            cs.tx_store.get(&txid).unwrap().inclusion(),
+            &Inclusion::Unconfirmed
+        );
+        assert!(cs
+            .pending_claims_snapshot()
+            .get(&height)
+            .is_some_and(|set| set.contains(&txid)));
+
+        let synced = header_store_at(height);
+        let block_hash = synced.block_hash(height).unwrap();
+        cs.resolve_pending_claims(&synced);
+
+        assert_eq!(
+            cs.tx_store.get(&txid).unwrap().inclusion(),
+            &Inclusion::ConfirmedUnverified { height, block_hash }
+        );
+        assert!(cs.pending_claims_snapshot().is_empty());
+    }
+
+    /// A claim whose tx never lands is re-reported by every later history
+    /// pass. The queue must not grow on the re-report.
+    #[test]
+    fn re_reporting_a_claim_whose_tx_never_landed_does_not_duplicate_it() {
+        let (mut cs, deriv) = build_coin_store();
+        let txid = funding_tx(deriv.receive_spk_at(2), 0.5).compute_txid();
+        let height = 200u32;
+        let reported = [ClaimAt { txid, height }];
+
+        assert!(cs.record_reported_heights(&reported));
+        let queued = BTreeMap::from([(height, BTreeSet::from([txid]))]);
+        assert_eq!(cs.pending_claims_snapshot(), queued);
+
+        assert!(!cs.record_reported_heights(&reported));
+        assert_eq!(cs.pending_claims_snapshot(), queued);
+    }
+
+    /// With a reconciler owning promotion the scan only queues the claim: the
+    /// tx stays Unconfirmed until the chain has a header at that height, then
+    /// the resolver promotes it to ConfirmedUnverified.
+    #[test]
+    fn a_reported_height_with_a_reconciler_is_queued_then_promoted() {
+        let (mut cs, deriv) = build_coin_store();
+        cs.set_reconciler_promotes();
+        let spk = deriv.receive_spk_at(2);
+        let tx = funding_tx(spk.clone(), 0.5);
+        let txid = tx.compute_txid();
+        cs.tx_store.update(crate::tx_store::TxEntry::for_test(tx));
+
+        let height = 200u32;
+        cs.update_spk_history(spk, vec![(txid, Some(height as u64))]);
+        assert!(cs.record_reported_heights(&[ClaimAt { txid, height }]));
+        assert!(cs
+            .pending_claims_snapshot()
+            .get(&height)
+            .is_some_and(|set| set.contains(&txid)));
+        assert_eq!(
+            cs.tx_store.get(&txid).unwrap().inclusion(),
+            &Inclusion::Unconfirmed
+        );
+
+        let synced = header_store_at(height);
+        let block_hash = synced.block_hash(height).unwrap();
+        cs.resolve_pending_claims(&synced);
+
+        assert_eq!(
+            cs.tx_store.get(&txid).unwrap().inclusion(),
+            &Inclusion::ConfirmedUnverified { height, block_hash }
+        );
+        assert!(cs.pending_claims_snapshot().is_empty());
+    }
+
+    // Regression: a tx queued in pending_claims that falls back to the
+    // mempool must be dropped from the queue, so syncing its header does not
+    // re-promote it at the stale height.
+    #[test]
+    fn demoted_tx_is_not_repromoted_from_stale_pending_claim() {
+        let (mut cs, deriv) = build_coin_store();
+        cs.set_reconciler_promotes();
         let spk = deriv.receive_spk_at(2);
         let tx = funding_tx(spk.clone(), 0.5);
         let txid = tx.compute_txid();
@@ -1976,18 +2320,7 @@ mod tests {
 
         // Now header H is synced. With the claim gone, resolve_pending_claims
         // has nothing to promote: the tx stays Unconfirmed.
-        let hdr = Header {
-            version: Version::ONE,
-            prev_blockhash: bitcoin::BlockHash::all_zeros(),
-            merkle_root: TxMerkleNode::all_zeros(),
-            time: 0,
-            bits: CompactTarget::from_consensus(0x207fffff),
-            nonce: 0,
-        };
-        let raw: [u8; Header::SIZE] = serialize(&hdr).try_into().expect("header is 80 bytes");
-        let synced =
-            HeaderStore::from_map(bitcoin::Network::Regtest, BTreeMap::from([(height, raw)]));
-        cs.resolve_pending_claims(&synced);
+        cs.resolve_pending_claims(&header_store_at(height));
         assert_eq!(
             cs.tx_store.get(&txid).unwrap().inclusion(),
             &Inclusion::Unconfirmed
