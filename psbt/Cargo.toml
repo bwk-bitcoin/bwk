@@ -1,0 +1,13 @@
+[package]
+name = "bwk-psbt"
+version = "0.0.1"
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+keywords.workspace = true
+readme.workspace = true
+
+[dependencies]
+bitcoin.workspace = true
+thiserror.workspace = true
