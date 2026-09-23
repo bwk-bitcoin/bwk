@@ -572,7 +572,7 @@ pub fn generate_recipient_pubkey(
     let sp_sk = keypair.secret_key();
 
     let input_keys = vec![(sp_sk, true /* is taproot */)];
-    let outpoints = vec![(outpoint.txid.to_string(), outpoint.vout)];
+    let outpoints = vec![outpoint];
     let partial_secret =
         bwk_sp::core::sending::calculate_partial_secret(&input_keys, &outpoints).ok()?;
 
