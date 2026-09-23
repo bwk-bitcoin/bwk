@@ -794,7 +794,7 @@ impl TestEnv {
         // Instead retrying on a timeout, let's wait for it and  "(...) catch up on
         // everything that was there when we entered this function."
         // (f839ee1afb0ff02c58422dae6d2678e5e654b605/src/rpc/blockchain.cpp#L513C18-L513C50).
-        // So the wallet wiil learn about the disconnect blocks properly.
+        // So the wallet will learn about the disconnect blocks properly.
         let _: serde_json::Value = self
             .bitcoind
             .client
