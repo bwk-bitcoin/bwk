@@ -1985,8 +1985,11 @@ mod tests {
             nonce: 0,
         };
         let raw: [u8; Header::SIZE] = serialize(&hdr).try_into().expect("header is 80 bytes");
-        let synced =
-            HeaderStore::from_map(bitcoin::Network::Regtest, BTreeMap::from([(height, raw)]));
+        let synced = HeaderStore::from_map(
+            bitcoin::Network::Regtest,
+            BTreeMap::from([(height, raw)]),
+            None,
+        );
         cs.resolve_pending_claims(&synced);
         assert_eq!(
             cs.tx_store.get(&txid).unwrap().inclusion(),
