@@ -140,6 +140,11 @@ fn a_watch_only_account_spends_with_lent_keys_only() {
         builder.add_input(sp_coin.clone());
     }
     let mut psbt = builder.generate().unwrap();
+    let prevouts: Vec<_> = psbt
+        .inputs
+        .iter()
+        .map(|input| input.witness_utxo.clone().unwrap())
+        .collect();
 
     // Signing without the lent keys leaves the inputs unsigned.
     let mut unsigned = psbt.clone();
@@ -151,6 +156,7 @@ fn a_watch_only_account_spends_with_lent_keys_only() {
         .output
         .iter()
         .any(|o| o.script_pubkey == external.script_pubkey()));
+    assert_change_is_recognised(&watch, &tx, &prevouts, &external);
 
     // bitcoind validates every signature, the SP and the BIP86 ones alike.
     env.broadcast_and_mine(&tx);
@@ -162,6 +168,38 @@ fn a_watch_only_account_spends_with_lent_keys_only() {
         .coins()
         .iter()
         .any(|(outpoint, entry)| outpoint.txid == txid && entry.label().is_some()));
+}
+
+/// Before broadcast, the receiving side recognises exactly the SP change of
+/// `tx`, and nothing once its script is swapped for a foreign key.
+fn assert_change_is_recognised(
+    account: &Account,
+    tx: &bitcoin::Transaction,
+    prevouts: &[bitcoin::TxOut],
+    external: &bitcoin::Address,
+) {
+    let change: Vec<_> = tx
+        .output
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.script_pubkey != external.script_pubkey())
+        .collect();
+    assert_eq!(change.len(), 1, "one external output and one change output");
+    let (change_vout, change_out) = change[0];
+
+    let owned = account.owned_outputs_of(tx, prevouts).unwrap();
+    assert_eq!(owned.len(), 1);
+    assert_eq!(owned[0].vout as usize, change_vout);
+    assert_eq!(owned[0].amount, change_out.value);
+    assert!(owned[0].is_change);
+    assert!(owned[0].label.is_some());
+
+    let mut tampered = tx.clone();
+    tampered.output[change_vout].script_pubkey = external_address().script_pubkey();
+    assert!(account
+        .owned_outputs_of(&tampered, prevouts)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]

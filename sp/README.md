@@ -76,6 +76,18 @@ Keys that are not the account's are refused with
 `AccountError::SpendKeyMismatch`. `SpendKeys` and `KeyRing` erase their
 secrets on drop, best effort (`SecretKey::non_secure_erase`).
 
+The SP change script is derived at signing time. Before broadcast, check it
+with `Account::owned_outputs_of`: it runs the scanner's receiving-side
+derivation (scan secret, the transaction's input public keys, labels) and
+never calls sending code, so a sending-side bug cannot vouch for itself.
+
+```rust
+let prevouts: Vec<_> = psbt.inputs.iter().map(|i| i.witness_utxo.clone().unwrap()).collect();
+let tx = account.sign_and_finalize_with_keys(&mut psbt, &keys)?;
+let owned = account.owned_outputs_of(&tx, &prevouts)?;
+// refuse to broadcast unless the change output is in `owned` with `is_change`
+```
+
 ## Architecture
 
 ```
