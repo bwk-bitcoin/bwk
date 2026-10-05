@@ -465,10 +465,7 @@ pub struct SpSecretProvider<
 > {
     coin_store: Arc<Mutex<SpCoinStore<P>>>,
     client: SpReceiver,
-    xprivs: std::collections::BTreeMap<
-        crate::receiver::bitcoin::bip32::Fingerprint,
-        crate::receiver::bitcoin::bip32::Xpriv,
-    >,
+    xprivs: crate::account::spend_keys::KeyRing,
     secp: crate::receiver::bitcoin::secp256k1::Secp256k1<crate::receiver::bitcoin::secp256k1::All>,
 }
 
@@ -480,6 +477,21 @@ impl<P: crate::profile::SpStorageProfile> SpSecretProvider<P> {
             crate::receiver::bitcoin::bip32::Fingerprint,
             crate::receiver::bitcoin::bip32::Xpriv,
         >,
+    ) -> Self {
+        Self::with_ring(
+            coin_store,
+            client,
+            crate::account::spend_keys::KeyRing::from_masters(xprivs),
+        )
+    }
+
+    /// Like [`SpSecretProvider::new`], drawing BIP32 input keys from a
+    /// [`KeyRing`](crate::account::spend_keys::KeyRing) that may hold
+    /// account-level keys rather than master keys.
+    pub fn with_ring(
+        coin_store: Arc<Mutex<SpCoinStore<P>>>,
+        client: SpReceiver,
+        xprivs: crate::account::spend_keys::KeyRing,
     ) -> Self {
         Self {
             coin_store,
@@ -497,24 +509,15 @@ impl<P: crate::profile::SpStorageProfile> SpSecretProvider<P> {
         let psbt_input = coin.to_psbt_input().ok()?;
 
         if !psbt_input.bip32_derivation.is_empty() {
-            psbt_input.bip32_derivation.values().find_map(|(fg, path)| {
-                let xpriv = self.xprivs.get(fg)?;
-                xpriv
-                    .derive_priv(&self.secp, path)
-                    .ok()
-                    .map(|k| k.private_key)
-            })
+            psbt_input
+                .bip32_derivation
+                .values()
+                .find_map(|(fg, path)| self.xprivs.derive(&self.secp, fg, path))
         } else if !psbt_input.tap_key_origins.is_empty() {
             psbt_input
                 .tap_key_origins
                 .values()
-                .find_map(|(_, (fg, path))| {
-                    let xpriv = self.xprivs.get(fg)?;
-                    xpriv
-                        .derive_priv(&self.secp, path)
-                        .ok()
-                        .map(|k| k.private_key)
-                })
+                .find_map(|(_, (fg, path))| self.xprivs.derive(&self.secp, fg, path))
         } else {
             None
         }

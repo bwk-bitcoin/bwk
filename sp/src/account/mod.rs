@@ -9,6 +9,7 @@
 pub mod coin_store;
 pub mod config;
 pub mod recipient;
+pub mod spend_keys;
 pub mod tx_store;
 pub mod unified;
 
