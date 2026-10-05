@@ -23,6 +23,7 @@ use {
             },
             config::Config,
             recipient::{SpChangeRecipientProvider, SpSecretProvider},
+            spend_keys::{KeyRing, SpendKeys},
             tx_store::{SpTxEntry, SpTxStore},
         },
         blindbit::{self, InfoResponse},
@@ -53,7 +54,7 @@ use {
         persist::config_store::{ConfigStore, NoopConfigStore},
     },
     bwk_sign::signing_manager::SigningManager,
-    miniscript::{psbt::PsbtExt, Descriptor, DescriptorPublicKey, ForEachKey},
+    miniscript::{psbt::PsbtExt, Descriptor, DescriptorPublicKey},
     std::{
         collections::{BTreeMap, BTreeSet},
         str::FromStr,
@@ -138,6 +139,10 @@ pub enum AccountError {
     InputNotOwned(OutPoint),
     #[error("silent payment derivation failed: {0}")]
     SilentPayment(#[from] crate::core::error::Error),
+    #[error("the spend key does not belong to this account")]
+    SpendKeyMismatch,
+    #[error("invalid transaction request: {0:?}")]
+    TxRequest(bwk_tx::template::TxRequestError),
 }
 
 #[cfg(feature = "mnemonic")]
@@ -1119,6 +1124,26 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         &self,
         request: &bwk_tx::template::TxRequest,
     ) -> Result<bwk_tx::tx_builder::TxBuilder, bwk_tx::template::TxRequestError> {
+        self.tx_builder_from_request_on(request, self.tx_builder())
+    }
+
+    /// Like [`Account::tx_builder_from_request`], with the spend authority
+    /// lent by `keys` (see [`Account::tx_builder_with_keys`]).
+    pub fn tx_builder_from_request_with_keys(
+        &self,
+        request: &bwk_tx::template::TxRequest,
+        keys: &SpendKeys,
+    ) -> Result<bwk_tx::tx_builder::TxBuilder, AccountError> {
+        let builder = self.tx_builder_with_keys(keys)?;
+        self.tx_builder_from_request_on(request, builder)
+            .map_err(AccountError::TxRequest)
+    }
+
+    fn tx_builder_from_request_on(
+        &self,
+        request: &bwk_tx::template::TxRequest,
+        builder: bwk_tx::tx_builder::TxBuilder,
+    ) -> Result<bwk_tx::tx_builder::TxBuilder, bwk_tx::template::TxRequestError> {
         use crate::{account::recipient::SpRecipientAddress, receiver::RecipientAddress};
         use bwk_tx::{template::TxRequestError, transaction::Amount as BwkAmount};
 
@@ -1147,7 +1172,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         }
 
         let feerate_msats_vb = (request.fee_rate.max(1.0) * 1000.0) as u64;
-        let mut builder = self.tx_builder();
+        let mut builder = builder;
         builder = if request.fee > 0 {
             builder.fee(request.fee)
         } else {
@@ -1287,7 +1312,33 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     /// account.sign_psbt(&mut psbt)?;
     /// ```
     pub fn tx_builder(&self) -> bwk_tx::tx_builder::TxBuilder {
-        let change_addr = self.sp_receiver.receiver.get_change_address();
+        self.tx_builder_with(
+            self.sp_receiver.clone(),
+            KeyRing::from_masters(self.master_xprivs()),
+        )
+    }
+
+    /// Like [`Account::tx_builder`], for an account that holds no spend
+    /// authority: the SP spend key and the BIP32 input keys come from `keys`,
+    /// for this builder only.
+    ///
+    /// # Errors
+    /// * `AccountError::SpendKeyMismatch` if `keys` is not this account's
+    ///   spend authority.
+    pub fn tx_builder_with_keys(
+        &self,
+        keys: &SpendKeys,
+    ) -> Result<bwk_tx::tx_builder::TxBuilder, AccountError> {
+        let receiver = self.receiver_with_keys(keys)?;
+        Ok(self.tx_builder_with(receiver, keys.ring().clone()))
+    }
+
+    fn tx_builder_with(
+        &self,
+        receiver: SpReceiver,
+        ring: KeyRing,
+    ) -> bwk_tx::tx_builder::TxBuilder {
+        let change_addr = receiver.receiver.get_change_address();
         let change_provider = Box::new(SpChangeRecipientProvider::new(
             change_addr,
             self.config.network,
@@ -1295,31 +1346,44 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
 
         let sp_source = SpCoinSource::new(self.coin_store.clone());
 
-        let all_xprivs = self.master_xprivs();
-
-        let sp_provider = Box::new(SpSecretProvider::new(
-            self.coin_store.clone(),
-            self.sp_receiver.clone(),
-            all_xprivs.clone(),
-        ));
-
         // Merge coin sources from all sub-accounts, enriching BIP32 coins
         // with their secret keys for SP partial secret computation. Each
         // scanner only gets the keys its own descriptor is derived from.
         let bip32_sources: Vec<Box<dyn bwk_coin::CoinSource>> = self
             .scanners()
             .map(|scanner| {
-                Box::new(KeyedBip32Source::new(
+                Box::new(KeyedBip32Source::with_ring(
                     Box::new(scanner.coin_source()),
-                    descriptor_xprivs(&scanner.descriptor(), &all_xprivs),
+                    ring.for_descriptor(&scanner.descriptor()),
                 )) as Box<dyn bwk_coin::CoinSource>
             })
             .collect();
         let merged_source = Box::new(MergedCoinSource::new(sp_source, bip32_sources));
 
+        let sp_provider = Box::new(SpSecretProvider::with_ring(
+            self.coin_store.clone(),
+            receiver,
+            ring,
+        ));
+
         bwk_tx::tx_builder::TxBuilder::new(change_provider)
             .coin_source(merged_source)
             .sp_provider(sp_provider)
+    }
+
+    /// This account's receiver with `keys`' spend secret, after checking that
+    /// `keys` is this account's spend authority.
+    fn receiver_with_keys(&self, keys: &SpendKeys) -> Result<SpReceiver, AccountError> {
+        let secp = Secp256k1::signing_only();
+        if keys.spend_public_key(&secp) != self.sp_receiver.get_spend_public_key() {
+            return Err(AccountError::SpendKeyMismatch);
+        }
+        SpReceiver::new(
+            self.sp_receiver.get_scan_key(),
+            crate::receiver::SpendKey::Secret(keys.b_spend()),
+            self.config.network,
+        )
+        .map_err(AccountError::SpReceiver)
     }
 
     /// Sign all inputs in a PSBT, both SP and BIP32 (segwit/taproot).
@@ -1352,6 +1416,99 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     ) -> Result<bitcoin::Transaction, AccountError> {
         self.sign_psbt(psbt)?;
         Self::finalize(psbt)
+    }
+
+    /// Sign all inputs with the spend authority lent by `keys`, for an
+    /// account that holds none (see [`Account::tx_builder_with_keys`]).
+    ///
+    /// 1. Signs SP inputs using `b_spend + tweak` (no taproot tweak).
+    /// 2. Signs BIP86 taproot key-path inputs whose key origin `keys`' ring
+    ///    covers.
+    ///
+    /// Inputs neither step covers are left unsigned, so finalizing fails.
+    ///
+    /// # Errors
+    /// * `AccountError::SpendKeyMismatch` if `keys` is not this account's
+    ///   spend authority.
+    pub fn sign_psbt_with_keys(
+        &self,
+        psbt: &mut bitcoin::Psbt,
+        keys: &SpendKeys,
+    ) -> Result<(), AccountError> {
+        let secp = Secp256k1::signing_only();
+        if keys.spend_public_key(&secp) != self.sp_receiver.get_spend_public_key() {
+            return Err(AccountError::SpendKeyMismatch);
+        }
+        self.sign_sp_inputs_with(psbt, keys.b_spend())?;
+        Self::sign_taproot_key_path_inputs(psbt, keys.ring())
+    }
+
+    /// [`Account::sign_psbt_with_keys`], then finalize into a broadcast-ready
+    /// transaction.
+    pub fn sign_and_finalize_with_keys(
+        &self,
+        psbt: &mut bitcoin::Psbt,
+        keys: &SpendKeys,
+    ) -> Result<bitcoin::Transaction, AccountError> {
+        self.sign_psbt_with_keys(psbt, keys)?;
+        Self::finalize(psbt)
+    }
+
+    /// Sign every BIP86 (single key, no script tree) taproot input whose key
+    /// origin `ring` covers, after checking the derived key is the input's
+    /// internal key.
+    fn sign_taproot_key_path_inputs(
+        psbt: &mut bitcoin::Psbt,
+        ring: &KeyRing,
+    ) -> Result<(), AccountError> {
+        let secp = Secp256k1::new();
+        let hash_ty = TapSighashType::Default;
+
+        let prevouts: Vec<bitcoin::TxOut> = psbt
+            .inputs
+            .iter()
+            .map(|input| {
+                input
+                    .witness_utxo
+                    .clone()
+                    .expect("PSBT input must have witness_utxo")
+            })
+            .collect();
+        let mut cache = SighashCache::new(&psbt.unsigned_tx);
+
+        for i in 0..psbt.inputs.len() {
+            let input = &psbt.inputs[i];
+            if input.tap_key_sig.is_some() || input.tap_merkle_root.is_some() {
+                continue;
+            }
+            let Some(internal_key) = input.tap_internal_key else {
+                continue;
+            };
+            let Some(sk) = input
+                .tap_key_origins
+                .get(&internal_key)
+                .and_then(|(_, (fg, path))| ring.derive(&secp, fg, path))
+            else {
+                continue;
+            };
+            let keypair = Keypair::from_secret_key(&secp, &sk);
+            if keypair.x_only_public_key().0 != internal_key {
+                continue;
+            }
+
+            let sighash = cache
+                .taproot_key_spend_signature_hash(i, &Prevouts::All(&prevouts), hash_ty)
+                .map_err(AccountError::Sighash)?;
+            let msg = Message::from_digest(sighash.to_byte_array());
+            let tweaked = bitcoin::key::TapTweak::tap_tweak(keypair, &secp, None).to_keypair();
+            let sig = secp.sign_schnorr(&msg, &tweaked);
+
+            psbt.inputs[i].tap_key_sig = Some(Signature {
+                signature: sig,
+                sighash_type: hash_ty,
+            });
+        }
+        Ok(())
     }
 
     /// Broadcast a signed spend in the background. Completion is reported via
@@ -1447,7 +1604,14 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
             .sp_receiver
             .try_get_secret_spend_key()
             .map_err(AccountError::Signing)?;
+        self.sign_sp_inputs_with(psbt, b_spend)
+    }
 
+    fn sign_sp_inputs_with(
+        &self,
+        psbt: &mut bitcoin::Psbt,
+        b_spend: SecretKey,
+    ) -> Result<(), AccountError> {
         let secp = Secp256k1::new();
         let hash_ty = TapSighashType::Default;
 
@@ -1648,24 +1812,6 @@ fn register_sub_signer(
     }
     signing_manager.register_bip32_descriptor(descriptor);
     Ok(())
-}
-
-#[cfg(feature = "mnemonic")]
-/// The subset of `xprivs` that `descriptor` is derived from, keyed by
-/// fingerprint: the only keys able to sign for it.
-fn descriptor_xprivs(
-    descriptor: &Descriptor<DescriptorPublicKey>,
-    xprivs: &BTreeMap<bitcoin::bip32::Fingerprint, bitcoin::bip32::Xpriv>,
-) -> BTreeMap<bitcoin::bip32::Fingerprint, bitcoin::bip32::Xpriv> {
-    let mut out = BTreeMap::new();
-    descriptor.for_each_key(|key| {
-        let fingerprint = key.master_fingerprint();
-        if let Some(xpriv) = xprivs.get(&fingerprint) {
-            out.insert(fingerprint, *xpriv);
-        }
-        true
-    });
-    out
 }
 
 #[cfg(feature = "mnemonic")]

@@ -290,6 +290,14 @@ impl Config {
         )
     }
 
+    /// Add an embedded watch-only sub-account from its public descriptor.
+    ///
+    /// The sub-account holds no signer: its inputs are signed with keys lent
+    /// to [`Account::sign_psbt_with_keys`](crate::account::Account::sign_psbt_with_keys).
+    pub fn add_watch_only_sub_account(&mut self, descriptor: Descriptor<DescriptorPublicKey>) {
+        self.push_descriptor_maybe(descriptor, None);
+    }
+
     fn add_sub_account_from_mnemonic(
         &mut self,
         mnemonic: &str,

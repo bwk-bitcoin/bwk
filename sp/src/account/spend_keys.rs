@@ -1,16 +1,22 @@
-//! Extended private keys a spend draws BIP32 input keys from.
+//! Spend authority handed to an [`Account`](super::Account) for one call.
 //!
-//! A [`KeyRing`] resolves the `(master fingerprint, full path)` origin a PSBT
-//! input carries to a secret key, from master keys or from keys rooted at an
-//! account path (e.g. `m/86'/0'/0'`), so a caller can hold an account key
-//! without holding the master key it was derived from.
+//! An account built from keys (`Config::from_keys` with a public spend key)
+//! scans, derives addresses and simulates spends without holding any spend
+//! authority. To spend, the caller derives the keys itself and lends them for
+//! the duration of a single build or sign call through [`SpendKeys`]; the
+//! account never stores them.
+//!
+//! The keys are scoped on purpose: the SP spend key (`b_spend`) and extended
+//! private keys rooted at an *account* path (e.g. `m/86'/0'/0'`), never the
+//! BIP39 mnemonic, the seed, or the master xpriv.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bitcoin::{
     bip32::{ChildNumber, DerivationPath, Fingerprint, Xpriv},
-    secp256k1::{Secp256k1, SecretKey, Signing},
+    secp256k1::{PublicKey, Secp256k1, SecretKey, Signing},
 };
+use miniscript::{Descriptor, DescriptorPublicKey, ForEachKey};
 
 /// An extended private key rooted at `origin_path` under the master key
 /// whose fingerprint is `master_fingerprint`.
@@ -92,6 +98,24 @@ impl KeyRing {
         self.keys.is_empty()
     }
 
+    /// The keys of this ring under a master fingerprint `descriptor` carries:
+    /// the only keys able to sign for it.
+    pub fn for_descriptor(&self, descriptor: &Descriptor<DescriptorPublicKey>) -> KeyRing {
+        let mut fingerprints = BTreeSet::new();
+        descriptor.for_each_key(|key| {
+            fingerprints.insert(key.master_fingerprint());
+            true
+        });
+        Self {
+            keys: self
+                .keys
+                .iter()
+                .filter(|key| fingerprints.contains(&key.master_fingerprint))
+                .cloned()
+                .collect(),
+        }
+    }
+
     /// The secret key at `path` under `fingerprint`, from the first key of
     /// the ring that is an ancestor of it.
     pub fn derive<C: Signing>(
@@ -111,6 +135,47 @@ impl Drop for KeyRing {
         for key in &mut self.keys {
             key.xpriv.private_key.non_secure_erase();
         }
+    }
+}
+
+/// The spend authority of an SP account, lent for one call.
+///
+/// `b_spend` is the BIP352 spend secret key; `ring` holds the keys for the
+/// BIP32 (taproot) sub-account inputs. Both are erased (best effort, see
+/// [`SecretKey::non_secure_erase`]) when this value is dropped.
+pub struct SpendKeys {
+    b_spend: SecretKey,
+    ring: KeyRing,
+}
+
+impl SpendKeys {
+    pub fn new(b_spend: SecretKey, ring: KeyRing) -> Self {
+        Self { b_spend, ring }
+    }
+
+    pub fn b_spend(&self) -> SecretKey {
+        self.b_spend
+    }
+
+    pub fn ring(&self) -> &KeyRing {
+        &self.ring
+    }
+
+    /// The public spend key `b_spend` corresponds to.
+    pub fn spend_public_key<C: Signing>(&self, secp: &Secp256k1<C>) -> PublicKey {
+        self.b_spend.public_key(secp)
+    }
+}
+
+impl std::fmt::Debug for SpendKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpendKeys").finish_non_exhaustive()
+    }
+}
+
+impl Drop for SpendKeys {
+    fn drop(&mut self) {
+        self.b_spend.non_secure_erase();
     }
 }
 
@@ -177,11 +242,38 @@ mod tests {
     }
 
     #[test]
+    fn a_descriptor_keeps_only_the_keys_it_is_derived_from() {
+        let secp = Secp256k1::new();
+        let master = master();
+        let fingerprint = master.fingerprint(&secp);
+        let other = Xpriv::new_master(bitcoin::Network::Testnet, &[8u8; 32]).unwrap();
+        let account_path = DerivationPath::from_str("m/86'/1'/0'").unwrap();
+        let account = master.derive_priv(&secp, &account_path).unwrap();
+        let xpub = bitcoin::bip32::Xpub::from_priv(&secp, &account);
+        let descriptor =
+            Descriptor::from_str(&format!("tr([{fingerprint}/86'/1'/0']{xpub}/0/*)")).unwrap();
+
+        let ring = KeyRing::from_masters(BTreeMap::from([
+            (fingerprint, master),
+            (other.fingerprint(&secp), other),
+        ]));
+        let kept = ring.for_descriptor(&descriptor);
+
+        let child = DerivationPath::from_str("m/86'/1'/0'/0/0").unwrap();
+        let expected = master.derive_priv(&secp, &child).unwrap().private_key;
+        assert_eq!(kept.keys.len(), 1);
+        assert_eq!(kept.derive(&secp, &fingerprint, &child), Some(expected));
+    }
+
+    #[test]
     fn debug_output_carries_no_key() {
         let secp = Secp256k1::new();
         let master = master();
-        let ring = KeyRing::from_masters(BTreeMap::from([(master.fingerprint(&secp), master)]));
-        let rendered = format!("{ring:?}");
+        let keys = SpendKeys::new(
+            master.private_key,
+            KeyRing::from_masters(BTreeMap::from([(master.fingerprint(&secp), master)])),
+        );
+        let rendered = format!("{keys:?} {:?}", keys.ring());
         assert!(!rendered.contains(&master.to_string()));
         assert!(!rendered.contains(&master.private_key.display_secret().to_string()));
     }

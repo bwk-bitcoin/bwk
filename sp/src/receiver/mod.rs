@@ -301,6 +301,10 @@ impl SpReceiver {
         self.scan_sk
     }
 
+    pub fn get_spend_public_key(&self) -> PublicKey {
+        (&self.spend_key).into()
+    }
+
     pub fn try_get_secret_spend_key(&self) -> Result<SecretKey, Error> {
         match self.spend_key {
             SpendKey::Public(_) => Err(Error::MissingSecretKey),

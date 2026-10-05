@@ -19,6 +19,11 @@ path = "src/bin/spdk_sync_bench.rs"
 required-features = ["bench-spdk"]
 
 [[test]]
+name = "injected_keys"
+path = "tests/injected_keys.rs"
+required-features = ["mnemonic"]
+
+[[test]]
 name = "integration"
 path = "tests/integration.rs"
 required-features = ["mnemonic"]

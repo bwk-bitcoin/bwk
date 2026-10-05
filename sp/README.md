@@ -47,6 +47,35 @@ loop {
 }
 ```
 
+## Watch-only accounts and lent spend keys
+
+An account built with `Config::from_keys` and a 33-byte *public* spend key
+scans, derives addresses and simulates spends, but holds no spend authority.
+Sub-accounts added with `Config::add_watch_only_sub_account` carry a public
+descriptor and no signer.
+
+To spend, the caller derives the keys itself and lends them for one call
+through `SpendKeys`: the BIP352 spend secret key and a `KeyRing` of
+extended private keys rooted at an *account* path (e.g. `m/86'/0'/0'`), not
+the master key. The account never stores them.
+
+```rust
+use bwk_sp::account::spend_keys::{KeyRing, OriginXpriv, SpendKeys};
+
+let mut ring = KeyRing::new();
+ring.push(OriginXpriv { master_fingerprint, origin_path, xpriv: account_xpriv });
+let keys = SpendKeys::new(b_spend, ring);
+
+let mut builder = account.tx_builder_with_keys(&keys)?;
+// ... outputs, fee, inputs
+let mut psbt = builder.generate()?;
+let tx = account.sign_and_finalize_with_keys(&mut psbt, &keys)?;
+```
+
+Keys that are not the account's are refused with
+`AccountError::SpendKeyMismatch`. `SpendKeys` and `KeyRing` erase their
+secrets on drop, best effort (`SecretKey::non_secure_erase`).
+
 ## Architecture
 
 ```
