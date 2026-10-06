@@ -1071,7 +1071,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     /// [`UnifiedCoin::spendable`](crate::account::unified::UnifiedCoin::spendable) to keep only
     /// live UTXOs.
     pub fn all_coins(&self) -> BTreeMap<OutPoint, crate::account::unified::UnifiedCoin> {
-        use crate::account::unified::{CoinOrigin, UnifiedCoin};
+        use crate::account::unified::{CoinOrigin, SubAccountKind, UnifiedCoin};
         let mut out: BTreeMap<OutPoint, UnifiedCoin> = BTreeMap::new();
 
         for (outpoint, entry) in self.coins() {
@@ -1088,7 +1088,8 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
             );
         }
 
-        for (sub_idx, scanner) in self.scanners().enumerate() {
+        for (index, scanner) in self.scanners().enumerate() {
+            let kind = SubAccountKind::from(&scanner.descriptor());
             for (outpoint, entry) in scanner.coins() {
                 let spendable = !matches!(
                     entry.status(),
@@ -1097,7 +1098,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
                 out.insert(
                     outpoint,
                     UnifiedCoin {
-                        origin: CoinOrigin::SubAccount(sub_idx),
+                        origin: CoinOrigin::SubAccount { index, kind },
                         outpoint,
                         amount: entry.coin.txout.value,
                         height: entry.height().map(|h| h as u32),

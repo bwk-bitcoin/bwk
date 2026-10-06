@@ -16,6 +16,8 @@ use bwk::{
 use bwk_sign::{bwk_descriptor, hot_signer::HotSigner};
 use serde::{Deserialize, Serialize};
 
+use crate::account::unified::SubAccountKind;
+
 /// Default filename a [`bwk::persist::config_store::FileConfigStore`] uses for an
 /// SP account's config. Consumers are free to choose another path
 /// when constructing the store.
@@ -89,12 +91,6 @@ pub struct SubAccountConfig {
     /// picked for its server says nothing about this one.
     #[serde(flatten)]
     pub endpoint: Endpoint,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum SubAccountKind {
-    Segwit,
-    Taproot,
 }
 
 impl Config {
@@ -314,6 +310,7 @@ impl Config {
                     .map_err(ConfigError::Derivator)?
                     .descriptor()
             }
+            SubAccountKind::Other => return Err(ConfigError::NoDefaultDescriptor(kind)),
         };
 
         self.push_descriptor_maybe(descriptor, sub_account_mnemonic);
@@ -421,6 +418,8 @@ pub enum ConfigError {
     DescriptorPath(#[source] bwk_descriptor::descriptor::Error),
     #[error("derivator error: {0}")]
     Derivator(#[source] bwk_descriptor::derivator::Error),
+    #[error("no default descriptor for a {0:?} sub-account")]
+    NoDefaultDescriptor(SubAccountKind),
 }
 
 #[cfg(test)]

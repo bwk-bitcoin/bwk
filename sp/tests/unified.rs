@@ -8,7 +8,7 @@
 mod common;
 
 use bitcoin::Amount;
-use bwk_sp::account::unified::{CoinOrigin, SpendableSummary};
+use bwk_sp::account::unified::{CoinOrigin, SpendableSummary, SubAccountKind};
 use common::test_account_named;
 
 #[test]
@@ -39,10 +39,21 @@ fn all_spendable_coins_empty_account() {
 fn coin_origin_eq_and_copy() {
     // Sanity check on CoinOrigin's derived impls: bindings rely on these.
     let a = CoinOrigin::Sp;
-    let b = CoinOrigin::SubAccount(0);
-    let c = CoinOrigin::SubAccount(0);
+    let b = CoinOrigin::SubAccount {
+        index: 0,
+        kind: SubAccountKind::Taproot,
+    };
+    let c = CoinOrigin::SubAccount {
+        index: 0,
+        kind: SubAccountKind::Taproot,
+    };
+    let d = CoinOrigin::SubAccount {
+        index: 0,
+        kind: SubAccountKind::Segwit,
+    };
     assert_ne!(a, b);
     assert_eq!(b, c);
+    assert_ne!(c, d);
     let _copy = a;
     let _still_usable = a;
 }
