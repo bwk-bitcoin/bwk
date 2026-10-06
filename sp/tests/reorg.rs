@@ -2,7 +2,8 @@
 
 mod common;
 
-use bitcoin::OutPoint;
+use bitcoin::{consensus::encode::serialize_hex, OutPoint};
+use bwk::bwk_electrum::notification::{Notification, SpNotification};
 use bwk_sp::blindbit;
 use bwk_utils::test as bwk_test;
 
@@ -58,12 +59,14 @@ fn test_reorg_detection_block_hash_mismatch(env: &mut TestEnv) {
     );
 }
 
-/// Tests that coins from orphaned blocks are removed after rescan.
+/// Tests that the same account drops a coin orphaned by a reorg on its next
+/// scan, and finds the coin that replaced it.
 ///
 /// This test verifies:
 /// 1. Create SP output in a block and detect it via scan
-/// 2. Force reorg that orphans the block containing the output
-/// 3. After rescan, the coin should not be found (was in orphaned block)
+/// 2. Force reorg that replaces the block with one mining a conflicting SP tx
+/// 3. On the next scan of the same account, the reorg is reported, the orphaned
+///    coin is gone and the replacement coin is found
 fn test_reorg_removes_orphaned_coins(env: &mut TestEnv) {
     use bwk_sign::{bip39, hot_signer::HotSigner};
     use bwk_sp::receiver::SpReceiver;
@@ -103,7 +106,7 @@ fn test_reorg_removes_orphaned_coins(env: &mut TestEnv) {
     let sp_tx = swap_to_sp(
         sk,
         outpoint,
-        txout,
+        txout.clone(),
         recipient_pubkey,
         bitcoin::Amount::from_sat(1000),
         &secp,
@@ -122,52 +125,71 @@ fn test_reorg_removes_orphaned_coins(env: &mut TestEnv) {
 
     // 8. Scan and verify coin is found
     let mut account = env.sp_account_with_mnemonic("reorg-removes", mnemonic_str);
+    let receiver = account.receiver().unwrap();
     account
         .scan_blocks(Some(start_height), Some(sp_height))
         .expect("scan");
 
+    let orphaned = OutPoint {
+        txid: sp_txid,
+        vout: 0,
+    };
     assert_eq!(account.coins().len(), 1, "Should find 1 coin before reorg");
+    assert!(account.coins().contains_key(&orphaned));
 
-    // 9. Invalidate the block containing the FUNDING tx to truly orphan the SP tx
-    let fund_height =
-        bwk_test::get_tx_height(&mut env.bitcoind.client, fund_txid).expect("fund height") as u32;
-    env.invalidate_block(fund_height);
-
-    // 10. Mine blocks on new fork to ensure wallet has mature coinbase outputs
-    env.mine(5);
-
-    // 11. Double-spend the funding input on the new chain
-    let new_addr: String = env
+    // 9. Replace the block holding the SP tx with one mining a conflicting SP tx
+    // that spends the same input with a higher fee.
+    env.invalidate_block(sp_height);
+    let replacement = swap_to_sp(
+        sk,
+        outpoint,
+        txout,
+        recipient_pubkey,
+        bitcoin::Amount::from_sat(2000),
+        &secp,
+    )
+    .unwrap();
+    let replacement_txid = replacement.compute_txid();
+    let miner: String = env.bitcoind.client.call("getnewaddress", &[]).unwrap();
+    let _: serde_json::Value = env
         .bitcoind
         .client
         .call(
-            "getnewaddress",
+            "generateblock",
             &[
-                serde_json::Value::String("".to_string()),
-                serde_json::Value::String("bech32m".to_string()),
+                miner.into(),
+                serde_json::json!([serialize_hex(&replacement)]),
             ],
         )
-        .expect("generate address");
-    let _: String = env
-        .bitcoind
-        .client
-        .call(
-            "sendtoaddress",
-            &[new_addr.into(), serde_json::Value::from(0.05)],
-        )
-        .expect("send to different address");
-
-    // 12. Mine new chain (SP tx is now invalid)
+        .unwrap();
     env.mine(1);
-    let new_height = env.height;
+    let replacement_height =
+        bwk_test::get_tx_height(&mut env.bitcoind.client, replacement_txid).unwrap() as u32;
+    assert_eq!(replacement_height, sp_height);
 
-    // 13. Verify backend works after reorg and rescan succeeds
-    let mut account2 = env.sp_account_with_mnemonic("reorg-removes-rescan", mnemonic_str);
-
-    // Rescan should succeed after reorg
-    account2
-        .scan_blocks(Some(start_height), Some(new_height))
+    // 10. Scan the same account again: it resumes above the orphaned block
+    account
+        .scan_blocks(None, Some(env.height))
         .expect("rescan after reorg");
+
+    let fork_heights: Vec<u32> = receiver
+        .try_iter()
+        .filter_map(|notif| match notif {
+            Notification::Sp(SpNotification::Reorg { fork_height }) => Some(fork_height),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fork_heights, vec![sp_height - 1]);
+
+    let replacement_coin = OutPoint {
+        txid: replacement_txid,
+        vout: 0,
+    };
+    let coins = account.coins();
+    assert_eq!(coins.len(), 1, "Only the replacement coin should remain");
+    assert!(!coins.contains_key(&orphaned));
+    assert!(coins.contains_key(&replacement_coin));
+    assert_eq!(account.last_scanned_height(), Some(env.height));
 }
 
 /// Tests coin reappears if re-included in new chain after reorg.
