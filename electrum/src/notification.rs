@@ -1,8 +1,6 @@
 //! Events the scanner reports, and the errors it surfaces.
 
-#[cfg(feature = "sp")]
-use miniscript::bitcoin::OutPoint;
-use miniscript::bitcoin::Txid;
+use miniscript::bitcoin::{Amount, OutPoint, Txid};
 
 use crate::{header_store::InvalidCause, tx_listener};
 
@@ -12,6 +10,19 @@ pub enum Notification {
     Electrum(TxListenerNotif),
     AddressTipChanged,
     CoinUpdate,
+    /// `outpoint` entered the coin store of the scanner named `account`.
+    CoinReceived {
+        account: String,
+        outpoint: OutPoint,
+        amount: Amount,
+        height: Option<u64>,
+    },
+    /// A coin of the scanner named `account` turned `Spent`/`BeingSpend`, or
+    /// left its coin store while unspent.
+    CoinSpent {
+        account: String,
+        outpoint: OutPoint,
+    },
     PaymentHistoryUpdated,
     InvalidElectrumConfig,
     InvalidLookAhead,

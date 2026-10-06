@@ -546,6 +546,7 @@ mod tests {
             bitcoin::Network::Regtest,
             descriptor,
             notif_sender,
+            "test".to_string(),
             0,
             0,
             20,

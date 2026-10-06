@@ -100,7 +100,7 @@ TxStore (raw txs + metadata)  ◄──── Account reconcile thread
 CoinStore.generate() ──► coins cache + address statuses
      │
      ▼
-Notification::CoinUpdate ──► Account consumer
+Notification::CoinReceived / CoinSpent / CoinUpdate ──► Account consumer
 ```
 
 ## Store Relationships
@@ -112,7 +112,11 @@ Notification::CoinUpdate ──► Account consumer
   height, its header is known) -> Verified (a merkle proof checks against that
   header). A CTA pass that mutates tx state emits `Notification::HeaderStoreUpdated`;
   a failed merkle proof or a header store that fails its own validation emits
-  `Notification::ValidationFailed`.
+  `Notification::ValidationFailed`. Each `generate()` notifies
+  `Notification::CoinReceived` and `Notification::CoinSpent` for the coins it
+  adds or spends, named by the scanner's account, then `Notification::CoinUpdate`.
+  The coins already stored when the scanner opens are the baseline: that first
+  `generate()` only notifies `Notification::CoinUpdate`.
 - `AddressStore`: Tracks generated addresses (recv/change tips + look_ahead).
   Notifies Electrum thread when new addresses need watching.
 - `LabelStore`: User labels keyed by OutPoint or Txid.

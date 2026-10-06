@@ -524,6 +524,7 @@ mod tests {
                 bitcoin::Network::Regtest,
                 descriptor.clone(),
                 notif_sender.clone(),
+                "test".to_string(),
                 recv_tip,
                 change_tip,
                 look_ahead,

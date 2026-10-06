@@ -202,6 +202,12 @@ pub struct CoinStore<P: ScanProfile = RamProfile<DefaultBackend>> {
     updates: Vec<Update>,
     derivator: SpkDerivator,
     notification: mpsc::Sender<Notification>,
+    /// Names the scanner in the per-coin notifications, since several
+    /// scanners can share one notification channel.
+    account: String,
+    /// `false` until the first `generate()`, whose coins are the baseline the
+    /// per-coin notifications diff against.
+    generated: bool,
     /// Pending claims indexed by server-reported height. A txid lands
     /// here when the server reports it at height H but the HeaderStore
     /// doesn't yet have a header at H; the next CTA resolves it.
@@ -322,6 +328,7 @@ impl<P: ScanProfile> CoinStore<P> {
         network: bitcoin::Network,
         descriptor: Descriptor<DescriptorPublicKey>,
         notification: mpsc::Sender<Notification>,
+        account: String,
         recv_tip: u32,
         change_tip: u32,
         look_ahead: u32,
@@ -347,6 +354,8 @@ impl<P: ScanProfile> CoinStore<P> {
             updates: Vec::new(),
             spk_history: BTreeMap::new(),
             notification,
+            account,
+            generated: false,
             derivator,
             pending_claims: BTreeMap::new(),
             merkle_in_flight: BTreeSet::new(),
@@ -807,7 +816,7 @@ impl<P: ScanProfile> CoinStore<P> {
             }
         } // => release label_store lock
 
-        self.store = coins;
+        let previous = std::mem::replace(&mut self.store, coins);
         self.spk_to_outpoint = spk_to_outpoint;
 
         // update address_store statuses + per-address tx history
@@ -829,8 +838,52 @@ impl<P: ScanProfile> CoinStore<P> {
 
         // FIXME: update statuses of those w/ CoinStatus::BeeingSpent
 
-        if let Err(e) = self.notification.send(Notification::CoinUpdate) {
-            log::error!("CoinStore::generate() fail to send notification: {e:?}");
+        let events = if self.generated {
+            self.coin_events(&previous)
+        } else {
+            Vec::new()
+        };
+        self.generated = true;
+        for notification in events.into_iter().chain([Notification::CoinUpdate]) {
+            if let Err(e) = self.notification.send(notification) {
+                log::error!("CoinStore::generate() fail to send notification: {e:?}");
+            }
+        }
+    }
+
+    /// The per-coin notifications from `previous` to the current coin map. An
+    /// outpoint absent from `previous` is received. A coin is spent when its
+    /// status turns `Spent`/`BeingSpend`, or when it leaves the map while
+    /// unspent. A coin received already spent yields both events. The first
+    /// `generate()` sets the baseline and notifies none of them.
+    fn coin_events(&self, previous: &BTreeMap<OutPoint, CoinEntry>) -> Vec<Notification> {
+        let mut events = Vec::new();
+        for (outpoint, entry) in &self.store {
+            let before = previous.get(outpoint);
+            if before.is_none() {
+                events.push(Notification::CoinReceived {
+                    account: self.account.clone(),
+                    outpoint: *outpoint,
+                    amount: entry.coin.txout.value,
+                    height: entry.height(),
+                });
+            }
+            if entry.is_spent() && !before.is_some_and(CoinEntry::is_spent) {
+                events.push(self.coin_spent(*outpoint));
+            }
+        }
+        for (outpoint, entry) in previous {
+            if !self.store.contains_key(outpoint) && !entry.is_spent() {
+                events.push(self.coin_spent(*outpoint));
+            }
+        }
+        events
+    }
+
+    fn coin_spent(&self, outpoint: OutPoint) -> Notification {
+        Notification::CoinSpent {
+            account: self.account.clone(),
+            outpoint,
         }
     }
 
@@ -1433,6 +1486,9 @@ impl CoinEntry {
     pub fn status(&self) -> CoinStatus {
         self.coin.status
     }
+    pub fn is_spent(&self) -> bool {
+        matches!(self.coin.status, CoinStatus::Spent | CoinStatus::BeingSpend)
+    }
     /// Returns a string representation of the coin's status.
     ///
     /// # Returns
@@ -1564,6 +1620,11 @@ mod tests {
     use std::sync::mpsc;
 
     fn build_coin_store() -> (CoinStore, SpkDerivator) {
+        let (cs, derivator, _notif_recv) = build_coin_store_with_receiver();
+        (cs, derivator)
+    }
+
+    fn build_coin_store_with_receiver() -> (CoinStore, SpkDerivator, mpsc::Receiver<Notification>) {
         let network = bitcoin::Network::Regtest;
         let mnemo = Mnemonic::generate(12).unwrap();
         let signer = HotSigner::new_from_mnemonics(network, &mnemo.to_string()).unwrap();
@@ -1572,7 +1633,7 @@ mod tests {
         let derivator = SpkDerivator::new_wpkh(xpub, network).unwrap();
         let descriptor = derivator.descriptor();
 
-        let (notif_sender, _notif_recv) = mpsc::channel();
+        let (notif_sender, notif_recv) = mpsc::channel();
         let tx_store = TxStore::new();
         let label_store = Arc::new(Mutex::new(LabelStore::new()));
         let mock_backend: Arc<dyn bwk_persist::backend::PersistenceBackend> =
@@ -1587,6 +1648,7 @@ mod tests {
             network,
             descriptor,
             notif_sender,
+            "test".to_string(),
             0, // recv_tip
             0, // change_tip
             5, // look_ahead: populates spk indices 0..=5
@@ -1594,7 +1656,103 @@ mod tests {
             label_store,
             account_store,
         );
-        (cs, derivator)
+        (cs, derivator, notif_recv)
+    }
+
+    /// A store holding one unconfirmed 0.5 BTC coin at receive index 2, with
+    /// the notifications of that first generate drained.
+    fn funded_coin_store() -> (CoinStore, mpsc::Receiver<Notification>, OutPoint) {
+        let (mut cs, deriv, notifs) = build_coin_store_with_receiver();
+        let tx = funding_tx(deriv.receive_spk_at(2), 0.5);
+        let outpoint = OutPoint::new(tx.compute_txid(), (tx.output.len() - 1) as u32);
+        cs.tx_store.update(TxEntry::for_test(tx));
+        cs.generate();
+        notifs.try_iter().for_each(drop);
+        (cs, notifs, outpoint)
+    }
+
+    #[test]
+    fn first_generate_over_stored_coins_notifies_no_coin_event() {
+        let (mut cs, deriv, notifs) = build_coin_store_with_receiver();
+        let funding = funding_tx(deriv.receive_spk_at(2), 0.5);
+        let outpoint = OutPoint::new(funding.compute_txid(), (funding.output.len() - 1) as u32);
+        cs.tx_store.update(TxEntry::for_test(funding));
+        cs.tx_store.update(TxEntry::for_test(spending_tx(outpoint)));
+
+        cs.generate();
+
+        let notifs: Vec<_> = notifs.try_iter().collect();
+        assert_eq!(notifs.len(), 1, "{notifs:?}");
+        assert!(matches!(notifs[0], Notification::CoinUpdate));
+        assert!(cs.coins().contains_key(&outpoint));
+    }
+
+    #[test]
+    fn generate_adding_a_coin_notifies_coin_received() {
+        let (mut cs, deriv, notifs) = build_coin_store_with_receiver();
+        cs.generate();
+        notifs.try_iter().for_each(drop);
+        let tx = funding_tx(deriv.receive_spk_at(2), 0.5);
+        let expected = OutPoint::new(tx.compute_txid(), (tx.output.len() - 1) as u32);
+        cs.tx_store.update(TxEntry::for_test(tx));
+
+        cs.generate();
+
+        let notifs: Vec<_> = notifs.try_iter().collect();
+        assert_eq!(notifs.len(), 2, "{notifs:?}");
+        assert!(matches!(
+            &notifs[0],
+            Notification::CoinReceived { account, outpoint, amount, height: None }
+                if account == "test"
+                    && *outpoint == expected
+                    && *amount == bitcoin::Amount::from_sat(50_000_000)
+        ));
+        assert!(matches!(notifs[1], Notification::CoinUpdate));
+    }
+
+    #[test]
+    fn generate_spending_a_coin_notifies_coin_spent() {
+        let (mut cs, notifs, expected) = funded_coin_store();
+        cs.tx_store.update(TxEntry::for_test(spending_tx(expected)));
+
+        cs.generate();
+
+        let notifs: Vec<_> = notifs.try_iter().collect();
+        assert_eq!(notifs.len(), 2, "{notifs:?}");
+        assert!(matches!(
+            &notifs[0],
+            Notification::CoinSpent { account, outpoint }
+                if account == "test" && *outpoint == expected
+        ));
+        assert!(matches!(notifs[1], Notification::CoinUpdate));
+    }
+
+    #[test]
+    fn generate_dropping_an_unspent_coin_notifies_coin_spent() {
+        let (mut cs, notifs, expected) = funded_coin_store();
+        cs.tx_store.remove(&expected.txid);
+
+        cs.generate();
+
+        let notifs: Vec<_> = notifs.try_iter().collect();
+        assert_eq!(notifs.len(), 2, "{notifs:?}");
+        assert!(matches!(
+            &notifs[0],
+            Notification::CoinSpent { account, outpoint }
+                if account == "test" && *outpoint == expected
+        ));
+        assert!(matches!(notifs[1], Notification::CoinUpdate));
+    }
+
+    #[test]
+    fn noop_generate_notifies_no_coin_event() {
+        let (mut cs, notifs, _) = funded_coin_store();
+
+        cs.generate();
+
+        let notifs: Vec<_> = notifs.try_iter().collect();
+        assert_eq!(notifs.len(), 1, "{notifs:?}");
+        assert!(matches!(notifs[0], Notification::CoinUpdate));
     }
 
     /// A server can hand back a tx whose input names a vout the funding tx

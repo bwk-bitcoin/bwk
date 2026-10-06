@@ -200,6 +200,7 @@ impl<P: ScanProfile> ElectrumScanner<P> {
             config.network,
             config.descriptor.clone(),
             sender.clone(),
+            config.account.clone(),
             receive,
             change,
             look_ahead,
