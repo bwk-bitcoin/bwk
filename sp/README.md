@@ -103,6 +103,33 @@ SpTxStore (transaction history)
 Notification ──► Account consumer
 ```
 
+## Backend trust
+
+The scanner takes chain facts from the Blindbit oracle and does not check them
+against the account's PoW-validated `HeaderStore` (used today only for block
+timestamps):
+
+- **Received outputs.** Tweaks, the new-UTXO filter and its block hash, and
+  the UTXO list (value, script, spent flag) all come from the oracle. Since the
+  oracle also picks the tweak, it can fabricate an output the account will
+  recognise as its own, with any amount, at any height. Such a coin cannot be
+  spent (taproot signatures commit to every prevout amount and script), but it
+  shows as confirmed balance and as a received payment.
+- **Scan tip and reorgs.** The scan end is the oracle's `/block-height` and
+  each block hash is the oracle's. The receive and spend frontiers only move
+  forward and `ScanState::last_block_hash` is not compared on resume, so a
+  block replaced by a reorg below the frontier is not rescanned, and a tip
+  reported above the real chain moves the frontier past blocks that are then
+  never scanned on that backend.
+
+A scan pass refuses a range wider than `MAX_SCAN_SPAN` blocks, so an absurd
+tip cannot size an allocation. Binding the scan to the header chain (end at
+`min(oracle tip, header tip)`, each filter block hash checked against
+`HeaderStore::block_hash`, rewinding both frontiers on mismatch) and checking
+received outputs against Electrum (merkle proof and raw transaction) are not
+done yet. Until then, treat a received SP payment as confirmed only once
+another source agrees.
+
 ## Stores
 
 - `SpCoinStore`: Detected SP outputs with spend status
