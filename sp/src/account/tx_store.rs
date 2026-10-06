@@ -259,13 +259,35 @@ impl<P: SpStorageProfile> SpTxStore<P> {
     }
 }
 
+/// A header store holding a single header, at `height`, dated `time`.
+#[cfg(test)]
+pub fn header_store_with_block_time(
+    network: bitcoin::Network,
+    height: u32,
+    time: u32,
+) -> Arc<HeaderStore> {
+    use bitcoin::hashes::Hash;
+
+    let header = bitcoin::block::Header {
+        version: bitcoin::block::Version::ONE,
+        prev_blockhash: bitcoin::BlockHash::all_zeros(),
+        merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+        time,
+        bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
+        nonce: 0,
+    };
+    let raw = bitcoin::consensus::serialize(&header).try_into().unwrap();
+    HeaderStore::from_map(network, std::collections::BTreeMap::from([(height, raw)]))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
-    use bitcoin::{hashes::Hash, Txid};
+    use bitcoin::{hashes::Hash, Network, Txid};
+    use bwk::bwk_electrum::header_store::HeaderStore;
 
-    use crate::account::tx_store::{SpTxEntry, SpTxStore};
+    use crate::account::tx_store::{header_store_with_block_time, SpTxEntry, SpTxStore};
 
     fn entry_at(n: u8, height: Option<u32>) -> SpTxEntry {
         let mut entry = SpTxEntry::new(Txid::from_byte_array([n; 32]));
@@ -295,5 +317,29 @@ mod tests {
         assert_eq!(unconfirmed.timestamp(), None);
         let mempool = store.get(&Txid::from_byte_array([4; 32])).unwrap();
         assert_eq!(mempool.height(), None);
+    }
+
+    #[test]
+    fn restamp_stamps_an_entry_once_its_header_lands() {
+        let mut store = SpTxStore::new();
+        let mempool = Txid::from_byte_array([1; 32]);
+        let confirmed = Txid::from_byte_array([2; 32]);
+        store.insert(SpTxEntry::new(mempool));
+        let mut entry = SpTxEntry::new(confirmed);
+        entry.height = Some(7);
+        store.insert(entry);
+
+        assert!(!store.restamp_missing_timestamps(&HeaderStore::new_in_memory(Network::Regtest)));
+        assert_eq!(store.get(&confirmed).unwrap().timestamp(), None);
+
+        let caught_up = header_store_with_block_time(Network::Regtest, 7, 1_700_000_000);
+        assert!(store.restamp_missing_timestamps(&caught_up));
+        assert_eq!(
+            store.get(&confirmed).unwrap().timestamp(),
+            Some(1_700_000_000)
+        );
+        assert_eq!(store.get(&mempool).unwrap().timestamp(), None);
+
+        assert!(!store.restamp_missing_timestamps(&caught_up));
     }
 }

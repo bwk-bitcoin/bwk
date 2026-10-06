@@ -1929,7 +1929,7 @@ pub(crate) mod mnemonic_probe {
 #[cfg(all(test, feature = "mnemonic"))]
 mod tests {
     use super::*;
-    use crate::receiver::OwnedOutput;
+    use crate::{account::tx_store::header_store_with_block_time, receiver::OwnedOutput};
     use bitcoin::{absolute::Height, hashes::hash160, secp256k1::Parity};
     use bwk::bwk_electrum::raw_client::CertificateCheck;
     use std::path::PathBuf;
@@ -2914,6 +2914,72 @@ mod tests {
             }],
         };
         bitcoin::Psbt::from_unsigned_tx(tx).unwrap()
+    }
+
+    /// A confirmed tx with no block time, recorded with `change` so it shows
+    /// in the payment history.
+    fn insert_undated_tx(account: &Account, height: u32) -> Txid {
+        let txid = Txid::from_byte_array([0x44; 32]);
+        let mut entry = SpTxEntry::new(txid);
+        entry.height = Some(height);
+        entry.change = 1_000;
+        account.tx_store.lock().unwrap().insert(entry);
+        txid
+    }
+
+    fn history_timestamp(account: &Account, txid: Txid) -> Option<u64> {
+        account
+            .payment_history()
+            .into_iter()
+            .find(|payment| payment.txid == txid.to_string())
+            .unwrap()
+            .timestamp
+    }
+
+    #[test]
+    fn a_tx_recorded_before_its_header_is_dated_then_restamped() {
+        let config = test_config();
+        let header_store = header_store_with_block_time(config.network, 7, 1_700_000_000);
+        let account = Account::with_header_store(config, header_store).unwrap();
+        let txid = insert_undated_tx(&account, 7);
+
+        assert_eq!(history_timestamp(&account, txid), Some(1_700_000_000));
+        assert_eq!(
+            account
+                .tx_store
+                .lock()
+                .unwrap()
+                .get(&txid)
+                .unwrap()
+                .timestamp(),
+            None
+        );
+
+        assert!(account.restamp_missing_timestamps());
+        assert_eq!(
+            account
+                .tx_store
+                .lock()
+                .unwrap()
+                .get(&txid)
+                .unwrap()
+                .timestamp(),
+            Some(1_700_000_000)
+        );
+        assert_eq!(history_timestamp(&account, txid), Some(1_700_000_000));
+
+        assert!(!account.restamp_missing_timestamps());
+    }
+
+    #[test]
+    fn restamp_without_a_header_scanner_stamps_nothing() {
+        let mut config = test_config();
+        config.header_scanner = false;
+        let account = Account::new(config).unwrap();
+        let txid = insert_undated_tx(&account, 7);
+
+        assert!(!account.restamp_missing_timestamps());
+        assert_eq!(history_timestamp(&account, txid), None);
     }
 
     #[test]
