@@ -542,6 +542,25 @@ mod tests {
         assert!(matches!(opened, Err(open::Error::Descriptor(_))));
     }
 
+    // Pointed at a closed local port, an account with a header scanner fails
+    // the open on its header store. Without one it opens: no header store is
+    // built, so nothing connects for headers.
+    #[test]
+    fn an_account_without_header_scanner_starts_no_header_connection() {
+        let dir = TempDir::new().unwrap();
+        let mut config = persisted_offline_config(&dir, 2);
+        config.scanner.set_stay_offline(false);
+        config.set_electrum_url("127.0.0.1".to_string());
+        config.set_electrum_port("1".to_string());
+
+        let opened: Result<Account, _> = Account::try_new(config.clone());
+        assert!(matches!(opened, Err(open::Error::HeaderStore(_))));
+
+        config.scanner.header_scanner = false;
+        let account: Account = Account::try_new(config).unwrap();
+        assert!(account.header_store().is_none());
+    }
+
     #[test]
     fn restart_restores_deep_change_tip_and_high_index_history_no_panic() {
         // Regression for the `address_store.rs "must be there"` panic on
@@ -691,7 +710,7 @@ mod integration_tests {
     use bwk_descriptor::descriptor::ScriptType;
     use bwk_electrum::{
         client::Client,
-        coin_store::Payment,
+        coin_store::{Payment, PaymentStatus},
         notification::{Notification, TxListenerNotif},
         raw_client::CertificateCheck,
         tx_store::Inclusion,
@@ -947,6 +966,80 @@ mod integration_tests {
             },
             TIMEOUT,
         );
+    }
+
+    /// Without a header scanner the account trusts its server: a received coin
+    /// comes out `Confirmed` at the mined height, stamped with that block's
+    /// time, from the header the scanner fetched on its own connection.
+    #[test]
+    fn an_account_without_header_scanner_confirms_at_the_block_time() {
+        let (url, port, _electrsd, bitcoind) = bootstrap_electrs();
+        generate(&bitcoind, 100);
+
+        let dir = TempDir::new().unwrap();
+        let mnemonic = Mnemonic::generate(12).unwrap();
+        let mut config = Config::new(
+            Some(mnemonic.to_string()),
+            "account".to_string(),
+            bitcoin::Network::Regtest,
+            ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
+            dir.path().to_path_buf(),
+            ".bwk".to_string(),
+            Some(PersistenceKind::Json),
+        )
+        .unwrap();
+        config.set_electrum_url(url);
+        config.set_electrum_port(port.to_string());
+        config.scanner.header_scanner = false;
+        let mut account: Account = Account::new(config);
+        assert!(account.header_store().is_none());
+
+        let recv_addr = account.scanner_mut().new_recv_addr();
+        let txid = send_to_address(&bitcoind, &recv_addr, Amount::from_btc(0.1).unwrap());
+        generate(&bitcoind, 1);
+        let height = get_block_height(&bitcoind);
+        let block_hash = get_block_hash_str(&bitcoind, height);
+        let block_time = bitcoind
+            .client
+            .get_block_header_info(&bitcoind.client.get_block_hash(height as u64).unwrap())
+            .unwrap()
+            .time as u64;
+
+        wait_until_timeout(
+            || {
+                let coins = account.scanner().coins();
+                coins.len() == 1 && coins.values().all(|c| c.status() == CoinStatus::Confirmed)
+            },
+            block_wait(1),
+        );
+
+        let coin = account.scanner().coins().pop_first().unwrap().1;
+        assert_eq!(coin.height(), Some(height as u64));
+        let entry = account
+            .scanner()
+            .tx_history()
+            .into_iter()
+            .find(|entry| entry.txid() == txid)
+            .unwrap();
+        match entry.inclusion() {
+            Inclusion::ConfirmedUnverified {
+                height: confirmed_at,
+                block_hash: confirmed_in,
+            } => {
+                assert_eq!(*confirmed_at, height);
+                assert_eq!(confirmed_in.to_string(), block_hash);
+            }
+            other => panic!("expected ConfirmedUnverified, got {other:?}"),
+        }
+        assert_eq!(entry.timestamp(), Some(block_time));
+        let payment = account
+            .scanner()
+            .payment_history()
+            .into_iter()
+            .find(|payment| payment.txid == txid.to_string())
+            .unwrap();
+        assert_eq!(payment.status, PaymentStatus::Verified);
+        assert_eq!(payment.timestamp, Some(block_time));
     }
 
     #[test]
