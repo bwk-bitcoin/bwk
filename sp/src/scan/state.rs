@@ -224,6 +224,14 @@ impl ScanState {
         }
     }
 
+    /// Move both frontiers back to `fork_height` after a reorg above it and
+    /// drop the hashes of the reorged blocks.
+    pub fn roll_back(&mut self, fork_height: u32) {
+        self.last_scanned_height = Some(fork_height);
+        self.last_spend_height = self.last_spend_height.map(|h| h.min(fork_height));
+        self.drop_block_hashes(|h| h > fork_height);
+    }
+
     fn drop_block_hashes(&mut self, drop: impl Fn(u32) -> bool) {
         let heights: Vec<u32> = self
             .block_hashes
@@ -565,6 +573,33 @@ mod tests {
 
         assert!(state.block_hashes().is_empty());
         assert_eq!(state.last_block_hash(), None);
+    }
+
+    #[test]
+    fn test_roll_back_moves_frontiers_to_fork() {
+        let mut state = ScanState::new(0);
+        advance_to(&mut state, 150);
+        state.advance_spend_frontier(149);
+
+        state.roll_back(147);
+
+        assert_eq!(state.last_scanned_height(), Some(147));
+        assert_eq!(state.last_spend_height(), Some(147));
+        assert_eq!(state.last_block_hash(), Some(hash_at(147)));
+        assert_eq!(state.block_hashes().len(), 3);
+        assert_eq!(state.next_scan_start(), 148);
+    }
+
+    #[test]
+    fn test_roll_back_keeps_trailing_spend_frontier() {
+        let mut state = ScanState::new(0);
+        advance_to(&mut state, 150);
+        state.advance_spend_frontier(120);
+
+        state.roll_back(147);
+
+        assert_eq!(state.last_scanned_height(), Some(147));
+        assert_eq!(state.last_spend_height(), Some(120));
     }
 
     #[test]

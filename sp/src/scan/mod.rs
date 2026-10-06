@@ -702,6 +702,78 @@ pub fn scan_blocks_with_observer<P: SpStorageProfile>(
     Ok(outcome)
 }
 
+/// Find where the chain forked off the scanned blocks: the highest kept height
+/// whose hash still matches the chain. `None` when the highest one matches or
+/// nothing was scanned yet.
+fn find_fork(
+    backend: &BackendContext,
+    scanned: &BTreeMap<u32, [u8; 32]>,
+) -> Result<Option<u32>, receiver::error::Error> {
+    if scanned.is_empty() {
+        return Ok(None);
+    }
+    for (depth, (height, hash)) in scanned.iter().rev().enumerate() {
+        let at = Height::from_consensus(*height)?;
+        let chain = blindbit::filter_new_utxos(&backend.agent, &backend.url, at)?.block_hash;
+        if chain.as_byte_array() == hash {
+            return Ok((depth > 0).then_some(*height));
+        }
+    }
+    Err(receiver::error::Error::ReorgTooDeep(REORG_DEPTH - 1))
+}
+
+/// Undo what the blocks above `fork_height` recorded: their coins, the spends
+/// and txs they confirmed, and both scan frontiers.
+fn roll_back<P: SpStorageProfile>(
+    stores: &ScanStores<P>,
+    fork_height: u32,
+    reorged: &HashSet<[u8; 32]>,
+) {
+    let pending = {
+        let mut coin_store = stores.coin_store.lock().expect("poisoned");
+        coin_store.roll_back(fork_height, reorged);
+        coin_store.persist();
+        coin_store.spending_txids()
+    };
+    {
+        let mut tx_store = stores.tx_store.lock().expect("poisoned");
+        tx_store.roll_back(fork_height, &pending);
+        tx_store.persist();
+    }
+    let mut state = stores.scan_state.lock().expect("poisoned");
+    state.roll_back(fork_height);
+    state.persist();
+}
+
+/// Roll the stores back to the fork when the chain reorganized under the
+/// scanned blocks, and make the scan start again above the fork.
+fn handle_reorg<P: SpStorageProfile>(
+    backend: &BackendContext,
+    scan: &mut ScanContext<P>,
+) -> Result<(), receiver::error::Error> {
+    let scanned = scan
+        .stores
+        .scan_state
+        .lock()
+        .expect("poisoned")
+        .block_hashes();
+    let Some(fork_height) = find_fork(backend, &scanned)? else {
+        return Ok(());
+    };
+    log::warn!("reorg detected above height {fork_height}, rolling back");
+    let reorged: HashSet<[u8; 32]> = scanned
+        .range(fork_height + 1..)
+        .map(|(_, hash)| *hash)
+        .collect();
+    roll_back(scan.stores, fork_height, &reorged);
+    let _ = scan
+        .stores
+        .sender
+        .send(Notification::Sp(SpNotification::Reorg { fork_height }));
+    scan.start = scan.start.min(Height::from_consensus(fork_height + 1)?);
+    Ok(())
+}
+
 fn should_interrupt(stop: &Arc<AtomicBool>) -> bool {
     stop.load(Ordering::Relaxed)
 }
@@ -1452,6 +1524,7 @@ fn process_scan<P: SpStorageProfile>(
     backend: &BackendContext,
     scan: &mut ScanContext<P>,
 ) -> Result<ScanOutcome, receiver::error::Error> {
+    handle_reorg(backend, scan)?;
     let start_u32 = scan.start.to_consensus_u32();
     let end_u32 = scan.end.to_consensus_u32();
 
@@ -1540,7 +1613,7 @@ impl<P: SpStorageProfile> crate::account::Account<P> {
     ///
     /// Returns immediately after spawning the scanner thread; progress is
     /// reported through the notification channel (`ScanStarted`,
-    /// `ScanReceiveProgress`, `ScanSpendProgress`, `ScanCompleted`,
+    /// `Reorg`, `ScanReceiveProgress`, `ScanSpendProgress`, `ScanCompleted`,
     /// `ScanStopped` when cancelled, `FailStartScanning`, `FailScan`). Use
     /// `is_scanning()` to poll for completion and `stop_scan()` to cancel.
     pub fn scan_oneshot(&mut self, start: Option<u32>) -> Result<(), AccountError> {

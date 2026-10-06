@@ -17,6 +17,8 @@ pub enum Error {
     InvalidRange(u32, u32),
     #[error("missing block hash for scanned block {0}")]
     MissingBlockHash(u32),
+    #[error("reorg deeper than {0} blocks")]
+    ReorgTooDeep(u32),
     #[error("unknown recipient address type")]
     UnknownAddressType,
     #[error(
