@@ -138,5 +138,9 @@ pub enum TxListenerNotif {
     Started,
     Connected(String),
     Error(tx_listener::Error),
+    /// The listener exited on a requested stop.
     Stopped,
+    /// The connection dropped: the listener has exited and does not reconnect,
+    /// restarting it is the consumer's call.
+    Disconnected,
 }

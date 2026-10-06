@@ -55,6 +55,10 @@ for (outpoint, entry) in scanner.coins() {
 }
 ```
 
+The scan reports its connection as `Notification::Electrum(TxListenerNotif)`.
+It sends `Stopped` once a `stop()` lands, and `Disconnected` when the connection
+dropped. A dropped connection is not retried: `start()` opens a new one.
+
 ### Async Listener (Recommended)
 
 ```rust

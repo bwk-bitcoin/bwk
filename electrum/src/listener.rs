@@ -67,14 +67,21 @@ macro_rules! send_notif {
 macro_rules! send_electrum {
     ($request:expr, $notification:expr, $statuses:expr, $msg:expr) => {
         if $request.send($msg).is_err() {
-            send_notif!($notification, $request, $statuses, TxListenerNotif::Stopped);
+            send_notif!(
+                $notification,
+                $request,
+                $statuses,
+                TxListenerNotif::Disconnected
+            );
             return $statuses;
         }
     };
 }
 
 /// Drive one Electrum connection until `stop_request` is set or the connection
-/// dies, folding everything the server reports into `coin_store`. Returns the
+/// dies, folding everything the server reports into `coin_store`. The exit is
+/// notified as `TxListenerNotif::Stopped` for the first and
+/// `TxListenerNotif::Disconnected` for the second. Returns the
 /// statuses store so the next listener can reuse it. Without a
 /// `header_scanner`, the claims are confirmed here against the headers this
 /// connection returns.
@@ -227,7 +234,12 @@ where
                         log::warn!("listen_txs(): unsolicited TxMerkle for {txid}@{height}");
                     }
                     CoinResponse::Stopped => {
-                        send_notif!(notification, request, statuses, TxListenerNotif::Stopped);
+                        send_notif!(
+                            notification,
+                            request,
+                            statuses,
+                            TxListenerNotif::Disconnected
+                        );
                         let _ = request.send(CoinRequest::Stop);
                         return statuses;
                     }
@@ -255,7 +267,12 @@ where
                 mpsc::TryRecvError::Disconnected => {
                     // NOTE: here the electrum client is dropped, we cannot continue
                     log::error!("listen_txs() electrum client stopped unexpectedly");
-                    send_notif!(notification, request, statuses, TxListenerNotif::Stopped);
+                    send_notif!(
+                        notification,
+                        request,
+                        statuses,
+                        TxListenerNotif::Disconnected
+                    );
                     let _ = request.send(CoinRequest::Stop);
                     return statuses;
                 }
@@ -276,13 +293,16 @@ fn flush_statuses<S: Store>(statuses: &mut S) {
 }
 
 /// Replicate the `send_electrum!`/`send_notif!` failure path: tell the consumer
-/// the listener stopped, and if even that fails, ask the client to stop. Returns
-/// `Break` so the caller can end the listener thread.
-fn signal_stopped(
+/// the connection dropped, and if even that fails, ask the client to stop.
+/// Returns `Break` so the caller can end the listener thread.
+fn signal_disconnected(
     request: &mpsc::Sender<CoinRequest>,
     notification: &NotificationSender,
 ) -> ControlFlow<()> {
-    if notification.send(TxListenerNotif::Stopped.into()).is_err() {
+    if notification
+        .send(TxListenerNotif::Disconnected.into())
+        .is_err()
+    {
         let _ = request.send(CoinRequest::Stop);
     }
     ControlFlow::Break(())
@@ -335,7 +355,7 @@ fn handle_address_tip<P: ScanProfile>(
     if !sub.is_empty() {
         flush_statuses(statuses);
         if request.send(CoinRequest::Subscribe(sub)).is_err() {
-            return signal_stopped(request, notification);
+            return signal_disconnected(request, notification);
         }
     }
     ControlFlow::Continue(())
@@ -407,7 +427,7 @@ fn handle_status_response<P: ScanProfile>(
         let hist = CoinRequest::History(history);
         log::debug!("listen_txs() send {}", hist.summary());
         if request.send(hist).is_err() {
-            return signal_stopped(request, notification);
+            return signal_disconnected(request, notification);
         }
     }
     if dirty {
@@ -430,7 +450,7 @@ fn handle_history_response_msg<P: ScanProfile>(
     if !outcome.missing_txs.is_empty()
         && request.send(CoinRequest::Txs(outcome.missing_txs)).is_err()
     {
-        return signal_stopped(request, notification);
+        return signal_disconnected(request, notification);
     }
     let pending_changed = store.record_reported_heights(&outcome.reported);
     if outcome.height_updated {
@@ -476,7 +496,7 @@ fn confirm_reported<P: ScanProfile>(
         let _ = notification.send(Notification::PaymentHistoryUpdated);
     }
     if !missing.is_empty() && request.send(CoinRequest::Headers(missing)).is_err() {
-        return signal_stopped(request, notification);
+        return signal_disconnected(request, notification);
     }
     ControlFlow::Continue(())
 }

@@ -54,6 +54,8 @@ for notification in receiver {
             let state = account.spendable_coins();
             println!("confirmed balance: {}", state.confirmed_balance);
         }
+        // A dropped connection is not retried: restart it or give up.
+        Notification::Electrum(TxListenerNotif::Disconnected) => account.start_electrum(),
         Notification::Electrum(TxListenerNotif::Stopped) => break,
         _ => {}
     }
