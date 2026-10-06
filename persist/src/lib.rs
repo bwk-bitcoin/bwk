@@ -94,6 +94,10 @@ pub const COINS_STORE_KEY: &str = "coins";
 /// Logical store name for the bwk-sp (silent-payment) transaction store.
 pub const TXS_STORE_KEY: &str = "txs";
 
+/// Logical store name for the bwk-sp hashes of the last scanned blocks, keyed
+/// by height, kept for reorg detection.
+pub const BLOCK_HASHES_STORE_KEY: &str = "block_hashes";
+
 /// Logical store name for hot-signer material (BIP32 mnemonics +
 /// per-signer descriptor sets), keyed by signer fingerprint.
 ///
@@ -123,6 +127,7 @@ pub const KNOWN_STORES: &[&str] = &[
     STATUSES_STORE_KEY,
     COINS_STORE_KEY,
     TXS_STORE_KEY,
+    BLOCK_HASHES_STORE_KEY,
     SIGNERS_STORE_KEY,
     HEADERS_STORE_KEY,
 ];
