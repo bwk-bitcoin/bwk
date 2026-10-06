@@ -1130,7 +1130,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         let mut recipients: Vec<SpRecipientAddress> = Vec::new();
 
         for output in &request.outputs {
-            let addr = RecipientAddress::try_from(output.address.clone()).map_err(|e| {
+            let addr = RecipientAddress::parse(&output.address, network).map_err(|e| {
                 TxRequestError::InvalidAddress {
                     address: output.address.clone(),
                     source: Box::new(e),

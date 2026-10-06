@@ -17,7 +17,6 @@ use std::str::FromStr;
 use bitcoin::bip32;
 use bitcoin::{
     absolute::Height,
-    address::NetworkUnchecked,
     hex::{DisplayHex, FromHex},
     secp256k1::{All, PublicKey, Secp256k1, SecretKey},
     Address, Amount, BlockHash, Network, ScriptBuf, Txid,
@@ -90,22 +89,31 @@ pub struct OwnedOutput {
     pub spend_status: OutputSpendStatus,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Clone, PartialEq)]
 #[serde(untagged)]
 pub enum RecipientAddress {
-    LegacyAddress(Address<NetworkUnchecked>),
+    LegacyAddress(Address),
     SpAddress(SilentPaymentAddress),
     Data(Vec<u8>), // OpReturn output
 }
 
-impl TryFrom<String> for RecipientAddress {
-    type Error = Error;
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        if let Ok(sp_address) = SilentPaymentAddress::try_from(value.as_str()) {
+impl RecipientAddress {
+    /// Parse `value` and reject an address that is not valid on `network`.
+    pub fn parse(value: &str, network: Network) -> Result<Self, Error> {
+        if let Ok(sp_address) = SilentPaymentAddress::try_from(value) {
+            let network = SpNetwork::from(network);
+            if sp_address.get_network() != network {
+                return Err(Error::SpNetworkMismatch {
+                    address: sp_address.get_network(),
+                    account: network,
+                });
+            }
             Ok(Self::SpAddress(sp_address))
-        } else if let Ok(legacy_address) = Address::from_str(&value) {
-            Ok(Self::LegacyAddress(legacy_address))
-        } else if let Ok(data) = Vec::from_hex(&value) {
+        } else if let Ok(legacy_address) = Address::from_str(value) {
+            Ok(Self::LegacyAddress(
+                legacy_address.require_network(network)?,
+            ))
+        } else if let Ok(data) = Vec::from_hex(value) {
             Ok(Self::Data(data))
         } else {
             Err(Error::UnknownAddressType)
@@ -116,7 +124,7 @@ impl TryFrom<String> for RecipientAddress {
 impl From<RecipientAddress> for String {
     fn from(value: RecipientAddress) -> Self {
         match value {
-            RecipientAddress::LegacyAddress(address) => address.assume_checked().to_string(),
+            RecipientAddress::LegacyAddress(address) => address.to_string(),
             RecipientAddress::SpAddress(sp_address) => sp_address.to_string(),
             RecipientAddress::Data(data) => data.to_lower_hex_string(),
         }
@@ -215,19 +223,12 @@ impl SpReceiver {
         let scan_pubkey = scan_sk.public_key(&secp);
         let change_label = Label::new(scan_sk, 0);
 
-        let sp_network = match network {
-            Network::Bitcoin => SpNetwork::Mainnet,
-            Network::Regtest => SpNetwork::Regtest,
-            Network::Testnet | Network::Signet => SpNetwork::Testnet,
-            _ => unreachable!(),
-        };
-
         let receiver = Receiver::new(
             0,
             scan_pubkey,
             (&spend_key).into(),
             change_label,
-            sp_network,
+            network.into(),
         )?;
 
         Ok(Self {

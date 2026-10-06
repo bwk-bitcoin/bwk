@@ -19,6 +19,13 @@ pub enum Error {
     MissingBlockHash(u32),
     #[error("unknown recipient address type")]
     UnknownAddressType,
+    #[error(
+        "silent payment address network ({address:?}) does not match account network ({account:?})"
+    )]
+    SpNetworkMismatch {
+        address: crate::core::utils::common::Network,
+        account: crate::core::utils::common::Network,
+    },
 
     // Wrapped external errors
     #[error(transparent)]
@@ -31,6 +38,8 @@ pub enum Error {
     BlockFilter(#[from] bitcoin::bip158::Error),
     #[error(transparent)]
     InvalidHeight(#[from] bitcoin::absolute::ConversionError),
+    #[error(transparent)]
+    Address(#[from] bitcoin::address::ParseError),
 
     // Backend pass-through for downstream crates
     #[error(transparent)]

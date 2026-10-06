@@ -8,7 +8,7 @@
 
 mod common;
 
-use bitcoin::{hashes::Hash, OutPoint};
+use bitcoin::{hashes::Hash, Address, Network, OutPoint, ScriptBuf};
 use bwk_tx::template::{TxOutputSpec, TxRequest, TxRequestError};
 use common::test_account_named;
 
@@ -16,10 +16,12 @@ fn account() -> bwk_sp::account::Account {
     test_account_named("template-tests", "http://127.0.0.1:1")
 }
 
-fn valid_address() -> &'static str {
-    // A real bech32 P2WPKH address. `RecipientAddress::try_from` only checks
-    // syntactic validity, so the network doesn't matter for these tests.
-    "bc1qkl8ms75cq6ajxtny7e88z3u9hkpkvktt5jwh6u"
+fn address(network: Network) -> String {
+    Address::p2wsh(&ScriptBuf::new(), network).to_string()
+}
+
+fn valid_address() -> String {
+    address(Network::Regtest)
 }
 
 #[test]
@@ -28,13 +30,13 @@ fn multiple_max_outputs_rejected() {
     let request = TxRequest {
         outputs: vec![
             TxOutputSpec {
-                address: valid_address().into(),
+                address: valid_address(),
                 amount: 0,
                 label: None,
                 max: true,
             },
             TxOutputSpec {
-                address: valid_address().into(),
+                address: valid_address(),
                 amount: 0,
                 label: None,
                 max: true,
@@ -83,7 +85,7 @@ fn manual_outpoint_not_in_wallet_is_coin_not_found() {
     };
     let request = TxRequest {
         outputs: vec![TxOutputSpec {
-            address: valid_address().into(),
+            address: valid_address(),
             amount: 1_000,
             label: None,
             max: false,
@@ -104,7 +106,7 @@ fn auto_select_on_empty_wallet_is_insufficient_funds() {
     let acc = account();
     let request = TxRequest {
         outputs: vec![TxOutputSpec {
-            address: valid_address().into(),
+            address: valid_address(),
             amount: 100_000,
             label: None,
             max: false,

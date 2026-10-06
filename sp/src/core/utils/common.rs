@@ -39,6 +39,17 @@ pub enum Network {
     Regtest,
 }
 
+impl From<bitcoin::Network> for Network {
+    fn from(network: bitcoin::Network) -> Self {
+        match network {
+            bitcoin::Network::Bitcoin => Network::Mainnet,
+            bitcoin::Network::Testnet | bitcoin::Network::Signet => Network::Testnet,
+            bitcoin::Network::Regtest => Network::Regtest,
+            _ => Network::Testnet,
+        }
+    }
+}
+
 impl From<Network> for &str {
     fn from(value: Network) -> Self {
         match value {
