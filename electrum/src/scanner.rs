@@ -36,7 +36,7 @@ use crate::{
     history::{aggregate_payments, AccountHistory, TxContribution},
     label_store::{LabelKey, LabelStore},
     listener::{listen_txs, ScanListeners, STATUS_KEYCHAIN_CHANGE, STATUS_KEYCHAIN_RECEIVE},
-    notification::{Notification, TxListenerNotif},
+    notification::{Notification, NotificationSender, TxListenerNotif},
     open,
     profile::{
         DefaultBackend, OpenScanFromBackend, RamProfile, ReopenStatuses, ScanProfile, ScanStores,
@@ -84,7 +84,7 @@ pub struct ElectrumScanner<P: ScanProfile = RamProfile<DefaultBackend>> {
     config: ScannerConfig,
     coin_store: Arc<Mutex<CoinStore<P>>>,
     label_store: Arc<Mutex<LabelStore<P>>>,
-    sender: mpsc::Sender<Notification>,
+    sender: NotificationSender,
     receiver: Option<mpsc::Receiver<Notification>>,
     listener: Worker,
     /// Live connection state, shared with the listener thread, which sets it
@@ -178,6 +178,7 @@ impl<P: ScanProfile> ElectrumScanner<P> {
         stores: ScanStores<P>,
         reopen_statuses: Option<ReopenStatuses<P>>,
     ) -> Self {
+        let sender = NotificationSender::from(sender);
         let tx_store = TxStore::from_store(stores.tx);
         let label_store = Arc::new(Mutex::new(LabelStore::from_store(stores.label)));
         let account_store = Arc::new(Mutex::new(stores.account));
@@ -568,6 +569,12 @@ impl<P: ScanProfile> ElectrumScanner<P> {
         self.coin_store.lock().expect("poisoned").init(address_tip);
     }
 
+    /// Report on `sender` from now on, the stores and the running listener
+    /// included.
+    pub fn set_sender(&mut self, sender: mpsc::Sender<Notification>) {
+        self.sender.set(sender);
+    }
+
     /// Signal the listener to stop without blocking. The listener winds down on
     /// its own and hands its statuses store back through `statuses_rx`, which
     /// the next start reclaims. Its handle is kept for `Drop` to join.
@@ -721,7 +728,7 @@ mod tests {
         bitcoin::{bip32::DerivationPath, Network},
         Descriptor, DescriptorPublicKey,
     };
-    use std::{collections::BTreeMap, path::PathBuf, str::FromStr};
+    use std::{collections::BTreeMap, path::PathBuf, str::FromStr, sync::mpsc};
 
     use crate::{
         coin_store::PaymentStatus,
@@ -831,5 +838,19 @@ mod tests {
 
         assert!(scanner.statuses_store.is_none(), "the listener took it");
         scanner.stop();
+    }
+
+    #[test]
+    fn set_sender_redirects_the_store_notifications() {
+        let mut scanner = ElectrumScanner::offline_for_test();
+        let old = scanner.receiver().unwrap();
+        old.try_iter().for_each(drop);
+        let (sender, new) = mpsc::channel();
+
+        scanner.set_sender(sender);
+        scanner.coin_store().lock().unwrap().generate();
+
+        assert!(matches!(new.try_recv(), Ok(Notification::CoinUpdate)));
+        assert!(old.try_recv().is_err());
     }
 }

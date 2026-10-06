@@ -27,7 +27,7 @@ use crate::{
     client::{CoinRequest, CoinResponse},
     coin_store::CoinStore,
     fanout::Fanout,
-    notification::{Notification, TxListenerNotif},
+    notification::{Notification, NotificationSender, TxListenerNotif},
     profile::ScanProfile,
     tx_listener,
     worker::IDLE_BACKOFF_MS,
@@ -72,7 +72,7 @@ macro_rules! send_electrum {
 pub fn listen_txs<P>(
     coin_store: Arc<Mutex<CoinStore<P>>>,
     derivator: SpkDerivator,
-    notification: mpsc::Sender<Notification>,
+    notification: impl Into<NotificationSender>,
     address_tip: mpsc::Receiver<AddressTip>,
     stop_request: Arc<AtomicBool>,
     request: mpsc::Sender<CoinRequest>,
@@ -84,6 +84,7 @@ where
     P: ScanProfile,
 {
     log::info!("listen_txs(): started");
+    let notification = notification.into();
     send_notif!(notification, request, statuses, TxListenerNotif::Started);
 
     let initial_keys: Vec<ScriptBuf> = match statuses.keys() {
@@ -228,7 +229,7 @@ fn flush_statuses<S: Store>(statuses: &mut S) {
 /// `Break` so the caller can end the listener thread.
 fn signal_stopped(
     request: &mpsc::Sender<CoinRequest>,
-    notification: &mpsc::Sender<Notification>,
+    notification: &NotificationSender,
 ) -> ControlFlow<()> {
     if notification.send(TxListenerNotif::Stopped.into()).is_err() {
         let _ = request.send(CoinRequest::Stop);
@@ -243,7 +244,7 @@ fn handle_address_tip<P: ScanProfile>(
     derivator: &SpkDerivator,
     statuses: &mut P::StatusesStore,
     request: &mpsc::Sender<CoinRequest>,
-    notification: &mpsc::Sender<Notification>,
+    notification: &NotificationSender,
 ) -> ControlFlow<()> {
     let AddressTip { recv, change } = tip;
     let mut sub = vec![];
@@ -297,7 +298,7 @@ fn handle_status_response<P: ScanProfile>(
     statuses: &mut P::StatusesStore,
     coin_store: &Mutex<CoinStore<P>>,
     request: &mpsc::Sender<CoinRequest>,
-    notification: &mpsc::Sender<Notification>,
+    notification: &NotificationSender,
 ) -> ControlFlow<()> {
     let mut history = vec![];
     let mut dirty = false;
@@ -371,7 +372,7 @@ fn handle_history_response_msg<P: ScanProfile>(
     map: BTreeMap<ScriptBuf, Vec<(Txid, Option<u64>)>>,
     coin_store: &Mutex<CoinStore<P>>,
     request: &mpsc::Sender<CoinRequest>,
-    notification: &mpsc::Sender<Notification>,
+    notification: &NotificationSender,
 ) -> ControlFlow<()> {
     let mut store = coin_store.lock().expect("poisoned");
     let outcome = store.handle_history_response(map);

@@ -1,8 +1,31 @@
 //! Events the scanner reports, and the errors it surfaces.
 
+use std::sync::{mpsc, Arc, Mutex};
+
 use miniscript::bitcoin::{Amount, OutPoint, Txid};
 
 use crate::{header_store::InvalidCause, tx_listener};
+
+/// The notification channel of a scanner, shared by every store and thread it
+/// owns, so [`set`](NotificationSender::set) redirects them all at once.
+#[derive(Debug, Clone)]
+pub struct NotificationSender(Arc<Mutex<mpsc::Sender<Notification>>>);
+
+impl NotificationSender {
+    pub fn send(&self, notification: Notification) -> Result<(), mpsc::SendError<Notification>> {
+        self.0.lock().expect("poisoned").send(notification)
+    }
+
+    pub fn set(&self, sender: mpsc::Sender<Notification>) {
+        *self.0.lock().expect("poisoned") = sender;
+    }
+}
+
+impl From<mpsc::Sender<Notification>> for NotificationSender {
+    fn from(sender: mpsc::Sender<Notification>) -> Self {
+        Self(Arc::new(Mutex::new(sender)))
+    }
+}
 
 /// Notifications sent by an Account to signal events.
 #[derive(Debug)]

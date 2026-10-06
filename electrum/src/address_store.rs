@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     config::Tip,
-    notification::Notification,
+    notification::{Notification, NotificationSender},
     profile::{DefaultBackend, RamProfile, ScanProfile},
 };
 
@@ -74,7 +74,7 @@ pub struct AddressStore<P: ScanProfile = RamProfile<DefaultBackend>> {
     recv_generated_tip: u32,
     change_generated_tip: u32,
     derivator: SpkDerivator,
-    notification: mpsc::Sender<Notification>,
+    notification: NotificationSender,
     tx_listener: Option<mpsc::Sender<AddressTip>>,
     look_ahead: u32,
     account_store: Arc<Mutex<P::AccountStore>>,
@@ -98,7 +98,7 @@ impl AddressStore<RamProfile<DefaultBackend>> {
     /// threading a full profile.
     pub fn new(
         derivator: SpkDerivator,
-        notification: mpsc::Sender<Notification>,
+        notification: impl Into<NotificationSender>,
         recv_tip: u32,
         change_tip: u32,
         look_ahead: u32,
@@ -128,7 +128,7 @@ impl<P: ScanProfile> AddressStore<P> {
     /// `Arc<Mutex<_>>` (used to persist the `Tip` singleton).
     pub fn with_account_store(
         derivator: SpkDerivator,
-        notification: mpsc::Sender<Notification>,
+        notification: impl Into<NotificationSender>,
         recv_tip: u32,
         change_tip: u32,
         look_ahead: u32,
@@ -139,7 +139,7 @@ impl<P: ScanProfile> AddressStore<P> {
             store: BTreeMap::new(),
             recv_generated_tip: recv_tip,
             change_generated_tip: change_tip,
-            notification,
+            notification: notification.into(),
             tx_listener: None,
             look_ahead,
             account_store,

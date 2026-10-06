@@ -17,7 +17,7 @@ use crate::{
     coin_state::CoinState,
     header_store::HeaderStore,
     label_store::{LabelKey, LabelStore},
-    notification::Notification,
+    notification::{Notification, NotificationSender},
     profile::{DefaultBackend, RamProfile, ScanProfile},
     tx_store::{Inclusion, InputMetadata, OutputMetadata, TxEntry, TxStore},
 };
@@ -201,7 +201,7 @@ pub struct CoinStore<P: ScanProfile = RamProfile<DefaultBackend>> {
     spk_history: BTreeMap<ScriptBuf, SpkHistory>,
     updates: Vec<Update>,
     derivator: SpkDerivator,
-    notification: mpsc::Sender<Notification>,
+    notification: NotificationSender,
     /// Names the scanner in the per-coin notifications, since several
     /// scanners can share one notification channel.
     account: String,
@@ -327,7 +327,7 @@ impl<P: ScanProfile> CoinStore<P> {
     pub fn new(
         network: bitcoin::Network,
         descriptor: Descriptor<DescriptorPublicKey>,
-        notification: mpsc::Sender<Notification>,
+        notification: impl Into<NotificationSender>,
         account: String,
         recv_tip: u32,
         change_tip: u32,
@@ -337,6 +337,7 @@ impl<P: ScanProfile> CoinStore<P> {
         account_store: Arc<Mutex<P::AccountStore>>,
     ) -> Self {
         let derivator = SpkDerivator::new(descriptor, network).unwrap();
+        let notification = notification.into();
         let address_store = Arc::new(Mutex::new(AddressStore::with_account_store(
             derivator.clone(),
             notification.clone(),
