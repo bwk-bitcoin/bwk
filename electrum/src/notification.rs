@@ -106,6 +106,9 @@ pub enum SpNotification {
     WaitingForBlocks { tip_height: u32 },
     /// Continuous mode: new block(s) detected
     NewBlocksDetected { from_height: u32, to_height: u32 },
+    /// The chain reorganized above `fork_height`: what the scan recorded above
+    /// it was rolled back and is scanned again
+    Reorg { fork_height: u32 },
 }
 
 #[derive(Debug, Clone)]
