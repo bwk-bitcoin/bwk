@@ -22,7 +22,7 @@ use {
             },
             config::Config,
             recipient::{SpChangeRecipientProvider, SpSecretProvider},
-            tx_store::{SpTxEntry, SpTxStore},
+            tx_store::{block_time, SpTxEntry, SpTxStore},
             unified::{CoinOrigin, SubAccountKind},
         },
         blindbit::{self, InfoResponse},
@@ -3003,6 +3003,7 @@ impl<P: crate::profile::SpStorageProfile> bwk::bwk_electrum::history::AccountHis
         // optional label for the transactions we know about (our sends and the
         // receives recorded by the scanner).
         {
+            let header_store = self.header_store();
             let tx_store = self.tx_store.lock().expect("poisoned");
             for e in tx_store.transactions() {
                 let c = map.entry(e.txid).or_default();
@@ -3013,7 +3014,9 @@ impl<P: crate::profile::SpStorageProfile> bwk::bwk_electrum::history::AccountHis
                         .merge(bwk::bwk_electrum::coin_store::PaymentStatus::Verified);
                 }
                 if c.timestamp.is_none() {
-                    c.timestamp = e.timestamp;
+                    // A header that landed after the last restamp still dates
+                    // the tx, read only: the restamp is what writes it.
+                    c.timestamp = e.timestamp.or_else(|| block_time(header_store?, e.height?));
                 }
                 if c.tx.is_none() {
                     c.tx = e.tx.clone();
