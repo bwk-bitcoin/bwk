@@ -504,9 +504,10 @@ fn refresh_unconfirmed_history<P: ScanProfile>(
 #[cfg(all(test, feature = "test"))]
 mod tests {
     use crate::{
-        client::{CoinRequest, CoinResponse},
+        client::{CoinError, CoinRequest, CoinResponse},
         coin_store::{CoinEntry, CoinStore},
         config::ScannerConfig,
+        electrum::response::{ErrorResponse, ErrorResult},
         fanout::Fanout,
         label_store::LabelStore,
         listener::{listen_txs, refresh_unconfirmed_history},
@@ -524,7 +525,13 @@ mod tests {
     use bwk_sign::{bip39::Mnemonic, hot_signer::HotSigner};
     use bwk_utils::test::{funding_tx, setup_logger, spending_tx};
     use miniscript::{
-        bitcoin::{self, bip32::DerivationPath, Network, OutPoint},
+        bitcoin::{
+            self,
+            bip32::DerivationPath,
+            block::{Header, Version},
+            hashes::Hash,
+            CompactTarget, Network, OutPoint, TxMerkleNode,
+        },
         Descriptor, DescriptorPublicKey,
     };
     use std::{
@@ -585,6 +592,15 @@ mod tests {
 
     impl CoinStoreMock {
         fn new(recv_tip: u32, change_tip: u32, look_ahead: u32) -> Self {
+            Self::with_header_scanner(recv_tip, change_tip, look_ahead, true)
+        }
+
+        fn with_header_scanner(
+            recv_tip: u32,
+            change_tip: u32,
+            look_ahead: u32,
+            header_scanner: bool,
+        ) -> Self {
             let (notif_sender, notif_recv) = mpsc::channel();
             let (tip_sender, tip_receiver) = mpsc::channel();
             let (req_sender, req_receiver) = mpsc::channel();
@@ -620,7 +636,7 @@ mod tests {
                 tx_store,
                 label_store,
                 account_store,
-                true,
+                header_scanner,
             )));
             coin_store.lock().expect("poisoned").init(tip_sender);
             let store = coin_store.clone();
@@ -638,7 +654,7 @@ mod tests {
                     resp_receiver,
                     statuses_store,
                     Arc::new(Fanout::default()),
-                    true,
+                    header_scanner,
                 );
             });
 
@@ -925,6 +941,157 @@ mod tests {
         // queues the claim at height 2, and the scan stops there, so the
         // entry stays Unconfirmed and the derived coin height is None.
         assert_eq!(coin.height(), None);
+    }
+
+    /// Without a header scanner the listener asks its own connection for the
+    /// header at a reported height, once, and confirms the coin in that block
+    /// with its time.
+    #[test]
+    fn without_header_scanner_a_reported_height_is_confirmed_from_its_header() {
+        let mut mock = CoinStoreMock::with_header_scanner(0, 0, 5, false);
+        thread::sleep(Duration::from_millis(200));
+        let _initial_subscribe: Vec<_> = mock.request.try_iter().collect();
+
+        let spk = mock.derivator.receive_spk_at(0);
+        let tx = funding_tx(spk.clone(), 0.1);
+        let txid = tx.compute_txid();
+        mock.response
+            .send(CoinResponse::History(BTreeMap::from([(
+                spk.clone(),
+                vec![(txid, Some(1))],
+            )])))
+            .unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let requests: Vec<_> = mock.request.try_iter().collect();
+        assert!(
+            matches!(&requests[..], [CoinRequest::Txs(t), CoinRequest::Headers(h)] if *t == vec![txid] && *h == vec![1]),
+            "{requests:?}"
+        );
+
+        // The tx bytes land before the header: nothing to confirm yet, and the
+        // header already asked for is not asked again.
+        mock.response.send(CoinResponse::Txs(vec![tx])).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert!(matches!(mock.request.try_recv(), Err(TryRecvError::Empty)));
+        let coin = mock.coins().pop_first().unwrap().1;
+        assert_eq!(coin.status(), CoinStatus::Unconfirmed);
+
+        let header = Header {
+            version: Version::ONE,
+            prev_blockhash: bitcoin::BlockHash::all_zeros(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 1_700_000_000,
+            bits: CompactTarget::from_consensus(0x207fffff),
+            nonce: 0,
+        };
+        mock.response
+            .send(CoinResponse::Headers(BTreeMap::from([(1, header)])))
+            .unwrap();
+        thread::sleep(Duration::from_millis(100));
+
+        let coin = mock.coins().pop_first().unwrap().1;
+        assert_eq!(coin.status(), CoinStatus::Confirmed);
+        assert_eq!(coin.height(), Some(1));
+        let entry = mock.store.lock().unwrap().tx_history().pop().unwrap();
+        assert_eq!(
+            entry.inclusion(),
+            &Inclusion::ConfirmedUnverified {
+                height: 1,
+                block_hash: header.block_hash(),
+            }
+        );
+        assert_eq!(entry.timestamp(), Some(1_700_000_000));
+
+        // Another tx at the same height is confirmed from the cached header,
+        // with no new request.
+        let other = funding_tx(spk.clone(), 0.2);
+        let other_txid = other.compute_txid();
+        mock.response
+            .send(CoinResponse::History(BTreeMap::from([(
+                spk,
+                vec![(txid, Some(1)), (other_txid, Some(1))],
+            )])))
+            .unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let requests: Vec<_> = mock.request.try_iter().collect();
+        assert!(
+            matches!(&requests[..], [CoinRequest::Txs(t)] if *t == vec![other_txid]),
+            "{requests:?}"
+        );
+        mock.response.send(CoinResponse::Txs(vec![other])).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert!(matches!(mock.request.try_recv(), Err(TryRecvError::Empty)));
+        let coins = mock.coins();
+        assert_eq!(coins.len(), 2);
+        assert!(coins.values().all(|c| c.status() == CoinStatus::Confirmed));
+    }
+
+    /// A failed header fetch is asked again on the next pass.
+    #[test]
+    fn without_header_scanner_a_failed_header_fetch_is_asked_again() {
+        let mock = CoinStoreMock::with_header_scanner(0, 0, 5, false);
+        thread::sleep(Duration::from_millis(200));
+        let _initial_subscribe: Vec<_> = mock.request.try_iter().collect();
+
+        let spk = mock.derivator.receive_spk_at(0);
+        let tx = funding_tx(spk.clone(), 0.1);
+        let txid = tx.compute_txid();
+        mock.response
+            .send(CoinResponse::History(BTreeMap::from([(
+                spk,
+                vec![(txid, Some(1))],
+            )])))
+            .unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let _txs_and_headers: Vec<_> = mock.request.try_iter().collect();
+
+        mock.response
+            .send(CoinResponse::Error(CoinError::HeaderFetch {
+                height: 1,
+                error: ErrorResponse {
+                    id: 0,
+                    error: ErrorResult {
+                        code: 1,
+                        message: "boom".to_string(),
+                    },
+                },
+            }))
+            .unwrap();
+        mock.response.send(CoinResponse::Txs(vec![tx])).unwrap();
+        thread::sleep(Duration::from_millis(100));
+
+        let requests: Vec<_> = mock.request.try_iter().collect();
+        assert!(
+            matches!(&requests[..], [CoinRequest::Headers(h)] if *h == vec![1]),
+            "{requests:?}"
+        );
+    }
+
+    /// With a header scanner the listener never asks for a header: claims are
+    /// the reconciler's.
+    #[test]
+    fn with_header_scanner_no_header_is_asked() {
+        let mock = CoinStoreMock::new(0, 0, 5);
+        thread::sleep(Duration::from_millis(200));
+        let _initial_subscribe: Vec<_> = mock.request.try_iter().collect();
+
+        let spk = mock.derivator.receive_spk_at(0);
+        let tx = funding_tx(spk.clone(), 0.1);
+        let txid = tx.compute_txid();
+        mock.response
+            .send(CoinResponse::History(BTreeMap::from([(
+                spk,
+                vec![(txid, Some(1))],
+            )])))
+            .unwrap();
+        mock.response.send(CoinResponse::Txs(vec![tx])).unwrap();
+        thread::sleep(Duration::from_millis(200));
+
+        let requests: Vec<_> = mock.request.try_iter().collect();
+        assert!(
+            matches!(&requests[..], [CoinRequest::Txs(t)] if *t == vec![txid]),
+            "{requests:?}"
+        );
     }
 
     // After a restart `pending_claims` (a non-persisted cache) is empty while a

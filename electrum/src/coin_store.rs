@@ -1692,15 +1692,23 @@ mod tests {
     use bwk_descriptor::descriptor::wpkh_path;
     use bwk_sign::{bip39::Mnemonic, hot_signer::HotSigner};
     use bwk_utils::test::{funding_tx, spending_tx};
-    use miniscript::bitcoin::bip32::ChildNumber;
+    use miniscript::bitcoin::{
+        bip32::ChildNumber, block::Version, hashes::Hash, CompactTarget, TxMerkleNode,
+    };
     use std::sync::mpsc;
 
     fn build_coin_store() -> (CoinStore, SpkDerivator) {
-        let (cs, derivator, _notif_recv) = build_coin_store_with_receiver();
+        build_coin_store_with(true)
+    }
+
+    fn build_coin_store_with(header_scanner: bool) -> (CoinStore, SpkDerivator) {
+        let (cs, derivator, _notif_recv) = build_coin_store_with_receiver(header_scanner);
         (cs, derivator)
     }
 
-    fn build_coin_store_with_receiver() -> (CoinStore, SpkDerivator, mpsc::Receiver<Notification>) {
+    fn build_coin_store_with_receiver(
+        header_scanner: bool,
+    ) -> (CoinStore, SpkDerivator, mpsc::Receiver<Notification>) {
         let network = bitcoin::Network::Regtest;
         let mnemo = Mnemonic::generate(12).unwrap();
         let signer = HotSigner::new_from_mnemonics(network, &mnemo.to_string()).unwrap();
@@ -1731,7 +1739,7 @@ mod tests {
             tx_store,
             label_store,
             account_store,
-            true,
+            header_scanner,
         );
         (cs, derivator, notif_recv)
     }
@@ -1739,7 +1747,7 @@ mod tests {
     /// A store holding one unconfirmed 0.5 BTC coin at receive index 2, with
     /// the notifications of that first generate drained.
     fn funded_coin_store() -> (CoinStore, mpsc::Receiver<Notification>, OutPoint) {
-        let (mut cs, deriv, notifs) = build_coin_store_with_receiver();
+        let (mut cs, deriv, notifs) = build_coin_store_with_receiver(true);
         let tx = funding_tx(deriv.receive_spk_at(2), 0.5);
         let outpoint = OutPoint::new(tx.compute_txid(), (tx.output.len() - 1) as u32);
         cs.tx_store.update(TxEntry::for_test(tx));
@@ -1750,7 +1758,7 @@ mod tests {
 
     #[test]
     fn first_generate_over_stored_coins_notifies_no_coin_event() {
-        let (mut cs, deriv, notifs) = build_coin_store_with_receiver();
+        let (mut cs, deriv, notifs) = build_coin_store_with_receiver(true);
         let funding = funding_tx(deriv.receive_spk_at(2), 0.5);
         let outpoint = OutPoint::new(funding.compute_txid(), (funding.output.len() - 1) as u32);
         cs.tx_store.update(TxEntry::for_test(funding));
@@ -1766,7 +1774,7 @@ mod tests {
 
     #[test]
     fn generate_adding_a_coin_notifies_coin_received() {
-        let (mut cs, deriv, notifs) = build_coin_store_with_receiver();
+        let (mut cs, deriv, notifs) = build_coin_store_with_receiver(true);
         cs.generate();
         notifs.try_iter().for_each(drop);
         let tx = funding_tx(deriv.receive_spk_at(2), 0.5);
@@ -2093,7 +2101,13 @@ mod tests {
     /// `inclusion`, regenerate, and return the resulting status of the
     /// single produced coin.
     fn status_for_inclusion(inclusion: Inclusion) -> CoinStatus {
-        let (mut cs, deriv) = build_coin_store();
+        statuses_for(inclusion, true).0
+    }
+
+    /// The coin and payment status a funding tx at `inclusion` reads as, in a
+    /// store run with or without a header scanner.
+    fn statuses_for(inclusion: Inclusion, header_scanner: bool) -> (CoinStatus, PaymentStatus) {
+        let (mut cs, deriv) = build_coin_store_with(header_scanner);
         let spk = deriv.receive_spk_at(2);
         let tx = funding_tx(spk.clone(), 0.5);
         let txid = tx.compute_txid();
@@ -2102,7 +2116,172 @@ mod tests {
         cs.generate();
         let coins = cs.coins();
         assert_eq!(coins.len(), 1);
-        coins.into_iter().next().unwrap().1.status()
+        let payment = cs.payment_status(&cs.tx_store.get(&txid).unwrap());
+        (coins.into_iter().next().unwrap().1.status(), payment)
+    }
+
+    fn header_at_time(time: u32) -> Header {
+        Header {
+            version: Version::ONE,
+            prev_blockhash: bitcoin::BlockHash::all_zeros(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time,
+            bits: CompactTarget::from_consensus(0x207fffff),
+            nonce: 0,
+        }
+    }
+
+    /// Every inclusion, and what it reads as without a header scanner: nothing
+    /// will ever verify a server-reported confirmation, so
+    /// `ConfirmedUnverified` reads as confirmed. A failed proof only comes from
+    /// a header scanner, but must not read confirmed either way. The
+    /// `*_inclusion_yields_*` tests cover the same with a header scanner.
+    #[test]
+    fn statuses_read_without_header_scanner() {
+        let hash = dummy_block_hash();
+        let cases: [(Inclusion, CoinStatus, PaymentStatus); 4] = [
+            (
+                Inclusion::Unconfirmed,
+                CoinStatus::Unconfirmed,
+                PaymentStatus::Unconfirmed,
+            ),
+            (
+                Inclusion::ConfirmedUnverified {
+                    height: 100,
+                    block_hash: hash,
+                },
+                CoinStatus::Confirmed,
+                PaymentStatus::Verified,
+            ),
+            (
+                Inclusion::Verified {
+                    height: 100,
+                    block_hash: hash,
+                },
+                CoinStatus::Confirmed,
+                PaymentStatus::Verified,
+            ),
+            (
+                Inclusion::VerifyFailed {
+                    height: 100,
+                    block_hash: hash,
+                },
+                CoinStatus::Unconfirmed,
+                PaymentStatus::VerifyFailed,
+            ),
+        ];
+        for (inclusion, coin, payment) in cases {
+            assert_eq!(
+                statuses_for(inclusion.clone(), false),
+                (coin, payment),
+                "{inclusion:?}"
+            );
+        }
+    }
+
+    /// A reported height the store has not promoted yet already reads as
+    /// confirmed in the payment history: unverified with a header scanner,
+    /// verified without one.
+    #[test]
+    fn a_pending_claim_reads_as_confirmed_with_and_without_header_scanner() {
+        for (header_scanner, expected) in [
+            (true, PaymentStatus::ConfirmedUnverified),
+            (false, PaymentStatus::Verified),
+        ] {
+            let (mut cs, deriv) = build_coin_store_with(header_scanner);
+            let tx = funding_tx(deriv.receive_spk_at(2), 0.5);
+            let txid = tx.compute_txid();
+            cs.tx_store.update(crate::tx_store::TxEntry::for_test(tx));
+            cs.record_reported_heights(&[ClaimAt { txid, height: 200 }]);
+
+            let entry = cs.tx_store.get(&txid).unwrap();
+            assert_eq!(entry.inclusion(), &Inclusion::Unconfirmed);
+            assert_eq!(cs.payment_status(&entry), expected, "{header_scanner}");
+        }
+    }
+
+    /// Without a header scanner a reported height is confirmed in the block
+    /// the server returned for it, stamped with its time, and the coin reads
+    /// confirmed. The tx store keeps `ConfirmedUnverified`: nothing proved it.
+    #[test]
+    fn a_pending_claim_is_confirmed_in_the_server_header() {
+        let (mut cs, deriv) = build_coin_store_with(false);
+        let tx = funding_tx(deriv.receive_spk_at(2), 0.5);
+        let txid = tx.compute_txid();
+        cs.tx_store.update(crate::tx_store::TxEntry::for_test(tx));
+        let height = 200;
+        cs.record_reported_heights(&[ClaimAt { txid, height }]);
+        assert_eq!(cs.pending_claim_heights(), vec![height]);
+        let header = header_at_time(1_700_000_000);
+
+        assert!(cs.confirm_pending_claims(height, &header));
+
+        let entry = cs.tx_store.get(&txid).unwrap();
+        assert_eq!(
+            entry.inclusion(),
+            &Inclusion::ConfirmedUnverified {
+                height,
+                block_hash: header.block_hash(),
+            }
+        );
+        assert_eq!(entry.timestamp(), Some(1_700_000_000));
+        assert!(cs.pending_claims_snapshot().is_empty());
+        cs.generate();
+        let coins = cs.coins();
+        assert_eq!(coins.len(), 1);
+        let coin = coins.into_values().next().unwrap();
+        assert_eq!(coin.status(), CoinStatus::Confirmed);
+        assert_eq!(coin.height(), Some(height as u64));
+        assert_eq!(cs.payment_status(&entry), PaymentStatus::Verified);
+
+        // A second header at the same height finds nothing left to confirm.
+        assert!(!cs.confirm_pending_claims(height, &header_at_time(1)));
+        assert_eq!(
+            cs.tx_store.get(&txid).unwrap().timestamp(),
+            Some(1_700_000_000)
+        );
+    }
+
+    /// A claim whose tx bytes have not landed yet stays queued past its
+    /// header, and is confirmed once they do.
+    #[test]
+    fn a_claim_waiting_for_its_tx_is_confirmed_once_the_tx_lands() {
+        let (mut cs, deriv) = build_coin_store_with(false);
+        let spk = deriv.receive_spk_at(2);
+        let tx = funding_tx(spk.clone(), 0.5);
+        let txid = tx.compute_txid();
+        let height = 200;
+        let outcome =
+            cs.handle_history_response(BTreeMap::from([(spk, vec![(txid, Some(height as u64))])]));
+        assert_eq!(outcome.missing_txs, vec![txid]);
+        cs.record_reported_heights(&outcome.reported);
+        let header = header_at_time(1_700_000_000);
+
+        assert!(!cs.confirm_pending_claims(height, &header));
+        assert_eq!(cs.pending_claim_height(&txid), Some(height));
+
+        cs.handle_txs_response(vec![tx]);
+        assert!(cs.confirm_pending_claims(height, &header));
+        assert_eq!(
+            cs.tx_store.get(&txid).unwrap().inclusion(),
+            &Inclusion::ConfirmedUnverified {
+                height,
+                block_hash: header.block_hash(),
+            }
+        );
+        assert!(cs.pending_claims_snapshot().is_empty());
+    }
+
+    /// A claim for a tx gone from the chain and from every in-flight update
+    /// is dropped rather than kept forever.
+    #[test]
+    fn a_claim_for_a_removed_tx_is_dropped() {
+        let (mut cs, deriv) = build_coin_store_with(false);
+        let txid = funding_tx(deriv.receive_spk_at(2), 0.5).compute_txid();
+        cs.record_reported_heights(&[ClaimAt { txid, height: 200 }]);
+
+        assert!(!cs.confirm_pending_claims(200, &header_at_time(1_700_000_000)));
+        assert!(cs.pending_claims_snapshot().is_empty());
     }
 
     #[test]

@@ -555,6 +555,84 @@ mod tests {
         assert!(state.req_id_tx_merkle.is_empty());
     }
 
+    // Sample from electrum/src/electrum/response.rs::tests::parse_header_response.
+    const HEADER_HEX: &str = "000000206e59d4b0d8d5b9daa4d3ad3093975b0f2a18a6909533350cbfb4b7a04adc6f5f380884ecf7425e488e7f2b249de516e839a5b2d48bcc9b65d45387ce5081c1e8563fe166ffff7f2001000000";
+
+    fn state_with_header(id: usize, height: u32) -> TxState {
+        let mut state = TxState::default();
+        state.req_id_header.insert(id, height);
+        state
+    }
+
+    #[test]
+    fn header_known_id_emits_header_at_its_height() {
+        let mut state = state_with_header(13, 101);
+        let mut batch = TxBatch::default();
+        let r = Response::Header(HeaderResponse {
+            id: 13,
+            raw_header: HEADER_HEX.to_string(),
+        });
+        handle_tx_response(&mut state, &mut batch, r);
+        let expected: Header = consensus::encode::deserialize_hex(HEADER_HEX).unwrap();
+        assert_eq!(batch.headers, BTreeMap::from([(101, expected)]));
+        assert_eq!(expected.time, 1_726_037_846);
+        assert!(batch.trailing.is_empty());
+        assert!(state.req_id_header.is_empty());
+
+        let out = drain_batch(batch);
+        assert!(matches!(&out[..], [CoinResponse::Headers(m)] if m.len() == 1));
+    }
+
+    #[test]
+    fn header_unknown_id_ignored() {
+        let mut state = TxState::default();
+        let mut batch = TxBatch::default();
+        let r = Response::Header(HeaderResponse {
+            id: 13,
+            raw_header: HEADER_HEX.to_string(),
+        });
+        handle_tx_response(&mut state, &mut batch, r);
+        assert!(batch.headers.is_empty());
+        assert!(batch.trailing.is_empty());
+    }
+
+    #[test]
+    fn header_bad_hex_yields_header_decode_error() {
+        let mut state = state_with_header(13, 101);
+        let mut batch = TxBatch::default();
+        let r = Response::Header(HeaderResponse {
+            id: 13,
+            raw_header: "zz".repeat(80),
+        });
+        handle_tx_response(&mut state, &mut batch, r);
+        assert!(batch.headers.is_empty());
+        match &batch.trailing[..] {
+            [CoinResponse::Error(CoinError::HeaderDecode { height: 101, .. })] => {}
+            other => panic!("expected HeaderDecode error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_with_header_id_yields_header_fetch() {
+        let mut state = state_with_header(13, 101);
+        let mut batch = TxBatch::default();
+        let r = Response::Error(ErrorResponse {
+            id: 13,
+            error: ErrorResult {
+                code: 1,
+                message: "boom".to_string(),
+            },
+        });
+        handle_tx_response(&mut state, &mut batch, r);
+        match &batch.trailing[..] {
+            [CoinResponse::Error(CoinError::HeaderFetch { height: 101, error })] => {
+                assert_eq!(error.error.message, "boom");
+            }
+            other => panic!("expected HeaderFetch error, got {other:?}"),
+        }
+        assert!(state.req_id_header.is_empty());
+    }
+
     #[test]
     fn error_without_merkle_id_yields_server_error() {
         let mut state = TxState::default();

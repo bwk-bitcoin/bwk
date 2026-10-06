@@ -275,6 +275,20 @@ mod tests {
         assert!(serde_json::from_value::<ScannerConfig>(value).is_err());
     }
 
+    #[test]
+    fn a_config_without_the_header_scanner_key_keeps_it_on() {
+        let mut config = config();
+        config.header_scanner = false;
+        let mut value: serde_json::Value = serde_json::to_value(config).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("header_scanner")
+            .unwrap();
+        let decoded: ScannerConfig = serde_json::from_value(value).unwrap();
+        assert!(decoded.header_scanner);
+    }
+
     /// A change made to an endpoint, and the policy it must leave behind.
     type ResetCase = (&'static str, fn(&mut Endpoint), CertificateCheck);
 
