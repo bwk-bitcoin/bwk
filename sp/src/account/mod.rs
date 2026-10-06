@@ -869,10 +869,12 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
                 vout: 0,
             },
             crate::receiver::OwnedOutput {
-                blockheight: bitcoin::absolute::Height::from_consensus(
-                    self.config.birthday_height.unwrap_or(0),
-                )
-                .expect("valid bench height"),
+                blockheight: Some(
+                    bitcoin::absolute::Height::from_consensus(
+                        self.config.birthday_height.unwrap_or(0),
+                    )
+                    .expect("valid bench height"),
+                ),
                 tweak: [0u8; 32],
                 amount: bitcoin::Amount::from_sat(1),
                 script: bitcoin::ScriptBuf::new(),
@@ -1186,7 +1188,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
                     origin: CoinOrigin::Sp,
                     outpoint,
                     amount: Amount::from_sat(entry.amount_sat()),
-                    height: Some(entry.height()),
+                    height: entry.height(),
                     spendable: entry.is_spendable(),
                     label: self.get_coin_label(&outpoint),
                 },
@@ -1891,9 +1893,9 @@ pub fn sp_coin_entry_to_coin(outpoint: OutPoint, entry: &SpCoinEntry) -> bwk_coi
             script_pubkey: entry.script().clone(),
         },
         outpoint,
-        height: Some(entry.height() as u64),
+        height: entry.height().map(u64::from),
         sequence: bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
-        status: bwk_coin::CoinStatus::Confirmed,
+        status: entry.coin_status(),
         label: None,
         satisfaction_size: bwk_coin::TAPROOT_KEYSPEND_SATISFACTION_WU,
         spend_info: bwk_coin::CoinSpendInfo::Sp {
@@ -2741,7 +2743,7 @@ mod tests {
 
     fn fake_sp_owned(spk: bitcoin::ScriptBuf, seed: u8) -> OwnedOutput {
         OwnedOutput {
-            blockheight: Height::from_consensus(100).unwrap(),
+            blockheight: Some(Height::from_consensus(100).unwrap()),
             tweak: [seed; 32],
             amount: bitcoin::Amount::from_sat(10_000),
             script: spk,
@@ -3051,12 +3053,14 @@ impl<P: crate::profile::SpStorageProfile> bwk::bwk_electrum::history::AccountHis
                 let received = map.entry(op.txid).or_default();
                 received.owned_out = received.owned_out.saturating_add(entry.amount_sat());
                 received.owned_vouts.insert(op.vout);
-                if received.height.is_none() {
-                    received.height = Some(entry.height() as u64);
+                if let Some(height) = entry.height() {
+                    if received.height.is_none() {
+                        received.height = Some(height as u64);
+                    }
+                    received.status = received
+                        .status
+                        .merge(bwk::bwk_electrum::coin_store::PaymentStatus::Verified);
                 }
-                received.status = received
-                    .status
-                    .merge(bwk::bwk_electrum::coin_store::PaymentStatus::Verified);
                 if let crate::receiver::OutputSpendStatus::Spent { txid, .. } = entry.status() {
                     let spent_in = bitcoin::Txid::from_byte_array(*txid);
                     let spent = map.entry(spent_in).or_default();

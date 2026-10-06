@@ -16,7 +16,7 @@ use crate::{
     profile::{SpRamProfile, SpStorageProfile},
     receiver::{OutputSpendStatus, OwnedOutput},
 };
-use bitcoin::{hashes::Hash, Amount, OutPoint, ScriptBuf, Txid};
+use bitcoin::{absolute::Height, hashes::Hash, Amount, OutPoint, ScriptBuf, Txid};
 use bwk::{
     bwk_electrum::profile::DefaultBackend,
     persist::{
@@ -54,9 +54,22 @@ impl SpCoinEntry {
         Self { outpoint, output }
     } // Getters (accessors)
 
-    /// Returns the block height where this output was confirmed.
-    pub fn height(&self) -> u32 {
-        self.output.blockheight.to_consensus_u32()
+    /// Returns the block height where this output was confirmed, `None` while
+    /// unconfirmed.
+    pub fn height(&self) -> Option<u32> {
+        self.output.blockheight.map(Height::to_consensus_u32)
+    }
+
+    pub fn is_confirmed(&self) -> bool {
+        self.output.blockheight.is_some()
+    }
+
+    pub fn coin_status(&self) -> CoinStatus {
+        if self.is_confirmed() {
+            CoinStatus::Confirmed
+        } else {
+            CoinStatus::Unconfirmed
+        }
     }
 
     /// Returns the amount as a bitcoin::Amount.
@@ -119,20 +132,20 @@ impl SpCoinEntry {
 
 /// Balance summary for the coin store.
 ///
-/// Provides counts and totals for confirmed and unconfirmed coins.
-/// For Silent Payments, we only see confirmed outputs, so unconfirmed
-/// fields are always zero.
+/// Provides counts and totals for confirmed and unconfirmed coins. An
+/// unconfirmed SP coin is one of our own broadcast outputs the scan has not
+/// confirmed yet.
 #[derive(Debug, Clone, Default)]
 pub struct CoinState {
-    /// Map of all spendable coins
+    /// Map of all spendable coins, confirmed or not
     pub coins: BTreeMap<OutPoint, SpCoinEntry>,
     /// Number of confirmed (spendable) coins
     pub confirmed_coins: usize,
     /// Total balance of confirmed coins in satoshis
     pub confirmed_balance: u64,
-    /// Number of unconfirmed coins (always 0 for SP)
+    /// Number of unconfirmed (spendable) coins
     pub unconfirmed_coins: usize,
-    /// Total balance of unconfirmed coins (always 0 for SP)
+    /// Total balance of unconfirmed coins in satoshis
     pub unconfirmed_balance: u64,
 }
 
@@ -261,10 +274,10 @@ impl<P: SpStorageProfile> SpCoinStore<P> {
 
     /// Undo what the blocks above `fork_height` recorded: drop the coins they
     /// created and put back as unconfirmed the spends confirmed in a `reorged`
-    /// block.
+    /// block. An unconfirmed coin was created by no block, so it stays.
     pub fn roll_back(&mut self, fork_height: u32, reorged: &HashSet<[u8; 32]>) {
         for (outpoint, entry) in self.coins() {
-            if entry.height() > fork_height {
+            if entry.height().is_some_and(|height| height > fork_height) {
                 self.remove(&outpoint);
                 continue;
             }
@@ -315,11 +328,17 @@ impl<P: SpStorageProfile> SpCoinStore<P> {
         let mut state = CoinState::default();
         if let Ok(iter) = self.store.iter() {
             for (outpoint, entry) in iter {
-                if entry.is_spendable() {
+                if !entry.is_spendable() {
+                    continue;
+                }
+                if entry.is_confirmed() {
                     state.confirmed_coins += 1;
                     state.confirmed_balance += entry.amount_sat();
-                    state.coins.insert(outpoint, entry);
+                } else {
+                    state.unconfirmed_coins += 1;
+                    state.unconfirmed_balance += entry.amount_sat();
                 }
+                state.coins.insert(outpoint, entry);
             }
         }
         state
@@ -338,7 +357,10 @@ impl<P: SpStorageProfile> SpCoinStore<P> {
     /// None }` (our own broadcast awaiting confirmation); a confirmed spend
     /// (`Spent { block_hash: Some }` / `Mined`) can never be spent again, so the
     /// spend sweep skips it. This is the sole seed for the sweep's watch set.
-    pub fn watchable(&self) -> Vec<(OutPoint, u32)> {
+    ///
+    /// An unconfirmed coin starts at `sweep_start`, the first unswept block,
+    /// since every sweep after it was recorded watched it.
+    pub fn watchable(&self, sweep_start: u32) -> Vec<(OutPoint, u32)> {
         self.store
             .iter()
             .ok()
@@ -353,7 +375,7 @@ impl<P: SpStorageProfile> SpCoinStore<P> {
                             }
                     )
                 })
-                .map(|(outpoint, entry)| (outpoint, entry.height()))
+                .map(|(outpoint, entry)| (outpoint, entry.height().unwrap_or(sweep_start)))
                 .collect()
             })
             .unwrap_or_default()
@@ -487,9 +509,9 @@ impl<P: SpStorageProfile + Send + Sync + 'static> CoinSource for SpCoinSource<P>
                     script_pubkey: entry.script().clone(),
                 },
                 outpoint,
-                height: Some(entry.height() as u64),
+                height: entry.height().map(u64::from),
                 sequence: bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
-                status: CoinStatus::Confirmed,
+                status: entry.coin_status(),
                 label: None,
                 satisfaction_size: TR_KEYSPEND_SATISFACTION_WEIGHT,
                 spend_info: CoinSpendInfo::Sp {
@@ -634,7 +656,7 @@ mod tests {
 
     fn test_owned_output(amount_sats: u64) -> OwnedOutput {
         OwnedOutput {
-            blockheight: Height::from_consensus(100).unwrap(),
+            blockheight: Some(Height::from_consensus(100).unwrap()),
             tweak: [0u8; 32],
             amount: Amount::from_sat(amount_sats),
             script: ScriptBuf::new(),
@@ -645,7 +667,7 @@ mod tests {
 
     fn test_spent_output(amount_sats: u64) -> OwnedOutput {
         OwnedOutput {
-            blockheight: Height::from_consensus(100).unwrap(),
+            blockheight: Some(Height::from_consensus(100).unwrap()),
             tweak: [0u8; 32],
             amount: Amount::from_sat(amount_sats),
             script: ScriptBuf::new(),
@@ -663,7 +685,7 @@ mod tests {
         let output = test_owned_output(10000);
         let entry = SpCoinEntry::new(outpoint, output);
 
-        assert_eq!(entry.height(), 100);
+        assert_eq!(entry.height(), Some(100));
         assert_eq!(entry.amount(), Amount::from_sat(10000));
         assert_eq!(entry.amount_sat(), 10000);
         assert_eq!(entry.outpoint(), &outpoint);
@@ -839,7 +861,7 @@ mod tests {
         store.insert(test_outpoint_2(), test_spent_output(20000));
         // Spent { block_hash: Some } at height 200 is not watchable.
         let mut spent_confirmed = test_owned_output(30000);
-        spent_confirmed.blockheight = Height::from_consensus(200).unwrap();
+        spent_confirmed.blockheight = Some(Height::from_consensus(200).unwrap());
         spent_confirmed.spend_status = OutputSpendStatus::Spent {
             txid: [7u8; 32],
             block_hash: Some([9u8; 32]),
@@ -854,7 +876,7 @@ mod tests {
         mined.spend_status = OutputSpendStatus::Mined([9u8; 32]);
         store.insert(outpoint_4, mined);
 
-        let mut watchable = store.watchable();
+        let mut watchable = store.watchable(0);
         watchable.sort();
         assert_eq!(
             watchable,
@@ -958,7 +980,7 @@ mod tests {
 
     fn output_at(height: u32, spend_status: OutputSpendStatus) -> OwnedOutput {
         OwnedOutput {
-            blockheight: Height::from_consensus(height).unwrap(),
+            blockheight: Some(Height::from_consensus(height).unwrap()),
             spend_status,
             ..test_owned_output(10000)
         }
@@ -1080,7 +1102,7 @@ mod tests {
             },
         };
         OwnedOutput {
-            blockheight: Height::from_consensus(100).unwrap(),
+            blockheight: Some(Height::from_consensus(100).unwrap()),
             tweak: [0u8; 32],
             amount: Amount::from_sat(10_000),
             script: spk,
@@ -1164,5 +1186,79 @@ mod tests {
         assert!(e
             .spending_txids
             .contains(&Txid::from_byte_array(spending_txid_bytes)));
+    }
+
+    fn unconfirmed_output(amount_sats: u64) -> OwnedOutput {
+        OwnedOutput {
+            blockheight: None,
+            ..test_owned_output(amount_sats)
+        }
+    }
+
+    #[test]
+    fn a_coin_persisted_with_a_bare_height_loads_confirmed() {
+        let entry = SpCoinEntry::new(test_outpoint(), test_owned_output(10_000));
+        let mut json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["output"]["blockheight"], serde_json::json!(100));
+        json["output"]["blockheight"] = serde_json::json!(200);
+
+        let loaded = decode_coin(&serde_json::to_vec(&json).unwrap()).unwrap();
+
+        assert!(loaded.is_confirmed());
+        assert_eq!(loaded.height(), Some(200));
+    }
+
+    #[test]
+    fn an_unconfirmed_coin_round_trips_unconfirmed() {
+        let entry = SpCoinEntry::new(test_outpoint(), unconfirmed_output(10_000));
+
+        let loaded = decode_coin(&encode_coin(&entry).unwrap()).unwrap();
+
+        assert!(!loaded.is_confirmed());
+        assert_eq!(loaded.height(), None);
+        assert_eq!(loaded.coin_status(), CoinStatus::Unconfirmed);
+    }
+
+    #[test]
+    fn an_unconfirmed_coin_counts_unconfirmed_and_is_offered_for_selection() {
+        let mut store = SpCoinStore::new();
+        store.insert(test_outpoint(), test_owned_output(10_000));
+        store.insert(test_outpoint_2(), unconfirmed_output(20_000));
+
+        let state = store.spendable_coins();
+        assert_eq!(state.confirmed_coins, 1);
+        assert_eq!(state.confirmed_balance, 10_000);
+        assert_eq!(state.unconfirmed_coins, 1);
+        assert_eq!(state.unconfirmed_balance, 20_000);
+        assert_eq!(state.coins.len(), 2);
+
+        let source = SpCoinSource::new(Arc::new(Mutex::new(store)));
+        let offered = source.spendable_coins();
+        let unconfirmed = offered
+            .iter()
+            .find(|coin| coin.outpoint == test_outpoint_2())
+            .unwrap();
+        assert_eq!(unconfirmed.status, CoinStatus::Unconfirmed);
+        assert_eq!(unconfirmed.height, None);
+        assert_eq!(offered.len(), 2);
+    }
+
+    #[test]
+    fn an_unconfirmed_coin_is_watched_from_the_sweep_start_and_survives_a_roll_back() {
+        let mut store = SpCoinStore::new();
+        store.insert(test_outpoint(), test_owned_output(10_000));
+        store.insert(test_outpoint_2(), unconfirmed_output(20_000));
+
+        let mut watchable = store.watchable(150);
+        watchable.sort();
+        assert_eq!(
+            watchable,
+            vec![(test_outpoint(), 100), (test_outpoint_2(), 150)]
+        );
+
+        store.roll_back(50, &HashSet::new());
+
+        assert!(store.get(&test_outpoint()).is_none());
+        assert!(store.get(&test_outpoint_2()).is_some());
     }
 }

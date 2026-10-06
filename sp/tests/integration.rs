@@ -1118,7 +1118,7 @@ fn test_notification_multiple_outputs_same_block(env: &mut TestEnv) {
     assert_eq!(
         outputs
             .values()
-            .filter(|coin| coin.height() == sp_tx_height)
+            .filter(|coin| coin.height() == Some(sp_tx_height))
             .count(),
         2,
         "Should have 2 outputs recorded for block {sp_tx_height}"

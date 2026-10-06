@@ -408,7 +408,7 @@ pub fn test_outpoint_3() -> OutPoint {
 /// The output is unspent and has default values for tweak and script.
 pub fn test_owned_output(height: u32, amount: u64) -> OwnedOutput {
     OwnedOutput {
-        blockheight: Height::from_consensus(height).unwrap_or(Height::ZERO),
+        blockheight: Some(Height::from_consensus(height).unwrap_or(Height::ZERO)),
         tweak: [0u8; 32],
         amount: Amount::from_sat(amount),
         script: ScriptBuf::new(),
@@ -422,7 +422,7 @@ pub fn test_owned_output(height: u32, amount: u64) -> OwnedOutput {
 /// The output is marked as Spent with a zeroed spending txid.
 pub fn test_spent_output(height: u32, amount: u64) -> OwnedOutput {
     OwnedOutput {
-        blockheight: Height::from_consensus(height).unwrap_or(Height::ZERO),
+        blockheight: Some(Height::from_consensus(height).unwrap_or(Height::ZERO)),
         tweak: [0u8; 32],
         amount: Amount::from_sat(amount),
         script: ScriptBuf::new(),
@@ -1124,7 +1124,10 @@ pub mod tests {
     fn test_test_owned_output() {
         let output = test_owned_output(100, 50000);
 
-        assert_eq!(output.blockheight.to_consensus_u32(), 100);
+        assert_eq!(
+            output.blockheight,
+            Some(Height::from_consensus(100).unwrap())
+        );
         assert_eq!(output.amount.to_sat(), 50000);
         assert!(matches!(output.spend_status, OutputSpendStatus::Unspent));
     }
@@ -1132,7 +1135,10 @@ pub mod tests {
     fn test_test_spent_output() {
         let output = test_spent_output(100, 50000);
 
-        assert_eq!(output.blockheight.to_consensus_u32(), 100);
+        assert_eq!(
+            output.blockheight,
+            Some(Height::from_consensus(100).unwrap())
+        );
         assert_eq!(output.amount.to_sat(), 50000);
         assert!(matches!(
             output.spend_status,

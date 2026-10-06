@@ -81,7 +81,9 @@ pub enum OutputSpendStatus {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct OwnedOutput {
-    pub blockheight: Height,
+    /// Height of the block the output confirmed in, `None` while unconfirmed.
+    #[serde(default)]
+    pub blockheight: Option<Height>,
     pub tweak: [u8; 32], // scalar in big endian format
     pub amount: Amount,
     pub script: ScriptBuf,

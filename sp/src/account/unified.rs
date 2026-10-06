@@ -59,7 +59,6 @@ pub struct UnifiedCoin {
     /// The coin's value.
     pub amount: Amount,
     /// The block height at which the coin was confirmed; `None` if unconfirmed.
-    /// SP coins are always confirmed when surfaced, so this is always `Some` for them.
     pub height: Option<u32>,
     /// True if the coin is currently spendable (not spent and not in-flight).
     pub spendable: bool,

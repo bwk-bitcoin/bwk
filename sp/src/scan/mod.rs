@@ -774,9 +774,11 @@ fn record_outputs<P: SpStorageProfile>(
     {
         let mut store = stores.coin_store.lock().expect("poisoned");
         for (outpoint, mut output) in outputs {
-            by_tx
-                .entry(outpoint.txid)
-                .or_insert(output.blockheight.to_consensus_u32());
+            if let Some(height) = output.blockheight {
+                by_tx
+                    .entry(outpoint.txid)
+                    .or_insert(height.to_consensus_u32());
+            }
             if let Some(existing) = store.get(&outpoint) {
                 if !matches!(existing.status(), OutputSpendStatus::Unspent) {
                     output.spend_status = existing.status().clone();
@@ -1071,7 +1073,7 @@ fn derive_owned(
             vout: utxo.vout,
         };
         let out = OwnedOutput {
-            blockheight: blkheight,
+            blockheight: Some(blkheight),
             tweak: tweak.to_be_bytes(),
             amount: utxo.value,
             script: utxo.scriptpubkey,
@@ -1469,7 +1471,14 @@ fn process_spends<P: SpStorageProfile>(
     scan: &ScanContext<P>,
 ) -> Result<ScanOutcome, receiver::error::Error> {
     let end_u32 = scan.end.to_consensus_u32();
-    let watch = WatchableSet::new(scan.stores.coin_store.lock().expect("poisoned").watchable());
+    let resume = effective_spend_start(scan.stores, scan.start.to_consensus_u32())?;
+    let watch = WatchableSet::new(
+        scan.stores
+            .coin_store
+            .lock()
+            .expect("poisoned")
+            .watchable(resume),
+    );
 
     // Nothing watchable -> no coin can be spent in this range; jump the frontier
     // straight to the tip.
@@ -1479,7 +1488,6 @@ fn process_spends<P: SpStorageProfile>(
         return Ok(ScanOutcome::Completed);
     };
 
-    let resume = effective_spend_start(scan.stores, scan.start.to_consensus_u32())?;
     // Start at the floor block itself, not one past it: a coin can be spent in
     // the same block it was created in.
     let cursor = resume.max(floor);
@@ -2056,7 +2064,7 @@ mod tests {
 
     fn owned_unspent(height: u32) -> OwnedOutput {
         OwnedOutput {
-            blockheight: Height::from_consensus(height).unwrap(),
+            blockheight: Some(Height::from_consensus(height).unwrap()),
             tweak: [0u8; 32],
             amount: Amount::from_sat(1000),
             script: ScriptBuf::new(),

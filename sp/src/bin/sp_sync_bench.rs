@@ -520,7 +520,7 @@ mod instrumented {
                     vout: 0,
                 },
                 OwnedOutput {
-                    blockheight: start_height,
+                    blockheight: Some(start_height),
                     tweak: [0u8; 32],
                     amount: bitcoin::Amount::from_sat(1),
                     script: bitcoin::ScriptBuf::new(),
