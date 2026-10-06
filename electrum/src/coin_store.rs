@@ -36,6 +36,15 @@ impl From<&Inclusion> for CoinStatus {
     }
 }
 
+/// The coin status `inclusion` reads as. Without a header scanner nothing will
+/// ever verify a server-reported confirmation, so it reads as confirmed.
+fn coin_status(inclusion: &Inclusion, header_scanner: bool) -> CoinStatus {
+    match inclusion {
+        Inclusion::ConfirmedUnverified { .. } if !header_scanner => CoinStatus::Confirmed,
+        inclusion => CoinStatus::from(inclusion),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum PaymentType {
     Receive,
@@ -219,6 +228,9 @@ pub struct CoinStore<P: ScanProfile = RamProfile<DefaultBackend>> {
     /// when the response lands (`clear_merkle_in_flight`) or the entry leaves
     /// `ConfirmedUnverified`. In-memory runtime state, never persisted.
     merkle_in_flight: BTreeSet<ClaimAt>,
+    /// Whether a header scanner verifies what the server reports, see
+    /// [`ScannerConfig::header_scanner`](crate::config::ScannerConfig::header_scanner).
+    header_scanner: bool,
 }
 
 #[derive(Debug, Default)]
@@ -337,6 +349,7 @@ impl<P: ScanProfile> CoinStore<P> {
         tx_store: TxStore<P>,
         label_store: Arc<Mutex<LabelStore<P>>>,
         account_store: Arc<Mutex<P::AccountStore>>,
+        header_scanner: bool,
     ) -> Self {
         let derivator = SpkDerivator::new(descriptor, network).unwrap();
         let notification = notification.into();
@@ -362,6 +375,7 @@ impl<P: ScanProfile> CoinStore<P> {
             derivator,
             pending_claims: BTreeMap::new(),
             merkle_in_flight: BTreeSet::new(),
+            header_scanner,
         }
     }
 
@@ -742,7 +756,7 @@ impl<P: ScanProfile> CoinStore<P> {
                         vout: vout as u32,
                     };
                     let height = entry.height();
-                    let status = CoinStatus::from(entry.inclusion());
+                    let status = coin_status(entry.inclusion(), self.header_scanner);
                     let spk = match addr.account() {
                         KeyChain::Receive => self.derivator.receive_at(addr.index()),
                         KeyChain::Change => self.derivator.change_at(addr.index()),
@@ -1115,6 +1129,22 @@ impl<P: ScanProfile> CoinStore<P> {
         self.pending_claims
             .iter()
             .find_map(|(height, txids)| txids.contains(txid).then_some(*height))
+    }
+
+    /// The payment status `entry` reads as. A tx the server reported confirmed
+    /// but not promoted yet already reads as `ConfirmedUnverified`, so the
+    /// payment does not read as unconfirmed while its proof is pending.
+    /// Without a header scanner nothing will ever verify it, so it reads as
+    /// `Verified`.
+    pub fn payment_status(&self, entry: &TxEntry) -> PaymentStatus {
+        let status = match self.pending_claim_height(&entry.txid()) {
+            Some(_) => PaymentStatus::ConfirmedUnverified,
+            None => PaymentStatus::from(entry.inclusion()),
+        };
+        match status {
+            PaymentStatus::ConfirmedUnverified if !self.header_scanner => PaymentStatus::Verified,
+            status => status,
+        }
     }
 
     /// Clear `claim` from the in-flight merkle-fetch set. Called when a
@@ -1701,6 +1731,7 @@ mod tests {
             tx_store,
             label_store,
             account_store,
+            true,
         );
         (cs, derivator, notif_recv)
     }

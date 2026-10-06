@@ -620,6 +620,7 @@ mod tests {
                 tx_store,
                 label_store,
                 account_store,
+                true,
             )));
             coin_store.lock().expect("poisoned").init(tip_sender);
             let store = coin_store.clone();

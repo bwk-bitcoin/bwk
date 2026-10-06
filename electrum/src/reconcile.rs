@@ -553,6 +553,7 @@ mod tests {
             TxStore::new(),
             label_store,
             account_store,
+            true,
         )));
         (coin_store, derivator)
     }

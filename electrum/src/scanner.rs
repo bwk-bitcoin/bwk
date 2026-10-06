@@ -36,7 +36,7 @@ use crate::{
     address_store::{AddressEntry, AddressStatus, AddressTip},
     client::{CoinRequest, CoinResponse},
     coin_state::CoinState,
-    coin_store::{CoinEntry, CoinStore, CoinStoreSource, Payment, PaymentStatus, PaymentType},
+    coin_store::{CoinEntry, CoinStore, CoinStoreSource, Payment, PaymentType},
     config::{ScannerConfig, Tip},
     fanout::Fanout,
     history::{aggregate_payments, AccountHistory, TxContribution},
@@ -214,6 +214,7 @@ impl<P: ScanProfile> ElectrumScanner<P> {
             tx_store,
             label_store.clone(),
             account_store,
+            config.header_scanner,
         )));
         coin_store.lock().expect("poisoned").generate();
         ElectrumScanner {
@@ -471,12 +472,13 @@ impl<P: ScanProfile> AccountHistory for ElectrumScanner<P> {
                 .into_iter()
                 .map(|entry| {
                     let pending_height = store.pending_claim_height(&entry.txid());
-                    (entry, pending_height)
+                    let status = store.payment_status(&entry);
+                    (entry, pending_height, status)
                 })
                 .collect::<Vec<_>>()
         };
         let labels = self.label_store.lock().expect("poisoned");
-        for (entry, pending_height) in history {
+        for (entry, pending_height, status) in history {
             let txid = entry.txid();
             let owned_in = entry
                 .inputs
@@ -510,9 +512,6 @@ impl<P: ScanProfile> AccountHistory for ElectrumScanner<P> {
             let projected_height = pending_height
                 .map(|height| height as u64)
                 .or(entry.height());
-            let projected_status = pending_height
-                .map(|_| PaymentStatus::ConfirmedUnverified)
-                .unwrap_or_else(|| PaymentStatus::from(entry.inclusion()));
             map.insert(
                 txid,
                 TxContribution {
@@ -520,7 +519,7 @@ impl<P: ScanProfile> AccountHistory for ElectrumScanner<P> {
                     owned_out,
                     owned_vouts,
                     height: projected_height,
-                    status: projected_status,
+                    status,
                     timestamp: entry.timestamp(),
                     label,
                     tx: Some(entry.tx().clone()),
