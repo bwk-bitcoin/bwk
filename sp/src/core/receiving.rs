@@ -302,7 +302,8 @@ impl<'de> Deserialize<'de> for SerializableBiMap {
         let pairs: Vec<(Label, SerializablePubkey)> = Deserialize::deserialize(deserializer)?;
         let mut bimap: BiMap<Label, PublicKey> = BiMap::new();
         for (label, ser_pubkey) in pairs {
-            bimap.insert(label, PublicKey::from_slice(&ser_pubkey.0).unwrap());
+            let pubkey = PublicKey::from_slice(&ser_pubkey.0).map_err(serde::de::Error::custom)?;
+            bimap.insert(label, pubkey);
         }
         Ok(SerializableBiMap(bimap))
     }
@@ -349,9 +350,11 @@ impl<'de> Deserialize<'de> for Receiver {
         Ok(Receiver {
             version: helper.version,
             network: helper.network,
-            scan_pubkey: PublicKey::from_slice(&helper.scan_pubkey.0).unwrap(),
-            spend_pubkey: PublicKey::from_slice(&helper.spend_pubkey.0).unwrap(),
-            change_label: Label::try_from(helper.change_label).unwrap(),
+            scan_pubkey: PublicKey::from_slice(&helper.scan_pubkey.0)
+                .map_err(serde::de::Error::custom)?,
+            spend_pubkey: PublicKey::from_slice(&helper.spend_pubkey.0)
+                .map_err(serde::de::Error::custom)?,
+            change_label: Label::try_from(helper.change_label).map_err(serde::de::Error::custom)?,
             labels: helper.labels.0,
         })
     }
@@ -648,6 +651,67 @@ pub fn calculate_ecdh_shared_secret(tweak_data: &PublicKey, b_scan: &SecretKey) 
 #[cfg(test)]
 mod tests {
     use super::Label;
+    use crate::core::{
+        receiving::Receiver,
+        secp256k1::{PublicKey, Secp256k1, SecretKey},
+        utils::common::Network,
+    };
+    use serde_json::{json, Value};
+
+    fn receiver() -> Receiver {
+        let secp = Secp256k1::new();
+        let scan_key = SecretKey::from_slice(&[1; 32]).unwrap();
+        let spend_key = SecretKey::from_slice(&[2; 32]).unwrap();
+        let mut receiver = Receiver::new(
+            0,
+            PublicKey::from_secret_key(&secp, &scan_key),
+            PublicKey::from_secret_key(&secp, &spend_key),
+            Label::new(scan_key, 0),
+            Network::Regtest,
+        )
+        .unwrap();
+        receiver.add_label(Label::new(scan_key, 1)).unwrap();
+        receiver
+    }
+
+    fn receiver_json() -> Value {
+        serde_json::to_value(receiver()).unwrap()
+    }
+
+    #[test]
+    fn deserialize_receiver() {
+        let receiver = receiver();
+        let value = serde_json::to_value(&receiver).unwrap();
+        assert_eq!(serde_json::from_value::<Receiver>(value).unwrap(), receiver);
+    }
+
+    #[test]
+    fn deserialize_receiver_malformed_scan_pubkey() {
+        let mut value = receiver_json();
+        value["scan_pubkey"] = json!(vec![0u8; 33]);
+        serde_json::from_value::<Receiver>(value).unwrap_err();
+    }
+
+    #[test]
+    fn deserialize_receiver_malformed_spend_pubkey() {
+        let mut value = receiver_json();
+        value["spend_pubkey"] = json!(vec![0u8; 33]);
+        serde_json::from_value::<Receiver>(value).unwrap_err();
+    }
+
+    #[test]
+    fn deserialize_receiver_malformed_change_label() {
+        let mut value = receiver_json();
+        value["change_label"] = json!("deadbeef");
+        serde_json::from_value::<Receiver>(value).unwrap_err();
+    }
+
+    #[test]
+    fn deserialize_receiver_malformed_labels_pubkey() {
+        let mut value = receiver_json();
+        value["labels"][0][1] = json!(vec![0u8; 33]);
+        serde_json::from_value::<Receiver>(value).unwrap_err();
+    }
 
     #[test]
     fn string_to_label_success() {
@@ -672,11 +736,6 @@ mod tests {
     // exactly the same spks as calling the per-tweak primitive once per tweak.
     #[test]
     fn candidate_output_spks_batch_matches_per_tweak() {
-        use crate::core::{
-            receiving::Receiver,
-            secp256k1::{PublicKey, Secp256k1, SecretKey},
-            utils::common::Network,
-        };
         use bitcoin_hashes::{sha256, Hash};
 
         let secp = Secp256k1::new();
