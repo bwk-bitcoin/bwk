@@ -34,7 +34,7 @@ use crate::{
     core::receiving::Label,
     profile::SpStorageProfile,
     receiver::{self, BlockData, FilterData, OutputSpendStatus, OwnedOutput, SpReceiver, UtxoData},
-    scan::state::ScanState,
+    scan::state::{ScanState, REORG_DEPTH},
     thread_pool::ThreadPool,
 };
 
@@ -833,13 +833,21 @@ fn record_spend_progress<P: SpStorageProfile>(
     Ok(())
 }
 
+/// Advance the receive frontier to `tip`, keeping the hashes of the scanned
+/// blocks (`hashes` starts at `start_u32`) that fall in the reorg window.
 fn record_scan_frontier<P: SpStorageProfile>(
     stores: &ScanStores<P>,
-    height: Height,
-    block_hash: BlockHash,
+    start_u32: u32,
+    tip: u32,
+    hashes: &[Option<BlockHash>],
 ) -> Result<(), receiver::error::Error> {
+    let from = start_u32.max((tip + 1).saturating_sub(REORG_DEPTH));
     let mut state = stores.scan_state.lock().expect("poisoned");
-    state.advance_frontier(height.to_consensus_u32(), *block_hash.as_byte_array());
+    for height in from..=tip {
+        let hash = hashes[(height - start_u32) as usize]
+            .ok_or(receiver::error::Error::MissingBlockHash(height))?;
+        state.advance_frontier(height, *hash.as_byte_array());
+    }
     state.persist();
     Ok(())
 }
@@ -1120,9 +1128,7 @@ fn commit_block<P: SpStorageProfile>(
 
     if last_checkpoint.elapsed() >= CHECKPOINT_INTERVAL {
         if let Some(tip) = *recv_tip {
-            let i = (tip - start_u32) as usize;
-            let hash = hashes[i].ok_or(receiver::error::Error::MissingBlockHash(tip))?;
-            record_scan_frontier(scan.stores, Height::from_consensus(tip)?, hash)?;
+            record_scan_frontier(scan.stores, start_u32, tip, hashes)?;
             save_state(scan.stores)?;
         }
         *last_checkpoint = std::time::Instant::now();
@@ -1249,9 +1255,7 @@ fn process_blocks<P: SpStorageProfile>(
         )?;
         if should_interrupt(scan.stop) {
             if let Some(tip) = recv_tip {
-                let i = (tip - start_u32) as usize;
-                let hash = hashes[i].ok_or(receiver::error::Error::MissingBlockHash(tip))?;
-                record_scan_frontier(scan.stores, Height::from_consensus(tip)?, hash)?;
+                record_scan_frontier(scan.stores, start_u32, tip, &hashes)?;
             }
             save_state(scan.stores)?;
             return Ok(ScanOutcome::interrupted(&scan.stores.scan_state));
@@ -1261,17 +1265,14 @@ fn process_blocks<P: SpStorageProfile>(
     if recv_tip != Some(end_u32) {
         if should_interrupt(scan.stop) {
             if let Some(tip) = recv_tip {
-                let i = (tip - start_u32) as usize;
-                let hash = hashes[i].ok_or(receiver::error::Error::MissingBlockHash(tip))?;
-                record_scan_frontier(scan.stores, Height::from_consensus(tip)?, hash)?;
+                record_scan_frontier(scan.stores, start_u32, tip, &hashes)?;
             }
             save_state(scan.stores)?;
             return Ok(ScanOutcome::interrupted(&scan.stores.scan_state));
         }
         return Err(receiver::error::Error::MissingBlockHash(end_u32));
     }
-    let end_hash = hashes[len - 1].ok_or(receiver::error::Error::MissingBlockHash(end_u32))?;
-    record_scan_frontier(scan.stores, scan.end, end_hash)?;
+    record_scan_frontier(scan.stores, start_u32, end_u32, &hashes)?;
     record_receive_progress(scan.stores, scan.end, scan.end)?;
     save_state(scan.stores)?;
     Ok(ScanOutcome::Completed)

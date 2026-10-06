@@ -7,7 +7,7 @@
 //!
 //! A dedicated `account` table holds the account-scoped singleton
 //! fields (e.g. `receive_index`, `change_index` for bwk wallets or
-//! `last_scanned_height`, `last_block_hash`, `birthday_height` for
+//! `last_scanned_height`, `last_spend_height`, `birthday_height` for
 //! silent-payment wallets) plus a `version` row stamped with
 //! [`DB_VERSION`].
 //!

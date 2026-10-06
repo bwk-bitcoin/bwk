@@ -1,41 +1,64 @@
 //! Scan state tracking for Silent Payment blockchain scanning.
 //!
 //! The `ScanState` tracks progress of blockchain scanning, including the last
-//! scanned block height and hash (for reorg detection), and the wallet's
-//! birthday height.
+//! scanned block height, the hashes of the last scanned blocks (for reorg
+//! detection), and the wallet's birthday height.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use bwk::persist::{
     self as persist,
     backend::{noop::NoopBackend, PersistenceBackend},
+    storage::{ram::RamStore, Store},
     PersistError,
 };
 
 /// Row key under the `account` store for [`ScanState::last_scanned_height`].
 const LAST_SCANNED_HEIGHT_ROW: &str = "last_scanned_height";
-/// Row key under the `account` store for [`ScanState::last_block_hash`].
-const LAST_BLOCK_HASH_ROW: &str = "last_block_hash";
 /// Row key under the `account` store for [`ScanState::birthday_height`].
 const BIRTHDAY_HEIGHT_ROW: &str = "birthday_height";
 /// Row key under the `account` store for [`ScanState::last_spend_height`].
 const LAST_SPEND_HEIGHT_ROW: &str = "last_spend_height";
 
+/// Number of last scanned block hashes kept. The oldest one is the deepest fork
+/// a scan can roll back to, so a reorg of up to 5 blocks is handled.
+pub const REORG_DEPTH: u32 = 6;
+
+type BlockHashes = RamStore<Arc<dyn PersistenceBackend>, u32, [u8; 32]>;
+
+fn encode_height(k: &u32) -> String {
+    k.to_string()
+}
+
+fn decode_height(s: &str) -> Result<u32, PersistError> {
+    s.parse()
+        .map_err(|e| PersistError::Serde(format!("bad block height key {s:?}: {e}")))
+}
+
+fn encode_hash(v: &[u8; 32]) -> Result<Vec<u8>, PersistError> {
+    serde_json::to_vec(v).map_err(|e| PersistError::Serde(format!("encode block hash: {e}")))
+}
+
+fn decode_hash(bytes: &[u8]) -> Result<[u8; 32], PersistError> {
+    serde_json::from_slice(bytes)
+        .map_err(|e| PersistError::Serde(format!("decode block hash: {e}")))
+}
+
 // ScanState
 
 /// Tracks blockchain scanning progress for Silent Payment wallets.
 ///
-/// This struct maintains the scan position (last scanned height and block hash)
-/// and the wallet's birthday height. The block hash is stored for reorg detection.
-#[derive(Clone)]
+/// This struct maintains the scan position (last scanned height and the hashes
+/// of the last [`REORG_DEPTH`] scanned blocks) and the wallet's birthday height.
+/// The block hashes are stored for reorg detection.
 pub struct ScanState {
     /// Receive (output) scan done up to here, not both passes (None if never
     /// scanned). Drives `next_scan_start`; the spend pass trails it.
     last_scanned_height: Option<u32>,
 
-    /// The hash of the last scanned block (for reorg detection). Corresponds to
-    /// `last_scanned_height`, the contiguous frontier of the receive pass.
-    last_block_hash: Option<[u8; 32]>,
+    /// Hashes of the last [`REORG_DEPTH`] blocks of the receive frontier, by
+    /// height.
+    block_hashes: BlockHashes,
 
     /// Spend (input) sweep done up to here (None if never swept). Trails the
     /// receive frontier; persisted separately so a resume skips swept heights.
@@ -49,13 +72,7 @@ pub struct ScanState {
 
 impl Default for ScanState {
     fn default() -> Self {
-        Self {
-            last_scanned_height: None,
-            last_block_hash: None,
-            last_spend_height: None,
-            birthday_height: 0,
-            backend: Arc::new(NoopBackend),
-        }
+        Self::new(0)
     }
 }
 
@@ -63,7 +80,7 @@ impl std::fmt::Debug for ScanState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScanState")
             .field("last_scanned_height", &self.last_scanned_height)
-            .field("last_block_hash", &self.last_block_hash)
+            .field("last_block_hash", &self.last_block_hash())
             .field("last_spend_height", &self.last_spend_height)
             .field("birthday_height", &self.birthday_height)
             .finish()
@@ -75,20 +92,19 @@ impl ScanState {
 
     /// Create a new scan state with the given birthday height (no persistence).
     pub fn new(birthday_height: u32) -> Self {
-        Self {
-            last_scanned_height: None,
-            last_block_hash: None,
-            last_spend_height: None,
-            birthday_height,
-            backend: Arc::new(NoopBackend),
-        }
+        Self::with_backend(birthday_height, Arc::new(NoopBackend))
     }
 
     /// Create a scan state backed by an arbitrary backend.
     pub fn with_backend(birthday_height: u32, backend: Arc<dyn PersistenceBackend>) -> Self {
         Self {
             last_scanned_height: None,
-            last_block_hash: None,
+            block_hashes: RamStore::empty(
+                backend.clone(),
+                persist::BLOCK_HASHES_STORE_KEY,
+                encode_height,
+                encode_hash,
+            ),
             last_spend_height: None,
             birthday_height,
             backend,
@@ -111,12 +127,6 @@ impl ScanState {
             None => None,
         };
 
-        let last_block_hash = match read_bytes(LAST_BLOCK_HASH_ROW)? {
-            Some(b) => serde_json::from_slice::<Option<[u8; 32]>>(&b)
-                .map_err(|e| PersistError::Serde(format!("scan_state last_block_hash: {e}")))?,
-            None => None,
-        };
-
         let birthday = match read_bytes(BIRTHDAY_HEIGHT_ROW)? {
             Some(b) => serde_json::from_slice::<u32>(&b)
                 .map_err(|e| PersistError::Serde(format!("scan_state birthday_height: {e}")))?,
@@ -129,9 +139,18 @@ impl ScanState {
             None => None,
         };
 
+        let block_hashes = RamStore::open(
+            backend.clone(),
+            persist::BLOCK_HASHES_STORE_KEY,
+            encode_height,
+            decode_height,
+            encode_hash,
+            decode_hash,
+        )?;
+
         Ok(Self {
             last_scanned_height,
-            last_block_hash,
+            block_hashes,
             last_spend_height,
             birthday_height: birthday,
             backend,
@@ -143,9 +162,17 @@ impl ScanState {
         self.last_scanned_height
     }
 
-    /// Returns the last scanned block hash, for reorg detection.
+    /// Returns the hash of the highest scanned block kept, for reorg detection.
     pub fn last_block_hash(&self) -> Option<[u8; 32]> {
-        self.last_block_hash
+        self.block_hashes.values_ref().next_back().copied()
+    }
+
+    /// Returns the hashes kept for the last scanned blocks, by height.
+    pub fn block_hashes(&self) -> BTreeMap<u32, [u8; 32]> {
+        self.block_hashes
+            .iter_ref()
+            .map(|(h, hash)| (*h, *hash))
+            .collect()
     }
 
     /// Returns the wallet's birthday height.
@@ -174,15 +201,14 @@ impl ScanState {
 
     pub fn clear_progress(&mut self) {
         self.last_scanned_height = None;
-        self.last_block_hash = None;
+        self.drop_block_hashes(|_| true);
         self.last_spend_height = None;
     }
 
     /// Advance the contiguous receive frontier monotonically with its block hash.
     ///
-    /// Used by the two-phase receive pass as its contiguous tip fills in.
-    /// `last_block_hash` corresponds to `last_scanned_height` (the receive
-    /// frontier), so the height and hash always move together.
+    /// Used by the two-phase receive pass as its contiguous tip fills in. The
+    /// hash is kept with the last [`REORG_DEPTH`] ones; older ones are dropped.
     pub fn advance_frontier(&mut self, height: u32, block_hash: [u8; 32]) {
         let advance = match self.last_scanned_height {
             Some(h) => height > h,
@@ -190,7 +216,25 @@ impl ScanState {
         };
         if advance {
             self.last_scanned_height = Some(height);
-            self.last_block_hash = Some(block_hash);
+            if let Err(e) = self.block_hashes.insert(height, block_hash) {
+                log::error!("ScanState::advance_frontier: {e}");
+            }
+            let floor = (height + 1).saturating_sub(REORG_DEPTH);
+            self.drop_block_hashes(|h| h < floor);
+        }
+    }
+
+    fn drop_block_hashes(&mut self, drop: impl Fn(u32) -> bool) {
+        let heights: Vec<u32> = self
+            .block_hashes
+            .keys_ref()
+            .copied()
+            .filter(|h| drop(*h))
+            .collect();
+        for height in heights {
+            if let Err(e) = self.block_hashes.remove(&height) {
+                log::error!("ScanState::drop_block_hashes: {e}");
+            }
         }
     }
 
@@ -226,19 +270,19 @@ impl ScanState {
 
     /// Persist the state through the configured backend.
     ///
-    /// Writes the three scalar fields as individual rows under the
+    /// Writes the block hashes under the [`persist::BLOCK_HASHES_STORE_KEY`]
+    /// store, then the three scalar fields as individual rows under the
     /// [`persist::ACCOUNT_STORE_KEY`] store.
-    pub fn persist(&self) {
+    pub fn persist(&mut self) {
         if let Err(e) = self.try_persist() {
             log::error!("ScanState::persist(): {e}");
         }
     }
 
-    pub fn try_persist(&self) -> Result<(), PersistError> {
+    pub fn try_persist(&mut self) -> Result<(), PersistError> {
+        self.block_hashes.flush()?;
         let last_scanned_height = serde_json::to_vec(&self.last_scanned_height)
             .map_err(|e| PersistError::Serde(format!("scan_state last_scanned_height: {e}")))?;
-        let last_block_hash = serde_json::to_vec(&self.last_block_hash)
-            .map_err(|e| PersistError::Serde(format!("scan_state last_block_hash: {e}")))?;
         let birthday_height = serde_json::to_vec(&self.birthday_height)
             .map_err(|e| PersistError::Serde(format!("scan_state birthday_height: {e}")))?;
         let last_spend_height = serde_json::to_vec(&self.last_spend_height)
@@ -248,7 +292,6 @@ impl ScanState {
             persist::ACCOUNT_STORE_KEY,
             &[
                 (LAST_SCANNED_HEIGHT_ROW.to_string(), last_scanned_height),
-                (LAST_BLOCK_HASH_ROW.to_string(), last_block_hash),
                 (BIRTHDAY_HEIGHT_ROW.to_string(), birthday_height),
                 (LAST_SPEND_HEIGHT_ROW.to_string(), last_spend_height),
             ],
@@ -487,6 +530,66 @@ mod tests {
         let backend = Arc::new(JsonBackend::open(temp_dir.clone()).unwrap());
         let loaded = ScanState::load_from_backend(0, backend).expect("load scan state");
         assert_eq!(loaded.last_spend_height(), Some(420));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    fn hash_at(height: u32) -> [u8; 32] {
+        let mut hash = [0u8; 32];
+        hash[..4].copy_from_slice(&height.to_le_bytes());
+        hash
+    }
+
+    fn advance_to(state: &mut ScanState, tip: u32) {
+        for height in 1..=tip {
+            state.advance_frontier(height, hash_at(height));
+        }
+    }
+
+    #[test]
+    fn test_block_hashes_pruned_below_reorg_depth() {
+        let mut state = ScanState::new(0);
+        advance_to(&mut state, 150);
+
+        let hashes = state.block_hashes();
+        assert_eq!(hashes.len(), 6);
+        assert_eq!(hashes.first_key_value(), Some((&145, &hash_at(145))));
+        assert_eq!(state.last_block_hash(), Some(hash_at(150)));
+    }
+
+    #[test]
+    fn test_clear_progress_drops_block_hashes() {
+        let mut state = ScanState::new(0);
+        advance_to(&mut state, 10);
+        state.clear_progress();
+
+        assert!(state.block_hashes().is_empty());
+        assert_eq!(state.last_block_hash(), None);
+    }
+
+    #[test]
+    fn test_block_hashes_persistence() {
+        let temp_dir = std::env::temp_dir().join("bwk-sp-block-hashes-test");
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        {
+            let backend = JsonBackend::open(temp_dir.clone()).unwrap();
+            let mut state = ScanState::with_backend(0, Arc::new(backend));
+            advance_to(&mut state, 50);
+            state.persist();
+            advance_to(&mut state, 150);
+            state.persist();
+        }
+
+        let backend = Arc::new(JsonBackend::open(temp_dir.clone()).unwrap());
+        let rows = backend.get_rows(persist::BLOCK_HASHES_STORE_KEY).unwrap();
+        assert_eq!(rows.len(), 6);
+        let loaded = ScanState::load_from_backend(0, backend).unwrap();
+        assert_eq!(loaded.last_scanned_height(), Some(150));
+        let hashes = loaded.block_hashes();
+        assert_eq!(hashes.len(), 6);
+        assert_eq!(hashes.first_key_value(), Some((&145, &hash_at(145))));
+        assert_eq!(loaded.last_block_hash(), Some(hash_at(150)));
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
