@@ -8,6 +8,12 @@
 //! (`bwk::account::Account`) pairs it with a
 //! [`HeaderStore`](crate::header_store::HeaderStore) and reconciles the two
 //! through [`ElectrumScanner::coin_store`].
+//!
+//! Run without a header scanner
+//! ([`ScannerConfig::header_scanner`](crate::config::ScannerConfig::header_scanner)
+//! `false`), there is no header store to pair it with: the listener then
+//! fetches the header of each reported height on its own connection and
+//! confirms the claim in that block, trusting the server.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -621,6 +627,7 @@ impl<P: ScanProfile> ElectrumScanner<P> {
         // store back: the thread reopens it from disk rather than giving up.
         let reopen_statuses = self.reopen_statuses.clone();
         let certificate_check = self.config.endpoint().certificate_check();
+        let header_scanner = self.config.header_scanner;
 
         self.listener.start(move |stop_request| {
             let statuses_store = match source {
@@ -683,6 +690,7 @@ impl<P: ScanProfile> ElectrumScanner<P> {
                 response,
                 statuses_store,
                 scan_listeners,
+                header_scanner,
             );
             // Clear before the handback: a replacement listener blocks on that
             // handback, so it cannot have set the flag yet and this cannot

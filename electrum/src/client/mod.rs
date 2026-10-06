@@ -85,6 +85,7 @@ pub enum CoinRequest {
     History(Vec<ScriptBuf>),
     Txs(Vec<Txid>),
     GetTxMerkle { txid: Txid, height: u32 },
+    Headers(Vec<u32>),
     Stop,
 }
 
@@ -105,6 +106,7 @@ impl Debug for CoinRequest {
                 .field("txid", &short_string(txid.to_string(), 10))
                 .field("height", height)
                 .finish(),
+            Self::Headers(heights) => f.debug_tuple("Headers").field(heights).finish(),
             Self::Stop => write!(f, "Stop"),
         }
     }
@@ -118,6 +120,7 @@ impl CoinRequest {
             Self::History(v) => format!("History({})", v.len()),
             Self::Txs(v) => format!("Txs({})", v.len()),
             Self::GetTxMerkle { .. } => "GetTxMerkle".to_string(),
+            Self::Headers(v) => format!("Headers({})", v.len()),
             Self::Stop => "Stop".to_string(),
         }
     }
@@ -141,6 +144,13 @@ pub enum CoinError {
         height: u32,
         error: ErrorResponse,
     },
+    #[error("header decode failed at {height}: {source}")]
+    HeaderDecode {
+        height: u32,
+        source: consensus::encode::FromHexError,
+    },
+    #[error("header fetch failed at {height}: {error}")]
+    HeaderFetch { height: u32, error: ErrorResponse },
     #[error("server error: {0}")]
     Server(ErrorResponse),
     #[error("transport error: {0}")]
@@ -157,6 +167,7 @@ pub enum CoinResponse {
         branch: Vec<[u8; MERKLE_HASH_BYTES]>,
         pos: u32,
     },
+    Headers(BTreeMap<u32 /* height */, Header>),
     Stopped,
     Error(CoinError),
 }
@@ -202,6 +213,10 @@ impl Debug for CoinResponse {
                 .field("txid", &short_string(txid.to_string(), 10))
                 .field("height", height)
                 .finish(),
+            Self::Headers(map) => {
+                let heights: Vec<_> = map.keys().collect();
+                f.debug_tuple("Headers").field(&heights).finish()
+            }
             Self::Stopped => write!(f, "Stopped"),
             Self::Error(e) => write!(f, "Error({e})"),
         }
@@ -216,6 +231,7 @@ impl CoinResponse {
             Self::History(m) => format!("History({} scripts)", m.len()),
             Self::Txs(v) => format!("Txs({})", v.len()),
             Self::TxMerkle { .. } => "TxMerkle".to_string(),
+            Self::Headers(m) => format!("Headers({})", m.len()),
             Self::Stopped => "Stopped".to_string(),
             Self::Error(e) => format!("Error({e})"),
         }

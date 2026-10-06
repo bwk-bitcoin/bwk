@@ -1,12 +1,12 @@
 use crate::electrum::{
     request::Request,
     response::{
-        GetMerkleResult, HistoryResult, Response, SHGetHistoryResponse, SHNotification,
-        SHSubscribeResponse, TxGetMerkleResponse, TxGetResponse, TxGetResult,
+        GetMerkleResult, HeaderResponse, HistoryResult, Response, SHGetHistoryResponse,
+        SHNotification, SHSubscribeResponse, TxGetMerkleResponse, TxGetResponse, TxGetResult,
     },
     types::ScriptHash,
 };
-use miniscript::bitcoin::{consensus, ScriptBuf, Transaction, Txid};
+use miniscript::bitcoin::{block::Header, consensus, ScriptBuf, Transaction, Txid};
 use std::{collections::BTreeMap, fmt::Debug, sync::mpsc};
 
 use super::{
@@ -21,6 +21,7 @@ use super::{
 struct TxState {
     req_id_spk: BTreeMap<usize /* request_id */, ScriptBuf>,
     req_id_tx_merkle: BTreeMap<usize /* request_id */, (Txid, u32 /* height */)>,
+    req_id_header: BTreeMap<usize /* request_id */, u32 /* height */>,
     watched_spks_sh: BTreeMap<usize /* request_id */, ScriptHash>,
     sh_spk: BTreeMap<ScriptHash, ScriptBuf>,
 }
@@ -31,6 +32,7 @@ struct TxBatch {
     statuses: BTreeMap<ScriptBuf, Option<String>>,
     txs: Vec<Transaction>,
     histories: BTreeMap<ScriptBuf, Vec<(Txid, Option<u64> /* height */)>>,
+    headers: BTreeMap<u32 /* height */, Header>,
     /// TxMerkle results and errors, emitted after the grouped responses.
     trailing: Vec<CoinResponse>,
 }
@@ -107,12 +109,36 @@ fn handle_tx_response(state: &mut TxState, batch: &mut TxBatch, r: Response) {
                     })),
             }
         }
+        Response::Header(HeaderResponse { id, raw_header }) => {
+            let Some(height) = state.req_id_header.remove(&id) else {
+                log::warn!("Client::listen_txs() Header: unknown id {id}");
+                return;
+            };
+            match consensus::encode::deserialize_hex::<Header>(&raw_header) {
+                Ok(header) => {
+                    batch.headers.insert(height, header);
+                }
+                Err(source) => batch
+                    .trailing
+                    .push(CoinResponse::Error(CoinError::HeaderDecode {
+                        height,
+                        source,
+                    })),
+            }
+        }
         Response::Error(e) => {
             if let Some((txid, height)) = state.req_id_tx_merkle.remove(&e.id) {
                 batch
                     .trailing
                     .push(CoinResponse::Error(CoinError::MerkleFetch {
                         txid,
+                        height,
+                        error: e,
+                    }));
+            } else if let Some(height) = state.req_id_header.remove(&e.id) {
+                batch
+                    .trailing
+                    .push(CoinResponse::Error(CoinError::HeaderFetch {
                         height,
                         error: e,
                     }));
@@ -126,13 +152,14 @@ fn handle_tx_response(state: &mut TxState, batch: &mut TxBatch, r: Response) {
     }
 }
 
-/// Emission order: History, Status, Txs, then the trailing merkle/error
-/// responses.
+/// Emission order: History, Status, Txs, Headers, then the trailing
+/// merkle/error responses.
 fn drain_batch(batch: TxBatch) -> Vec<CoinResponse> {
     let TxBatch {
         statuses,
         txs,
         histories,
+        headers,
         trailing,
     } = batch;
     let mut out = Vec::new();
@@ -144,6 +171,9 @@ fn drain_batch(batch: TxBatch) -> Vec<CoinResponse> {
     }
     if !txs.is_empty() {
         out.push(CoinResponse::Txs(txs));
+    }
+    if !headers.is_empty() {
+        out.push(CoinResponse::Headers(headers));
     }
     out.extend(trailing);
     out
@@ -214,6 +244,16 @@ where
             log::debug!("Client::listen_txs() tx_get_merkle request: {req:?}");
             state.req_id_tx_merkle.insert(id, (txid, height));
             send_batch(client, vec![req], send)
+        }
+        CoinRequest::Headers(heights) => {
+            let mut batch = vec![];
+            for height in heights {
+                let mut header = Request::header(height as usize);
+                let id = client.register(&mut header);
+                state.req_id_header.insert(id, height);
+                batch.push(header);
+            }
+            send_batch(client, batch, send)
         }
         CoinRequest::Stop => {
             let _ = send.send(CoinResponse::Stopped.into());

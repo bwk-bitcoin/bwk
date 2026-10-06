@@ -7,6 +7,10 @@
 //! heights as pending claims and stops there: nothing here reads a header,
 //! verifies a proof or promotes a claim. That is the reconciler's half, and it
 //! runs against the validated chain over its own connection.
+//!
+//! A scan run without a header scanner has no reconciler: it asks this same
+//! connection for the header at each height a claim waits on, and confirms
+//! the claim in that block, trusting the server.
 
 use std::{
     collections::BTreeMap,
@@ -20,11 +24,11 @@ use std::{
 use bwk_backoff::Backoff;
 use bwk_descriptor::derivator::SpkDerivator;
 use bwk_persist::storage::Store;
-use miniscript::bitcoin::{ScriptBuf, Txid};
+use miniscript::bitcoin::{block::Header, ScriptBuf, Txid};
 
 use crate::{
     address_store::AddressTip,
-    client::{CoinRequest, CoinResponse},
+    client::{CoinError, CoinRequest, CoinResponse},
     coin_store::CoinStore,
     fanout::Fanout,
     notification::{Notification, NotificationSender, TxListenerNotif},
@@ -42,6 +46,10 @@ pub const STATUS_KEYCHAIN_CHANGE: u32 = 1;
 /// Woken after each batch of scanned state the listener folded, so every
 /// reconciler on this scanner runs its pass without polling the stores.
 pub type ScanListeners = Arc<Fanout<()>>;
+
+/// Headers the scan connection returned, by height, for a scan run without a
+/// header scanner. `None` while the request is in flight.
+type ServerHeaders = BTreeMap<u32, Option<Header>>;
 
 // On a dead channel the listener bails out and hands `$statuses` back to the
 // caller (so a later restart can reuse it), mirroring the normal return paths.
@@ -67,7 +75,9 @@ macro_rules! send_electrum {
 
 /// Drive one Electrum connection until `stop_request` is set or the connection
 /// dies, folding everything the server reports into `coin_store`. Returns the
-/// statuses store so the next listener can reuse it.
+/// statuses store so the next listener can reuse it. Without a
+/// `header_scanner`, the claims are confirmed here against the headers this
+/// connection returns.
 #[allow(clippy::too_many_arguments)]
 pub fn listen_txs<P>(
     coin_store: Arc<Mutex<CoinStore<P>>>,
@@ -79,12 +89,14 @@ pub fn listen_txs<P>(
     response: mpsc::Receiver<CoinResponse>,
     mut statuses: P::StatusesStore,
     scan_listeners: ScanListeners,
+    header_scanner: bool,
 ) -> P::StatusesStore
 where
     P: ScanProfile,
 {
     log::info!("listen_txs(): started");
     let notification = notification.into();
+    let mut server_headers = (!header_scanner).then(ServerHeaders::new);
     send_notif!(notification, request, statuses, TxListenerNotif::Started);
 
     let initial_keys: Vec<ScriptBuf> = match statuses.keys() {
@@ -170,6 +182,14 @@ where
                         {
                             return statuses;
                         }
+                        // Set only without a header scanner: confirm on the server's headers.
+                        if let Some(headers) = server_headers.as_mut() {
+                            if confirm_reported(&coin_store, headers, &request, &notification)
+                                .is_break()
+                            {
+                                return statuses;
+                            }
+                        }
                         scan_listeners.notify(());
                     }
                     CoinResponse::Txs(txs) => {
@@ -177,6 +197,28 @@ where
                             .lock()
                             .expect("poisoned")
                             .handle_txs_response(txs);
+                        // The tx bytes a queued claim waited on may have landed.
+                        // Set only without a header scanner: confirm on the server's headers.
+                        if let Some(headers) = server_headers.as_mut() {
+                            if confirm_reported(&coin_store, headers, &request, &notification)
+                                .is_break()
+                            {
+                                return statuses;
+                            }
+                        }
+                        scan_listeners.notify(());
+                    }
+                    CoinResponse::Headers(landed) => {
+                        let Some(headers) = server_headers.as_mut() else {
+                            log::warn!("listen_txs(): unsolicited Headers");
+                            continue;
+                        };
+                        headers.extend(landed.into_iter().map(|(h, header)| (h, Some(header))));
+                        if confirm_reported(&coin_store, headers, &request, &notification)
+                            .is_break()
+                        {
+                            return statuses;
+                        }
                         scan_listeners.notify(());
                     }
                     CoinResponse::TxMerkle { txid, height, .. } => {
@@ -190,6 +232,15 @@ where
                         return statuses;
                     }
                     CoinResponse::Error(e) => {
+                        // Forget a failed header fetch so a later pass asks again.
+                        if let (
+                            Some(headers),
+                            CoinError::HeaderFetch { height, .. }
+                            | CoinError::HeaderDecode { height, .. },
+                        ) = (server_headers.as_mut(), &e)
+                        {
+                            headers.remove(height);
+                        }
                         send_notif!(
                             notification,
                             request,
@@ -393,6 +444,43 @@ fn handle_history_response_msg<P: ScanProfile>(
     ControlFlow::Continue(())
 }
 
+/// Confirm every pending claim whose header the connection already returned,
+/// and ask it for the heights it has not. `Break` ends the listener thread.
+fn confirm_reported<P: ScanProfile>(
+    coin_store: &Mutex<CoinStore<P>>,
+    headers: &mut ServerHeaders,
+    request: &mpsc::Sender<CoinRequest>,
+    notification: &NotificationSender,
+) -> ControlFlow<()> {
+    let mut store = coin_store.lock().expect("poisoned");
+    let mut missing = Vec::new();
+    let mut changed = false;
+    for pending_claim_height in store.pending_claim_heights() {
+        match headers.get(&pending_claim_height) {
+            Some(Some(header)) => {
+                changed |= store.confirm_pending_claims(pending_claim_height, header)
+            }
+            Some(None) => {}
+            None => {
+                headers.insert(pending_claim_height, None);
+                missing.push(pending_claim_height);
+            }
+        }
+    }
+    if changed {
+        store.tx_store_mut().persist();
+        store.generate();
+    }
+    drop(store);
+    if changed {
+        let _ = notification.send(Notification::PaymentHistoryUpdated);
+    }
+    if !missing.is_empty() && request.send(CoinRequest::Headers(missing)).is_err() {
+        return signal_stopped(request, notification);
+    }
+    ControlFlow::Continue(())
+}
+
 /// On listener (re)connect, force a `History` refresh for every spk that
 /// owns a still-`Inclusion::Unconfirmed` tx. `pending_claims` is an
 /// in-memory cache a restart wipes, and the resubscribed status matches the
@@ -549,6 +637,7 @@ mod tests {
                     resp_receiver,
                     statuses_store,
                     Arc::new(Fanout::default()),
+                    true,
                 );
             });
 
