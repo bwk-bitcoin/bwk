@@ -1323,12 +1323,13 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
 
     /// Sign all inputs in a PSBT, both SP and BIP32 (segwit/taproot).
     ///
-    /// 1. Signs SP inputs using `b_spend + tweak` (no taproot tweak).
+    /// 1. Signs SP inputs using `b_spend + tweak` (no taproot tweak), skipped
+    ///    when this account has no spend secret key.
     /// 2. Signs BIP32 inputs with the wallet's hot signers.
     ///
     /// # Errors
-    /// * `AccountError::NoKeys` if this account has no spend secret key
-    /// * `AccountError::Transaction` on signing failure
+    /// * `AccountError::AuxRand`, `AccountError::Sighash` or
+    ///   `AccountError::Tweak` on SP signing failure
     pub fn sign_psbt(&self, psbt: &mut bitcoin::Psbt) -> Result<(), AccountError> {
         // Sign SP inputs
         if self.can_sign() {
