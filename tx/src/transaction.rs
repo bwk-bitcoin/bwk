@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use bwk_coin::{shuffle_coins, Coin, CoinSource};
 
 use crate::{
-    coin_selection::CoinSelector,
+    coin_selection::{discard_dust, CoinSelector},
     recipient::{FinalizationContext, PsbtOutputInfo, RecipientProvider, SpPartialSecretProvider},
     DUST_AMOUNT,
 };
@@ -55,6 +55,12 @@ pub enum Error {
     NotChange,
     #[error("missing change output, {excess} sats would be lost to fees")]
     MissingChange { excess: u64 },
+    #[error("nothing left to send after the fee: {remainder} sats is below the dust limit")]
+    MaxUnderDust { remainder: u64 },
+    #[error("{count} coins exceed the {max} that automatic coin selection supports; consolidate them with a max send")]
+    TooManyCoins { count: usize, max: usize },
+    #[error("a silent payment recipient output cannot be derived")]
+    SpOutputDerivation,
     #[error(
         "disproportionate fee: {fee} sats for {paid_outputs} sats of outputs \
          exceeds both {max_percent}% and {max_amount} sats"
@@ -317,7 +323,8 @@ impl TxTemplate {
         // Batch-derive SP output scripts so the k-counter is correct
         // across all outputs sharing the same scan key (BIP352).
         if let (Some(p), Some(secret)) = (sp_provider, partial_secret) {
-            p.derive_sp_scripts(&mut outputs, secret);
+            p.derive_sp_scripts(&mut outputs, secret)
+                .map_err(|_| Error::SpOutputDerivation)?;
         }
 
         let ctx = FinalizationContext {
@@ -546,30 +553,34 @@ pub fn process_fees(
         return result;
     }
 
+    // A max output takes everything left after the fee; there is no change
+    // output, so only the fee without change matters.
+    if let Drain::Max = drain {
+        let remainder = fee_allowance - fee_wo_change;
+        if remainder < DUST_AMOUNT {
+            result.error = Some(Error::MaxUnderDust { remainder });
+            return result;
+        }
+        result.max = Some(remainder);
+        result.fees = Some(fee_wo_change);
+        return result;
+    }
+
     let fee = if (fee_allowance - fee_wo_change) < DUST_AMOUNT {
         // Enough for fee but not for drain
         let lost = fee_allowance - fee_wo_change;
-        match drain {
-            Drain::Change => {
-                result.warnings.push(Warning::ChangeUnderDust(lost));
-            }
-            Drain::Max => {
-                result.warnings.push(Warning::MaxUnderDust(lost));
-            }
-            Drain::None => {}
+        if let Drain::Change = drain {
+            result.warnings.push(Warning::ChangeUnderDust(lost));
         }
         fee_allowance
-    } else if (fee_allowance - fee_with_change) < DUST_AMOUNT {
-        // Create a drain < DUST, so we dont
+    } else if fee_allowance
+        .checked_sub(fee_with_change)
+        .is_none_or(|left| left < DUST_AMOUNT)
+    {
+        // A change output would be dust, or would not even pay its own fee
         let lost = fee_allowance - fee_wo_change;
-        match drain {
-            Drain::Change => {
-                result.warnings.push(Warning::ChangeCreateDust(lost));
-            }
-            Drain::Max => {
-                result.warnings.push(Warning::MaxCreateDust(lost));
-            }
-            Drain::None => {}
+        if let Drain::Change = drain {
+            result.warnings.push(Warning::ChangeCreateDust(lost));
         }
         fee_allowance
     } else {
@@ -583,10 +594,7 @@ pub fn process_fees(
                 result.change = Some(fee_allowance - fee_with_change);
                 fee_with_change
             }
-            Drain::Max => {
-                result.max = Some(fee_allowance - fee_wo_change);
-                fee_wo_change
-            }
+            Drain::Max => unreachable!("handled above"),
         }
     };
     result.fees = Some(fee);
@@ -611,7 +619,14 @@ fn select_inputs(
         let base_weight_vb = tx_estimated_weight(tx_template).to_vbytes_ceil();
         let base_fee = base_weight_vb * rate / 1000;
         let target = outputs_total + base_fee;
-        selector.select_coins(source.spendable_coins(), target, rate)
+        let candidates = source.spendable_coins();
+        if let Some(max) = selector.max_candidates() {
+            let count = discard_dust(candidates.iter().collect(), rate).len();
+            if count > max {
+                return Err(Error::TooManyCoins { count, max });
+            }
+        }
+        selector.select_coins(candidates, target, rate)
     };
     if selected.is_empty() {
         return Err(Error::CoinSelection);
@@ -728,7 +743,13 @@ pub fn process_transaction(
         }
         (None, None, Some(change)) => result.change = Some(bitcoin::Amount::from_sat(change)),
         (None, None, None) => {}
-        (_, _, _) => unreachable!(),
+        // process_fees returns either a max amount, a change amount or
+        // neither, matching `drain`; any other combination is a bug, reported
+        // instead of aborting the process.
+        (_, _, _) => {
+            result.error = Some(Error::Output);
+            return result;
+        }
     }
 
     result
@@ -880,5 +901,23 @@ mod test {
             res.tx_template
                 .finalize(None, false, None, Network::Signet, 10, 100_000, false);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn a_change_that_cannot_pay_its_own_fee_is_absorbed_not_wrapped() {
+        // 150 vB without change and 193 vB with it, at 200 sat/vB: 30,000 and
+        // 38,600 sats. 36,000 sats are left for the fee, so a change output
+        // would not even pay for itself.
+        let res = process_fees(
+            Fees::MilliSatsVb(200_000),
+            Weight::from_wu(600),
+            Weight::from_wu(772),
+            136_000,
+            100_000,
+            Drain::Change,
+        );
+        assert!(res.error.is_none(), "got {:?}", res.error);
+        assert_eq!(res.change, None);
+        assert_eq!(res.fees, Some(36_000));
     }
 }

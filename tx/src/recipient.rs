@@ -37,11 +37,15 @@ pub trait SpPartialSecretProvider {
     /// BIP352 requires all SP outputs sharing the same scan key to be derived
     /// together with incrementing `k` values. This method is called during
     /// `finalize()` after computing `partial_secret` but before `build_psbt()`.
+    ///
+    /// Fails when an output cannot be derived, e.g. when a recipient's spend
+    /// key sums to the point at infinity, which BIP352 says must fail the send.
     fn derive_sp_scripts(
         &self,
         _outputs: &mut [Box<dyn RecipientProvider>],
         _partial_secret: SecretKey,
-    ) {
+    ) -> Result<(), Error> {
+        Ok(())
     }
 }
 

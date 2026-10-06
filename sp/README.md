@@ -47,6 +47,47 @@ loop {
 }
 ```
 
+## Watch-only accounts and lent spend keys
+
+An account built with `Config::from_keys` and a 33-byte *public* spend key
+scans, derives addresses and simulates spends, but holds no spend authority.
+Sub-accounts added with `Config::add_watch_only_sub_account` carry a public
+descriptor and no signer.
+
+To spend, the caller derives the keys itself and lends them for one call
+through `SpendKeys`: the BIP352 spend secret key and a `KeyRing` of
+extended private keys rooted at an *account* path (e.g. `m/86'/0'/0'`), not
+the master key. The account never stores them.
+
+```rust
+use bwk_sp::account::spend_keys::{KeyRing, OriginXpriv, SpendKeys};
+
+let mut ring = KeyRing::new();
+ring.push(OriginXpriv { master_fingerprint, origin_path, xpriv: account_xpriv });
+let keys = SpendKeys::new(b_spend, ring);
+
+let mut builder = account.tx_builder_with_keys(&keys)?;
+// ... outputs, fee, inputs
+let mut psbt = builder.generate()?;
+let tx = account.sign_and_finalize_with_keys(&mut psbt, &keys)?;
+```
+
+Keys that are not the account's are refused with
+`AccountError::SpendKeyMismatch`. `SpendKeys` and `KeyRing` erase their
+secrets on drop, best effort (`SecretKey::non_secure_erase`).
+
+The SP change script is derived at signing time. Before broadcast, check it
+with `Account::owned_outputs_of`: it runs the scanner's receiving-side
+derivation (scan secret, the transaction's input public keys, labels) and
+never calls sending code, so a sending-side bug cannot vouch for itself.
+
+```rust
+let prevouts: Vec<_> = psbt.inputs.iter().map(|i| i.witness_utxo.clone().unwrap()).collect();
+let tx = account.sign_and_finalize_with_keys(&mut psbt, &keys)?;
+let owned = account.owned_outputs_of(&tx, &prevouts)?;
+// refuse to broadcast unless the change output is in `owned` with `is_change`
+```
+
 ## Architecture
 
 ```
@@ -61,6 +102,33 @@ SpTxStore (transaction history)
      ▼
 Notification ──► Account consumer
 ```
+
+## Backend trust
+
+The scanner takes chain facts from the Blindbit oracle and does not check them
+against the account's PoW-validated `HeaderStore` (used today only for block
+timestamps):
+
+- **Received outputs.** Tweaks, the new-UTXO filter and its block hash, and
+  the UTXO list (value, script, spent flag) all come from the oracle. Since the
+  oracle also picks the tweak, it can fabricate an output the account will
+  recognise as its own, with any amount, at any height. Such a coin cannot be
+  spent (taproot signatures commit to every prevout amount and script), but it
+  shows as confirmed balance and as a received payment.
+- **Scan tip and reorgs.** The scan end is the oracle's `/block-height` and
+  each block hash is the oracle's. The receive and spend frontiers only move
+  forward and `ScanState::last_block_hash` is not compared on resume, so a
+  block replaced by a reorg below the frontier is not rescanned, and a tip
+  reported above the real chain moves the frontier past blocks that are then
+  never scanned on that backend.
+
+A scan pass refuses a range wider than `MAX_SCAN_SPAN` blocks, so an absurd
+tip cannot size an allocation. Binding the scan to the header chain (end at
+`min(oracle tip, header tip)`, each filter block hash checked against
+`HeaderStore::block_hash`, rewinding both frontiers on mismatch) and checking
+received outputs against Electrum (merkle proof and raw transaction) are not
+done yet. Until then, treat a received SP payment as confirmed only once
+another source agrees.
 
 ## Stores
 

@@ -79,6 +79,9 @@ pub fn discard_dust<T: CoinCandidate>(coins: Vec<&T>, feerate: u64 /* msats/vb *
         .collect()
 }
 
+/// The exhaustive search tries every subset (2^n), so it is capped.
+pub const MAX_EXHAUSTIVE_COINS: usize = 20;
+
 pub fn all_coins_combinations<T: CoinCandidate>(
     coins: Vec<&T>,
     feerate: u64, /* msats/vb*/
@@ -86,7 +89,7 @@ pub fn all_coins_combinations<T: CoinCandidate>(
     let coins = discard_dust(coins, feerate);
 
     let n = coins.len();
-    if n == 0 || n > 20 {
+    if n == 0 || n > MAX_EXHAUSTIVE_COINS {
         // NOTE: >20 coins is too much resources intensive
         return None;
     }
@@ -210,6 +213,13 @@ pub fn select<T: CoinCandidate>(
 /// Implement this to provide custom selection algorithms.
 pub trait CoinSelector {
     fn select_coins(&self, candidates: Vec<Coin>, target: u64, feerate: u64) -> Vec<Coin>;
+
+    /// The most non-dust candidates this selector can consider, if bounded.
+    /// Selection is refused with `Error::TooManyCoins` above it, rather than
+    /// failing as if the funds were missing.
+    fn max_candidates(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Default coin selector wrapping the exhaustive algorithm.
@@ -230,6 +240,10 @@ impl Default for DefaultCoinSelector {
 }
 
 impl CoinSelector for DefaultCoinSelector {
+    fn max_candidates(&self) -> Option<usize> {
+        Some(MAX_EXHAUSTIVE_COINS)
+    }
+
     fn select_coins(&self, candidates: Vec<Coin>, target: u64, feerate: u64) -> Vec<Coin> {
         if candidates.is_empty() {
             return vec![];

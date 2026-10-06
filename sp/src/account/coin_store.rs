@@ -494,12 +494,25 @@ impl<P: SpStorageProfile + Send + Sync + 'static> CoinSource for MergedCoinSourc
 /// secret when sending to SP addresses with mixed inputs.
 pub struct KeyedBip32Source {
     inner: Box<dyn CoinSource>,
-    xprivs: BTreeMap<Fingerprint, Xpriv>,
+    xprivs: crate::account::spend_keys::KeyRing,
     secp: Secp256k1<All>,
 }
 
 impl KeyedBip32Source {
     pub fn new(inner: Box<dyn CoinSource>, xprivs: BTreeMap<Fingerprint, Xpriv>) -> Self {
+        Self::with_ring(
+            inner,
+            crate::account::spend_keys::KeyRing::from_masters(xprivs),
+        )
+    }
+
+    /// Like [`KeyedBip32Source::new`], drawing keys from a
+    /// [`KeyRing`](crate::account::spend_keys::KeyRing) that may hold
+    /// account-level keys rather than master keys.
+    pub fn with_ring(
+        inner: Box<dyn CoinSource>,
+        xprivs: crate::account::spend_keys::KeyRing,
+    ) -> Self {
         Self {
             inner,
             xprivs,
@@ -520,24 +533,15 @@ impl KeyedBip32Source {
 
         // Try segwit bip32_derivation first, then taproot tap_key_origins
         let derived_key = if !psbt_input.bip32_derivation.is_empty() {
-            psbt_input.bip32_derivation.values().find_map(|(fg, path)| {
-                let xpriv = self.xprivs.get(fg)?;
-                xpriv
-                    .derive_priv(&self.secp, path)
-                    .ok()
-                    .map(|k| k.private_key)
-            })
+            psbt_input
+                .bip32_derivation
+                .values()
+                .find_map(|(fg, path)| self.xprivs.derive(&self.secp, fg, path))
         } else if !psbt_input.tap_key_origins.is_empty() {
             psbt_input
                 .tap_key_origins
                 .values()
-                .find_map(|(_, (fg, path))| {
-                    let xpriv = self.xprivs.get(fg)?;
-                    xpriv
-                        .derive_priv(&self.secp, path)
-                        .ok()
-                        .map(|k| k.private_key)
-                })
+                .find_map(|(_, (fg, path))| self.xprivs.derive(&self.secp, fg, path))
         } else {
             None
         };

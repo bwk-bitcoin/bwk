@@ -10,6 +10,9 @@ pub enum Error {
     NoSpProvider,
     /// Failed to compute SP partial secret
     SpPartialSecret,
+    /// A silent payment recipient output cannot be derived (BIP352 output key
+    /// at infinity)
+    SpOutputDerivation,
     /// Coin not found in store
     CoinNotFound,
     /// Change output already added to template

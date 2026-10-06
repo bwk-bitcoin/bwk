@@ -15,6 +15,8 @@ pub enum Error {
     // Validation
     #[error("invalid scan range: start ({0}) > end ({1})")]
     InvalidRange(u32, u32),
+    #[error("scan range {0}..={1} is wider than {2} blocks; the backend tip is not plausible")]
+    RangeTooLarge(u32, u32, u32),
     #[error("missing block hash for scanned block {0}")]
     MissingBlockHash(u32),
     #[error("unknown recipient address type")]

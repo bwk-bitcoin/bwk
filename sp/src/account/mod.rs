@@ -9,6 +9,7 @@
 pub mod coin_store;
 pub mod config;
 pub mod recipient;
+pub mod spend_keys;
 pub mod tx_store;
 pub mod unified;
 
@@ -22,10 +23,16 @@ use {
             },
             config::Config,
             recipient::{SpChangeRecipientProvider, SpSecretProvider},
+            spend_keys::{KeyRing, SpendKeys},
             tx_store::{SpTxEntry, SpTxStore},
         },
         blindbit::{self, InfoResponse},
-        core::utils::common::SilentPaymentAddress,
+        core::{
+            receiving::{
+                calculate_ecdh_shared_secret, calculate_tweak_data, eligible_input_pubkey, Label,
+            },
+            utils::common::SilentPaymentAddress,
+        },
         receiver::{bip39, SpReceiver},
         scan::{state::ScanState, ScanRuntimeConfig, ScanRuntimeConfigError},
     },
@@ -52,7 +59,7 @@ use {
         persist::config_store::{ConfigStore, NoopConfigStore},
     },
     bwk_sign::signing_manager::SigningManager,
-    miniscript::{psbt::PsbtExt, Descriptor, DescriptorPublicKey, ForEachKey},
+    miniscript::{psbt::PsbtExt, Descriptor, DescriptorPublicKey},
     std::{
         collections::{BTreeMap, BTreeSet},
         str::FromStr,
@@ -137,6 +144,12 @@ pub enum AccountError {
     InputNotOwned(OutPoint),
     #[error("silent payment derivation failed: {0}")]
     SilentPayment(#[from] crate::core::error::Error),
+    #[error("the spend key does not belong to this account")]
+    SpendKeyMismatch,
+    #[error("invalid transaction request: {0:?}")]
+    TxRequest(bwk_tx::template::TxRequestError),
+    #[error("{prevouts} prevouts given for {inputs} inputs")]
+    PrevoutCount { inputs: usize, prevouts: usize },
 }
 
 #[cfg(feature = "mnemonic")]
@@ -286,26 +299,59 @@ fn sp_owned_output_value(
     tx: &bitcoin::Transaction,
     prevouts: &[TxOut],
 ) -> Result<u64, AccountError> {
+    Ok(sp_owned_outputs(sp_receiver, tx, prevouts)?
+        .iter()
+        .map(|owned| owned.amount.to_sat())
+        .sum())
+}
+
+#[cfg(feature = "mnemonic")]
+/// An output of a transaction that an account's scan key recognises as its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedOutputMatch {
+    pub vout: u32,
+    pub amount: Amount,
+    /// The BIP352 label the output pays; `None` for the unlabeled address.
+    pub label: Option<Label>,
+    /// Whether `label` is the change label (`m = 0`).
+    pub is_change: bool,
+}
+
+/// The outputs of `tx` that `sp_receiver` owns, found the way the scanner
+/// finds them: tweak data from the transaction's eligible input public keys,
+/// ECDH with the scan secret, then label matching. No sending-side code runs.
+#[cfg(feature = "mnemonic")]
+fn sp_owned_outputs(
+    sp_receiver: &SpReceiver,
+    tx: &bitcoin::Transaction,
+    prevouts: &[TxOut],
+) -> Result<Vec<OwnedOutputMatch>, AccountError> {
+    if prevouts.len() != tx.input.len() {
+        return Err(AccountError::PrevoutCount {
+            inputs: tx.input.len(),
+            prevouts: prevouts.len(),
+        });
+    }
     let outputs: Vec<_> = tx
         .output
         .iter()
         .filter_map(|output| p2tr_output_key(&output.script_pubkey))
         .collect();
     if outputs.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
     let input_pubkeys: Vec<PublicKey> = tx
         .input
         .iter()
         .zip(prevouts)
-        .map(|(input, prevout)| crate::core::receiving::eligible_input_pubkey(input, prevout))
+        .map(|(input, prevout)| eligible_input_pubkey(input, prevout))
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .flatten()
         .collect();
     if input_pubkeys.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
     let outpoints: Vec<_> = tx
         .input
@@ -318,26 +364,32 @@ fn sp_owned_output_value(
         })
         .collect();
     let input_refs: Vec<_> = input_pubkeys.iter().collect();
-    let tweak = crate::core::receiving::calculate_tweak_data(&input_refs, &outpoints)?;
-    let shared_secret =
-        crate::core::receiving::calculate_ecdh_shared_secret(&tweak, &sp_receiver.get_scan_key());
+    let tweak = calculate_tweak_data(&input_refs, &outpoints)?;
+    let scan_sk = sp_receiver.get_scan_key();
+    let shared_secret = calculate_ecdh_shared_secret(&tweak, &scan_sk);
     let owned = sp_receiver
         .receiver
-        .scan_transaction(&shared_secret, outputs.clone())?;
-    let owned_keys: BTreeSet<XOnlyPublicKey> = owned
-        .values()
-        .flat_map(|outputs| outputs.keys().copied())
+        .scan_transaction(&shared_secret, outputs)?;
+    let owned_keys: BTreeMap<XOnlyPublicKey, Option<Label>> = owned
+        .into_iter()
+        .flat_map(|(label, outputs)| outputs.into_keys().map(move |key| (key, label.clone())))
         .collect();
+    let change_label = Label::new(scan_sk, 0);
 
     Ok(tx
         .output
         .iter()
-        .filter_map(|output| {
-            p2tr_output_key(&output.script_pubkey)
-                .filter(|key| owned_keys.contains(key))
-                .map(|_| output.value.to_sat())
+        .enumerate()
+        .filter_map(|(vout, output)| {
+            let label = owned_keys.get(&p2tr_output_key(&output.script_pubkey)?)?;
+            Some(OwnedOutputMatch {
+                vout: vout as u32,
+                amount: output.value,
+                is_change: label.as_ref() == Some(&change_label),
+                label: label.clone(),
+            })
         })
-        .sum())
+        .collect())
 }
 
 #[cfg(feature = "mnemonic")]
@@ -1118,6 +1170,26 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         &self,
         request: &bwk_tx::template::TxRequest,
     ) -> Result<bwk_tx::tx_builder::TxBuilder, bwk_tx::template::TxRequestError> {
+        self.tx_builder_from_request_on(request, self.tx_builder())
+    }
+
+    /// Like [`Account::tx_builder_from_request`], with the spend authority
+    /// lent by `keys` (see [`Account::tx_builder_with_keys`]).
+    pub fn tx_builder_from_request_with_keys(
+        &self,
+        request: &bwk_tx::template::TxRequest,
+        keys: &SpendKeys,
+    ) -> Result<bwk_tx::tx_builder::TxBuilder, AccountError> {
+        let builder = self.tx_builder_with_keys(keys)?;
+        self.tx_builder_from_request_on(request, builder)
+            .map_err(AccountError::TxRequest)
+    }
+
+    fn tx_builder_from_request_on(
+        &self,
+        request: &bwk_tx::template::TxRequest,
+        builder: bwk_tx::tx_builder::TxBuilder,
+    ) -> Result<bwk_tx::tx_builder::TxBuilder, bwk_tx::template::TxRequestError> {
         use crate::{account::recipient::SpRecipientAddress, receiver::RecipientAddress};
         use bwk_tx::{template::TxRequestError, transaction::Amount as BwkAmount};
 
@@ -1146,7 +1218,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         }
 
         let feerate_msats_vb = (request.fee_rate.max(1.0) * 1000.0) as u64;
-        let mut builder = self.tx_builder();
+        let mut builder = builder;
         builder = if request.fee > 0 {
             builder.fee(request.fee)
         } else {
@@ -1286,7 +1358,33 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     /// account.sign_psbt(&mut psbt)?;
     /// ```
     pub fn tx_builder(&self) -> bwk_tx::tx_builder::TxBuilder {
-        let change_addr = self.sp_receiver.receiver.get_change_address();
+        self.tx_builder_with(
+            self.sp_receiver.clone(),
+            KeyRing::from_masters(self.master_xprivs()),
+        )
+    }
+
+    /// Like [`Account::tx_builder`], for an account that holds no spend
+    /// authority: the SP spend key and the BIP32 input keys come from `keys`,
+    /// for this builder only.
+    ///
+    /// # Errors
+    /// * `AccountError::SpendKeyMismatch` if `keys` is not this account's
+    ///   spend authority.
+    pub fn tx_builder_with_keys(
+        &self,
+        keys: &SpendKeys,
+    ) -> Result<bwk_tx::tx_builder::TxBuilder, AccountError> {
+        let receiver = self.receiver_with_keys(keys)?;
+        Ok(self.tx_builder_with(receiver, keys.ring().clone()))
+    }
+
+    fn tx_builder_with(
+        &self,
+        receiver: SpReceiver,
+        ring: KeyRing,
+    ) -> bwk_tx::tx_builder::TxBuilder {
+        let change_addr = receiver.receiver.get_change_address();
         let change_provider = Box::new(SpChangeRecipientProvider::new(
             change_addr,
             self.config.network,
@@ -1294,31 +1392,44 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
 
         let sp_source = SpCoinSource::new(self.coin_store.clone());
 
-        let all_xprivs = self.master_xprivs();
-
-        let sp_provider = Box::new(SpSecretProvider::new(
-            self.coin_store.clone(),
-            self.sp_receiver.clone(),
-            all_xprivs.clone(),
-        ));
-
         // Merge coin sources from all sub-accounts, enriching BIP32 coins
         // with their secret keys for SP partial secret computation. Each
         // scanner only gets the keys its own descriptor is derived from.
         let bip32_sources: Vec<Box<dyn bwk_coin::CoinSource>> = self
             .scanners()
             .map(|scanner| {
-                Box::new(KeyedBip32Source::new(
+                Box::new(KeyedBip32Source::with_ring(
                     Box::new(scanner.coin_source()),
-                    descriptor_xprivs(&scanner.descriptor(), &all_xprivs),
+                    ring.for_descriptor(&scanner.descriptor()),
                 )) as Box<dyn bwk_coin::CoinSource>
             })
             .collect();
         let merged_source = Box::new(MergedCoinSource::new(sp_source, bip32_sources));
 
+        let sp_provider = Box::new(SpSecretProvider::with_ring(
+            self.coin_store.clone(),
+            receiver,
+            ring,
+        ));
+
         bwk_tx::tx_builder::TxBuilder::new(change_provider)
             .coin_source(merged_source)
             .sp_provider(sp_provider)
+    }
+
+    /// This account's receiver with `keys`' spend secret, after checking that
+    /// `keys` is this account's spend authority.
+    fn receiver_with_keys(&self, keys: &SpendKeys) -> Result<SpReceiver, AccountError> {
+        let secp = Secp256k1::signing_only();
+        if keys.spend_public_key(&secp) != self.sp_receiver.get_spend_public_key() {
+            return Err(AccountError::SpendKeyMismatch);
+        }
+        SpReceiver::new(
+            self.sp_receiver.get_scan_key(),
+            crate::receiver::SpendKey::Secret(keys.b_spend()),
+            self.config.network,
+        )
+        .map_err(AccountError::SpReceiver)
     }
 
     /// Sign all inputs in a PSBT, both SP and BIP32 (segwit/taproot).
@@ -1351,6 +1462,123 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     ) -> Result<bitcoin::Transaction, AccountError> {
         self.sign_psbt(psbt)?;
         Self::finalize(psbt)
+    }
+
+    /// Sign all inputs with the spend authority lent by `keys`, for an
+    /// account that holds none (see [`Account::tx_builder_with_keys`]).
+    ///
+    /// 1. Signs SP inputs using `b_spend + tweak` (no taproot tweak).
+    /// 2. Signs BIP86 taproot key-path inputs whose key origin `keys`' ring
+    ///    covers.
+    ///
+    /// Inputs neither step covers are left unsigned, so finalizing fails.
+    ///
+    /// # Errors
+    /// * `AccountError::SpendKeyMismatch` if `keys` is not this account's
+    ///   spend authority.
+    pub fn sign_psbt_with_keys(
+        &self,
+        psbt: &mut bitcoin::Psbt,
+        keys: &SpendKeys,
+    ) -> Result<(), AccountError> {
+        let secp = Secp256k1::signing_only();
+        if keys.spend_public_key(&secp) != self.sp_receiver.get_spend_public_key() {
+            return Err(AccountError::SpendKeyMismatch);
+        }
+        self.sign_sp_inputs_with(psbt, keys.b_spend())?;
+        Self::sign_taproot_key_path_inputs(psbt, keys.ring())
+    }
+
+    /// [`Account::sign_psbt_with_keys`], then finalize into a broadcast-ready
+    /// transaction.
+    pub fn sign_and_finalize_with_keys(
+        &self,
+        psbt: &mut bitcoin::Psbt,
+        keys: &SpendKeys,
+    ) -> Result<bitcoin::Transaction, AccountError> {
+        self.sign_psbt_with_keys(psbt, keys)?;
+        Self::finalize(psbt)
+    }
+
+    /// Sign every BIP86 (single key, no script tree) taproot input whose key
+    /// origin `ring` covers, after checking the derived key is the input's
+    /// internal key.
+    fn sign_taproot_key_path_inputs(
+        psbt: &mut bitcoin::Psbt,
+        ring: &KeyRing,
+    ) -> Result<(), AccountError> {
+        let secp = Secp256k1::new();
+        let hash_ty = TapSighashType::Default;
+
+        let prevouts: Vec<bitcoin::TxOut> = psbt
+            .inputs
+            .iter()
+            .map(|input| {
+                input
+                    .witness_utxo
+                    .clone()
+                    .expect("PSBT input must have witness_utxo")
+            })
+            .collect();
+        let mut cache = SighashCache::new(&psbt.unsigned_tx);
+
+        for i in 0..psbt.inputs.len() {
+            let input = &psbt.inputs[i];
+            if input.tap_key_sig.is_some() || input.tap_merkle_root.is_some() {
+                continue;
+            }
+            let Some(internal_key) = input.tap_internal_key else {
+                continue;
+            };
+            let Some(sk) = input
+                .tap_key_origins
+                .get(&internal_key)
+                .and_then(|(_, (fg, path))| ring.derive(&secp, fg, path))
+            else {
+                continue;
+            };
+            let keypair = Keypair::from_secret_key(&secp, &sk);
+            if keypair.x_only_public_key().0 != internal_key {
+                continue;
+            }
+
+            let sighash = cache
+                .taproot_key_spend_signature_hash(i, &Prevouts::All(&prevouts), hash_ty)
+                .map_err(AccountError::Sighash)?;
+            let msg = Message::from_digest(sighash.to_byte_array());
+            let tweaked = bitcoin::key::TapTweak::tap_tweak(keypair, &secp, None).to_keypair();
+            let sig = secp.sign_schnorr(&msg, &tweaked);
+
+            psbt.inputs[i].tap_key_sig = Some(Signature {
+                signature: sig,
+                sighash_type: hash_ty,
+            });
+        }
+        Ok(())
+    }
+
+    /// The outputs of a fully signed `tx` that this account owns, found with
+    /// the scanner's receiving-side derivation: only the scan secret and the
+    /// spend public key are used, so a watch-only account can call it.
+    /// `prevouts[i]` is the output spent by `tx.input[i]`.
+    ///
+    /// The SP change of a spend is derived at signing time; checking it here,
+    /// before broadcast, catches a sending-side derivation that would pay a
+    /// key the scanner never finds.
+    ///
+    /// Inputs that are not BIP352-eligible (e.g. taproot script-path spends)
+    /// add nothing to the shared secret, as the BIP specifies.
+    ///
+    /// # Errors
+    /// * `AccountError::PrevoutCount` if `prevouts` does not match the inputs.
+    /// * `AccountError::SilentPayment` if an input is malformed for its type
+    ///   or the derivation fails.
+    pub fn owned_outputs_of(
+        &self,
+        tx: &bitcoin::Transaction,
+        prevouts: &[TxOut],
+    ) -> Result<Vec<OwnedOutputMatch>, AccountError> {
+        sp_owned_outputs(&self.sp_receiver, tx, prevouts)
     }
 
     /// Broadcast a signed spend in the background. Completion is reported via
@@ -1446,7 +1674,14 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
             .sp_receiver
             .try_get_secret_spend_key()
             .map_err(AccountError::Signing)?;
+        self.sign_sp_inputs_with(psbt, b_spend)
+    }
 
+    fn sign_sp_inputs_with(
+        &self,
+        psbt: &mut bitcoin::Psbt,
+        b_spend: SecretKey,
+    ) -> Result<(), AccountError> {
         let secp = Secp256k1::new();
         let hash_ty = TapSighashType::Default;
 
@@ -1647,24 +1882,6 @@ fn register_sub_signer(
     }
     signing_manager.register_bip32_descriptor(descriptor);
     Ok(())
-}
-
-#[cfg(feature = "mnemonic")]
-/// The subset of `xprivs` that `descriptor` is derived from, keyed by
-/// fingerprint: the only keys able to sign for it.
-fn descriptor_xprivs(
-    descriptor: &Descriptor<DescriptorPublicKey>,
-    xprivs: &BTreeMap<bitcoin::bip32::Fingerprint, bitcoin::bip32::Xpriv>,
-) -> BTreeMap<bitcoin::bip32::Fingerprint, bitcoin::bip32::Xpriv> {
-    let mut out = BTreeMap::new();
-    descriptor.for_each_key(|key| {
-        let fingerprint = key.master_fingerprint();
-        if let Some(xpriv) = xprivs.get(&fingerprint) {
-            out.insert(fingerprint, *xpriv);
-        }
-        true
-    });
-    out
 }
 
 #[cfg(feature = "mnemonic")]
@@ -1881,6 +2098,140 @@ mod tests {
         assert_eq!(entry.timestamp, Some(4));
         assert_eq!(entry.label.as_deref(), Some("label"));
         assert_eq!(entry.change, 5);
+    }
+
+    /// A one-input key-path taproot spend paying the account's change
+    /// address, its unlabeled address, then an external key, with outputs
+    /// derived by the sending side.
+    fn spend_to_account(account: &Account) -> (bitcoin::Transaction, Vec<TxOut>) {
+        let secp = Secp256k1::new();
+        let input_sk = SecretKey::from_slice(&[7; 32]).unwrap();
+        let (input_key, _) = input_sk.x_only_public_key(&secp);
+        let prevout = TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::new_p2tr_tweaked(
+                bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(input_key),
+            ),
+        };
+        let previous_output = OutPoint::new(Txid::from_byte_array([3; 32]), 1);
+        let partial_secret = crate::core::sending::calculate_partial_secret(
+            &[(input_sk, true)],
+            &[(previous_output.txid.to_string(), previous_output.vout)],
+        )
+        .unwrap();
+        let change_address = account.sp_receiver.receiver.get_change_address();
+        let receive_address = account.sp_address();
+        let keys = crate::core::sending::generate_recipient_pubkeys(
+            vec![change_address, receive_address],
+            partial_secret,
+        )
+        .unwrap();
+        let p2tr = |key: XOnlyPublicKey| {
+            ScriptBuf::new_p2tr_tweaked(bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(
+                key,
+            ))
+        };
+        let external = SecretKey::from_slice(&[9; 32])
+            .unwrap()
+            .x_only_public_key(&secp)
+            .0;
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output,
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::ZERO,
+                witness: bitcoin::Witness::from_slice(&[vec![0; 64]]),
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(40_000),
+                    script_pubkey: p2tr(keys[&change_address][0]),
+                },
+                TxOut {
+                    value: Amount::from_sat(30_000),
+                    script_pubkey: p2tr(keys[&receive_address][0]),
+                },
+                TxOut {
+                    value: Amount::from_sat(20_000),
+                    script_pubkey: p2tr(external),
+                },
+            ],
+        };
+        (tx, vec![prevout])
+    }
+
+    #[test]
+    fn owned_outputs_of_finds_change_and_unlabeled_outputs() {
+        let account = Account::new(test_config()).unwrap();
+        let (tx, prevouts) = spend_to_account(&account);
+
+        let owned = account.owned_outputs_of(&tx, &prevouts).unwrap();
+
+        let change_label = Label::new(account.sp_receiver.get_scan_key(), 0);
+        assert_eq!(
+            owned,
+            vec![
+                OwnedOutputMatch {
+                    vout: 0,
+                    amount: Amount::from_sat(40_000),
+                    label: Some(change_label),
+                    is_change: true,
+                },
+                OwnedOutputMatch {
+                    vout: 1,
+                    amount: Amount::from_sat(30_000),
+                    label: None,
+                    is_change: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn owned_outputs_of_ignores_a_replaced_change_key() {
+        let account = Account::new(test_config()).unwrap();
+        let (mut tx, prevouts) = spend_to_account(&account);
+        let secp = Secp256k1::new();
+        let (other, _) = SecretKey::from_slice(&[5; 32])
+            .unwrap()
+            .x_only_public_key(&secp);
+        tx.output[0].script_pubkey = ScriptBuf::new_p2tr_tweaked(
+            bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(other),
+        );
+
+        let owned = account.owned_outputs_of(&tx, &prevouts).unwrap();
+
+        assert!(owned.iter().all(|o| o.vout != 0 && !o.is_change));
+    }
+
+    #[test]
+    fn owned_outputs_of_rejects_another_accounts_view() {
+        let account = Account::new(test_config()).unwrap();
+        let (tx, prevouts) = spend_to_account(&account);
+        let mut other = test_config();
+        other.mnemonic = Some(
+            "legal winner thank year wave sausage worth useful legal winner thank yellow"
+                .to_string(),
+        );
+        let other = Account::new(other).unwrap();
+
+        assert!(other.owned_outputs_of(&tx, &prevouts).unwrap().is_empty());
+    }
+
+    #[test]
+    fn owned_outputs_of_requires_one_prevout_per_input() {
+        let account = Account::new(test_config()).unwrap();
+        let (tx, _) = spend_to_account(&account);
+
+        assert!(matches!(
+            account.owned_outputs_of(&tx, &[]),
+            Err(AccountError::PrevoutCount {
+                inputs: 1,
+                prevouts: 0
+            })
+        ));
     }
 
     #[test]
