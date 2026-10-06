@@ -119,7 +119,11 @@ fn test_bip32_only_sp_change_bookkeeping(env: &mut TestEnv) {
         .tx_history()
         .iter()
         .any(|entry| entry.txid() == txid));
-    assert!(account.coins().is_empty());
+    let coins: Vec<_> = account.coins().into_values().collect();
+    assert_eq!(coins.len(), 1);
+    assert_eq!(coins[0].outpoint().txid, txid);
+    assert_eq!(coins[0].amount_sat(), change);
+    assert!(!coins[0].is_confirmed());
     let payment = account
         .payment_history()
         .into_iter()
@@ -211,7 +215,7 @@ fn test_standard_output_ownership_is_counted_once(env: &mut TestEnv) {
         .into_iter()
         .find(|payment| payment.txid == txid.to_string())
         .unwrap();
-    assert!(matches!(payment.payment_type, PaymentType::Send));
+    assert!(matches!(payment.payment_type, PaymentType::ToSelf));
     assert_eq!(payment.amount, fee);
 }
 

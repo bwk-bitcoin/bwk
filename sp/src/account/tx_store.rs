@@ -40,8 +40,8 @@ pub struct SpTxEntry {
     pub timestamp: Option<u64>,
     pub label: Option<String>,
     /// SP-owned outputs derived when recording an outgoing send. Lets the
-    /// history aggregator net the send amount while unconfirmed, before the
-    /// block scan records the coins.
+    /// history aggregator net the send amount while no change coin is
+    /// recorded.
     pub change: u64,
 }
 

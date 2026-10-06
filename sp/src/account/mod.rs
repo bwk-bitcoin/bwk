@@ -149,7 +149,18 @@ pub enum AccountError {
 struct SpendAnalysis {
     sp_inputs: Vec<OutPoint>,
     sub_accounts: BTreeSet<usize>,
-    sp_change: u64,
+    /// The outputs paying our SP keys, unconfirmed.
+    sp_outputs: BTreeMap<OutPoint, crate::receiver::OwnedOutput>,
+}
+
+#[cfg(feature = "mnemonic")]
+impl SpendAnalysis {
+    fn sp_change(&self) -> u64 {
+        self.sp_outputs
+            .values()
+            .map(|output| output.amount.to_sat())
+            .sum()
+    }
 }
 
 #[cfg(feature = "mnemonic")]
@@ -310,27 +321,29 @@ fn analyze_unconfirmed_spend<P: crate::profile::SpStorageProfile>(
         }));
     }
 
-    let sp_change = sp_owned_output_value(sp_receiver, tx, &prevouts)?;
+    let sp_outputs = sp_owned_outputs(sp_receiver, tx, &prevouts)?;
     Ok(SpendAnalysis {
         sp_inputs,
         sub_accounts: owned_sub_accounts,
-        sp_change,
+        sp_outputs,
     })
 }
 
+/// The outputs of `tx` paying our SP keys, as unconfirmed owned outputs
+/// carrying the tweak that spends them.
 #[cfg(feature = "mnemonic")]
-fn sp_owned_output_value(
+fn sp_owned_outputs(
     sp_receiver: &SpReceiver,
     tx: &bitcoin::Transaction,
     prevouts: &[TxOut],
-) -> Result<u64, AccountError> {
+) -> Result<BTreeMap<OutPoint, crate::receiver::OwnedOutput>, AccountError> {
     let outputs: Vec<_> = tx
         .output
         .iter()
         .filter_map(|output| p2tr_output_key(&output.script_pubkey))
         .collect();
     if outputs.is_empty() {
-        return Ok(0);
+        return Ok(BTreeMap::new());
     }
 
     let input_pubkeys: Vec<PublicKey> = tx
@@ -343,7 +356,7 @@ fn sp_owned_output_value(
         .flatten()
         .collect();
     if input_pubkeys.is_empty() {
-        return Ok(0);
+        return Ok(BTreeMap::new());
     }
     let outpoints: Vec<_> = tx
         .input
@@ -361,21 +374,34 @@ fn sp_owned_output_value(
         crate::core::receiving::calculate_ecdh_shared_secret(&tweak, &sp_receiver.get_scan_key());
     let owned = sp_receiver
         .receiver
-        .scan_transaction(&shared_secret, outputs.clone())?;
-    let owned_keys: BTreeSet<XOnlyPublicKey> = owned
-        .values()
-        .flat_map(|outputs| outputs.keys().copied())
+        .scan_transaction(&shared_secret, outputs)?;
+    let owned_keys: BTreeMap<XOnlyPublicKey, _> = owned
+        .into_iter()
+        .flat_map(|(label, outputs)| {
+            outputs
+                .into_iter()
+                .map(move |(key, tweak)| (key, (label.clone(), tweak)))
+        })
         .collect();
 
+    let txid = tx.compute_txid();
     Ok(tx
         .output
         .iter()
-        .filter_map(|output| {
-            p2tr_output_key(&output.script_pubkey)
-                .filter(|key| owned_keys.contains(key))
-                .map(|_| output.value.to_sat())
+        .zip(0u32..)
+        .filter_map(|(output, vout)| {
+            let (label, tweak) = owned_keys.get(&p2tr_output_key(&output.script_pubkey)?)?;
+            let owned = crate::receiver::OwnedOutput {
+                blockheight: None,
+                tweak: tweak.to_be_bytes(),
+                amount: output.value,
+                script: output.script_pubkey.clone(),
+                label: label.clone(),
+                spend_status: crate::receiver::OutputSpendStatus::Unspent,
+            };
+            Some((OutPoint::new(txid, vout), owned))
         })
-        .sum())
+        .collect())
 }
 
 #[cfg(feature = "mnemonic")]
@@ -389,15 +415,24 @@ fn apply_unconfirmed_spend<P: crate::profile::SpStorageProfile>(
 ) -> Txid {
     let txid = tx.compute_txid();
     let has_sp_inputs = !analysis.sp_inputs.is_empty();
-    if !analysis.sp_inputs.is_empty() {
+    let sp_change = analysis.sp_change();
+    if has_sp_inputs || !analysis.sp_outputs.is_empty() {
         let mut coins = coin_store.lock().expect("poisoned");
         for outpoint in analysis.sp_inputs {
             coins.mark_spent(&outpoint, txid.to_byte_array());
             let _ = sender.send(Notification::Sp(SpNotification::OutputSpent(outpoint)));
         }
+        for (outpoint, output) in analysis.sp_outputs {
+            // A scan that already found it holds the confirmed entry.
+            if coins.get(&outpoint).is_some() {
+                continue;
+            }
+            coins.insert(outpoint, output);
+            let _ = sender.send(Notification::Sp(SpNotification::NewOutput(outpoint)));
+        }
         coins.persist();
     }
-    if has_sp_inputs || analysis.sp_change > 0 {
+    if has_sp_inputs || sp_change > 0 {
         let mut txs = tx_store.lock().expect("poisoned");
         let mut entry = txs
             .get(&txid)
@@ -405,7 +440,7 @@ fn apply_unconfirmed_spend<P: crate::profile::SpStorageProfile>(
         if entry.tx.is_none() {
             entry.tx = Some(tx.clone());
         }
-        entry.change = analysis.sp_change;
+        entry.change = sp_change;
         txs.insert(entry);
         txs.persist();
     }
@@ -1165,9 +1200,11 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         }
     }
 
-    /// Total balance across SP and all sub-accounts.
+    /// Total balance across SP and all sub-accounts, the unconfirmed SP coins
+    /// of our own broadcasts included.
     pub fn total_balance(&self) -> u64 {
-        let sp_balance = self.balance();
+        let sp = self.spendable_coins();
+        let sp_balance = sp.confirmed_balance + sp.unconfirmed_balance;
         let bip32_balance: u64 = self.scanners().map(|s| s.balance().0).sum();
         sp_balance + bip32_balance
     }
@@ -1509,7 +1546,9 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     /// Inject a just-broadcast spend into local state as unconfirmed.
     ///
     /// Resolves every input from wallet stores, derives owned SP outputs, and
-    /// then records the transaction in each relevant store.
+    /// then records the transaction in each relevant store. The owned SP
+    /// outputs land in the coin store as unconfirmed coins until a scan
+    /// confirms them.
     pub fn record_unconfirmed_spend(
         &self,
         tx: &bitcoin::Transaction,
@@ -1999,7 +2038,17 @@ mod tests {
             SpendAnalysis {
                 sp_inputs: Vec::new(),
                 sub_accounts: BTreeSet::new(),
-                sp_change: 5,
+                sp_outputs: BTreeMap::from([(
+                    OutPoint::new(txid, 0),
+                    crate::receiver::OwnedOutput {
+                        blockheight: None,
+                        tweak: [0; 32],
+                        amount: Amount::from_sat(5),
+                        script: ScriptBuf::new(),
+                        label: None,
+                        spend_status: crate::receiver::OutputSpendStatus::Unspent,
+                    },
+                )]),
             },
         );
 
@@ -3091,9 +3140,10 @@ impl<P: crate::profile::SpStorageProfile> bwk::bwk_electrum::history::AccountHis
                 if c.tx.is_none() {
                     c.tx = e.tx.clone();
                 }
-                // Our own send's SP change nets the amount while unconfirmed.
-                // Once the scan records the real change coin, `owned_out` is set
-                // from it above, so the recorded value is no longer applied.
+                // Our own send's SP change nets the amount while no change coin
+                // is recorded. Once one is (at broadcast or by the scan),
+                // `owned_out` is set from it above, so the recorded value is no
+                // longer applied.
                 if e.change > 0 && c.owned_out == 0 {
                     c.owned_out = e.change;
                 }

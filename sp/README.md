@@ -80,7 +80,9 @@ Notification ──► Account consumer
 
 ## Stores
 
-- `SpCoinStore`: Detected SP outputs with spend status
+- `SpCoinStore`: Detected SP outputs with spend status. Our own broadcast's SP
+  outputs are recorded at once as unconfirmed coins, spendable and counted in the
+  unconfirmed balance, until a scan confirms them
 - `SpTxStore`: Transaction history (direction and amount derived by the aggregator)
 - `bwk_electrum::label_store::LabelStore`: User labels for coins and transactions (shared with bwk)
 - `ScanState`: Scan progress and checkpoint management

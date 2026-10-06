@@ -1522,7 +1522,12 @@ fn test_unconfirmed_spend_injection(env: &mut TestEnv) {
         assert_eq!(
             account.balance(),
             0,
-            "balance drops to 0 (change not yet scanned)"
+            "confirmed balance drops to 0 (change not yet scanned)"
+        );
+        assert_eq!(
+            account.spendable_coins().unconfirmed_balance,
+            change,
+            "the change is recorded as an unconfirmed coin"
         );
         let out = account
             .payment_history()
