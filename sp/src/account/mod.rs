@@ -23,6 +23,7 @@ use {
             config::Config,
             recipient::{SpChangeRecipientProvider, SpSecretProvider},
             tx_store::{SpTxEntry, SpTxStore},
+            unified::SubAccountKind,
         },
         blindbit::{self, InfoResponse},
         core::utils::common::SilentPaymentAddress,
@@ -38,6 +39,7 @@ use {
     },
     bwk::{
         bwk_electrum::{
+            address_store::AddressEntry,
             coin_store::SpendRecorder,
             config::{Endpoint, ScannerConfig},
             header_follower::HeaderFollower,
@@ -973,6 +975,24 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         &mut self,
     ) -> impl Iterator<Item = &mut ElectrumScanner<RamProfile<DefaultBackend>>> {
         self.sub_accounts.iter_mut().map(|sub| &mut sub.scanner)
+    }
+
+    /// Reveal a fresh receive address on the first taproot sub-account,
+    /// advancing its receive tip. `None` when there is no taproot sub-account.
+    pub fn new_taproot_address(&mut self) -> Option<AddressEntry> {
+        self.new_sub_account_address(SubAccountKind::Taproot)
+    }
+
+    /// Reveal a fresh receive address on the first segwit sub-account,
+    /// advancing its receive tip. `None` when there is no segwit sub-account.
+    pub fn new_segwit_address(&mut self) -> Option<AddressEntry> {
+        self.new_sub_account_address(SubAccountKind::Segwit)
+    }
+
+    fn new_sub_account_address(&mut self, kind: SubAccountKind) -> Option<AddressEntry> {
+        self.scanners_mut()
+            .find(|scanner| SubAccountKind::from(&scanner.descriptor()) == kind)
+            .map(|scanner| scanner.new_addr())
     }
 
     /// Every BIP32 master xpriv this wallet can sign with: the silent-payments
@@ -2167,6 +2187,49 @@ mod tests {
             mnemonic: None,
             endpoint,
         }
+    }
+
+    fn assert_reveals_fresh_addresses(
+        add_sub_account: fn(&mut Config) -> Result<(), config::ConfigError>,
+        reveal: fn(&mut Account) -> Option<AddressEntry>,
+        reveal_missing: fn(&mut Account) -> Option<AddressEntry>,
+        address_type: bitcoin::AddressType,
+    ) {
+        let mut config = test_config();
+        add_sub_account(&mut config).unwrap();
+        let mut account = Account::new(config).unwrap();
+
+        assert!(reveal_missing(&mut account).is_none());
+        let first = reveal(&mut account).unwrap();
+        let second = reveal(&mut account).unwrap();
+        assert_ne!(first.address, second.address);
+        assert_eq!(second.index, first.index + 1);
+        for entry in [first, second] {
+            assert_eq!(
+                entry.address.assume_checked().address_type(),
+                Some(address_type)
+            );
+        }
+    }
+
+    #[test]
+    fn new_taproot_address_reveals_fresh_addresses() {
+        assert_reveals_fresh_addresses(
+            Config::add_default_taproot_sub_account,
+            Account::new_taproot_address,
+            Account::new_segwit_address,
+            bitcoin::AddressType::P2tr,
+        );
+    }
+
+    #[test]
+    fn new_segwit_address_reveals_fresh_addresses() {
+        assert_reveals_fresh_addresses(
+            Config::add_default_segwit_sub_account,
+            Account::new_segwit_address,
+            Account::new_taproot_address,
+            bitcoin::AddressType::P2wpkh,
+        );
     }
 
     fn endpoint_at(url: &str, port: u16, check: CertificateCheck) -> Endpoint {
