@@ -466,6 +466,20 @@ mod tests {
     }
 
     #[test]
+    fn a_config_without_the_header_scanner_key_keeps_it_on() {
+        let mut config = test_config();
+        config.header_scanner = false;
+        let mut value = serde_json::to_value(config).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("header_scanner")
+            .unwrap();
+        let config: Config = serde_json::from_value(value).unwrap();
+        assert!(config.header_scanner);
+    }
+
+    #[test]
     fn set_electrum_endpoint_keeps_hostname() {
         let mut config = test_config();
 

@@ -2476,6 +2476,46 @@ mod tests {
         }
     }
 
+    /// Without a header scanner the account opens no header store, spawns no
+    /// reconcile pass, and hands the setting down to every sub-account scan.
+    #[test]
+    fn an_account_without_header_scanner_has_no_header_store() {
+        let mut config = test_config();
+        let mnemonic = config
+            .mnemonic
+            .clone()
+            .expect("test_config carries a mnemonic");
+        config.header_scanner = false;
+        config.descriptors = vec![
+            sub_account_config(&mnemonic, config.network, Endpoint::default()),
+            sub_account_config(&mnemonic, config.network, Endpoint::default()),
+        ];
+
+        let account = Account::new(config).unwrap();
+
+        assert!(account.header_store().is_none());
+        assert_eq!(account.scanners().count(), 2);
+        assert!(account.scanners().all(|s| !s.config().header_scanner));
+        assert_eq!(reconcilers(&account.sub_accounts).count(), 0);
+    }
+
+    /// A sub-account scan with a header scanner would queue claims nothing
+    /// resolves in an account without one, so it is refused.
+    #[test]
+    fn a_sub_account_with_another_header_scanner_setting_is_refused() {
+        let mut config = test_config();
+        config.header_scanner = false;
+        let mut account = Account::new(config).unwrap();
+        let (sub, mnemonic) = build_offline_segwit_sub("sub-segwit-0");
+        assert!(sub.config().header_scanner);
+
+        assert!(matches!(
+            account.add_sub_account(sub, Some(mnemonic)),
+            Err(AccountError::HeaderScannerMismatch)
+        ));
+        assert_eq!(account.scanners().count(), 0);
+    }
+
     /// The constructor rebuilds each sub-account scanner from its own
     /// endpoint, so a config whose sub-accounts stayed behind reopens them on
     /// the previous server while the account half points at the new one.
