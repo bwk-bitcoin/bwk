@@ -79,6 +79,13 @@ touches both. Three Electrum connections in total: one for the scanner, two for
 the header store, because `Client::listen_headers` and `Client::listen_txs`
 each consume the `Client`, so a connection hosts exactly one typed listener.
 
+Setting `config.scanner.header_scanner` to `false` opts the account out of the
+header store and the reconcile pass, leaving the scanner connection only. The
+server is then trusted: a height it reports is confirmed in the block whose
+header the scanner fetches on its own connection, which also gives the
+confirmation time, and the coin reads `Confirmed` without any merkle proof. On
+by default.
+
 ```
 Electrum server              Electrum server          Electrum server
      │  (scanner conn)            │  (header conn)         │  (merkle conn)

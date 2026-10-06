@@ -93,6 +93,12 @@ response, and the validator never touches the coin stores. The `Reconciler`
 pairs them, promoting `ConfirmedUnverified` to `Verified` and stamping
 confirmation times through `ElectrumScanner::coin_store`.
 
+`ScannerConfig::header_scanner` (on by default) opts an account out of both:
+no `HeaderFollower` and no `Reconciler`. The scanner's listener then fetches
+the header of each reported height on its own connection, promotes the claim
+to `ConfirmedUnverified` in that block with its time, and the coin store reads
+it as `Confirmed`/`Verified`. Nothing ever writes `Verified` in that mode.
+
 ### Silent Payments Wallet (`bwk-sp`)
 ```
 Account (sp/src/account/mod.rs)

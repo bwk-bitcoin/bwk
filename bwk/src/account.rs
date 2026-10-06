@@ -6,6 +6,7 @@ use std::{
 
 use bwk_electrum::{
     coin_store::{ChangeTipUpdater, SpendRecorder},
+    config::Endpoint,
     header_follower::HeaderFollower,
     header_store::HeaderStore,
     history::{AccountHistory, TxContribution},
@@ -36,12 +37,12 @@ use crate::{
 /// header store validates the chain and fetches inclusion proofs over its own
 /// connection. This type owns both, plus the signers, and runs the pass that
 /// promotes what the scanner recorded into verified state.
+///
+/// With [`ScannerConfig::header_scanner`](bwk_electrum::config::ScannerConfig::header_scanner)
+/// off there is no header store and no reconcile pass: the scanner takes the
+/// confirmations the server reports as is.
 pub struct Account<P: StorageProfile = RamProfile<DefaultBackend>> {
     scanner: ElectrumScanner<P>,
-    /// Validated header chain, this account's own or one shared across
-    /// accounts. The reconcile thread reads it on every chain-tip advance and
-    /// fetches its merkle proofs through it.
-    headers: HeaderFollower<P>,
     signing_manager: SigningManager<P::SignerStore>,
     /// Wallet-level half of [`Config`]; the scanner owns the rest.
     mnemonic: Option<String>,
@@ -53,10 +54,44 @@ pub struct Account<P: StorageProfile = RamProfile<DefaultBackend>> {
     /// [`bwk_persist::config_store::CallbackConfigStore`] to bridge save/load through
     /// host-supplied closures, or any other [`ConfigStore`] impl.
     config_store: Arc<dyn ConfigStore<Config>>,
-    /// Declared last so its thread is joined after the scanner's: both hold the
+    /// `None` when the account runs without a header scanner. Declared last so
+    /// its reconcile thread is joined after the scanner's: both hold the
     /// persistence backend alive, and the account directory stays locked until
     /// each of them has exited.
+    header_scanner: Option<HeaderScanner<P>>,
+}
+
+/// The validated header chain an account promotes its scan against, and the
+/// pass doing it.
+struct HeaderScanner<P: StorageProfile> {
+    /// This account's own chain or one shared across accounts. The reconcile
+    /// thread reads it on every chain-tip advance and fetches its merkle
+    /// proofs through it.
+    headers: HeaderFollower<P>,
     reconciler: Reconciler<P>,
+}
+
+impl<P: OpenFromBackend> HeaderScanner<P> {
+    /// Follow `target` and run the reconcile pass. A store already running
+    /// against `target` (the usual case at open) is left alone.
+    fn start(&mut self, target: Endpoint) {
+        self.headers
+            .follow(Some(target), slice::from_ref(&self.reconciler));
+        self.reconciler.start();
+    }
+
+    /// Idle the header store, when this account owns it, and the reconcile
+    /// pass.
+    fn stop(&mut self) {
+        self.headers.stop();
+        self.reconciler.stop();
+    }
+
+    /// Reconnect the header store to `target`, see [`HeaderFollower::reconnect`].
+    fn reconnect(&mut self, target: Endpoint) {
+        self.headers
+            .reconnect(target, slice::from_ref(&self.reconciler));
+    }
 }
 
 impl<P: StorageProfile> std::fmt::Debug for Account<P> {
@@ -80,9 +115,9 @@ impl<P: OpenFromBackend> Account<P> {
     /// the [`RamProfile<DefaultBackend>`] storage strategy via the
     /// `Account` struct's default type parameter.
     ///
-    /// Builds its own [`HeaderStore`] from `config`; use
-    /// [`Account::try_new_with_header_store`] to share an existing one
-    /// instead.
+    /// Builds its own [`HeaderStore`] from `config`, unless it runs without a
+    /// header scanner; use [`Account::try_new_with_header_store`] to share an
+    /// existing one instead.
     ///
     /// Config persistence defaults to [`NoopConfigStore`]; use
     /// [`Account::try_with_config_store`] to wire a concrete impl
@@ -102,7 +137,8 @@ impl<P: OpenFromBackend> Account<P> {
     }
 
     /// Like [`Account::try_new`] but sharing an existing [`HeaderStore`]
-    /// handle instead of building one.
+    /// handle instead of building one. An account without a header scanner
+    /// leaves it unused.
     pub fn try_new_with_header_store(
         config: Config,
         header_store: Arc<HeaderStore<P::HeaderStore>>,
@@ -160,7 +196,8 @@ impl<P: OpenFromBackend> Account<P> {
     }
 
     /// `header_store == None` builds the account its own store, which it then
-    /// owns and may idle from [`Account::stop_electrum`].
+    /// owns and may idle from [`Account::stop_electrum`]. No store at all
+    /// without a header scanner.
     fn try_new_inner(
         config: Config,
         header_store: Option<Arc<HeaderStore<P::HeaderStore>>>,
@@ -171,9 +208,10 @@ impl<P: OpenFromBackend> Account<P> {
             return Err(open::Error::EmptyAccount);
         }
         config.scanner.validate_descriptor()?;
-        let headers = match header_store {
-            Some(store) => HeaderFollower::borrowed(store, sender.clone()),
-            None => HeaderFollower::open(
+        let headers = match (config.scanner.header_scanner, header_store) {
+            (false, _) => None,
+            (true, Some(store)) => Some(HeaderFollower::borrowed(store, sender.clone())),
+            (true, None) => Some(HeaderFollower::open(
                 // An account asked to stay offline opens its store idle; the
                 // first start points it at the configured endpoint.
                 (!config.scanner.stay_offline())
@@ -184,7 +222,7 @@ impl<P: OpenFromBackend> Account<P> {
                 config.scanner.account_dir(),
                 None,
                 sender.clone(),
-            )?,
+            )?),
         };
         let backend: Arc<dyn PersistenceBackend> = config.scanner.build_backend()?;
         // Hot-signer material must not land on the SQLite DB; route the
@@ -213,7 +251,7 @@ impl<P: OpenFromBackend> Account<P> {
 
     fn from_stores(
         config: Config,
-        headers: HeaderFollower<P>,
+        headers: Option<HeaderFollower<P>>,
         sender: mpsc::Sender<Notification>,
         config_store: Arc<dyn ConfigStore<Config>>,
         stores: Stores<P>,
@@ -229,26 +267,31 @@ impl<P: OpenFromBackend> Account<P> {
             signing_manager.register_bip32_descriptor(scanner_config.descriptor.clone());
         }
         let stay_offline = scanner_config.stay_offline();
-        // Once per account, not per reconciler: a store shared by several
-        // accounts would otherwise report the same event to this channel as
-        // many times as it has reconcilers on it.
-        headers.store().register_notifications(sender.clone());
         let scanner = ElectrumScanner::from_stores(
             scanner_config,
             sender.clone(),
             stores.scan,
             reopen_statuses,
         );
-        let reconciler = Reconciler::spawn(&scanner, headers.store().clone(), sender.clone());
+        let header_scanner = headers.map(|headers| {
+            // Once per account, not per reconciler: a store shared by several
+            // accounts would otherwise report the same event to this channel as
+            // many times as it has reconcilers on it.
+            headers.store().register_notifications(sender.clone());
+            let reconciler = Reconciler::spawn(&scanner, headers.store().clone(), sender.clone());
+            HeaderScanner {
+                headers,
+                reconciler,
+            }
+        });
         let mut account = Account {
             scanner,
-            headers,
             signing_manager,
             mnemonic,
             sender,
             receiver: None,
             config_store,
-            reconciler,
+            header_scanner,
         };
         if !stay_offline {
             account.start_electrum();
@@ -266,9 +309,11 @@ impl<P: OpenFromBackend> Account<P> {
         // see by itself, so reconnect it too or `Verified` promotions would
         // stall. Done first, so the `start_electrum` below finds it running and
         // leaves it.
-        if let Some(target) = self.scanner.config().endpoint().configured().cloned() {
-            self.headers
-                .reconnect(target, slice::from_ref(&self.reconciler));
+        if let (Some(target), Some(header_scanner)) = (
+            self.scanner.config().endpoint().configured().cloned(),
+            self.header_scanner.as_mut(),
+        ) {
+            header_scanner.reconnect(target);
         }
         self.start_electrum();
     }
@@ -371,8 +416,8 @@ impl<P: OpenFromBackend> Account<P> {
     }
 
     /// Start every Electrum connection this account drives: the scanner's
-    /// listener, the header store's worker and merkle clients, and the
-    /// reconcile pass. Records that this account should come up online again on
+    /// listener and, with a header scanner, the header store's worker and
+    /// merkle clients and the reconcile pass. Records that this account should come up online again on
     /// the next open.
     pub fn start_electrum(&mut self) {
         let Some(target) = self.scanner.config().endpoint().configured().cloned() else {
@@ -384,11 +429,10 @@ impl<P: OpenFromBackend> Account<P> {
         };
         self.scanner.set_stay_offline(false);
         self.scanner.start();
-        // A store this account owns comes back up with it; one already running
-        // against this endpoint (the usual case at open) is left alone.
-        self.headers
-            .follow(Some(target), slice::from_ref(&self.reconciler));
-        self.reconciler.start();
+        // A store this account owns comes back up with it.
+        if let Some(header_scanner) = self.header_scanner.as_mut() {
+            header_scanner.start(target);
+        }
         self.persist_config();
     }
 
@@ -398,8 +442,9 @@ impl<P: OpenFromBackend> Account<P> {
     /// [`Account::try_new_with_header_store`]) is the sharer's to stop.
     pub fn stop_electrum(&mut self) {
         self.scanner.stop();
-        self.headers.stop();
-        self.reconciler.stop();
+        if let Some(header_scanner) = self.header_scanner.as_mut() {
+            header_scanner.stop();
+        }
         self.scanner.set_stay_offline(true);
         self.persist_config();
     }
@@ -413,9 +458,12 @@ impl<P: OpenFromBackend> Account<P> {
 
     /// Test-only accessor for the account's `HeaderStore` handle, used to
     /// assert store identity (`Arc::ptr_eq`) across accounts sharing one.
+    /// `None` without a header scanner.
     #[cfg(any(test, feature = "test"))]
-    pub fn header_store(&self) -> &Arc<HeaderStore<P::HeaderStore>> {
-        self.headers.store()
+    pub fn header_store(&self) -> Option<&Arc<HeaderStore<P::HeaderStore>>> {
+        self.header_scanner
+            .as_ref()
+            .map(|header_scanner| header_scanner.headers.store())
     }
 
     /// Sets the look-ahead value for the account.
