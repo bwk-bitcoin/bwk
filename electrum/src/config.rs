@@ -114,6 +114,10 @@ pub struct Tip {
     pub change: u32,
 }
 
+fn header_scanner_default() -> bool {
+    true
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ScannerConfig {
     #[serde(skip)]
@@ -129,6 +133,10 @@ pub struct ScannerConfig {
     /// next open. Unrelated to whether a connection is currently up.
     #[serde(default)]
     pub stay_offline: bool,
+    /// `false` runs the scan without a header chain: no header sync, no
+    /// merkle proof, a confirmation the server reports is taken as is.
+    #[serde(default = "header_scanner_default")]
+    pub header_scanner: bool,
     pub network: miniscript::bitcoin::Network,
     pub look_ahead: u32,
     pub descriptor: Descriptor<DescriptorPublicKey>,
@@ -138,7 +146,7 @@ pub struct ScannerConfig {
 
 impl ScannerConfig {
     /// A scanner watching `descriptor`, with the defaults for everything the
-    /// caller has no opinion on: online, no server pinned,
+    /// caller has no opinion on: online, no server pinned, header scanner on,
     /// [`DEFAULT_LOOK_AHEAD`] addresses of look-ahead.
     pub fn new(
         descriptor: Descriptor<DescriptorPublicKey>,
@@ -154,6 +162,7 @@ impl ScannerConfig {
             account,
             endpoint: Endpoint::default(),
             stay_offline: false,
+            header_scanner: true,
             network,
             look_ahead: DEFAULT_LOOK_AHEAD,
             descriptor,

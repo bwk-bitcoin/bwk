@@ -287,6 +287,7 @@ pub mod tests {
   "electrum_port": 50002,
   "certificate_check": "validate",
   "stay_offline": false,
+  "header_scanner": true,
   "network": "regtest",
   "look_ahead": 20,
   "descriptor": "wpkh([73c5da0a/84'/1'/0']tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M/<0;1>/*)#gwycrcrh",
