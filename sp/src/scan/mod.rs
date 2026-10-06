@@ -542,38 +542,12 @@ pub struct ScanStores<P: SpStorageProfile> {
 
 /// Resolve a block's time for `height` from the shared HeaderStore, whose worker
 /// follows the chain and stores every header (with its nTime). Non-blocking: a
-/// height the worker has not synced yet returns `None` and is stamped on a later
-/// scan by [`restamp_missing_timestamps`], so a scan never stalls waiting for a
-/// header (which never arrives at all when no endpoint worker is running).
-/// Always `None` without a header store.
+/// height the worker has not synced yet returns `None` and is stamped later by
+/// [`SpTxStore::restamp_missing_timestamps`](crate::account::tx_store::SpTxStore::restamp_missing_timestamps),
+/// so a scan never stalls waiting for a header (which never arrives at all when
+/// no endpoint worker is running). Always `None` without a header store.
 fn block_time<P: SpStorageProfile>(stores: &ScanStores<P>, height: u32) -> Option<u64> {
-    stores
-        .header_store
-        .as_ref()?
-        .header(height)
-        .map(|h| h.time as u64)
-}
-
-/// Fill in confirmation timestamps left `None` by an earlier scan (the header
-/// was not synced yet when the tx confirmed). Runs at the start of every scan so
-/// stragglers heal as the header worker catches up.
-fn restamp_missing_timestamps<P: SpStorageProfile>(stores: &ScanStores<P>) {
-    let mut tx_store = stores.tx_store.lock().expect("poisoned");
-    let mut stamped = false;
-    for entry in tx_store.transactions() {
-        if entry.timestamp.is_some() {
-            continue;
-        }
-        if let Some(height) = entry.height {
-            if let Some(time) = block_time(stores, height) {
-                tx_store.update_timestamp(&entry.txid, time);
-                stamped = true;
-            }
-        }
-    }
-    if stamped {
-        tx_store.persist();
-    }
+    crate::account::tx_store::block_time(stores.header_store.as_ref()?, height)
 }
 
 /// Connection + fetch config for the blindbit backend. Grouped so the scan
@@ -1535,7 +1509,13 @@ fn process_scan<P: SpStorageProfile>(
     let end_u32 = scan.end.to_consensus_u32();
 
     // Heal any confirmation timestamps a prior scan could not resolve yet.
-    restamp_missing_timestamps(scan.stores);
+    if let Some(header_store) = &scan.stores.header_store {
+        scan.stores
+            .tx_store
+            .lock()
+            .expect("poisoned")
+            .restamp_missing_timestamps(header_store);
+    }
 
     if spend_frontier(scan.stores)?.is_none() {
         if let Some(floor) = start_u32.checked_sub(1) {

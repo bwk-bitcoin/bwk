@@ -1109,6 +1109,18 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         self.headers.as_ref().map(HeaderFollower::store)
     }
 
+    /// Stamp the confirmed txs still missing a block time from the header
+    /// store. Local only, no network call. Returns whether any got stamped,
+    /// always `false` without a header scanner.
+    pub fn restamp_missing_timestamps(&self) -> bool {
+        self.header_store().is_some_and(|header_store| {
+            self.tx_store
+                .lock()
+                .expect("poisoned")
+                .restamp_missing_timestamps(header_store)
+        })
+    }
+
     /// Point the header validator at the endpoint this account and its
     /// sub-accounts currently point at.
     fn follow_header_target(&mut self) {

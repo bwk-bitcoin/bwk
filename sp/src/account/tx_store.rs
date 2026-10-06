@@ -6,7 +6,7 @@ use std::{collections::HashSet, str::FromStr, sync::Arc};
 
 use bitcoin::{Transaction, Txid};
 use bwk::{
-    bwk_electrum::profile::DefaultBackend,
+    bwk_electrum::{header_store::HeaderStore, profile::DefaultBackend},
     persist::{
         backend::{noop::NoopBackend, PersistenceBackend},
         storage::{ram::RamStore, Store},
@@ -18,6 +18,12 @@ use crate::profile::{SpRamProfile, SpStorageProfile};
 use serde::{Deserialize, Serialize};
 
 pub const STORE_KEY: &str = bwk::persist::TXS_STORE_KEY;
+
+/// The time of the block at `height`, `None` while `header_store` has not
+/// synced it.
+pub fn block_time(header_store: &HeaderStore, height: u32) -> Option<u64> {
+    header_store.header(height).map(|h| h.time as u64)
+}
 
 /// A transaction entry in the store.
 ///
@@ -208,6 +214,26 @@ impl<P: SpStorageProfile> SpTxStore<P> {
                 log::error!("SpTxStore::roll_back: {e}");
             }
         }
+    }
+
+    /// Stamp the confirmed entries still missing a block time from
+    /// `header_store`, and persist. Returns whether any got stamped.
+    pub fn restamp_missing_timestamps(&mut self, header_store: &HeaderStore) -> bool {
+        let mut stamped = false;
+        for entry in self.transactions() {
+            if entry.timestamp.is_some() {
+                continue;
+            }
+            let Some(time) = entry.height.and_then(|h| block_time(header_store, h)) else {
+                continue;
+            };
+            self.update_timestamp(&entry.txid, time);
+            stamped = true;
+        }
+        if stamped {
+            self.persist();
+        }
+        stamped
     }
 
     pub fn transactions(&self) -> Vec<SpTxEntry> {
