@@ -16,7 +16,7 @@ use crate::{
     profile::{SpRamProfile, SpStorageProfile},
     receiver::{OutputSpendStatus, OwnedOutput},
 };
-use bitcoin::{hashes::Hash, Amount, OutPoint, ScriptBuf};
+use bitcoin::{hashes::Hash, Amount, OutPoint, ScriptBuf, Txid};
 use bwk::{
     bwk_electrum::profile::DefaultBackend,
     persist::{
@@ -257,6 +257,48 @@ impl<P: SpStorageProfile> SpCoinStore<P> {
         }) {
             log::error!("SpCoinStore::confirm_spend: {e}");
         }
+    }
+
+    /// Undo what the blocks above `fork_height` recorded: drop the coins they
+    /// created and put back as unconfirmed the spends confirmed in a `reorged`
+    /// block.
+    pub fn roll_back(&mut self, fork_height: u32, reorged: &HashSet<[u8; 32]>) {
+        for (outpoint, entry) in self.coins() {
+            if entry.height() > fork_height {
+                self.remove(&outpoint);
+                continue;
+            }
+            let status = match entry.status() {
+                OutputSpendStatus::Spent {
+                    txid,
+                    block_hash: Some(hash),
+                } if reorged.contains(hash) => OutputSpendStatus::Spent {
+                    txid: *txid,
+                    block_hash: None,
+                },
+                OutputSpendStatus::Mined(hash) if reorged.contains(hash) => {
+                    OutputSpendStatus::Unspent
+                }
+                _ => continue,
+            };
+            if let Err(e) = self
+                .store
+                .modify(&outpoint, |entry| entry.output.spend_status = status)
+            {
+                log::error!("SpCoinStore::roll_back: {e}");
+            }
+        }
+    }
+
+    /// Txids of the known transactions spending a coin of the store.
+    pub fn spending_txids(&self) -> HashSet<Txid> {
+        self.coins()
+            .values()
+            .filter_map(|entry| match entry.status() {
+                OutputSpendStatus::Spent { txid, .. } => Some(Txid::from_byte_array(*txid)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Returns a snapshot of every coin as a fresh `BTreeMap`.
@@ -912,6 +954,115 @@ mod tests {
         let coins = store.coins();
         assert_eq!(coins.len(), 1);
         assert!(coins.contains_key(&test_outpoint()));
+    }
+
+    fn output_at(height: u32, spend_status: OutputSpendStatus) -> OwnedOutput {
+        OwnedOutput {
+            blockheight: Height::from_consensus(height).unwrap(),
+            spend_status,
+            ..test_owned_output(10000)
+        }
+    }
+
+    fn outpoint_n(n: u8) -> OutPoint {
+        OutPoint {
+            txid: Txid::from_byte_array([n; 32]),
+            vout: 0,
+        }
+    }
+
+    #[test]
+    fn test_coin_store_roll_back() {
+        let reorged_hash = [0xEE; 32];
+        let kept_hash = [0xCC; 32];
+        let reorged = HashSet::from([reorged_hash]);
+        let mut store = SpCoinStore::new();
+        store.insert(outpoint_n(1), output_at(100, OutputSpendStatus::Unspent));
+        store.insert(outpoint_n(2), output_at(111, OutputSpendStatus::Unspent));
+        store.insert(
+            outpoint_n(3),
+            output_at(
+                100,
+                OutputSpendStatus::Spent {
+                    txid: [7; 32],
+                    block_hash: Some(reorged_hash),
+                },
+            ),
+        );
+        store.insert(
+            outpoint_n(4),
+            output_at(100, OutputSpendStatus::Mined(reorged_hash)),
+        );
+        store.insert(
+            outpoint_n(5),
+            output_at(100, OutputSpendStatus::Mined(kept_hash)),
+        );
+        store.insert(
+            outpoint_n(6),
+            output_at(
+                100,
+                OutputSpendStatus::Spent {
+                    txid: [8; 32],
+                    block_hash: Some(kept_hash),
+                },
+            ),
+        );
+
+        store.roll_back(110, &reorged);
+
+        assert_eq!(store.len(), 5);
+        assert!(store.get(&outpoint_n(2)).is_none());
+        assert_eq!(
+            store.get(&outpoint_n(1)).unwrap().status(),
+            &OutputSpendStatus::Unspent
+        );
+        assert_eq!(
+            store.get(&outpoint_n(3)).unwrap().status(),
+            &OutputSpendStatus::Spent {
+                txid: [7; 32],
+                block_hash: None,
+            }
+        );
+        assert_eq!(
+            store.get(&outpoint_n(4)).unwrap().status(),
+            &OutputSpendStatus::Unspent
+        );
+        assert_eq!(
+            store.get(&outpoint_n(5)).unwrap().status(),
+            &OutputSpendStatus::Mined(kept_hash)
+        );
+        assert_eq!(
+            store.get(&outpoint_n(6)).unwrap().status(),
+            &OutputSpendStatus::Spent {
+                txid: [8; 32],
+                block_hash: Some(kept_hash),
+            }
+        );
+    }
+
+    #[test]
+    fn test_coin_store_spending_txids() {
+        let mut store = SpCoinStore::new();
+        store.insert(outpoint_n(1), output_at(100, OutputSpendStatus::Unspent));
+        store.insert(
+            outpoint_n(2),
+            output_at(
+                100,
+                OutputSpendStatus::Spent {
+                    txid: [7; 32],
+                    block_hash: None,
+                },
+            ),
+        );
+        store.insert(
+            outpoint_n(3),
+            output_at(100, OutputSpendStatus::Mined([0xEE; 32])),
+        );
+
+        assert_eq!(
+            store.spending_txids(),
+            HashSet::from([Txid::from_byte_array([7; 32])])
+        );
     }
 
     // ---------------------------------------------------------------
