@@ -897,6 +897,43 @@ mod tests {
     }
 
     #[test]
+    fn a_sub_dust_max_is_an_error_not_a_panic() {
+        // 4,000 sats at 1 sat/vB leaves about 3,900 after the fee.
+        let (_signer, derivator) = wpkh_signer();
+        let mut builder = test::builder_from_derivator(derivator.clone()).feerate(1_000);
+        builder.receive_coin(test::receive_coin(4_000, &derivator, 0));
+        builder.dummy_external_output_max();
+
+        let res = builder.simulate();
+        assert!(
+            matches!(res.error, Some(Error::MaxUnderDust { remainder }) if remainder < crate::DUST_AMOUNT),
+            "got {:?}",
+            res.error
+        );
+    }
+
+    #[test]
+    fn a_max_send_ignores_the_weight_of_a_change_it_never_creates() {
+        // 18,000 sats at 100 sat/vB leaves about 5,800 without change, but a
+        // change output would leave under the dust limit: the max output is
+        // still above it, so the send goes through.
+        let (_signer, derivator) = wpkh_signer();
+        let mut builder = test::builder_from_derivator(derivator.clone()).feerate(100_000);
+        builder.receive_coin(test::receive_coin(18_000, &derivator, 0));
+        builder.dummy_external_output_max();
+
+        let res = builder.simulate();
+        assert!(res.error.is_none(), "got {:?}", res.error);
+        let fee = res.fees.expect("fee").to_sat();
+        let max = match res.tx_template.outputs[0].amount() {
+            Amount::Max(Some(v)) => v,
+            other => panic!("max not resolved: {other:?}"),
+        };
+        assert_eq!(fee + max, 18_000);
+        assert!(max >= crate::DUST_AMOUNT);
+    }
+
+    #[test]
     fn test_coin_by_outpoint_bypasses_selection() {
         let (_signer, derivator) = wpkh_signer();
         let mut builder = test::builder_from_derivator(derivator.clone());

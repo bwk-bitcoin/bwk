@@ -55,6 +55,8 @@ pub enum Error {
     NotChange,
     #[error("missing change output, {excess} sats would be lost to fees")]
     MissingChange { excess: u64 },
+    #[error("nothing left to send after the fee: {remainder} sats is below the dust limit")]
+    MaxUnderDust { remainder: u64 },
     #[error(
         "disproportionate fee: {fee} sats for {paid_outputs} sats of outputs \
          exceeds both {max_percent}% and {max_amount} sats"
@@ -546,30 +548,31 @@ pub fn process_fees(
         return result;
     }
 
+    // A max output takes everything left after the fee; there is no change
+    // output, so only the fee without change matters.
+    if let Drain::Max = drain {
+        let remainder = fee_allowance - fee_wo_change;
+        if remainder < DUST_AMOUNT {
+            result.error = Some(Error::MaxUnderDust { remainder });
+            return result;
+        }
+        result.max = Some(remainder);
+        result.fees = Some(fee_wo_change);
+        return result;
+    }
+
     let fee = if (fee_allowance - fee_wo_change) < DUST_AMOUNT {
         // Enough for fee but not for drain
         let lost = fee_allowance - fee_wo_change;
-        match drain {
-            Drain::Change => {
-                result.warnings.push(Warning::ChangeUnderDust(lost));
-            }
-            Drain::Max => {
-                result.warnings.push(Warning::MaxUnderDust(lost));
-            }
-            Drain::None => {}
+        if let Drain::Change = drain {
+            result.warnings.push(Warning::ChangeUnderDust(lost));
         }
         fee_allowance
     } else if (fee_allowance - fee_with_change) < DUST_AMOUNT {
         // Create a drain < DUST, so we dont
         let lost = fee_allowance - fee_wo_change;
-        match drain {
-            Drain::Change => {
-                result.warnings.push(Warning::ChangeCreateDust(lost));
-            }
-            Drain::Max => {
-                result.warnings.push(Warning::MaxCreateDust(lost));
-            }
-            Drain::None => {}
+        if let Drain::Change = drain {
+            result.warnings.push(Warning::ChangeCreateDust(lost));
         }
         fee_allowance
     } else {
@@ -583,10 +586,7 @@ pub fn process_fees(
                 result.change = Some(fee_allowance - fee_with_change);
                 fee_with_change
             }
-            Drain::Max => {
-                result.max = Some(fee_allowance - fee_wo_change);
-                fee_wo_change
-            }
+            Drain::Max => unreachable!("handled above"),
         }
     };
     result.fees = Some(fee);
@@ -728,7 +728,13 @@ pub fn process_transaction(
         }
         (None, None, Some(change)) => result.change = Some(bitcoin::Amount::from_sat(change)),
         (None, None, None) => {}
-        (_, _, _) => unreachable!(),
+        // process_fees returns either a max amount, a change amount or
+        // neither, matching `drain`; any other combination is a bug, reported
+        // instead of aborting the process.
+        (_, _, _) => {
+            result.error = Some(Error::Output);
+            return result;
+        }
     }
 
     result
