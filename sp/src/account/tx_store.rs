@@ -2,7 +2,7 @@
 //!
 //! Generic wrapper around any `Store<Key = Txid, Value = SpTxEntry>`.
 
-use std::{str::FromStr, sync::Arc};
+use std::{collections::HashSet, str::FromStr, sync::Arc};
 
 use bitcoin::{Transaction, Txid};
 use bwk::{
@@ -189,6 +189,27 @@ impl<P: SpStorageProfile> SpTxStore<P> {
         }
     }
 
+    /// Undo the confirmations above `fork_height`: a tx in `pending` (still
+    /// spending a coin of the wallet) goes back to unconfirmed, any other is
+    /// dropped.
+    pub fn roll_back(&mut self, fork_height: u32, pending: &HashSet<Txid>) {
+        for entry in self.transactions() {
+            if entry.height.is_none_or(|h| h <= fork_height) {
+                continue;
+            }
+            if !pending.contains(&entry.txid) {
+                self.remove(&entry.txid);
+                continue;
+            }
+            if let Err(e) = self.store.modify(&entry.txid, |entry| {
+                entry.height = None;
+                entry.timestamp = None;
+            }) {
+                log::error!("SpTxStore::roll_back: {e}");
+            }
+        }
+    }
+
     pub fn transactions(&self) -> Vec<SpTxEntry> {
         self.store
             .values()
@@ -209,5 +230,44 @@ impl<P: SpStorageProfile> SpTxStore<P> {
         if let Err(e) = self.store.flush() {
             log::error!("SpTxStore::persist() flush: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use bitcoin::{hashes::Hash, Txid};
+
+    use crate::account::tx_store::{SpTxEntry, SpTxStore};
+
+    fn entry_at(n: u8, height: Option<u32>) -> SpTxEntry {
+        let mut entry = SpTxEntry::new(Txid::from_byte_array([n; 32]));
+        entry.height = height;
+        entry.timestamp = height.map(u64::from);
+        entry
+    }
+
+    #[test]
+    fn test_tx_store_roll_back() {
+        let mut store = SpTxStore::new();
+        store.insert(entry_at(1, Some(100)));
+        store.insert(entry_at(2, Some(111)));
+        store.insert(entry_at(3, Some(112)));
+        store.insert(entry_at(4, None));
+        let pending = HashSet::from([Txid::from_byte_array([3; 32])]);
+
+        store.roll_back(110, &pending);
+
+        assert_eq!(store.len(), 3);
+        assert!(store.get(&Txid::from_byte_array([2; 32])).is_none());
+        let kept = store.get(&Txid::from_byte_array([1; 32])).unwrap();
+        assert_eq!(kept.height(), Some(100));
+        assert_eq!(kept.timestamp(), Some(100));
+        let unconfirmed = store.get(&Txid::from_byte_array([3; 32])).unwrap();
+        assert_eq!(unconfirmed.height(), None);
+        assert_eq!(unconfirmed.timestamp(), None);
+        let mempool = store.get(&Txid::from_byte_array([4; 32])).unwrap();
+        assert_eq!(mempool.height(), None);
     }
 }
