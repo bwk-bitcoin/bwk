@@ -3,7 +3,9 @@ use bwk_coin::{
 };
 use bwk_descriptor::derivator::SpkDerivator;
 use miniscript::{
-    bitcoin::{self, address::NetworkUnchecked, OutPoint, ScriptBuf, Sequence, Txid},
+    bitcoin::{
+        self, address::NetworkUnchecked, block::Header, OutPoint, ScriptBuf, Sequence, Txid,
+    },
     Descriptor, DescriptorPublicKey,
 };
 use serde::{Deserialize, Serialize};
@@ -1356,6 +1358,49 @@ impl<P: ScanProfile> CoinStore<P> {
             self.remove_pending_claim(*claim);
         }
         ChainUpdateOutcome { to_fetch, changed }
+    }
+
+    /// Promote only the pending claims queued at `reported_height` to
+    /// `ConfirmedUnverified`, in the block of `header` and stamped with its
+    /// time. `header` must be the header the server returned for
+    /// `reported_height`. The path of a scan run without a header scanner,
+    /// where nothing would ever resolve a claim against a validated chain. A
+    /// claim whose tx bytes have not landed yet stays queued for a later pass.
+    /// Returns whether any tx was promoted.
+    pub fn confirm_pending_claims(&mut self, reported_height: u32, header: &Header) -> bool {
+        let Some(txids) = self.pending_claims.get(&reported_height).cloned() else {
+            return false;
+        };
+        let block_hash = header.block_hash();
+        let mut changed = false;
+        for txid in txids {
+            match self.tx_store.get(&txid).map(|e| e.inclusion().clone()) {
+                None if self.update_in_flight(&txid) => continue,
+                Some(Inclusion::Unconfirmed) => {
+                    self.tx_store.update_inclusion(
+                        &txid,
+                        Inclusion::ConfirmedUnverified {
+                            height: reported_height,
+                            block_hash,
+                        },
+                    );
+                    self.tx_store.update_timestamp(&txid, header.time as u64);
+                    changed = true;
+                }
+                // Gone from the chain, or already promoted: the claim is dead.
+                None | Some(_) => {}
+            }
+            self.remove_pending_claim(ClaimAt {
+                txid,
+                height: reported_height,
+            });
+        }
+        changed
+    }
+
+    /// Heights the pending claims wait on.
+    pub fn pending_claim_heights(&self) -> Vec<u32> {
+        self.pending_claims.keys().copied().collect()
     }
 
     /// True while `txid` is referenced by an incomplete update, i.e. its
