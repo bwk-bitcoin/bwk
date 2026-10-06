@@ -403,7 +403,7 @@ fn to_sp_network(network: Network) -> crate::core::utils::common::Network {
 fn batch_derive_sp_scripts(
     outputs: &mut [Box<dyn RecipientProvider>],
     partial_secret: crate::receiver::bitcoin::secp256k1::SecretKey,
-) {
+) -> Result<(), TxError> {
     // Collect SP output indices and reconstruct their addresses
     let mut sp_indices = Vec::new();
     let mut sp_addresses = Vec::new();
@@ -427,13 +427,13 @@ fn batch_derive_sp_scripts(
     }
 
     if sp_addresses.is_empty() {
-        return;
+        return Ok(());
     }
 
     // Single call with all addresses: BIP352 k-counter increments per scan-key group
     let pubkey_map =
         crate::core::sending::generate_recipient_pubkeys(sp_addresses.clone(), partial_secret)
-            .expect("failed to generate SP recipient pubkeys");
+            .map_err(|_| TxError::SpOutputDerivation)?;
 
     // Assign the correct pubkey to each output using per-address counters
     let mut counters: HashMap<SilentPaymentAddress, usize> = HashMap::new();
@@ -448,6 +448,7 @@ fn batch_derive_sp_scripts(
         let script = ScriptBuf::new_p2tr_tweaked(pubkey.dangerous_assume_tweaked());
         outputs[output_idx].set_precomputed_script(script);
     }
+    Ok(())
 }
 
 // SpSecretProvider
@@ -585,8 +586,8 @@ impl<P: crate::profile::SpStorageProfile + Send + Sync + 'static> SpPartialSecre
         &self,
         outputs: &mut [Box<dyn RecipientProvider>],
         partial_secret: crate::receiver::bitcoin::secp256k1::SecretKey,
-    ) {
-        batch_derive_sp_scripts(outputs, partial_secret);
+    ) -> Result<(), TxError> {
+        batch_derive_sp_scripts(outputs, partial_secret)
     }
 }
 
@@ -680,8 +681,8 @@ impl SpPartialSecretProvider for Account {
         &self,
         outputs: &mut [Box<dyn RecipientProvider>],
         partial_secret: crate::receiver::bitcoin::secp256k1::SecretKey,
-    ) {
-        batch_derive_sp_scripts(outputs, partial_secret);
+    ) -> Result<(), TxError> {
+        batch_derive_sp_scripts(outputs, partial_secret)
     }
 }
 
@@ -747,5 +748,29 @@ mod tests {
         let addr = sp_address(SpNetwork::Testnet);
         assert!(b.try_send_to_sp(addr, 10_000).is_ok());
         assert_eq!(b.tx_template.outputs.len(), 1);
+    }
+
+    /// A recipient that knows the sender's inputs can publish a spend key
+    /// B_spend = -t_0*G; BIP352 says the send must then fail, not abort.
+    #[test]
+    fn an_output_key_at_infinity_fails_the_derivation() {
+        use crate::core::utils::common::calculate_t_n;
+        let secp = Secp256k1::new();
+        let partial = SecretKey::from_slice(&[3u8; 32]).unwrap();
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        // B_scan = G, so the ECDH point is partial * G.
+        let scan = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&one).unwrap());
+        let ecdh = PublicKey::from_secret_key(&secp, &partial);
+        let t0 = calculate_t_n(&ecdh, 0).unwrap();
+        let spend = PublicKey::from_secret_key(&secp, &t0).negate(&secp);
+        let addr = SilentPaymentAddress::new(scan, spend, SpNetwork::Testnet, 0).unwrap();
+        let mut outputs: Vec<Box<dyn RecipientProvider>> =
+            vec![Box::new(SpRecipient::new(addr, 10_000, Network::Regtest))];
+
+        assert!(matches!(
+            batch_derive_sp_scripts(&mut outputs, partial),
+            Err(TxError::SpOutputDerivation)
+        ));
     }
 }

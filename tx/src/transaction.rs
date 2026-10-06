@@ -59,6 +59,8 @@ pub enum Error {
     MaxUnderDust { remainder: u64 },
     #[error("{count} coins exceed the {max} that automatic coin selection supports; consolidate them with a max send")]
     TooManyCoins { count: usize, max: usize },
+    #[error("a silent payment recipient output cannot be derived")]
+    SpOutputDerivation,
     #[error(
         "disproportionate fee: {fee} sats for {paid_outputs} sats of outputs \
          exceeds both {max_percent}% and {max_amount} sats"
@@ -321,7 +323,8 @@ impl TxTemplate {
         // Batch-derive SP output scripts so the k-counter is correct
         // across all outputs sharing the same scan key (BIP352).
         if let (Some(p), Some(secret)) = (sp_provider, partial_secret) {
-            p.derive_sp_scripts(&mut outputs, secret);
+            p.derive_sp_scripts(&mut outputs, secret)
+                .map_err(|_| Error::SpOutputDerivation)?;
         }
 
         let ctx = FinalizationContext {
