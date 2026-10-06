@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use bwk_coin::{shuffle_coins, Coin, CoinSource};
 
 use crate::{
-    coin_selection::CoinSelector,
+    coin_selection::{discard_dust, CoinSelector},
     recipient::{FinalizationContext, PsbtOutputInfo, RecipientProvider, SpPartialSecretProvider},
     DUST_AMOUNT,
 };
@@ -57,6 +57,8 @@ pub enum Error {
     MissingChange { excess: u64 },
     #[error("nothing left to send after the fee: {remainder} sats is below the dust limit")]
     MaxUnderDust { remainder: u64 },
+    #[error("{count} coins exceed the {max} that automatic coin selection supports; consolidate them with a max send")]
+    TooManyCoins { count: usize, max: usize },
     #[error(
         "disproportionate fee: {fee} sats for {paid_outputs} sats of outputs \
          exceeds both {max_percent}% and {max_amount} sats"
@@ -614,7 +616,14 @@ fn select_inputs(
         let base_weight_vb = tx_estimated_weight(tx_template).to_vbytes_ceil();
         let base_fee = base_weight_vb * rate / 1000;
         let target = outputs_total + base_fee;
-        selector.select_coins(source.spendable_coins(), target, rate)
+        let candidates = source.spendable_coins();
+        if let Some(max) = selector.max_candidates() {
+            let count = discard_dust(candidates.iter().collect(), rate).len();
+            if count > max {
+                return Err(Error::TooManyCoins { count, max });
+            }
+        }
+        selector.select_coins(candidates, target, rate)
     };
     if selected.is_empty() {
         return Err(Error::CoinSelection);

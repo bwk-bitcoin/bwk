@@ -934,6 +934,23 @@ mod tests {
     }
 
     #[test]
+    fn auto_selection_over_the_exhaustive_limit_is_refused_explicitly() {
+        let (_signer, derivator) = wpkh_signer();
+        let mut builder = test::builder_from_derivator(derivator.clone()).feerate(1_000);
+        for i in 0..21u32 {
+            builder.receive_coin(test::receive_coin(10_000, &derivator, i));
+        }
+        builder.dummy_external_output(5_000);
+
+        let res = builder.simulate();
+        assert!(
+            matches!(res.error, Some(Error::TooManyCoins { count: 21, max: 20 })),
+            "got {:?}",
+            res.error
+        );
+    }
+
+    #[test]
     fn test_coin_by_outpoint_bypasses_selection() {
         let (_signer, derivator) = wpkh_signer();
         let mut builder = test::builder_from_derivator(derivator.clone());
