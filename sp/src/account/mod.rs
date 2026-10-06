@@ -195,6 +195,38 @@ fn forward_header_progress(
 }
 
 #[cfg(feature = "mnemonic")]
+/// Restamp the txs the scan recorded before their header landed each time the
+/// header chain moves, and notify `PaymentHistoryUpdated` when one got stamped.
+/// The ticks that piled up during a restamp are drained first, so a long sync
+/// runs one restamp per batch rather than one per header. Holds both stores
+/// weakly and ends with either.
+fn restamp_on_chain_tick<P: crate::profile::SpStorageProfile>(
+    header_store: &Arc<HeaderStore>,
+    tx_store: &Arc<Mutex<SpTxStore<P>>>,
+    sender: mpsc::Sender<Notification>,
+) {
+    let ticks = header_store.register_chain_tick();
+    let header_store = Arc::downgrade(header_store);
+    let tx_store = Arc::downgrade(tx_store);
+    thread::spawn(move || {
+        while ticks.recv().is_ok() {
+            while ticks.try_recv().is_ok() {}
+            let (Some(header_store), Some(tx_store)) = (header_store.upgrade(), tx_store.upgrade())
+            else {
+                break;
+            };
+            let stamped = tx_store
+                .lock()
+                .expect("poisoned")
+                .restamp_missing_timestamps(&header_store);
+            if stamped && sender.send(Notification::PaymentHistoryUpdated).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+#[cfg(feature = "mnemonic")]
 impl<P: crate::profile::SpStorageProfile> BroadcastWorker<P> {
     fn run(self) {
         let result = self.run_inner();
@@ -628,6 +660,7 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
             // sub-accounts.
             headers.store().register_notifications(sender.clone());
             forward_header_progress(headers.store(), sender.clone());
+            restamp_on_chain_tick(headers.store(), &tx_store, sender.clone());
         }
 
         let sub_accounts: Vec<SubAccount> = scanners

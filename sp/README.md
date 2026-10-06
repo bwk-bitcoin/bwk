@@ -55,6 +55,14 @@ arriving on or spent from one of them comes as `Notification::CoinReceived` /
 `Account::sub_account_origin(&account)` maps it to the `CoinOrigin` (index and
 kind) it comes from.
 
+## Confirmation times
+
+A tx the scan records before the header store has its block carries no
+timestamp yet. The account stamps it as soon as the header chain moves, and
+sends `Notification::PaymentHistoryUpdated` when a restamp changed something.
+`Account::restamp_missing_timestamps()` runs the same pass on demand, local
+only. Without a header scanner there is no block time to stamp with.
+
 ## Architecture
 
 ```
