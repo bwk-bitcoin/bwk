@@ -717,6 +717,74 @@ mod tests {
         assert!(mock.listener.is_finished());
     }
 
+    /// A started mock with its startup notifications drained.
+    fn started_mock() -> CoinStoreMock {
+        let mock = CoinStoreMock::new(0, 0, 5);
+        thread::sleep(Duration::from_millis(200));
+        mock.notif.try_iter().for_each(drop);
+        mock
+    }
+
+    /// The listener notifications sent once `mock`'s listener has exited.
+    fn exit_notifs(mock: &CoinStoreMock) -> Vec<Notification> {
+        for _ in 0..50 {
+            if mock.listener.is_finished() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(mock.listener.is_finished());
+        mock.notif.try_iter().collect()
+    }
+
+    #[test]
+    fn requested_stop_notifies_stopped_only() {
+        let mock = started_mock();
+
+        mock.stop();
+
+        let notifs = exit_notifs(&mock);
+        assert!(
+            matches!(
+                &notifs[..],
+                [Notification::Electrum(TxListenerNotif::Stopped)]
+            ),
+            "{notifs:?}"
+        );
+    }
+
+    #[test]
+    fn dropped_response_channel_notifies_disconnected_only() {
+        let mut mock = started_mock();
+
+        mock.response = mpsc::channel().0;
+
+        let notifs = exit_notifs(&mock);
+        assert!(
+            matches!(
+                &notifs[..],
+                [Notification::Electrum(TxListenerNotif::Disconnected)]
+            ),
+            "{notifs:?}"
+        );
+    }
+
+    #[test]
+    fn stopped_client_notifies_disconnected_only() {
+        let mock = started_mock();
+
+        mock.response.send(CoinResponse::Stopped).unwrap();
+
+        let notifs = exit_notifs(&mock);
+        assert!(
+            matches!(
+                &notifs[..],
+                [Notification::Electrum(TxListenerNotif::Disconnected)]
+            ),
+            "{notifs:?}"
+        );
+    }
+
     fn simple_recv() -> (bitcoin::Transaction, CoinStoreMock) {
         setup_logger();
         let look_ahead = 5;

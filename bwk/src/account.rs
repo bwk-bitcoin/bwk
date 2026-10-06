@@ -1373,8 +1373,12 @@ mod integration_tests {
             };
         let is_started =
             |n: &Notification| matches!(n, Notification::Electrum(TxListenerNotif::Started));
-        let is_stopped =
-            |n: &Notification| matches!(n, Notification::Electrum(TxListenerNotif::Stopped));
+        let is_stopped = |n: &Notification| match n {
+            Notification::Electrum(TxListenerNotif::Disconnected) => {
+                panic!("a requested stop was reported as a dropped connection")
+            }
+            n => matches!(n, Notification::Electrum(TxListenerNotif::Stopped)),
+        };
 
         // The listener works before any restart.
         let blocks = receive(&mut account, &bitcoind, 200_000);
