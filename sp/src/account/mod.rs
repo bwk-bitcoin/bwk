@@ -1970,7 +1970,10 @@ pub(crate) mod mnemonic_probe {
 #[cfg(all(test, feature = "mnemonic"))]
 mod tests {
     use super::*;
-    use crate::{account::tx_store::header_store_with_block_time, receiver::OwnedOutput};
+    use crate::{
+        account::{recipient::TxBuilderSpExt, tx_store::header_store_with_block_time},
+        receiver::OwnedOutput,
+    };
     use bitcoin::{absolute::Height, hashes::hash160, secp256k1::Parity};
     use bwk::bwk_electrum::raw_client::CertificateCheck;
     use std::path::PathBuf;
@@ -2064,6 +2067,86 @@ mod tests {
         assert_eq!(entry.timestamp, Some(4));
         assert_eq!(entry.label.as_deref(), Some("label"));
         assert_eq!(entry.change, 5);
+    }
+
+    /// A taproot sub-account holding one unconfirmed 0.5 BTC coin, as the
+    /// scanner records a receive the server reported in the mempool.
+    fn account_with_an_unconfirmed_taproot_coin() -> Account {
+        let mut config = test_config();
+        config.add_default_taproot_sub_account().unwrap();
+        let mut account = Account::new(config).unwrap();
+        let scanner = account.scanners_mut().next().unwrap();
+        let spk = scanner.new_addr().address.assume_checked().script_pubkey();
+        let mut coin_store = scanner.coin_store().lock().unwrap();
+        coin_store
+            .tx_store_mut()
+            .update(bwk::bwk_electrum::tx_store::TxEntry::for_test(
+                bwk_utils::test::funding_tx(spk, 0.5),
+            ));
+        coin_store.generate();
+        drop(coin_store);
+        account
+    }
+
+    #[test]
+    fn a_self_send_to_sp_records_its_sp_outputs_unconfirmed() {
+        let account = account_with_an_unconfirmed_taproot_coin();
+        let before = account.total_balance();
+        assert_eq!(before, 50_000_000);
+
+        let mut builder = account.tx_builder().feerate(1000);
+        builder.send_to_sp(account.sp_address(), 100_000);
+        for coin in builder.select_coins(100_000, 1000) {
+            builder.add_input(coin);
+        }
+        let mut psbt = builder.generate().unwrap();
+        let tx = account.sign_and_finalize(&mut psbt).unwrap();
+        let outputs: u64 = tx.output.iter().map(|output| output.value.to_sat()).sum();
+        let fee = before - outputs;
+        let txid = account.record_unconfirmed_spend(&tx).unwrap();
+
+        let coins: Vec<_> = account
+            .coins()
+            .into_values()
+            .filter(|entry| entry.outpoint().txid == txid)
+            .collect();
+        assert_eq!(coins.len(), tx.output.len());
+        assert!(coins.iter().all(|entry| !entry.is_confirmed()));
+        assert!(coins.iter().all(SpCoinEntry::is_spendable));
+        assert_eq!(
+            coins.iter().map(SpCoinEntry::amount_sat).sum::<u64>(),
+            outputs
+        );
+        let summary = account.all_spendable_coins();
+        assert_eq!(summary.unconfirmed_balance, Amount::from_sat(outputs));
+        assert_eq!(summary.confirmed_balance, Amount::ZERO);
+        assert_eq!(account.balance(), 0);
+        assert_eq!(account.total_balance(), before - fee);
+        assert!(account
+            .all_coins()
+            .values()
+            .filter(|coin| coin.outpoint.txid == txid)
+            .all(|coin| coin.height.is_none()));
+    }
+
+    #[test]
+    fn an_unconfirmed_sp_coin_is_picked_by_coin_selection() {
+        let account = account_with_an_unconfirmed_taproot_coin();
+        let mut builder = account.tx_builder().feerate(1000);
+        builder.send_to_sp(account.sp_address(), 100_000);
+        for coin in builder.select_coins(100_000, 1000) {
+            builder.add_input(coin);
+        }
+        let mut psbt = builder.generate().unwrap();
+        let tx = account.sign_and_finalize(&mut psbt).unwrap();
+        let txid = account.record_unconfirmed_spend(&tx).unwrap();
+
+        let selected = account.tx_builder().select_coins(50_000, 1000);
+
+        assert!(!selected.is_empty());
+        assert!(selected.iter().all(|coin| coin.outpoint.txid == txid
+            && coin.status == bwk_coin::CoinStatus::Unconfirmed
+            && coin.height.is_none()));
     }
 
     #[test]

@@ -2130,6 +2130,34 @@ mod tests {
     }
 
     #[test]
+    fn record_outputs_confirms_an_unconfirmed_coin() {
+        let outpoint = op(1);
+        let (stores, _rx) = test_stores(&[]);
+        let unconfirmed = OwnedOutput {
+            blockheight: None,
+            ..owned_unspent(0)
+        };
+        {
+            let mut coin_store = stores.coin_store.lock().unwrap();
+            coin_store.insert(outpoint, unconfirmed);
+            coin_store.mark_spent(&outpoint, [2; 32]);
+        }
+
+        record_outputs(&stores, HashMap::from([(outpoint, owned_unspent(100))])).unwrap();
+
+        let entry = stores.coin_store.lock().unwrap().get(&outpoint).unwrap();
+        assert!(entry.is_confirmed());
+        assert_eq!(entry.height(), Some(100));
+        assert_eq!(
+            entry.status(),
+            &OutputSpendStatus::Spent {
+                txid: [2; 32],
+                block_hash: None,
+            }
+        );
+    }
+
+    #[test]
     fn record_outputs_preserves_spent_status_on_rediscovery() {
         let outpoint = op(1);
         let (stores, _rx) = test_stores(&[(outpoint, 100)]);
