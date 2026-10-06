@@ -139,6 +139,8 @@ pub enum AccountError {
     InputNotOwned(OutPoint),
     #[error("missing witness_utxo for input {0}")]
     MissingPrevout(OutPoint),
+    #[error("the sub-account header scanner setting differs from the account's")]
+    HeaderScannerMismatch,
     #[error("silent payment derivation failed: {0}")]
     SilentPayment(#[from] crate::core::error::Error),
 }
@@ -438,8 +440,8 @@ pub struct Account<
     /// whole account.
     signing_manager: SigningManager,
     /// The validated header chain this account promotes its scanners against,
-    /// and the endpoint it follows.
-    headers: HeaderFollower<RamProfile<DefaultBackend>>,
+    /// and the endpoint it follows. `None` without a header scanner.
+    headers: Option<HeaderFollower<RamProfile<DefaultBackend>>>,
 }
 
 #[cfg(feature = "mnemonic")]
@@ -448,8 +450,9 @@ pub struct Account<
 struct SubAccount {
     scanner: ElectrumScanner<RamProfile<DefaultBackend>>,
     /// Held for its `Drop`, which joins the reconcile thread. Declared after
-    /// `scanner` so the scanner stops its listener first.
-    reconciler: Reconciler<RamProfile<DefaultBackend>>,
+    /// `scanner` so the scanner stops its listener first. `None` without a
+    /// header scanner.
+    reconciler: Option<Reconciler<RamProfile<DefaultBackend>>>,
 }
 
 // Constructors are tied to the default SpRamProfile because they open
@@ -534,7 +537,8 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
     }
 
     /// `header_store == None` opens this account its own store, which it then
-    /// owns and may idle from [`Account::stop_electrum`].
+    /// owns and may idle from [`Account::stop_electrum`]. No store at all
+    /// without a header scanner, and a shared one is left unused.
     fn with_config_store_and_header_store(
         config: Config,
         config_store: Arc<dyn ConfigStore<Config>>,
@@ -585,6 +589,7 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
             endpoint.adopt_certificate_check(config.endpoint());
             scanner_config.set_stay_offline(endpoint.url().is_none());
             scanner_config.set_endpoint(endpoint);
+            scanner_config.header_scanner = config.header_scanner;
             scanners.push(ElectrumScanner::try_new_with_sender(
                 scanner_config,
                 sender.clone(),
@@ -602,9 +607,10 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
         // Opened against the same target the scanners are followed at, so an
         // account with no endpoint of its own still validates against the one
         // its sub-accounts watch.
-        let headers = match header_store {
-            Some(store) => HeaderFollower::borrowed(store, sender.clone()),
-            None => HeaderFollower::open(
+        let headers = match (config.header_scanner, header_store) {
+            (false, _) => None,
+            (true, Some(store)) => Some(HeaderFollower::borrowed(store, sender.clone())),
+            (true, None) => Some(HeaderFollower::open(
                 header_store_target(&config, &scanners),
                 config.network,
                 config.persistence,
@@ -613,21 +619,25 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
                 // range, whose confirmation block times the scanner reads here.
                 Some(config.min_birthday_height()),
                 sender.clone(),
-            )?,
+            )?),
         };
-        // Once per account, not per reconciler: every sub-account shares this
-        // header store, so registering per reconciler would report the same
-        // event to this channel as many times as there are sub-accounts.
-        headers.store().register_notifications(sender.clone());
-        forward_header_progress(headers.store(), sender.clone());
+        if let Some(headers) = &headers {
+            // Once per account, not per reconciler: every sub-account shares
+            // this header store, so registering per reconciler would report the
+            // same event to this channel as many times as there are
+            // sub-accounts.
+            headers.store().register_notifications(sender.clone());
+            forward_header_progress(headers.store(), sender.clone());
+        }
 
         let sub_accounts: Vec<SubAccount> = scanners
             .into_iter()
             .map(|mut scanner| {
                 // Spawned first: the reconciler registers for the scan ticks, so
                 // a scan started before it would fire them at nobody.
-                let reconciler =
-                    Reconciler::spawn(&scanner, headers.store().clone(), sender.clone());
+                let reconciler = headers.as_ref().map(|headers| {
+                    Reconciler::spawn(&scanner, headers.store().clone(), sender.clone())
+                });
                 if !scanner.config().stay_offline() {
                     scanner.start();
                 }
@@ -934,12 +944,17 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     /// account's notification channel, like the configured sub-accounts.
     ///
     /// `mnemonic` is the key that signs for it; pass `None` for a
-    /// watch-only sub-account.
+    /// watch-only sub-account. The scanner must carry this account's
+    /// [`Config::header_scanner`] setting, or
+    /// [`AccountError::HeaderScannerMismatch`] is returned.
     pub fn add_sub_account(
         &mut self,
         mut scanner: ElectrumScanner<RamProfile<DefaultBackend>>,
         mnemonic: Option<String>,
     ) -> Result<(), AccountError> {
+        if scanner.config().header_scanner != self.config.header_scanner {
+            return Err(AccountError::HeaderScannerMismatch);
+        }
         if let Some(mnemonic) = mnemonic {
             register_sub_signer(
                 &mut self.signing_manager,
@@ -951,8 +966,9 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         scanner.set_sender(self.sender.clone());
         // Spawned first: the reconciler registers for the scan ticks, so a
         // scan started before it would fire them at nobody.
-        let reconciler =
-            Reconciler::spawn(&scanner, self.headers.store().clone(), self.sender.clone());
+        let reconciler = self.headers.as_ref().map(|headers| {
+            Reconciler::spawn(&scanner, headers.store().clone(), self.sender.clone())
+        });
         // A scanner already running fired its earlier ticks before the
         // reconciler registered: one catch-up pass covers what they carried.
         scanner.scan_listeners().notify(());
@@ -966,8 +982,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         });
         // The first sub-account carrying an endpoint is what an account with
         // none of its own follows, so recompute rather than leave it idle.
-        let target = self.header_target();
-        self.headers.follow(target, reconcilers(&self.sub_accounts));
+        self.follow_header_target();
         Ok(())
     }
 
@@ -1047,9 +1062,11 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         for sub in &mut self.sub_accounts {
             sub.scanner.stop();
         }
-        self.headers.stop();
-        for sub in &mut self.sub_accounts {
-            sub.reconciler.stop();
+        if let Some(headers) = self.headers.as_mut() {
+            headers.stop();
+        }
+        for reconciler in reconcilers_mut(&mut self.sub_accounts) {
+            reconciler.stop();
         }
     }
 
@@ -1059,10 +1076,9 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         for sub in &mut self.sub_accounts {
             sub.scanner.start();
         }
-        let target = self.header_target();
-        self.headers.follow(target, reconcilers(&self.sub_accounts));
-        for sub in &mut self.sub_accounts {
-            sub.reconciler.start();
+        self.follow_header_target();
+        for reconciler in reconcilers_mut(&mut self.sub_accounts) {
+            reconciler.start();
         }
     }
 
@@ -1083,20 +1099,23 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
             Some((url, port)) => self.config.set_electrum_endpoint(url, port),
             None => self.config.clear_electrum_endpoint(),
         }
-        let target = self.header_target();
-        self.headers.follow(target, reconcilers(&self.sub_accounts));
+        self.follow_header_target();
         self.persist_config();
     }
 
-    /// The validated header chain this account's scanners promote against.
-    pub fn header_store(&self) -> &Arc<HeaderStore> {
-        self.headers.store()
+    /// The validated header chain this account's scanners promote against,
+    /// `None` without a header scanner.
+    pub fn header_store(&self) -> Option<&Arc<HeaderStore>> {
+        self.headers.as_ref().map(HeaderFollower::store)
     }
 
-    /// The endpoint the header validator should follow, given what this
-    /// account and its sub-accounts currently point at.
-    fn header_target(&self) -> Option<Endpoint> {
-        header_store_target(&self.config, self.scanners())
+    /// Point the header validator at the endpoint this account and its
+    /// sub-accounts currently point at.
+    fn follow_header_target(&mut self) {
+        let target = header_store_target(&self.config, self.scanners());
+        if let Some(headers) = self.headers.as_mut() {
+            headers.follow(target, reconcilers(&self.sub_accounts));
+        }
     }
 
     /// Total balance across SP and all sub-accounts.
@@ -1658,7 +1677,19 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
 fn reconcilers(
     sub_accounts: &[SubAccount],
 ) -> impl Iterator<Item = &Reconciler<RamProfile<DefaultBackend>>> {
-    sub_accounts.iter().map(|sub| &sub.reconciler)
+    sub_accounts
+        .iter()
+        .filter_map(|sub| sub.reconciler.as_ref())
+}
+
+#[cfg(feature = "mnemonic")]
+/// The reconcile passes of `sub_accounts`, mutably.
+fn reconcilers_mut(
+    sub_accounts: &mut [SubAccount],
+) -> impl Iterator<Item = &mut Reconciler<RamProfile<DefaultBackend>>> {
+    sub_accounts
+        .iter_mut()
+        .filter_map(|sub| sub.reconciler.as_mut())
 }
 
 #[cfg(feature = "mnemonic")]
@@ -2435,7 +2466,7 @@ mod tests {
         let account =
             Account::with_header_store(config, shared.clone()).expect("with_header_store");
 
-        assert!(Arc::ptr_eq(account.header_store(), &shared));
+        assert!(Arc::ptr_eq(account.header_store().unwrap(), &shared));
         assert_eq!(account.scanners().count(), 2);
         // What sharing is for: every sub-account promotes against that one
         // chain, not a per-scanner copy.

@@ -536,7 +536,8 @@ pub struct ScanStores<P: SpStorageProfile> {
     pub tx_store: Arc<Mutex<crate::account::tx_store::SpTxStore<P>>>,
     pub scan_state: Arc<Mutex<ScanState>>,
     pub sender: mpsc::Sender<Notification>,
-    pub header_store: Arc<bwk::bwk_electrum::header_store::HeaderStore>,
+    /// `None` for an account run without a header scanner.
+    pub header_store: Option<Arc<bwk::bwk_electrum::header_store::HeaderStore>>,
 }
 
 /// Resolve a block's time for `height` from the shared HeaderStore, whose worker
@@ -544,8 +545,13 @@ pub struct ScanStores<P: SpStorageProfile> {
 /// height the worker has not synced yet returns `None` and is stamped on a later
 /// scan by [`restamp_missing_timestamps`], so a scan never stalls waiting for a
 /// header (which never arrives at all when no endpoint worker is running).
+/// Always `None` without a header store.
 fn block_time<P: SpStorageProfile>(stores: &ScanStores<P>, height: u32) -> Option<u64> {
-    stores.header_store.header(height).map(|h| h.time as u64)
+    stores
+        .header_store
+        .as_ref()?
+        .header(height)
+        .map(|h| h.time as u64)
 }
 
 /// Fill in confirmation timestamps left `None` by an earlier scan (the header
@@ -1643,7 +1649,7 @@ impl<P: SpStorageProfile> crate::account::Account<P> {
         let sender = self.sender.clone();
         let stop = self.scanner_stop.clone();
         let min_birthday = self.config.min_birthday_height();
-        let header_store = self.header_store().clone();
+        let header_store = self.header_store().cloned();
         let runtime = self.scan_runtime;
 
         let handle = thread::spawn(move || {
@@ -1753,7 +1759,7 @@ impl<P: SpStorageProfile> crate::account::Account<P> {
         let sender = self.sender.clone();
         let stop = self.scanner_stop.clone();
         let mut first_start = start.map(|h| h.max(self.config.min_birthday_height()));
-        let header_store = self.header_store().clone();
+        let header_store = self.header_store().cloned();
         let runtime = self.scan_runtime;
 
         let handle = thread::spawn(move || {
@@ -1963,7 +1969,7 @@ impl<P: SpStorageProfile> crate::account::Account<P> {
             tx_store: self.tx_store.clone(),
             scan_state: self.scan_state.clone(),
             sender: self.sender.clone(),
-            header_store: self.header_store().clone(),
+            header_store: self.header_store().cloned(),
         };
 
         let outcome = scan_blocks(
@@ -2096,9 +2102,9 @@ mod tests {
             tx_store: Arc::new(Mutex::new(SpTxStore::new())),
             scan_state: Arc::new(Mutex::new(ScanState::new(0))),
             sender: tx,
-            header_store: bwk::bwk_electrum::header_store::HeaderStore::new_in_memory(
+            header_store: Some(bwk::bwk_electrum::header_store::HeaderStore::new_in_memory(
                 bitcoin::Network::Regtest,
-            ),
+            )),
         };
         (stores, rx)
     }

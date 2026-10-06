@@ -67,11 +67,20 @@ pub struct Config {
     pub dust_limit: Option<u64>,
     /// Block height to start scanning from (skip earlier blocks)
     pub birthday_height: Option<u32>,
+    /// `false` runs every sub-account without a header chain: no header sync,
+    /// no merkle proof, a confirmation the server reports is taken as is. The
+    /// silent-payment scan then has no block time to stamp its txs with.
+    #[serde(default = "header_scanner_default")]
+    pub header_scanner: bool,
 
     // Sub-accounts
     /// Optional descriptors for embedded standard wallets (segwit, taproot, etc.)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub descriptors: Vec<SubAccountConfig>,
+}
+
+fn header_scanner_default() -> bool {
+    true
 }
 
 /// Configuration for an embedded standard wallet sub-account.
@@ -119,6 +128,7 @@ impl Config {
             persistence: Some(bwk::persist::PersistenceKind::default()),
             dust_limit: None,
             birthday_height: None,
+            header_scanner: true,
             descriptors: Vec::new(),
         }
     }
@@ -168,6 +178,7 @@ impl Config {
             persistence: Some(bwk::persist::PersistenceKind::default()),
             dust_limit: None,
             birthday_height: None,
+            header_scanner: true,
             descriptors: Vec::new(),
         })
     }

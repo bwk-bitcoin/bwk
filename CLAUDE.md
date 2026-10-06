@@ -113,6 +113,10 @@ Account (sp/src/account/mod.rs)
 └── SigningManager (hot signers for the sub-account descriptors)
 ```
 
+`bwk_sp::Config::header_scanner` (on by default) applies the same opt-out to
+every sub-account: no `HeaderStore` and no `Reconciler`. The silent-payment
+scan reads its block times from that store, so its txs then carry none.
+
 ### Transaction Building (`bwk-tx`)
 ```
 TxBuilder
