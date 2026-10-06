@@ -1794,8 +1794,9 @@ impl<P: SpStorageProfile> crate::account::Account<P> {
     /// every block). The scan call returns `Ok(())` after persisting state
     /// , i.e. cancellation is graceful, not an error.
     ///
-    /// `scan_oneshot` resets this flag to `false` at the start of each run,
-    /// so leaving the flag in `true` between runs is harmless.
+    /// Every scan entry point (`scan_oneshot`, `start_continuous_scan` and the
+    /// custom-range `scan_blocks`) resets this flag to `false` before it runs,
+    /// so a flag left `true` by a previous cancel does not stop the next scan.
     ///
     /// Intended for consumers that hold an `Account` behind a `Mutex` and
     /// need to interrupt a scan without first re-acquiring the mutex (which
@@ -1816,6 +1817,7 @@ impl<P: SpStorageProfile> crate::account::Account<P> {
         }
 
         // Custom range scan (legacy behavior)
+        self.scanner_stop.store(false, Ordering::Relaxed);
         let (resume_start, spend_resume) = {
             let st = self.scan_state.lock().expect("poisoned");
             (st.next_scan_start(), st.next_spend_start())

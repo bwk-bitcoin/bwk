@@ -5,7 +5,7 @@
 mod common;
 
 use std::{
-    sync::Arc,
+    sync::{atomic::Ordering, Arc},
     thread,
     time::{Duration, Instant},
 };
@@ -63,6 +63,7 @@ fn test_scanning() {
     test_incremental_scanning(&mut env);
     test_rescan_idempotent(&mut env);
     test_scan_notifications(&mut env);
+    test_stale_stop_flag_does_not_stop_range_scan(&mut env);
     test_new_output_notification(&mut env);
     test_persistence_after_scan(&mut env);
     test_background_scanner_start_stop(&mut env);
@@ -665,6 +666,32 @@ fn test_scan_notifications(env: &mut TestEnv) {
         saw_completed,
         "Should have received ScanCompleted notification"
     );
+}
+
+/// A stop flag left `true` by an earlier cancel must not cut the next
+/// custom-range scan short.
+fn test_stale_stop_flag_does_not_stop_range_scan(env: &mut TestEnv) {
+    let blindbit_url = env.url();
+    let start_height = env.next_scan_height();
+    env.mine(100);
+    let mut account = test_account(&blindbit_url);
+    let receiver = account.receiver().unwrap();
+
+    account.cancel_flag().store(true, Ordering::Relaxed);
+    account
+        .scan_blocks(Some(start_height), Some(env.height))
+        .unwrap();
+
+    assert_eq!(account.last_scanned_height(), Some(env.height));
+    let mut saw_completed = false;
+    while let Ok(notif) = receiver.try_recv() {
+        match notif {
+            Notification::Sp(SpNotification::ScanCompleted) => saw_completed = true,
+            Notification::Sp(SpNotification::ScanStopped) => panic!("scan reported stopped"),
+            _ => {}
+        }
+    }
+    assert!(saw_completed);
 }
 
 /// Test 10.4.4.2: NewOutput notification when SP output found.
