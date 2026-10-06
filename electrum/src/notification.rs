@@ -47,8 +47,13 @@ pub enum SpNotification {
     FailScan { message: String },
     /// Scanner is stopping
     StoppingScan,
-    /// Scanner has stopped
-    ScanStopped,
+    /// Scanner has stopped, or a scan was cancelled before reaching its end.
+    /// Carries the receive and spend frontiers persisted at that point, `None`
+    /// for a frontier never recorded.
+    ScanStopped {
+        last_scanned: Option<u32>,
+        last_spend: Option<u32>,
+    },
     /// Receive (output) scan progress update
     ScanReceiveProgress { current: u32, end: u32 },
     /// Spend (input) sweep progress update

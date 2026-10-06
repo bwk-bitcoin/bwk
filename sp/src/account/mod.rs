@@ -2021,10 +2021,16 @@ mod tests {
             Notification::Sp(SpNotification::StoppingScan)
         ));
 
-        let notif = Notification::Sp(SpNotification::ScanStopped);
+        let notif = Notification::Sp(SpNotification::ScanStopped {
+            last_scanned: Some(10),
+            last_spend: Some(9),
+        });
         assert!(matches!(
             notif,
-            Notification::Sp(SpNotification::ScanStopped)
+            Notification::Sp(SpNotification::ScanStopped {
+                last_scanned: Some(10),
+                last_spend: Some(9),
+            })
         ));
 
         let notif = Notification::Sp(SpNotification::ScanReceiveProgress {

@@ -581,6 +581,45 @@ struct BackendContext {
     runtime: ScanRuntimeConfig,
 }
 
+/// How a scan run ended: it reached the end of its range, or the stop flag cut
+/// it short (state persisted up to where it stopped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanOutcome {
+    Completed,
+    /// The receive and spend frontiers as persisted when the scan stopped,
+    /// `None` for a frontier never recorded.
+    Interrupted {
+        last_scanned: Option<u32>,
+        last_spend: Option<u32>,
+    },
+}
+
+impl ScanOutcome {
+    /// A stop at the frontiers `state` persisted.
+    pub fn interrupted(state: &Mutex<ScanState>) -> Self {
+        let state = state.lock().expect("poisoned");
+        Self::Interrupted {
+            last_scanned: state.last_scanned_height(),
+            last_spend: state.last_spend_height(),
+        }
+    }
+}
+
+impl From<ScanOutcome> for SpNotification {
+    fn from(outcome: ScanOutcome) -> Self {
+        match outcome {
+            ScanOutcome::Completed => SpNotification::ScanCompleted,
+            ScanOutcome::Interrupted {
+                last_scanned,
+                last_spend,
+            } => SpNotification::ScanStopped {
+                last_scanned,
+                last_spend,
+            },
+        }
+    }
+}
+
 /// Wallet-side handles and the height range for a scan.
 struct ScanContext<'a, P: SpStorageProfile> {
     sp_receiver: &'a SpReceiver,
@@ -604,7 +643,7 @@ pub fn scan_blocks<P: SpStorageProfile>(
     dust_limit: Option<Amount>,
     with_cutthrough: bool,
     runtime: ScanRuntimeConfig,
-) -> Result<(), receiver::error::Error> {
+) -> Result<ScanOutcome, receiver::error::Error> {
     scan_blocks_with_observer(
         agent,
         blindbit_url,
@@ -633,7 +672,7 @@ pub fn scan_blocks_with_observer<P: SpStorageProfile>(
     with_cutthrough: bool,
     runtime: ScanRuntimeConfig,
     block_data_observer: Option<BlockDataObserver>,
-) -> Result<(), receiver::error::Error> {
+) -> Result<ScanOutcome, receiver::error::Error> {
     // `start > end` is allowed: it means the receive pass is already at the tip
     // and only the trailing spend sweep needs to run. `process_scan` decides
     // per phase and errors if neither phase has work.
@@ -655,12 +694,12 @@ pub fn scan_blocks_with_observer<P: SpStorageProfile>(
         runtime,
         block_data_observer,
     };
-    process_scan(&backend, &mut scan)?;
+    let outcome = process_scan(&backend, &mut scan)?;
     log::info!(
-        "Blindbit scan completed in {} seconds",
+        "Blindbit scan {outcome:?} in {} seconds",
         start_time.elapsed().as_secs()
     );
-    Ok(())
+    Ok(outcome)
 }
 
 fn should_interrupt(stop: &Arc<AtomicBool>) -> bool {
@@ -1113,14 +1152,14 @@ enum BlockOutcome {
 }
 
 /// Consume `BlockData` from `receiver` (produced by [`fetch_blocks`]), derive the
-/// owned outputs of each block, and commit them in height order. Returns `true`
-/// if the scan was interrupted via `stop` (state already persisted); on normal
-/// completion it records the receive-scan frontier and returns `false`.
+/// owned outputs of each block, and commit them in height order. Returns
+/// `Interrupted` if the scan was stopped via `stop` (state already persisted); on
+/// normal completion it records the receive-scan frontier and returns `Completed`.
 fn process_blocks<P: SpStorageProfile>(
     backend: &BackendContext,
     scan: &mut ScanContext<P>,
     receiver: channel::Receiver<Result<BlockData, receiver::error::Error>>,
-) -> Result<bool, receiver::error::Error> {
+) -> Result<ScanOutcome, receiver::error::Error> {
     let start_u32 = scan.start.to_consensus_u32();
     let end_u32 = scan.end.to_consensus_u32();
     let len = (end_u32 - start_u32 + 1) as usize;
@@ -1215,7 +1254,7 @@ fn process_blocks<P: SpStorageProfile>(
                 record_scan_frontier(scan.stores, Height::from_consensus(tip)?, hash)?;
             }
             save_state(scan.stores)?;
-            return Ok(true);
+            return Ok(ScanOutcome::interrupted(&scan.stores.scan_state));
         }
     }
 
@@ -1227,7 +1266,7 @@ fn process_blocks<P: SpStorageProfile>(
                 record_scan_frontier(scan.stores, Height::from_consensus(tip)?, hash)?;
             }
             save_state(scan.stores)?;
-            return Ok(true);
+            return Ok(ScanOutcome::interrupted(&scan.stores.scan_state));
         }
         return Err(receiver::error::Error::MissingBlockHash(end_u32));
     }
@@ -1235,7 +1274,7 @@ fn process_blocks<P: SpStorageProfile>(
     record_scan_frontier(scan.stores, scan.end, end_hash)?;
     record_receive_progress(scan.stores, scan.end, scan.end)?;
     save_state(scan.stores)?;
-    Ok(false)
+    Ok(ScanOutcome::Completed)
 }
 
 /// Sweep `[spend_frontier+1, end]` for inputs spending any still-owned output:
@@ -1311,7 +1350,7 @@ fn run_sweep<P: SpStorageProfile, S: SpendScanner>(
     mut watch: WatchableSet,
     mut cursor: u32,
     end: Height,
-) -> Result<(), receiver::error::Error> {
+) -> Result<ScanOutcome, receiver::error::Error> {
     let end_u32 = end.to_consensus_u32();
     let mut last_progress = cursor.saturating_sub(1);
     let mut last_checkpoint = Instant::now();
@@ -1320,7 +1359,7 @@ fn run_sweep<P: SpStorageProfile, S: SpendScanner>(
         if should_interrupt(stop) {
             record_spend_frontier(stores, Height::from_consensus(cursor - 1)?)?;
             save_state(stores)?;
-            return Ok(());
+            return Ok(ScanOutcome::interrupted(&stores.scan_state));
         }
 
         let SpendsAt {
@@ -1355,7 +1394,7 @@ fn run_sweep<P: SpStorageProfile, S: SpendScanner>(
             None => {
                 record_spend_frontier(stores, end)?;
                 save_state(stores)?;
-                return Ok(());
+                return Ok(ScanOutcome::Completed);
             }
             Some(floor) if floor > cursor => {
                 record_spend_frontier(stores, Height::from_consensus(floor - 1)?)?;
@@ -1369,13 +1408,13 @@ fn run_sweep<P: SpStorageProfile, S: SpendScanner>(
 
     record_spend_frontier(stores, end)?;
     save_state(stores)?;
-    Ok(())
+    Ok(ScanOutcome::Completed)
 }
 
 fn process_spends<P: SpStorageProfile>(
     backend: &BackendContext,
     scan: &ScanContext<P>,
-) -> Result<(), receiver::error::Error> {
+) -> Result<ScanOutcome, receiver::error::Error> {
     let end_u32 = scan.end.to_consensus_u32();
     let watch = WatchableSet::new(scan.stores.coin_store.lock().expect("poisoned").watchable());
 
@@ -1384,7 +1423,7 @@ fn process_spends<P: SpStorageProfile>(
     let Some(floor) = watch.floor() else {
         record_spend_frontier(scan.stores, scan.end)?;
         save_state(scan.stores)?;
-        return Ok(());
+        return Ok(ScanOutcome::Completed);
     };
 
     let resume = effective_spend_start(scan.stores, scan.start.to_consensus_u32())?;
@@ -1394,7 +1433,7 @@ fn process_spends<P: SpStorageProfile>(
     if cursor > end_u32 {
         record_spend_frontier(scan.stores, scan.end)?;
         save_state(scan.stores)?;
-        return Ok(());
+        return Ok(ScanOutcome::Completed);
     }
 
     let mut scanner = BlindbitSpendScanner::new(backend, cursor, end_u32);
@@ -1411,7 +1450,7 @@ fn process_spends<P: SpStorageProfile>(
 fn process_scan<P: SpStorageProfile>(
     backend: &BackendContext,
     scan: &mut ScanContext<P>,
-) -> Result<(), receiver::error::Error> {
+) -> Result<ScanOutcome, receiver::error::Error> {
     let start_u32 = scan.start.to_consensus_u32();
     let end_u32 = scan.end.to_consensus_u32();
 
@@ -1440,21 +1479,21 @@ fn process_scan<P: SpStorageProfile>(
         let fetchers = fetch_blocks(sender, backend, scan);
         let result = process_blocks(backend, scan, receiver);
         fetchers.stop();
-        let interrupted = result?;
+        let outcome = result?;
         #[cfg(feature = "scan-profile")]
         profiling::add(&profiling::RECEIVE_WALL_NS, recv_t.elapsed());
-        if interrupted {
-            // Interrupted mid-scan; process_blocks already persisted state.
-            return Ok(());
+        if matches!(outcome, ScanOutcome::Interrupted { .. }) {
+            // process_blocks already persisted state.
+            return Ok(outcome);
         }
     }
 
     #[cfg(feature = "scan-profile")]
     let spend_t = Instant::now();
-    process_spends(backend, scan)?;
+    let outcome = process_spends(backend, scan)?;
     #[cfg(feature = "scan-profile")]
     profiling::add(&profiling::SPEND_WALL_NS, spend_t.elapsed());
-    Ok(())
+    Ok(outcome)
 }
 
 // Account scan-orchestration methods.
@@ -1501,8 +1540,8 @@ impl<P: SpStorageProfile> crate::account::Account<P> {
     /// Returns immediately after spawning the scanner thread; progress is
     /// reported through the notification channel (`ScanStarted`,
     /// `ScanReceiveProgress`, `ScanSpendProgress`, `ScanCompleted`,
-    /// `FailStartScanning`, `FailScan`). Use `is_scanning()` to poll for
-    /// completion and `stop_scan()` to cancel.
+    /// `ScanStopped` when cancelled, `FailStartScanning`, `FailScan`). Use
+    /// `is_scanning()` to poll for completion and `stop_scan()` to cancel.
     pub fn scan_oneshot(&mut self, start: Option<u32>) -> Result<(), AccountError> {
         if self
             .scanner_handle
@@ -1601,8 +1640,8 @@ impl<P: SpStorageProfile> crate::account::Account<P> {
                 with_cutthrough,
                 runtime,
             ) {
-                Ok(()) => {
-                    let _ = sender.send(Notification::Sp(SpNotification::ScanCompleted));
+                Ok(outcome) => {
+                    let _ = sender.send(Notification::Sp(outcome.into()));
                 }
                 Err(e) => {
                     let _ = sender.send(Notification::Sp(SpNotification::FailScan {
@@ -1732,10 +1771,11 @@ impl<P: SpStorageProfile> crate::account::Account<P> {
                     with_cutthrough,
                     runtime,
                 ) {
-                    Ok(()) => {
+                    Ok(ScanOutcome::Completed) => {
                         let _ = sender.send(Notification::Sp(SpNotification::ScanCompleted));
                         last_notified_tip = Some(chain_height);
                     }
+                    Ok(ScanOutcome::Interrupted { .. }) => break,
                     Err(e) => {
                         let _ = sender.send(Notification::Sp(SpNotification::FailScan {
                             message: e.to_string(),
@@ -1748,7 +1788,8 @@ impl<P: SpStorageProfile> crate::account::Account<P> {
                 thread::sleep(Duration::from_millis(500));
             }
 
-            let _ = sender.send(Notification::Sp(SpNotification::ScanStopped));
+            let stopped = ScanOutcome::interrupted(&scan_state).into();
+            let _ = sender.send(Notification::Sp(stopped));
         });
 
         self.scanner_handle = Some(handle);
@@ -1788,11 +1829,10 @@ impl<P: SpStorageProfile> crate::account::Account<P> {
 
     /// Returns a clone of the scanner cancellation flag.
     ///
-    /// Setting this `AtomicBool` to `true` causes any in-flight OneShot or
-    /// Continuous scan to bail at the next per-block checkpoint inside
-    /// spdk-core's `process_blocks` (which calls `should_interrupt()` before
-    /// every block). The scan call returns `Ok(())` after persisting state
-    /// , i.e. cancellation is graceful, not an error.
+    /// Setting this `AtomicBool` to `true` causes any in-flight scan to bail at
+    /// the next per-block checkpoint. Cancellation is graceful, not an error:
+    /// the scan persists its state and reports `ScanStopped` instead of
+    /// `ScanCompleted`.
     ///
     /// Every scan entry point (`scan_oneshot`, `start_continuous_scan` and the
     /// custom-range `scan_blocks`) resets this flag to `false` before it runs,
@@ -1852,7 +1892,7 @@ impl<P: SpStorageProfile> crate::account::Account<P> {
             header_store: self.header_store().clone(),
         };
 
-        scan_blocks(
+        let outcome = scan_blocks(
             self.agent.clone(),
             &self.config.blindbit_url,
             &self.sp_receiver,
@@ -1866,9 +1906,7 @@ impl<P: SpStorageProfile> crate::account::Account<P> {
         )
         .map_err(AccountError::Scan)?;
 
-        let _ = self
-            .sender
-            .send(Notification::Sp(SpNotification::ScanCompleted));
+        let _ = self.sender.send(Notification::Sp(outcome.into()));
         Ok(())
     }
 
@@ -2070,7 +2108,7 @@ mod tests {
             cursor: 101,
         };
         let stop = Arc::new(AtomicBool::new(false));
-        run_sweep(
+        let outcome = run_sweep(
             &stores,
             &stop,
             &mut scanner,
@@ -2079,6 +2117,7 @@ mod tests {
             Height::from_consensus(10000).unwrap(),
         )
         .unwrap();
+        assert_eq!(outcome, ScanOutcome::Completed);
 
         // The gap 201..=4999 (no watchable coin active) is never fetched, but
         // block 5000, op(2)'s creation block, is swept: a same-block spend there
@@ -2108,7 +2147,7 @@ mod tests {
             cursor: 101,
         };
         let stop = Arc::new(AtomicBool::new(false));
-        run_sweep(
+        let outcome = run_sweep(
             &stores,
             &stop,
             &mut scanner,
@@ -2117,6 +2156,7 @@ mod tests {
             Height::from_consensus(10000).unwrap(),
         )
         .unwrap();
+        assert_eq!(outcome, ScanOutcome::Completed);
 
         // Block 5000 is scanned and op(2)'s spend is caught; once it is removed
         // nothing above 5000 is watchable, so no height above it is fetched.
@@ -2145,7 +2185,7 @@ mod tests {
             cursor: 101,
         };
         let stop = Arc::new(AtomicBool::new(false));
-        run_sweep(
+        let outcome = run_sweep(
             &stores,
             &stop,
             &mut scanner,
@@ -2154,6 +2194,7 @@ mod tests {
             Height::from_consensus(10000).unwrap(),
         )
         .unwrap();
+        assert_eq!(outcome, ScanOutcome::Completed);
 
         // The low coin stays unspent, so every height is swept (no wrong jump).
         assert_eq!(scanner.requested.len(), 10000 - 101 + 1);
@@ -2175,7 +2216,37 @@ mod tests {
             cursor: 101,
         };
         let stop = Arc::new(AtomicBool::new(false));
-        run_sweep(
+        let outcome = run_sweep(
+            &stores,
+            &stop,
+            &mut scanner,
+            watch,
+            101,
+            Height::from_consensus(10000).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(outcome, ScanOutcome::Completed);
+
+        // After the only coin is spent at 150, nothing is watchable -> no fetch above.
+        assert!(!scanner.requested.iter().any(|&h| h > 150));
+        assert_eq!(
+            stores.scan_state.lock().unwrap().last_spend_height(),
+            Some(10000)
+        );
+    }
+
+    #[test]
+    fn run_sweep_reports_interrupted_when_stopped() {
+        let coins = [(op(1), 100)];
+        let (stores, _rx) = test_stores(&coins);
+        let watch = WatchableSet::new(coins.iter().copied());
+        let mut scanner = FakeScanner {
+            spends: HashMap::new(),
+            requested: Vec::new(),
+            cursor: 101,
+        };
+        let stop = Arc::new(AtomicBool::new(true));
+        let outcome = run_sweep(
             &stores,
             &stop,
             &mut scanner,
@@ -2185,11 +2256,17 @@ mod tests {
         )
         .unwrap();
 
-        // After the only coin is spent at 150, nothing is watchable -> no fetch above.
-        assert!(!scanner.requested.iter().any(|&h| h > 150));
+        assert_eq!(
+            outcome,
+            ScanOutcome::Interrupted {
+                last_scanned: None,
+                last_spend: Some(100),
+            }
+        );
+        assert!(scanner.requested.is_empty());
         assert_eq!(
             stores.scan_state.lock().unwrap().last_spend_height(),
-            Some(10000)
+            Some(100)
         );
     }
 }

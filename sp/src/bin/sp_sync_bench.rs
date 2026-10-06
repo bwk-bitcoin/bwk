@@ -183,7 +183,7 @@ mod instrumented {
             error::Error as SpError, BlockData, OutputSpendStatus, OwnedOutput, SpReceiver,
             SpendKey,
         },
-        scan::{scan_blocks_with_observer, ScanRuntimeConfig, ScanStores},
+        scan::{scan_blocks_with_observer, ScanOutcome, ScanRuntimeConfig, ScanStores},
     };
     use plotters::prelude::*;
     use serde::{Deserialize, Serialize};
@@ -531,7 +531,7 @@ mod instrumented {
         }
         let client = client.clone();
         let scan_url = url.to_string();
-        let scan_handle = thread::spawn(move || -> Result<(), SpError> {
+        let scan_handle = thread::spawn(move || -> Result<ScanOutcome, SpError> {
             let res = scan_blocks_with_observer(
                 agent,
                 &scan_url,

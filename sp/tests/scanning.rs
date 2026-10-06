@@ -687,7 +687,7 @@ fn test_stale_stop_flag_does_not_stop_range_scan(env: &mut TestEnv) {
     while let Ok(notif) = receiver.try_recv() {
         match notif {
             Notification::Sp(SpNotification::ScanCompleted) => saw_completed = true,
-            Notification::Sp(SpNotification::ScanStopped) => panic!("scan reported stopped"),
+            Notification::Sp(SpNotification::ScanStopped { .. }) => panic!("scan reported stopped"),
             _ => {}
         }
     }

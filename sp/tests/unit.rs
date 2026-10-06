@@ -182,7 +182,15 @@ fn test_notification_channel_send_receive() {
         }))
         .unwrap();
     sender.send(SpNotification::StoppingScan.into()).unwrap();
-    sender.send(SpNotification::ScanStopped.into()).unwrap();
+    sender
+        .send(
+            SpNotification::ScanStopped {
+                last_scanned: Some(150),
+                last_spend: None,
+            }
+            .into(),
+        )
+        .unwrap();
 
     // Verify received notifications
     assert!(matches!(
@@ -218,7 +226,10 @@ fn test_notification_channel_send_receive() {
     ));
     assert!(matches!(
         receiver.recv().unwrap(),
-        Notification::Sp(SpNotification::ScanStopped)
+        Notification::Sp(SpNotification::ScanStopped {
+            last_scanned: Some(150),
+            last_spend: None,
+        })
     ));
 }
 
