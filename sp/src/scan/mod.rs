@@ -1408,6 +1408,21 @@ fn process_spends<P: SpStorageProfile>(
     )
 }
 
+/// Widest range one scan pass accepts (about 19 years of blocks). It bounds
+/// what a backend reporting an absurd tip can make the scanner allocate.
+const MAX_SCAN_SPAN: u32 = 1_000_000;
+
+fn check_scan_span(lowest: u32, end: u32) -> Result<(), receiver::error::Error> {
+    if end.saturating_sub(lowest) >= MAX_SCAN_SPAN {
+        return Err(receiver::error::Error::RangeTooLarge(
+            lowest,
+            end,
+            MAX_SCAN_SPAN,
+        ));
+    }
+    Ok(())
+}
+
 fn process_scan<P: SpStorageProfile>(
     backend: &BackendContext,
     scan: &mut ScanContext<P>,
@@ -1428,10 +1443,15 @@ fn process_scan<P: SpStorageProfile>(
     // The two passes resume from their own frontiers, so a stop during the spend
     // sweep can be resumed at the same tip (receive done, spend still trailing).
     let receive_has_work = start_u32 <= end_u32;
-    let spend_has_work = effective_spend_start(scan.stores, start_u32)? <= end_u32;
+    let spend_start = effective_spend_start(scan.stores, start_u32)?;
+    let spend_has_work = spend_start <= end_u32;
     if !receive_has_work && !spend_has_work {
         return Err(receiver::error::Error::InvalidRange(start_u32, end_u32));
     }
+    // The end comes from the backend's reported tip and sizes per-height
+    // bookkeeping and the number of blocks requested; refuse an implausible
+    // range before allocating or fetching anything.
+    check_scan_span(start_u32.min(spend_start), end_u32)?;
 
     if receive_has_work {
         #[cfg(feature = "scan-profile")]
@@ -2189,5 +2209,21 @@ mod tests {
             stores.scan_state.lock().unwrap().last_spend_height(),
             Some(10000)
         );
+    }
+
+    /// The scan end is the backend's reported tip; an absurd one must be
+    /// refused before it sizes any allocation.
+    #[test]
+    fn an_implausible_scan_range_is_refused() {
+        assert!(check_scan_span(900_000, 900_100).is_ok());
+        assert!(check_scan_span(1, MAX_SCAN_SPAN).is_ok());
+        assert!(matches!(
+            check_scan_span(900_000, 499_999_999),
+            Err(receiver::error::Error::RangeTooLarge(
+                900_000,
+                499_999_999,
+                MAX_SCAN_SPAN
+            ))
+        ));
     }
 }
