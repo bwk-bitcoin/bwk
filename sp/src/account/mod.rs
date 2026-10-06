@@ -135,6 +135,8 @@ pub enum AccountError {
     MissingInputCoin(OutPoint),
     #[error("BIP32 input is not owned by a sub-account: {0}")]
     InputNotOwned(OutPoint),
+    #[error("missing witness_utxo for input {0}")]
+    MissingPrevout(OutPoint),
     #[error("silent payment derivation failed: {0}")]
     SilentPayment(#[from] crate::core::error::Error),
 }
@@ -1328,6 +1330,8 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     /// 2. Signs BIP32 inputs with the wallet's hot signers.
     ///
     /// # Errors
+    /// * `AccountError::MissingPrevout` if the PSBT spends an SP coin and any
+    ///   input lacks its `witness_utxo`
     /// * `AccountError::AuxRand`, `AccountError::Sighash` or
     ///   `AccountError::Tweak` on SP signing failure
     pub fn sign_psbt(&self, psbt: &mut bitcoin::Psbt) -> Result<(), AccountError> {
@@ -1443,6 +1447,19 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     /// Source: adapted from cygnet3/spdk's silent-payment input signing.
     /// See `sp/NOTICE`.
     fn sign_sp_inputs(&self, psbt: &mut bitcoin::Psbt) -> Result<(), AccountError> {
+        let sp_inputs: Vec<(usize, SpCoinEntry)> = {
+            let coin_store = self.coin_store.lock().expect("poisoned");
+            psbt.unsigned_tx
+                .input
+                .iter()
+                .enumerate()
+                .filter_map(|(i, input)| coin_store.get(&input.previous_output).map(|e| (i, e)))
+                .collect()
+        };
+        if sp_inputs.is_empty() {
+            return Ok(());
+        }
+
         let b_spend = self
             .sp_receiver
             .try_get_secret_spend_key()
@@ -1451,29 +1468,25 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         let secp = Secp256k1::new();
         let hash_ty = TapSighashType::Default;
 
-        let prevouts: Vec<bitcoin::TxOut> = psbt
+        // `Prevouts::All` needs the spent output of every input, not only the SP ones.
+        let prevouts = psbt
             .inputs
             .iter()
-            .map(|input| {
+            .zip(&psbt.unsigned_tx.input)
+            .map(|(input, txin)| {
                 input
                     .witness_utxo
                     .clone()
-                    .expect("PSBT input must have witness_utxo")
+                    .ok_or(AccountError::MissingPrevout(txin.previous_output))
             })
-            .collect();
+            .collect::<Result<Vec<TxOut>, AccountError>>()?;
 
         let mut cache = SighashCache::new(&psbt.unsigned_tx);
-        let coin_store = self.coin_store.lock().expect("poisoned");
 
         let mut aux_rand = [0u8; 32];
         getrandom::getrandom(&mut aux_rand).map_err(AccountError::AuxRand)?;
 
-        for (i, input) in psbt.unsigned_tx.input.iter().enumerate() {
-            let Some(entry) = coin_store.get(&input.previous_output) else {
-                // Not an SP input, skip
-                continue;
-            };
-
+        for (i, entry) in sp_inputs {
             let sighash = cache
                 .taproot_key_spend_signature_hash(i, &Prevouts::All(&prevouts), hash_ty)
                 .map_err(AccountError::Sighash)?;
@@ -2558,6 +2571,72 @@ mod tests {
             bwk::bwk_electrum::address_store::AddressStatus::Used
         );
         assert!(hit.funding_txids.contains(&outpoint.txid));
+    }
+
+    // sign_psbt: prevout requirements
+
+    fn psbt_spending(outpoints: &[OutPoint]) -> bitcoin::Psbt {
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: outpoints
+                .iter()
+                .map(|outpoint| bitcoin::TxIn {
+                    previous_output: *outpoint,
+                    ..Default::default()
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: fake_tr_spk(1),
+            }],
+        };
+        bitcoin::Psbt::from_unsigned_tx(tx).unwrap()
+    }
+
+    #[test]
+    fn sign_psbt_without_sp_input_ignores_missing_prevouts() {
+        let account = Account::new(test_config()).unwrap();
+        let foreign = OutPoint {
+            txid: Txid::from_byte_array([0x11; 32]),
+            vout: 0,
+        };
+        let mut psbt = psbt_spending(&[foreign]);
+
+        account.sign_psbt(&mut psbt).unwrap();
+
+        assert!(psbt.inputs[0].tap_key_sig.is_none());
+    }
+
+    #[test]
+    fn sign_psbt_with_sp_input_errors_on_missing_prevout() {
+        let account = Account::new(test_config()).unwrap();
+        let spk = fake_tr_spk(21);
+        let sp_outpoint = OutPoint {
+            txid: Txid::from_byte_array([0x22; 32]),
+            vout: 0,
+        };
+        let sp_coin = fake_sp_owned(spk.clone(), 21);
+        let sp_amount = sp_coin.amount;
+        account
+            .coin_store
+            .lock()
+            .expect("poisoned")
+            .insert(sp_outpoint, sp_coin);
+        let foreign = OutPoint {
+            txid: Txid::from_byte_array([0x33; 32]),
+            vout: 1,
+        };
+        let mut psbt = psbt_spending(&[sp_outpoint, foreign]);
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: sp_amount,
+            script_pubkey: spk,
+        });
+
+        let err = account.sign_psbt(&mut psbt).unwrap_err();
+
+        assert!(matches!(err, AccountError::MissingPrevout(outpoint) if outpoint == foreign));
+        assert!(psbt.inputs[0].tap_key_sig.is_none());
     }
 }
 
