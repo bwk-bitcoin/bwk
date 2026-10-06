@@ -568,8 +568,11 @@ pub fn process_fees(
             result.warnings.push(Warning::ChangeUnderDust(lost));
         }
         fee_allowance
-    } else if (fee_allowance - fee_with_change) < DUST_AMOUNT {
-        // Create a drain < DUST, so we dont
+    } else if fee_allowance
+        .checked_sub(fee_with_change)
+        .is_none_or(|left| left < DUST_AMOUNT)
+    {
+        // A change output would be dust, or would not even pay its own fee
         let lost = fee_allowance - fee_wo_change;
         if let Drain::Change = drain {
             result.warnings.push(Warning::ChangeCreateDust(lost));
@@ -886,5 +889,23 @@ mod test {
             res.tx_template
                 .finalize(None, false, None, Network::Signet, 10, 100_000, false);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn a_change_that_cannot_pay_its_own_fee_is_absorbed_not_wrapped() {
+        // 150 vB without change and 193 vB with it, at 200 sat/vB: 30,000 and
+        // 38,600 sats. 36,000 sats are left for the fee, so a change output
+        // would not even pay for itself.
+        let res = process_fees(
+            Fees::MilliSatsVb(200_000),
+            Weight::from_wu(600),
+            Weight::from_wu(772),
+            136_000,
+            100_000,
+            Drain::Change,
+        );
+        assert!(res.error.is_none(), "got {:?}", res.error);
+        assert_eq!(res.change, None);
+        assert_eq!(res.fees, Some(36_000));
     }
 }
