@@ -2351,13 +2351,13 @@ mod tests {
     use crate::electrum::response::{ErrorResponse, ErrorResult};
     use miniscript::bitcoin::{
         block::{Header, Version},
-        consensus::serialize,
+        consensus::{encode::deserialize_hex, serialize},
         constants::genesis_block,
         hashes::Hash,
         params::Params,
         BlockHash, CompactTarget, TxMerkleNode,
     };
-    use std::fs;
+    use std::{fs, str::FromStr};
     use temp_dir::TempDir;
 
     fn raw_header(h: &Header) -> [u8; Header::SIZE] {
@@ -3967,5 +3967,534 @@ mod tests {
         let s0 = [0xB0u8; 32];
         let s1 = [0xB1u8; 32];
         assert!(!verify_merkle_branch(txid, &[s0, s1], 4, root));
+    }
+
+    /// Taproot activation, the lowest birthday a mainnet silent-payments
+    /// account can set, and the one the checkpoint fixtures below are built
+    /// for.
+    const TEST_MIN_HEIGHT: u32 = 709_632;
+
+    /// Mainnet block 707616, the backfill floor `TEST_MIN_HEIGHT` resolves to
+    /// and a retarget boundary, so a valid checkpoint height.
+    const TEST_CHECKPOINT_HEIGHT: u32 = 707_616;
+
+    /// Hash of mainnet block 707616. Read from mempool.space,
+    /// blockstream.info and blockchain.info on 2026-08-31, all three agreeing.
+    const TEST_CHECKPOINT_HASH: &str =
+        "00000000000000000002c26934496974adf77b74332c6e9ada689e0b0212a302";
+
+    /// Raw header of that same block, one consensus field per line: version,
+    /// prev hash, merkle root, time, bits, nonce. Same sources.
+    const MAINNET_CHECKPOINT_RAW: &str = concat!(
+        "0400a020",
+        "51f1fb78fa247329c5f4bbe6a11be379d5f4339bcdc006000000000000000000",
+        "44d4acc7214631657c93c5d667cdd6a89c18b4b40bb0c26e019b1a422cf76a3b",
+        "a2f57e61",
+        "cffe0c17",
+        "25c56a83",
+    );
+
+    fn mainnet_checkpoint_header() -> Header {
+        deserialize_hex(MAINNET_CHECKPOINT_RAW).unwrap()
+    }
+
+    fn mainnet_checkpoint() -> Checkpoint {
+        Checkpoint::new(
+            TEST_CHECKPOINT_HEIGHT,
+            BlockHash::from_str(TEST_CHECKPOINT_HASH).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[cfg(not(feature = "no-checkpoint"))]
+    #[test]
+    #[should_panic(expected = "a mainnet header store needs a checkpoint")]
+    fn a_mainnet_store_without_checkpoint_panics() {
+        let _ = HeaderStore::start_or_open(
+            None,
+            None,
+            Network::Bitcoin,
+            None,
+            None,
+            None,
+            CertificateCheck::Validate,
+        );
+    }
+
+    #[test]
+    fn a_mainnet_store_with_a_checkpoint_opens() {
+        assert!(HeaderStore::start_or_open(
+            None,
+            None,
+            Network::Bitcoin,
+            None,
+            None,
+            Some(mainnet_checkpoint()),
+            CertificateCheck::Validate,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_regtest_store_needs_no_checkpoint() {
+        assert!(HeaderStore::start_or_open(
+            None,
+            None,
+            Network::Regtest,
+            None,
+            None,
+            None,
+            CertificateCheck::Validate,
+        )
+        .is_ok());
+    }
+
+    /// Stands in for a fabricated anchor: a real mainnet header carrying only
+    /// minimum-difficulty work, so it clears `check_pow` (which clamps to the
+    /// network pow limit) while being anything but the checkpoint block.
+    /// Mining a fresh one at mainnet difficulty is not an option in a test.
+    fn forged_mainnet_anchor() -> Header {
+        genesis_block(Params::new(Network::Bitcoin)).header
+    }
+
+    /// An idle store bound to `checkpoint`, at `path` or in memory.
+    fn store_with_checkpoint(
+        network: Network,
+        path: Option<std::path::PathBuf>,
+        checkpoint: Checkpoint,
+    ) -> Arc<HeaderStore> {
+        HeaderStore::start_or_open(
+            None,
+            None,
+            network,
+            path,
+            None,
+            Some(checkpoint),
+            CertificateCheck::default(),
+        )
+        .unwrap()
+    }
+
+    fn assert_refused(store: &HeaderStore) {
+        assert_eq!(store.tip(), None);
+        assert_eq!(
+            store.validation_state(),
+            HeaderValidationState::Invalid(InvalidCause::Checkpoint)
+        );
+    }
+
+    #[test]
+    fn checkpoint_fixtures_are_one_block() {
+        assert_eq!(
+            backfill_floor(Some(TEST_MIN_HEIGHT), 0, Network::Bitcoin),
+            TEST_CHECKPOINT_HEIGHT
+        );
+        assert_eq!(
+            mainnet_checkpoint_header().block_hash(),
+            mainnet_checkpoint().hash(),
+            "the raw fixture and the hash fixture must be the same block"
+        );
+    }
+
+    #[test]
+    fn anchor_at_the_checkpoint_is_accepted() {
+        let store = store_with_checkpoint(Network::Bitcoin, None, mainnet_checkpoint());
+        store
+            .append_batch(
+                0,
+                TEST_CHECKPOINT_HEIGHT,
+                &[raw_header(&mainnet_checkpoint_header())],
+            )
+            .unwrap();
+
+        assert_eq!(store.min_height(), Some(TEST_CHECKPOINT_HEIGHT));
+        assert_eq!(
+            store.block_hash(TEST_CHECKPOINT_HEIGHT),
+            Some(mainnet_checkpoint().hash())
+        );
+        assert_eq!(store.validation_state(), HeaderValidationState::Valid);
+    }
+
+    #[test]
+    fn fabricated_anchor_at_the_checkpoint_is_refused() {
+        // A server that mines a low-difficulty chain from the anchor upward
+        // is caught here: the work is fine, the hash is not the checkpoint.
+        let store = store_with_checkpoint(Network::Bitcoin, None, mainnet_checkpoint());
+        let err = store
+            .append_batch(
+                0,
+                TEST_CHECKPOINT_HEIGHT,
+                &[raw_header(&forged_mainnet_anchor())],
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, MutateError::Checkpoint));
+        assert_refused(&store);
+    }
+
+    #[test]
+    fn fabricated_anchor_through_append_anchor_is_refused() {
+        let store = store_with_checkpoint(Network::Bitcoin, None, mainnet_checkpoint());
+        let err = store
+            .append_anchor(
+                0,
+                TEST_CHECKPOINT_HEIGHT,
+                raw_header(&forged_mainnet_anchor()),
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, MutateError::Checkpoint));
+        assert_refused(&store);
+    }
+
+    #[test]
+    fn anchor_without_checkpoint_rests_on_proof_of_work() {
+        // Same height, same header the checkpoint refuses: with no
+        // checkpoint it is taken on work alone.
+        let store = HeaderStore::new_in_memory(Network::Bitcoin);
+        store
+            .append_batch(
+                0,
+                TEST_CHECKPOINT_HEIGHT,
+                &[raw_header(&forged_mainnet_anchor())],
+            )
+            .unwrap();
+
+        assert_eq!(store.min_height(), Some(TEST_CHECKPOINT_HEIGHT));
+        assert_eq!(store.validation_state(), HeaderValidationState::Valid);
+    }
+
+    /// A regtest store bound to a checkpoint at 2016 whose hash is `hash`.
+    fn regtest_store_with_checkpoint(hash: BlockHash) -> Arc<HeaderStore> {
+        store_with_checkpoint(Network::Regtest, None, Checkpoint::new(2016, hash).unwrap())
+    }
+
+    #[test]
+    fn sync_passes_a_matching_checkpoint_above_the_anchor() {
+        let chain = build_chain(2020);
+        let store = regtest_store_with_checkpoint(chain[2016].block_hash());
+        let raws: Vec<_> = chain.iter().map(raw_header).collect();
+        store.append_batch(0, 0, &raws).unwrap();
+
+        assert_eq!(store.tip(), Some(2019));
+        assert_eq!(store.block_hash(2016), Some(chain[2016].block_hash()));
+        assert_eq!(store.validation_state(), HeaderValidationState::Valid);
+    }
+
+    #[test]
+    fn sync_refuses_a_chain_without_the_checkpoint_block() {
+        let chain = build_chain(2020);
+        let store = regtest_store_with_checkpoint(BlockHash::all_zeros());
+        let raws: Vec<_> = chain.iter().map(raw_header).collect();
+        let err = store.append_batch(0, 0, &raws).unwrap_err();
+
+        assert!(matches!(err, MutateError::Checkpoint));
+        assert_refused(&store);
+    }
+
+    #[test]
+    fn tip_append_refuses_a_chain_without_the_checkpoint_block() {
+        let chain = build_chain(2017);
+        let store = regtest_store_with_checkpoint(BlockHash::all_zeros());
+        let raws: Vec<_> = chain[..2016].iter().map(raw_header).collect();
+        store.append_batch(0, 0, &raws).unwrap();
+
+        let err = store.append(0, 2016, raw_header(&chain[2016])).unwrap_err();
+
+        assert!(matches!(err, MutateError::Checkpoint));
+        assert_refused(&store);
+    }
+
+    fn is_checkpoint_refusal(notification: Notification) -> bool {
+        matches!(
+            notification,
+            Notification::ValidationFailed(ValidationFailure::HeaderStore(
+                InvalidCause::Checkpoint
+            ))
+        )
+    }
+
+    #[test]
+    fn a_checkpoint_refusal_is_notified() {
+        let chain = build_chain(2017);
+        let store = regtest_store_with_checkpoint(BlockHash::all_zeros());
+        let (notif_tx, notif_rx) = mpsc::channel();
+        store.register_notifications(notif_tx);
+        let raws: Vec<_> = chain[..2016].iter().map(raw_header).collect();
+        store.append_batch(0, 0, &raws).unwrap();
+        assert!(notif_rx.try_recv().is_err());
+
+        store.append(0, 2016, raw_header(&chain[2016])).unwrap_err();
+
+        assert!(is_checkpoint_refusal(notif_rx.try_recv().unwrap()));
+    }
+
+    #[test]
+    fn a_checkpoint_refusal_on_reload_is_notified_on_registration() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("headers.bin");
+        let map = BTreeMap::from([(TEST_CHECKPOINT_HEIGHT, raw_header(&forged_mainnet_anchor()))]);
+        write_binary(&path, &map);
+        let store = store_with_checkpoint(Network::Bitcoin, Some(path), mainnet_checkpoint());
+        let (notif_tx, notif_rx) = mpsc::channel();
+
+        store.register_notifications(notif_tx);
+
+        assert!(is_checkpoint_refusal(notif_rx.try_recv().unwrap()));
+    }
+
+    #[test]
+    fn tip_append_past_a_matching_checkpoint_is_accepted() {
+        let chain = build_chain(2018);
+        let store = regtest_store_with_checkpoint(chain[2016].block_hash());
+        let raws: Vec<_> = chain[..2016].iter().map(raw_header).collect();
+        store.append_batch(0, 0, &raws).unwrap();
+
+        store.append(0, 2016, raw_header(&chain[2016])).unwrap();
+        store.append(0, 2017, raw_header(&chain[2017])).unwrap();
+
+        assert_eq!(store.tip(), Some(2017));
+        assert_eq!(store.validation_state(), HeaderValidationState::Valid);
+    }
+
+    #[test]
+    fn reorg_branch_replacing_the_checkpoint_block_is_refused() {
+        let chain = build_chain(2017);
+        let store = regtest_store_with_checkpoint(chain[2016].block_hash());
+        let raws: Vec<_> = chain.iter().map(raw_header).collect();
+        store.append_batch(0, 0, &raws).unwrap();
+        let branch: BTreeMap<u32, [u8; Header::SIZE]> = build_branch(chain[2015], 2016, 2, 0xC0)
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (2016 + i as u32, raw_header(h)))
+            .collect();
+
+        let err = store.replace_branch(0, 2015, &branch).unwrap_err();
+
+        assert!(matches!(err, MutateError::Checkpoint));
+        assert_refused(&store);
+    }
+
+    #[test]
+    fn reorg_branch_above_the_checkpoint_is_applied() {
+        let chain = build_chain(2018);
+        let store = regtest_store_with_checkpoint(chain[2016].block_hash());
+        let raws: Vec<_> = chain.iter().map(raw_header).collect();
+        store.append_batch(0, 0, &raws).unwrap();
+        let fork = build_branch(chain[2016], 2017, 1, 0xC0);
+        let branch = BTreeMap::from([(2017, raw_header(&fork[0]))]);
+
+        store.replace_branch(0, 2016, &branch).unwrap();
+
+        assert_eq!(store.block_hash(2017), Some(fork[0].block_hash()));
+        assert_eq!(store.validation_state(), HeaderValidationState::Valid);
+    }
+
+    #[test]
+    fn initial_sync_anchors_at_a_checkpoint_below_the_backfill_floor() {
+        // min_height 4040 would put the backfill floor at 2016; the checkpoint
+        // at 0 anchors the chain instead.
+        let chain = build_chain(6);
+        let store = store_with_checkpoint(
+            Network::Regtest,
+            None,
+            Checkpoint::new(0, chain[0].block_hash()).unwrap(),
+        );
+        let (req_tx, req_rx) = mpsc::channel::<HeaderRequest>();
+        let (resp_tx, resp_rx) = mpsc::channel::<HeaderResponse>();
+        resp_tx
+            .send(HeaderResponse::Batch {
+                start: 0,
+                raws: chain[0..5].iter().map(raw_header).collect(),
+            })
+            .unwrap();
+        let mut deferred = VecDeque::new();
+
+        let ok = initial_sync(
+            &store,
+            Network::Regtest,
+            Some(4040),
+            0,
+            (5, raw_header(&chain[5])),
+            &req_tx,
+            &resp_rx,
+            &mut deferred,
+        );
+
+        assert!(ok);
+        assert!(matches!(
+            req_rx.try_recv(),
+            Ok(HeaderRequest::GetHeaders { start: 0, count: 5 })
+        ));
+        assert_eq!(store.min_height(), Some(0));
+        assert_eq!(store.tip(), Some(4));
+    }
+
+    #[test]
+    fn initial_sync_anchors_at_a_checkpoint_above_the_backfill_floor() {
+        // The checkpoint at 4032 sits above the floor of 2016: the sync still
+        // starts at the checkpoint, nothing below it is fetched.
+        let fresh = build_chain(6);
+        let store = store_with_checkpoint(
+            Network::Regtest,
+            None,
+            Checkpoint::new(4032, fresh[0].block_hash()).unwrap(),
+        );
+        let (req_tx, req_rx) = mpsc::channel::<HeaderRequest>();
+        let (resp_tx, resp_rx) = mpsc::channel::<HeaderResponse>();
+        resp_tx
+            .send(HeaderResponse::Batch {
+                start: 4032,
+                raws: fresh[0..5].iter().map(raw_header).collect(),
+            })
+            .unwrap();
+        let mut deferred = VecDeque::new();
+
+        let ok = initial_sync(
+            &store,
+            Network::Regtest,
+            Some(4040),
+            0,
+            (4037, raw_header(&fresh[5])),
+            &req_tx,
+            &resp_rx,
+            &mut deferred,
+        );
+
+        assert!(ok);
+        assert!(matches!(
+            req_rx.try_recv(),
+            Ok(HeaderRequest::GetHeaders {
+                start: 4032,
+                count: 5
+            })
+        ));
+        assert_eq!(store.min_height(), Some(4032));
+        assert_eq!(store.block_hash(4032), Some(fresh[0].block_hash()));
+    }
+
+    #[test]
+    fn initial_sync_reanchors_a_stored_range_above_the_checkpoint() {
+        // Nothing proves rows stored above the checkpoint against it: the sync
+        // wipes them and re-anchors at the checkpoint.
+        let chain = build_chain(6);
+        let store = store_with_checkpoint(
+            Network::Regtest,
+            None,
+            Checkpoint::new(0, chain[0].block_hash()).unwrap(),
+        );
+        for (i, h) in build_chain(4).iter().enumerate() {
+            store.insert_unchecked(2016 + i as u32, raw_header(h));
+        }
+        let (req_tx, _req_rx) = mpsc::channel::<HeaderRequest>();
+        let (resp_tx, resp_rx) = mpsc::channel::<HeaderResponse>();
+        resp_tx
+            .send(HeaderResponse::Batch {
+                start: 0,
+                raws: chain[0..5].iter().map(raw_header).collect(),
+            })
+            .unwrap();
+        let mut deferred = VecDeque::new();
+
+        let ok = initial_sync(
+            &store,
+            Network::Regtest,
+            Some(4040),
+            0,
+            (5, raw_header(&chain[5])),
+            &req_tx,
+            &resp_rx,
+            &mut deferred,
+        );
+
+        assert!(ok);
+        assert_eq!(store.min_height(), Some(0));
+        assert!(store.block_hash(2016).is_none(), "rows above it are wiped");
+    }
+
+    #[test]
+    fn persisted_fabricated_anchor_is_wiped_on_reload() {
+        // The reload replays the anchor on work alone, so the checkpoint has
+        // to be checked there or a fabricated chain would outlive the sync
+        // that refused it.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("headers.bin");
+        let map = BTreeMap::from([(TEST_CHECKPOINT_HEIGHT, raw_header(&forged_mainnet_anchor()))]);
+        write_binary(&path, &map);
+
+        let store = store_with_checkpoint(Network::Bitcoin, Some(path), mainnet_checkpoint());
+
+        assert_refused(&store);
+    }
+
+    #[test]
+    fn persisted_checkpoint_block_survives_reload() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("headers.bin");
+        let map = BTreeMap::from([(
+            TEST_CHECKPOINT_HEIGHT,
+            raw_header(&mainnet_checkpoint_header()),
+        )]);
+        write_binary(&path, &map);
+
+        let store = store_with_checkpoint(Network::Bitcoin, Some(path), mainnet_checkpoint());
+
+        assert!(wait_until(Duration::from_secs(5), || {
+            store.validation_state() == HeaderValidationState::Valid
+        }));
+        assert_eq!(store.tip(), Some(TEST_CHECKPOINT_HEIGHT));
+    }
+
+    #[test]
+    fn persisted_range_below_the_checkpoint_survives_reload() {
+        // Its tip has not reached the checkpoint yet: the sync checks it
+        // there.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("headers.bin");
+        let map = BTreeMap::from([(
+            TEST_CHECKPOINT_HEIGHT - 2016,
+            raw_header(&forged_mainnet_anchor()),
+        )]);
+        write_binary(&path, &map);
+
+        let store = store_with_checkpoint(Network::Bitcoin, Some(path), mainnet_checkpoint());
+
+        assert!(wait_until(Duration::from_secs(5), || {
+            store.validation_state() == HeaderValidationState::Valid
+        }));
+        assert_eq!(store.tip(), Some(TEST_CHECKPOINT_HEIGHT - 2016));
+    }
+
+    #[test]
+    fn sanity_check_refuses_another_block_at_the_checkpoint_height() {
+        let chain = build_chain(3);
+        let map: BTreeMap<u32, [u8; Header::SIZE]> = chain
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (i as u32, raw_header(h)))
+            .collect();
+        let matching = Checkpoint::new(0, chain[0].block_hash()).unwrap();
+        let other = Checkpoint::new(0, chain[1].block_hash()).unwrap();
+        let above = Checkpoint::new(2016, chain[1].block_hash()).unwrap();
+
+        assert_eq!(sanity_check(Network::Regtest, Some(matching), &map), Ok(()));
+        assert_eq!(
+            sanity_check(Network::Regtest, Some(other), &map),
+            Err(InvalidCause::Checkpoint)
+        );
+        assert_eq!(sanity_check(Network::Regtest, Some(above), &map), Ok(()));
+    }
+
+    #[test]
+    fn genesis_anchored_chain_holds_the_checkpoint_by_linkage() {
+        // A chain from genesis is checked at the checkpoint height only once
+        // the sync reaches it; below it the reload passes.
+        let genesis = genesis_block(Params::new(Network::Bitcoin)).header;
+        let map = BTreeMap::from([(0, raw_header(&genesis))]);
+
+        assert_eq!(
+            sanity_check(Network::Bitcoin, Some(mainnet_checkpoint()), &map),
+            Ok(())
+        );
     }
 }

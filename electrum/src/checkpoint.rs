@@ -46,3 +46,40 @@ impl Checkpoint {
         self.hash
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use miniscript::bitcoin::{hashes::Hash, BlockHash};
+
+    use crate::checkpoint::{Checkpoint, Error};
+
+    #[test]
+    fn a_retarget_boundary_is_accepted() {
+        let hash = BlockHash::all_zeros();
+        let checkpoint = Checkpoint::new(707_616, hash).unwrap();
+        assert_eq!(checkpoint.height(), 707_616);
+        assert_eq!(checkpoint.hash(), hash);
+    }
+
+    #[test]
+    fn a_height_off_the_retarget_boundary_is_refused() {
+        let err = Checkpoint::new(707_617, BlockHash::all_zeros()).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::NotRetargetBoundary {
+                height: 707_617,
+                interval: 2016
+            }
+        ));
+    }
+
+    #[test]
+    fn a_checkpoint_round_trips_through_serde() {
+        let checkpoint = Checkpoint::new(4032, BlockHash::all_zeros()).unwrap();
+        let json = serde_json::to_string(&checkpoint).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Checkpoint>(&json).unwrap(),
+            checkpoint
+        );
+    }
+}
