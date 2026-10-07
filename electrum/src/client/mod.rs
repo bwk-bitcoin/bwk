@@ -671,6 +671,76 @@ fn decode_tx_merkle_branch(merkle: &[String]) -> Result<Vec<[u8; MERKLE_HASH_BYT
 mod tests {
     use super::*;
     use crate::electrum::response::TxGetMerkleResponse;
+    use serde_json::Value;
+    use std::{
+        io::{BufRead, BufReader, Write},
+        net::{TcpListener, TcpStream},
+    };
+
+    /// A tx listener on a fresh connection to a local fake server, and the
+    /// server side of that connection.
+    fn listener_on_fake_server() -> (
+        mpsc::Sender<CoinRequest>,
+        mpsc::Receiver<CoinResponse>,
+        BufReader<TcpStream>,
+    ) {
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let client = Client::new("127.0.0.1", port, CertificateCheck::Validate).unwrap();
+        let (stream, _) = server.accept().unwrap();
+        stream.set_read_timeout(Some(PING_INTERVAL * 5)).unwrap();
+        let (request, response) = client.listen_txs::<CoinRequest, CoinResponse>();
+        (request, response, BufReader::new(stream))
+    }
+
+    /// The next request the server reads, a batch of one, as its method and
+    /// id.
+    fn read_request(server: &mut BufReader<TcpStream>) -> (String, u64) {
+        let mut line = String::new();
+        server.read_line(&mut line).unwrap();
+        let [request]: [Value; 1] = serde_json::from_str(&line).unwrap();
+        (
+            request["method"].as_str().unwrap().to_string(),
+            request["id"].as_u64().unwrap(),
+        )
+    }
+
+    #[test]
+    fn keepalive_pings_the_connection_after_the_interval() {
+        let (_request, _response, mut server) = listener_on_fake_server();
+
+        let (method, _) = read_request(&mut server);
+
+        assert_eq!(method, "server.ping");
+    }
+
+    #[test]
+    fn keepalive_pong_is_swallowed() {
+        let (_request, response, mut server) = listener_on_fake_server();
+        let (_, id) = read_request(&mut server);
+
+        let pong = format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":null}}\n");
+        server.get_mut().write_all(pong.as_bytes()).unwrap();
+
+        let (method, _) = read_request(&mut server);
+        assert_eq!(method, "server.ping");
+        assert!(matches!(
+            response.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn keepalive_does_not_outlive_a_dropped_consumer() {
+        let (request, response, _server) = listener_on_fake_server();
+
+        drop(request);
+
+        assert!(matches!(
+            response.recv_timeout(PING_INTERVAL * 5),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
 
     #[test]
     fn decode_tx_merkle_branch_sample() {
