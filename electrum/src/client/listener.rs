@@ -1,4 +1,5 @@
 use crate::{
+    client::PING_INTERVAL,
     electrum::{request::Request, response::Response},
     raw_client,
 };
@@ -38,6 +39,8 @@ pub(super) enum Flow {
 /// A transport read error terminates the listener: the connection is dead, so
 /// it emits the error once and returns instead of looping and re-emitting.
 /// Recovery is the consumer's responsibility (e.g. `HeaderStore::restart()`).
+/// The connection is pinged every [`PING_INTERVAL`]; pongs never reach the
+/// consumer.
 pub(super) fn run_listener<RQ, RS, Req, S>(
     mut client: Client,
     send: mpsc::Sender<RS>,
@@ -57,9 +60,20 @@ pub(super) fn run_listener<RQ, RS, Req, S>(
     let mut last_sent = Instant::now();
     let mut backoff = Backoff::new_ms(50);
     let mut inbox: VecDeque<Req> = VecDeque::new();
+    let mut last_ping = Instant::now();
 
     loop {
         let mut received = false;
+
+        if last_ping.elapsed() >= PING_INTERVAL {
+            let mut ping = Request::ping();
+            client.register(&mut ping);
+            if let Err(e) = client.inner.try_send_batch(vec![&ping]) {
+                let _ = send.send(transport_err(e));
+                return;
+            }
+            last_ping = Instant::now();
+        }
 
         // A pending batch unanswered too long means electrs likely dropped a
         // request (empty response while busy); resend so the batch can complete.

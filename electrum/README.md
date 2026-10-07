@@ -59,6 +59,10 @@ The scan reports its connection as `Notification::Electrum(TxListenerNotif)`.
 It sends `Stopped` once a `stop()` lands, and `Disconnected` when the connection
 dropped. A dropped connection is not retried: `start()` opens a new one.
 
+Every listener connection (the scan's, and the header store's two) sends
+`server.ping` every minute, so a server does not drop it as idle. A ping that
+fails to send ends the connection the same way as a drop.
+
 ### Async Listener (Recommended)
 
 ```rust

@@ -32,6 +32,12 @@ use tx_listener::listen_txs;
 const SEND_MAX_RETRIES: usize = 3;
 const SEND_RETRY_DELAY: Duration = Duration::from_millis(300);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// A server may drop a client that stays silent (ElectrumX does after about
+/// ten minutes), so every listener pings its connection this often.
+#[cfg(not(test))]
+const PING_INTERVAL: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const PING_INTERVAL: Duration = Duration::from_millis(200);
 /// Length of one merkle branch sibling.
 pub const MERKLE_HASH_BYTES: usize = 32;
 const SHORT_HEX_BYTES: usize = 8;
@@ -386,7 +392,8 @@ impl Client {
     /// Spawn the tx listener on a background thread. `RQ`/`RS` are generic
     /// so this listener can be used standalone, outside a bwk/bwk-sp
     /// `Account`, with the consumer's own wrapper request/response types
-    /// instead of `CoinRequest`/`CoinResponse` directly.
+    /// instead of `CoinRequest`/`CoinResponse` directly. The connection is
+    /// pinged every minute.
     pub fn listen_txs<RQ, RS>(self) -> (mpsc::Sender<RQ>, mpsc::Receiver<RS>)
     where
         RQ: Into<CoinRequest> + Debug + Send + 'static,
@@ -402,7 +409,8 @@ impl Client {
     /// Spawn the header listener on a background thread. `RQ`/`RS` are
     /// generic so this listener can be used standalone, outside a bwk/bwk-sp
     /// `Account`, with the consumer's own wrapper request/response types
-    /// instead of `HeaderRequest`/`HeaderResponse` directly.
+    /// instead of `HeaderRequest`/`HeaderResponse` directly. The connection
+    /// is pinged every minute.
     pub fn listen_headers<RQ, RS>(self) -> (mpsc::Sender<RQ>, mpsc::Receiver<RS>)
     where
         RQ: Into<HeaderRequest> + Debug + Send + 'static,

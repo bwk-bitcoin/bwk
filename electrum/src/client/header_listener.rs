@@ -109,6 +109,7 @@ fn handle_header_response(
                 sender(HeaderResponse::Error(HeaderError::Server(e)));
             }
         }
+        Response::Ping(_) => {}
         r => {
             log::error!("handle_header_response: unexpected {r:?}");
         }
