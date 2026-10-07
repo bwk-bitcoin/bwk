@@ -22,7 +22,7 @@ use {
             },
             config::Config,
             recipient::{SpChangeRecipientProvider, SpSecretProvider},
-            tx_store::{block_time, SpTxEntry, SpTxStore},
+            tx_store::{header_time, SpTxEntry, SpTxStore},
             unified::{CoinOrigin, SubAccountKind},
         },
         blindbit::{self, InfoResponse},
@@ -3216,7 +3216,9 @@ impl<P: crate::profile::SpStorageProfile> bwk::bwk_electrum::history::AccountHis
                 if c.timestamp.is_none() {
                     // A header that landed after the last restamp still dates
                     // the tx, read only: the restamp is what writes it.
-                    c.timestamp = e.timestamp.or_else(|| block_time(header_store?, e.height?));
+                    c.timestamp = e
+                        .timestamp
+                        .or_else(|| header_time(header_store?, e.height?));
                 }
                 if c.tx.is_none() {
                     c.tx = e.tx.clone();

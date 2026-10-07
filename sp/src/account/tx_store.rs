@@ -19,10 +19,20 @@ use serde::{Deserialize, Serialize};
 
 pub const STORE_KEY: &str = bwk::persist::TXS_STORE_KEY;
 
-/// The time of the block at `height`, `None` while `header_store` has not
-/// synced it.
-pub fn block_time(header_store: &HeaderStore, height: u32) -> Option<u64> {
+/// The time of the block at `height`, `None` while `header_store` does not hold
+/// it.
+pub fn header_time(header_store: &HeaderStore, height: u32) -> Option<u64> {
     header_store.header(height).map(|h| h.time as u64)
+}
+
+/// [`header_time`], and a height below the store's floor asks it to extend the
+/// chain down, the time is then stamped once the range lands.
+pub fn block_time(header_store: &HeaderStore, height: u32) -> Option<u64> {
+    let time = header_time(header_store, height);
+    if time.is_none() {
+        header_store.request_extend_down(height);
+    }
+    time
 }
 
 /// A transaction entry in the store.
