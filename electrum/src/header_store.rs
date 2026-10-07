@@ -2702,9 +2702,9 @@ mod tests {
 
     #[test]
     fn initial_sync_reanchors_below_stored_floor() {
-        // Persisted rows at 4032..=4035, but the wanted floor drops to 0
-        // (no min_height, low server tip): the stale range must be wiped
-        // and the sync re-anchored at 0.
+        // Persisted rows at 4032..=4035, but the server tip is low so the
+        // wanted floor is 0: the stale range must be wiped and the sync
+        // re-anchored at 0.
         let chain = build_chain(11);
         let store = HeaderStore::new_in_memory(Network::Regtest);
         for (i, h) in chain.iter().enumerate().take(4) {
@@ -3188,8 +3188,8 @@ mod tests {
     #[test]
     fn mtp_enforced_at_full_window_above_sparse_anchor() {
         // Seed a store whose lowest stored height is exactly the backfill
-        // floor `initial_sync` now produces for a sparse start: the retarget
-        // boundary one interval below the account's snapped min_height. Every
+        // floor `initial_sync` produces for a sparse start: the retarget
+        // boundary one interval below the snapped server tip. Every
         // height at or above `floor + MTP_WINDOW` has a full MTP window; a
         // header whose timestamp does not beat that window's median must be
         // rejected. On the old upward scan `ancestors_for` returned no
@@ -3803,7 +3803,7 @@ mod tests {
 
     #[test]
     fn backfill_floor_saturates_near_genesis() {
-        // A min_height inside the first retarget period snaps to 0, and the
+        // A tip inside the first retarget period snaps to 0, and the
         // retarget-interval padding must saturate rather than underflow.
         let network = Network::Bitcoin;
         assert_eq!(backfill_floor(5, network), 0);
@@ -4214,43 +4214,71 @@ mod tests {
         assert_eq!(store.validation_state(), HeaderValidationState::Valid);
     }
 
+    /// A response channel already holding `chain` from `start`, cut in the
+    /// retarget-interval batches `initial_sync` asks for.
+    fn serve_from(chain: &[Header], start: u32) -> mpsc::Receiver<HeaderResponse> {
+        let (resp_tx, resp_rx) = mpsc::channel::<HeaderResponse>();
+        for (i, batch) in chain.chunks(2016).enumerate() {
+            resp_tx
+                .send(HeaderResponse::Batch {
+                    start: start + (i * 2016) as u32,
+                    raws: batch.iter().map(raw_header).collect(),
+                })
+                .unwrap();
+        }
+        resp_rx
+    }
+
     #[test]
     fn initial_sync_anchors_at_a_checkpoint_below_the_backfill_floor() {
-        // min_height 4040 would put the backfill floor at 2016; the checkpoint
-        // at 0 anchors the chain instead.
-        let chain = build_chain(6);
+        // A server tip at 4037 would put the floor at 2016; the checkpoint at
+        // 0 anchors the chain instead.
+        let chain = build_chain(4038);
         let store = store_with_checkpoint(
             Network::Regtest,
             None,
             Checkpoint::new(0, chain[0].block_hash()).unwrap(),
         );
         let (req_tx, req_rx) = mpsc::channel::<HeaderRequest>();
-        let (resp_tx, resp_rx) = mpsc::channel::<HeaderResponse>();
-        resp_tx
-            .send(HeaderResponse::Batch {
-                start: 0,
-                raws: chain[0..5].iter().map(raw_header).collect(),
-            })
-            .unwrap();
-        let mut deferred = VecDeque::new();
+        let resp_rx = serve_from(&chain[..4037], 0);
 
         let ok = initial_sync(
             &store,
             Network::Regtest,
             0,
-            (5, raw_header(&chain[5])),
+            (4037, raw_header(&chain[4037])),
             &req_tx,
             &resp_rx,
-            &mut deferred,
+            &mut VecDeque::new(),
         );
 
         assert!(ok);
-        assert!(matches!(
-            req_rx.try_recv(),
-            Ok(HeaderRequest::GetHeaders { start: 0, count: 5 })
-        ));
+        recv_get_headers(&req_rx, 0, 2016);
         assert_eq!(store.min_height(), Some(0));
-        assert_eq!(store.tip(), Some(4));
+        assert_eq!(store.tip(), Some(4036));
+    }
+
+    #[test]
+    fn initial_sync_without_a_checkpoint_starts_a_retarget_period_below_the_tip() {
+        let fresh = build_chain(2022);
+        let store = HeaderStore::new_in_memory(Network::Regtest);
+        let (req_tx, req_rx) = mpsc::channel::<HeaderRequest>();
+        let resp_rx = serve_from(&fresh[..2021], 2016);
+
+        let ok = initial_sync(
+            &store,
+            Network::Regtest,
+            0,
+            (4037, raw_header(&fresh[2021])),
+            &req_tx,
+            &resp_rx,
+            &mut VecDeque::new(),
+        );
+
+        assert!(ok);
+        recv_get_headers(&req_rx, 2016, 2016);
+        assert_eq!(store.min_height(), Some(2016));
+        assert_eq!(store.tip(), Some(4036));
     }
 
     #[test]
