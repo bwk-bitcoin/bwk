@@ -3069,6 +3069,17 @@ mod tests {
     }
 
     #[test]
+    fn a_history_read_below_the_header_floor_queues_no_extension() {
+        let config = test_config();
+        let header_store = header_store_with_block_time(config.network, 10, 1_700_000_000);
+        let account = Account::with_header_store(config, header_store.clone()).unwrap();
+        let txid = insert_undated_tx(&account, 4);
+
+        assert_eq!(history_timestamp(&account, txid), None);
+        assert_eq!(header_store.extension_wanted(), None);
+    }
+
+    #[test]
     fn a_tx_recorded_before_its_header_is_dated_then_restamped() {
         let config = test_config();
         let header_store = header_store_with_block_time(config.network, 7, 1_700_000_000);

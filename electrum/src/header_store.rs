@@ -1088,7 +1088,7 @@ where
     }
 
     /// The height the next extension goes down to, without taking it.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test"))]
     pub fn extension_wanted(&self) -> Option<u32> {
         *self.extend_down.lock().expect("poisoned")
     }

@@ -297,7 +297,9 @@ mod tests {
     use bitcoin::{hashes::Hash, Network, Txid};
     use bwk::bwk_electrum::header_store::HeaderStore;
 
-    use crate::account::tx_store::{header_store_with_block_time, SpTxEntry, SpTxStore};
+    use crate::account::tx_store::{
+        block_time, header_store_with_block_time, SpTxEntry, SpTxStore,
+    };
 
     fn entry_at(n: u8, height: Option<u32>) -> SpTxEntry {
         let mut entry = SpTxEntry::new(Txid::from_byte_array([n; 32]));
@@ -351,5 +353,34 @@ mod tests {
         assert_eq!(store.get(&mempool).unwrap().timestamp(), None);
 
         assert!(!store.restamp_missing_timestamps(&caught_up));
+    }
+
+    #[test]
+    fn a_block_time_below_the_header_floor_asks_for_an_extension() {
+        let header_store = header_store_with_block_time(Network::Regtest, 10, 1_700_000_000);
+
+        assert_eq!(block_time(&header_store, 4), None);
+        assert_eq!(header_store.extension_wanted(), Some(4));
+    }
+
+    #[test]
+    fn a_block_time_the_header_store_holds_asks_for_nothing() {
+        let header_store = header_store_with_block_time(Network::Regtest, 10, 1_700_000_000);
+
+        assert_eq!(block_time(&header_store, 10), Some(1_700_000_000));
+        assert_eq!(block_time(&header_store, 12), None);
+        assert_eq!(header_store.extension_wanted(), None);
+    }
+
+    #[test]
+    fn a_restamp_below_the_header_floor_asks_for_an_extension() {
+        let mut store = SpTxStore::new();
+        let mut entry = SpTxEntry::new(Txid::from_byte_array([3; 32]));
+        entry.height = Some(4);
+        store.insert(entry);
+        let header_store = header_store_with_block_time(Network::Regtest, 10, 1_700_000_000);
+
+        assert!(!store.restamp_missing_timestamps(&header_store));
+        assert_eq!(header_store.extension_wanted(), Some(4));
     }
 }
