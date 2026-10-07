@@ -1087,6 +1087,12 @@ where
         }
     }
 
+    /// The height the next extension goes down to, without taking it.
+    #[cfg(test)]
+    pub fn extension_wanted(&self) -> Option<u32> {
+        *self.extend_down.lock().expect("poisoned")
+    }
+
     pub fn tip(&self) -> Option<u32> {
         self.inner
             .lock()
@@ -4590,5 +4596,227 @@ mod tests {
             sanity_check(Network::Bitcoin, Some(mainnet_checkpoint()), &map),
             Ok(())
         );
+    }
+
+    /// A store holding `chain[4032..4040]` at their own heights, a sparse range
+    /// whose floor 4032 a tx confirmed lower sits below.
+    fn store_above_2016(chain: &[Header]) -> Arc<HeaderStore> {
+        let store = HeaderStore::new_in_memory(Network::Regtest);
+        for (h, header) in chain.iter().enumerate().take(4040).skip(4032) {
+            store.insert_unchecked(h as u32, raw_header(header));
+        }
+        store
+    }
+
+    /// A response channel already holding one batch of `chain[start..end]`.
+    fn serve(
+        chain: &[Header],
+        start: u32,
+        end: u32,
+    ) -> (mpsc::Sender<HeaderResponse>, mpsc::Receiver<HeaderResponse>) {
+        let (resp_tx, resp_rx) = mpsc::channel::<HeaderResponse>();
+        resp_tx
+            .send(HeaderResponse::Batch {
+                start,
+                raws: chain[start as usize..end as usize]
+                    .iter()
+                    .map(raw_header)
+                    .collect(),
+            })
+            .unwrap();
+        (resp_tx, resp_rx)
+    }
+
+    #[test]
+    fn extension_prepends_a_range_linking_into_the_floor() {
+        let chain = build_chain(4040);
+        let store = store_above_2016(&chain);
+        let ticks = store.register_chain_tick();
+        let (req_tx, req_rx) = mpsc::channel::<HeaderRequest>();
+        let (_resp_tx, resp_rx) = serve(&chain, 2016, 4032);
+
+        extend_down(&store, 0, 2100, &req_tx, &resp_rx, &mut VecDeque::new());
+
+        recv_get_headers(&req_rx, 2016, 2016);
+        assert_eq!(store.min_height(), Some(2016), "floor snapped to 2016");
+        assert_eq!(store.tip(), Some(4039));
+        assert_eq!(store.block_hash(2100), Some(chain[2100].block_hash()));
+        assert_eq!(store.block_hash(4032), Some(chain[4032].block_hash()));
+        assert!(ticks.try_recv().is_ok(), "the claims wait for a chain tick");
+    }
+
+    #[test]
+    fn extension_not_linking_into_the_floor_is_refused() {
+        let chain = build_chain(4040);
+        let store = store_above_2016(&chain);
+        let (notif_tx, notif_rx) = mpsc::channel();
+        store.register_notifications(notif_tx);
+        // Valid on its own, but forked from the stored chain: its last header
+        // is not the floor's parent.
+        let fork = build_branch(chain[2015], 2016, 2016, 0x40);
+        let (req_tx, _req_rx) = mpsc::channel::<HeaderRequest>();
+        let (resp_tx, resp_rx) = mpsc::channel::<HeaderResponse>();
+        resp_tx
+            .send(HeaderResponse::Batch {
+                start: 2016,
+                raws: fork.iter().map(raw_header).collect(),
+            })
+            .unwrap();
+
+        extend_down(&store, 0, 2100, &req_tx, &resp_rx, &mut VecDeque::new());
+
+        assert_eq!(store.min_height(), Some(4032), "chain kept as it was");
+        assert_eq!(store.block_hash(2100), None);
+        assert_eq!(store.validation_state(), HeaderValidationState::Valid);
+        assert!(matches!(
+            notif_rx.try_recv().unwrap(),
+            Notification::ValidationFailed(ValidationFailure::HeaderStore(
+                InvalidCause::Validator(ValidatorError::PrevHashMismatch)
+            ))
+        ));
+    }
+
+    #[test]
+    fn extension_short_of_the_floor_is_dropped() {
+        let chain = build_chain(4040);
+        let store = store_above_2016(&chain);
+        let (req_tx, _req_rx) = mpsc::channel::<HeaderRequest>();
+        let (_resp_tx, resp_rx) = serve(&chain, 2016, 3000);
+
+        extend_down(&store, 0, 2100, &req_tx, &resp_rx, &mut VecDeque::new());
+
+        assert_eq!(store.min_height(), Some(4032), "chain kept as it was");
+    }
+
+    #[test]
+    fn extension_into_another_checkpoint_block_refuses_the_chain() {
+        let chain = build_chain(4040);
+        let store = store_with_checkpoint(
+            Network::Regtest,
+            None,
+            Checkpoint::new(2016, BlockHash::all_zeros()).unwrap(),
+        );
+        for (h, header) in chain.iter().enumerate().take(4040).skip(4032) {
+            store.insert_unchecked(h as u32, raw_header(header));
+        }
+        let (req_tx, _req_rx) = mpsc::channel::<HeaderRequest>();
+        let (_resp_tx, resp_rx) = serve(&chain, 2016, 4032);
+
+        extend_down(&store, 0, 2016, &req_tx, &resp_rx, &mut VecDeque::new());
+
+        assert_refused(&store);
+    }
+
+    #[test]
+    fn extension_requests_coalesce_to_the_lowest_below_the_floor() {
+        let chain = build_chain(4040);
+        let store = store_above_2016(&chain);
+        let (req_tx, req_rx) = mpsc::channel::<HeaderRequest>();
+        *store.header_req.lock().unwrap() = Some(req_tx);
+
+        store.request_extend_down(3000);
+        store.request_extend_down(2500);
+        store.request_extend_down(3500);
+        store.request_extend_down(4032);
+
+        assert_eq!(store.extension_wanted(), Some(2500));
+        let wakes = req_rx
+            .try_iter()
+            .filter(|rq| matches!(rq, HeaderRequest::Wake))
+            .count();
+        assert_eq!(wakes, 2, "only a lower height wakes the worker again");
+    }
+
+    #[test]
+    fn extension_is_not_requested_on_an_empty_store() {
+        let store = HeaderStore::new_in_memory(Network::Regtest);
+        store.request_extend_down(100);
+        assert_eq!(store.extension_wanted(), None);
+    }
+
+    #[test]
+    fn woken_worker_extends_the_chain() {
+        // Anchored at a checkpoint at 4032, so the start itself extends
+        // nothing: only the request below does.
+        let chain = build_chain(4040);
+        let store = store_with_checkpoint(
+            Network::Regtest,
+            None,
+            Checkpoint::new(4032, chain[4032].block_hash()).unwrap(),
+        );
+        for (h, header) in chain.iter().enumerate().skip(4032) {
+            store.insert_unchecked(h as u32, raw_header(header));
+        }
+        let (req_tx, req_rx) = mpsc::channel::<HeaderRequest>();
+        let (resp_tx, resp_rx) = mpsc::channel::<HeaderResponse>();
+        *store.header_req.lock().unwrap() = Some(req_tx.clone());
+        let weak = Arc::downgrade(&store);
+        let worker = thread::spawn(move || run_worker(weak, Network::Regtest, 0, req_tx, resp_rx));
+        assert!(matches!(
+            req_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            HeaderRequest::Subscribe
+        ));
+        resp_tx
+            .send(HeaderResponse::Tip {
+                height: 4039,
+                raw: raw_header(&chain[4039]),
+            })
+            .unwrap();
+
+        store.request_extend_down(2100);
+        assert!(matches!(
+            req_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            HeaderRequest::Wake
+        ));
+        resp_tx.send(HeaderResponse::Woken).unwrap();
+        recv_get_headers(&req_rx, 2016, 2016);
+        resp_tx
+            .send(HeaderResponse::Batch {
+                start: 2016,
+                raws: chain[2016..4032].iter().map(raw_header).collect(),
+            })
+            .unwrap();
+
+        assert!(wait_until(Duration::from_secs(5), || store.min_height() == Some(2016)));
+        resp_tx.send(HeaderResponse::Stopped).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_stored_range_above_the_checkpoint_is_extended_down_to_it() {
+        // Rows at 4032..=4035 with a checkpoint at 2016 the server holds: the
+        // chain is extended down to the checkpoint instead of re-anchored.
+        let chain = build_chain(4040);
+        let store = store_with_checkpoint(
+            Network::Regtest,
+            None,
+            Checkpoint::new(2016, chain[2016].block_hash()).unwrap(),
+        );
+        for (h, header) in chain.iter().enumerate().take(4036).skip(4032) {
+            store.insert_unchecked(h as u32, raw_header(header));
+        }
+        let (req_tx, _req_rx) = mpsc::channel::<HeaderRequest>();
+        let (resp_tx, resp_rx) = serve(&chain, 2016, 4032);
+        resp_tx
+            .send(HeaderResponse::Batch {
+                start: 4036,
+                raws: chain[4036..4039].iter().map(raw_header).collect(),
+            })
+            .unwrap();
+
+        let ok = initial_sync(
+            &store,
+            Network::Regtest,
+            0,
+            (4039, raw_header(&chain[4039])),
+            &req_tx,
+            &resp_rx,
+            &mut VecDeque::new(),
+        );
+
+        assert!(ok);
+        assert_eq!(store.min_height(), Some(2016));
+        assert_eq!(store.block_hash(2016), Some(chain[2016].block_hash()));
+        assert_eq!(store.validation_state(), HeaderValidationState::Valid);
     }
 }

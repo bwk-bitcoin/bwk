@@ -1409,6 +1409,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn claim_below_the_floor_asks_for_an_extension() {
+        let (coin_store, _deriv) = bare_coin_store();
+        let (mut map, _tip) = build_header_map(20);
+        map.retain(|h, _| *h >= 10);
+        let header_store = HeaderStore::from_map(Network::Regtest, map);
+        let (notif_tx, _notif_rx) = mpsc::channel();
+        {
+            let mut store = coin_store.lock().unwrap();
+            for (value, height) in [(0.1, 7), (0.2, 4)] {
+                let tx = funding_tx(bitcoin::ScriptBuf::new(), value);
+                store
+                    .tx_store_mut()
+                    .update(crate::tx_store::TxEntry::for_test(tx.clone()));
+                store.insert_pending_claim(ClaimAt {
+                    txid: tx.compute_txid(),
+                    height,
+                });
+            }
+        }
+
+        on_chain_update(&coin_store, &header_store, &notif_tx, ListenerId::next());
+
+        assert_eq!(header_store.extension_wanted(), Some(4));
+    }
+
     // Refusal path: a tampered merkle branch against a header whose hash
     // still matches the entry's stored hash must notify
     // `ValidationFailed(MerkleProof)` and move the entry to the terminal
