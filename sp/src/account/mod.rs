@@ -23,7 +23,6 @@ use {
             config::Config,
             recipient::{SpChangeRecipientProvider, SpSecretProvider},
             tx_store::{header_time, SpTxEntry, SpTxStore},
-            unified::{CoinOrigin, SubAccountKind},
         },
         blindbit::{self, InfoResponse},
         core::utils::common::SilentPaymentAddress,
@@ -45,7 +44,7 @@ use {
             header_follower::HeaderFollower,
             header_store::HeaderStore,
             label_store::{LabelKey, LabelStore},
-            notification::{Notification, SpNotification},
+            notification::{CoinOrigin, Notification, SpNotification, SubAccountKind},
             profile::{DefaultBackend, RamProfile},
             raw_client::CertificateCheck,
             reconcile::Reconciler,
@@ -1213,7 +1212,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     /// [`UnifiedCoin::spendable`](crate::account::unified::UnifiedCoin::spendable) to keep only
     /// live UTXOs.
     pub fn all_coins(&self) -> BTreeMap<OutPoint, crate::account::unified::UnifiedCoin> {
-        use crate::account::unified::{CoinOrigin, SubAccountKind, UnifiedCoin};
+        use crate::account::unified::UnifiedCoin;
         let mut out: BTreeMap<OutPoint, UnifiedCoin> = BTreeMap::new();
 
         for (outpoint, entry) in self.coins() {

@@ -10,13 +10,14 @@ use std::{
 
 use bitcoin::{bip32::ChildNumber, Network};
 use bwk::{
-    bwk_electrum::{checkpoint::Checkpoint, config::Endpoint, raw_client::CertificateCheck},
+    bwk_electrum::{
+        checkpoint::Checkpoint, config::Endpoint, notification::SubAccountKind,
+        raw_client::CertificateCheck,
+    },
     miniscript::{Descriptor, DescriptorPublicKey},
 };
 use bwk_sign::{bwk_descriptor, hot_signer::HotSigner};
 use serde::{Deserialize, Serialize};
-
-use crate::account::unified::SubAccountKind;
 
 /// Default filename a [`bwk::persist::config_store::FileConfigStore`] uses for an
 /// SP account's config. Consumers are free to choose another path

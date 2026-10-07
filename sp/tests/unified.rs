@@ -8,7 +8,10 @@
 mod common;
 
 use bitcoin::Amount;
-use bwk_sp::account::unified::{CoinOrigin, SpendableSummary, SubAccountKind};
+use bwk_sp::{
+    account::unified::SpendableSummary,
+    bwk::bwk_electrum::notification::{CoinOrigin, SubAccountKind},
+};
 use common::test_account_named;
 
 #[test]
