@@ -158,6 +158,12 @@ where
                 Dispatch::Terminate
             }
         }
+        HeaderRequest::Wake => {
+            if send.send(HeaderResponse::Woken.into()).is_err() {
+                return Dispatch::Terminate;
+            }
+            Dispatch::Empty
+        }
         HeaderRequest::Stop => {
             let _ = send.send(HeaderResponse::Stopped.into());
             Dispatch::Terminate

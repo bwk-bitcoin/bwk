@@ -247,7 +247,13 @@ impl CoinResponse {
 #[derive(Clone, Debug)]
 pub enum HeaderRequest {
     Subscribe,
-    GetHeaders { start: u32, count: u32 },
+    GetHeaders {
+        start: u32,
+        count: u32,
+    },
+    /// Answered at once with [`HeaderResponse::Woken`], without reaching the
+    /// server: lets another thread wake the worker blocked on the responses.
+    Wake,
     Stop,
 }
 
@@ -283,6 +289,7 @@ pub enum HeaderResponse {
         raws: Vec<[u8; Header::SIZE]>,
     },
     Stopped,
+    Woken,
     Error(HeaderError),
 }
 
@@ -310,6 +317,7 @@ impl Debug for HeaderResponse {
                 .field("count", &raws.len())
                 .finish(),
             Self::Stopped => write!(f, "Stopped"),
+            Self::Woken => write!(f, "Woken"),
             Self::Error(e) => write!(f, "Error({e})"),
         }
     }

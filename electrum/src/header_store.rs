@@ -118,6 +118,9 @@ where
     /// A block the consumer vouches for: the chain is anchored at it and must
     /// hold it at its height.
     checkpoint: Option<Checkpoint>,
+    /// Lowest height a claim below the stored floor waits at, for the worker
+    /// to extend the chain down to. Requests coalesce here.
+    extend_down: Mutex<Option<u32>>,
     /// Request side of the header worker's client, kept so `stop` can close
     /// the connection instead of waiting out the worker's receive timeout.
     header_req: Mutex<Option<mpsc::Sender<HeaderRequest>>>,
@@ -296,6 +299,8 @@ pub(crate) enum MutateError {
     BadAnchor,
     #[error("header at the checkpoint height is not the checkpoint block")]
     Checkpoint,
+    #[error("the range does not end right below a stored header")]
+    Unlinked,
 }
 
 #[derive(Debug)]
@@ -383,6 +388,7 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
             writer_token: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
             checkpoint: None,
+            extend_down: Mutex::new(None),
             header_req: Mutex::new(None),
             merkle_req: Mutex::new(None),
             merkle: Arc::default(),
@@ -620,6 +626,7 @@ where
             writer_token: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
             checkpoint,
+            extend_down: Mutex::new(None),
             header_req: Mutex::new(None),
             merkle_req: Mutex::new(None),
             merkle: Arc::default(),
@@ -969,6 +976,41 @@ where
         }
     }
 
+    /// Prepend `raws`, the headers from `low` up to the stored floor, all or
+    /// nothing: the range topped by the floor header must replay as one chain,
+    /// which proves it links into the stored one and gives the floor the
+    /// retarget check it was anchored without.
+    fn prepend(
+        &self,
+        token: u64,
+        low: u32,
+        raws: &[[u8; Header::SIZE]],
+    ) -> Result<(), MutateError> {
+        let floor = low + raws.len() as u32;
+        let network = self.network;
+        let res = self.with_writer(token, |inner| -> Result<(), MutateError> {
+            let floor_raw = inner.store.get(&floor)?.ok_or(MutateError::Unlinked)?;
+            let mut range: BTreeMap<u32, [u8; Header::SIZE]> =
+                (low..).zip(raws.iter().copied()).collect();
+            range.insert(floor, floor_raw);
+            replay_validate(network, &range, |_, _| {})?;
+            for (h, raw) in range.range(..floor) {
+                self.hold_checkpoint(inner, *h, raw)?;
+                inner.store.insert(*h, *raw)?;
+            }
+            inner.store.flush()?;
+            Ok(())
+        });
+        match res {
+            Some(Ok(())) => {
+                self.notify_listeners();
+                Ok(())
+            }
+            Some(Err(e)) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     /// Refuse the chain when `raw` at `h` is another block than the
     /// consumer's checkpoint: the server serves a chain the consumer does not
     /// vouch for, so the whole chain is wiped and flagged `Invalid`, not just
@@ -1023,6 +1065,26 @@ where
             .keys()
             .ok()?
             .next()
+    }
+
+    /// Ask the worker to extend the chain down to `height`, for a tx the
+    /// server reports confirmed below the stored floor. A no-op at or above
+    /// the floor, or below a lower height already asked for. The claims
+    /// waiting there resolve on the chain tick the extension ends with.
+    pub fn request_extend_down(&self, height: u32) {
+        if self.min_height().is_none_or(|floor| height >= floor) {
+            return;
+        }
+        {
+            let mut wanted = self.extend_down.lock().expect("poisoned");
+            if wanted.is_some_and(|lowest| lowest <= height) {
+                return;
+            }
+            *wanted = Some(height);
+        }
+        if let Some(req) = self.header_req.lock().expect("poisoned").as_ref() {
+            let _ = req.send(HeaderRequest::Wake);
+        }
     }
 
     pub fn tip(&self) -> Option<u32> {
@@ -1702,6 +1764,17 @@ fn run_worker(
             apply_one(&store, token, h, raw, &req_tx, &resp_rx, &mut deferred);
         }
 
+        let Some(store) = weak.upgrade() else {
+            return;
+        };
+        let wanted = store.extend_down.lock().expect("poisoned").take();
+        if let Some(height) = wanted {
+            extend_down(&store, token, height, &req_tx, &resp_rx, &mut deferred);
+            continue;
+        }
+        // Not held across the wait: the worker must not keep the store alive.
+        drop(store);
+
         let resp = match resp_rx.recv_timeout(RECV_TIMEOUT) {
             Ok(r) => r,
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -1740,6 +1813,8 @@ fn run_worker(
                 }
             }
             HeaderResponse::Stopped => return,
+            // The loop top takes the extension it was woken for.
+            HeaderResponse::Woken => {}
             HeaderResponse::Error(e) => {
                 log::warn!("HeaderStore::run_worker: server error: {e}");
             }
@@ -1800,16 +1875,26 @@ fn initial_sync(
     let (tip_h, _) = server_tip;
 
     // With a checkpoint the chain is anchored at it, without one an empty
-    // store starts one retarget period below the server tip.
+    // store starts one retarget period below the server tip. Anything older
+    // comes from the downward extension.
     let low = match store.checkpoint {
         Some(checkpoint) => checkpoint.height(),
         None => backfill_floor(tip_h, network),
     };
 
-    // A stored range starting above the wanted floor cannot reach it (the
-    // checkpoint below it, or a server tip behind it): wipe it so the
-    // first-boot anchor logic below re-anchors at `low`; headers are a
-    // refetchable cache.
+    // A checkpoint below the stored range moves the wanted floor below the
+    // stored one: extend the verified chain down to it, when the server holds
+    // that range.
+    if store
+        .min_height()
+        .is_some_and(|min| low < min && min <= tip_h)
+    {
+        extend_down(store, token, low, req_tx, resp_rx, deferred);
+    }
+
+    // A stored range still starting above the wanted floor (the extension
+    // failed, or the server tip is behind it) is wiped so the first-boot anchor
+    // logic below re-anchors at `low`; headers are a refetchable cache.
     if store.min_height().is_some_and(|min| low < min) {
         log::warn!(
             "HeaderStore::initial_sync: stored range cannot reach floor {low}; wiping and re-anchoring"
@@ -1889,6 +1974,63 @@ fn initial_sync(
     }
 
     true
+}
+
+/// Fetch the headers from the retarget boundary at or below `height` up to the
+/// stored floor, so every retarget in the range has its window, and prepend
+/// them once they verify and link into the floor. A range that fails is
+/// dropped and the chain kept; one that fails validation is reported as
+/// `ValidationFailed`.
+fn extend_down(
+    store: &Arc<HeaderStore>,
+    token: u64,
+    height: u32,
+    req_tx: &mpsc::Sender<HeaderRequest>,
+    resp_rx: &mpsc::Receiver<HeaderResponse>,
+    deferred: &mut VecDeque<(u32, [u8; Header::SIZE])>,
+) {
+    let Some(floor) = store.min_height().filter(|floor| height < *floor) else {
+        return;
+    };
+    let low = snap(height, store.network);
+    store.publish_progress(HeaderProgressEvent::Started {
+        phase: HeaderProgressPhase::InitialSync,
+        start: low,
+        end: floor - 1,
+    });
+    let mut raws = Vec::with_capacity((floor - low) as usize);
+    while low + (raws.len() as u32) < floor {
+        let start = low + raws.len() as u32;
+        let count = (floor - start).min(backfill_chunk(store.network));
+        match request_headers(req_tx, resp_rx, start, count, deferred) {
+            Some(batch) if batch.len() == count as usize => raws.extend(batch),
+            _ => {
+                log::warn!("HeaderStore::extend_down: no full batch at start={start}");
+                store.publish_progress(HeaderProgressEvent::Failed {
+                    phase: HeaderProgressPhase::InitialSync,
+                });
+                return;
+            }
+        }
+    }
+    match store.prepend(token, low, &raws) {
+        Ok(()) => store.publish_progress(HeaderProgressEvent::Completed {
+            phase: HeaderProgressPhase::InitialSync,
+        }),
+        Err(e) => {
+            log::warn!("HeaderStore::extend_down: range {low}..{floor} refused: {e}");
+            store.publish_progress(HeaderProgressEvent::Failed {
+                phase: HeaderProgressPhase::InitialSync,
+            });
+            if let MutateError::Validate(e) = e {
+                store.notifications.notify_with(|| {
+                    Notification::ValidationFailed(ValidationFailure::HeaderStore(
+                        InvalidCause::Validator(e.clone()),
+                    ))
+                });
+            }
+        }
+    }
 }
 
 /// Apply a single incoming header at height `h`. Fast-path on contiguous
@@ -2225,6 +2367,8 @@ fn receive_headers(
                 log::warn!("HeaderStore::request_headers: server error: {e}");
             }
             HeaderResponse::Stopped => return RequestHeadersOutcome::Cancelled,
+            // The extension it woke the worker for stays queued for the loop.
+            HeaderResponse::Woken => {}
         }
     }
 }
@@ -3043,6 +3187,7 @@ mod tests {
             writer_token: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
             checkpoint: None,
+            extend_down: Mutex::new(None),
             header_req: Mutex::new(None),
             merkle_req: Mutex::new(None),
             merkle: Arc::default(),

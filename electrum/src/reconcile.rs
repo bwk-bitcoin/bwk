@@ -462,8 +462,14 @@ fn on_chain_update<P: ScanProfile>(
     let changed = reverify.changed || promote.changed;
     let mut to_fetch = reverify.to_fetch;
     to_fetch.extend(promote.to_fetch);
+    let lowest_claim = store.pending_claim_heights().first().copied();
 
     commit_chain_update(store, notification, changed);
+    // A claim below the chain's floor never finds its header: have the chain
+    // extended down to it, the claim resolves on the tick that follows.
+    if let Some(height) = lowest_claim {
+        header_store.request_extend_down(height);
+    }
     queue_merkle_fetches::<P>(header_store, merkle_id, to_fetch);
 }
 
