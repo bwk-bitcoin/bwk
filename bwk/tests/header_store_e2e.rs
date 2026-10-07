@@ -132,7 +132,6 @@ fn multi_account_shared_header_store() {
         Network::Regtest,
         None,
         None,
-        None,
         CertificateCheck::Validate,
     )
     .unwrap();
@@ -301,7 +300,6 @@ fn reorg_reconfirms_verified() {
         Network::Regtest,
         None,
         None,
-        None,
         CertificateCheck::Validate,
     )
     .unwrap();
@@ -431,7 +429,6 @@ fn restart_requeues_stranded_merkle_fetch() {
         Network::Regtest,
         None,
         None,
-        None,
         CertificateCheck::Validate,
     )
     .unwrap();
@@ -483,7 +480,7 @@ fn restart_requeues_stranded_merkle_fetch() {
     );
 }
 
-/// Sparse-anchor sync across the retarget-interval floor: with a birthday
+/// Sparse-anchor sync across the retarget-interval floor: with a server tip
 /// past two retarget intervals (2 * 2016), `backfill_floor` lands on the
 /// previous boundary (height 2016) instead of saturating to genesis, so
 /// the worker anchors the chain via `append_anchor` and merkle
@@ -501,13 +498,12 @@ fn sparse_anchor_above_retarget_boundary_syncs_and_verifies() {
     let chain_tip = get_block_height(&bitcoind);
     assert!(chain_tip >= 4132, "chain too short: {chain_tip}");
 
-    // min_height 4100 snaps to 4032 and pads one interval back to 2016.
+    // The server tip snaps to 4032 and pads one interval back to 2016.
     let header_store = HeaderStore::start(
         url.clone(),
         port,
         Network::Regtest,
         None,
-        Some(4100),
         None,
         CertificateCheck::Validate,
     )

@@ -38,8 +38,8 @@ fn restart_from_cache_skips_full_validation() {
     let persist_dir = TempDir::new().unwrap();
     let persist_path = persist_dir.path().join(HEADERS_FILENAME);
 
-    // First boot: sync headers from a relatively low `min_height` so the
-    // backfill writes a meaningful range to disk.
+    // First boot: the regtest tip is low, so the backfill starts at genesis
+    // and writes a meaningful range to disk.
     let initial_tip = get_block_height(&bitcoind);
     let expected_tip = {
         let store = HeaderStore::start(
@@ -47,7 +47,6 @@ fn restart_from_cache_skips_full_validation() {
             port,
             Network::Regtest,
             Some(persist_path.clone()),
-            Some(0),
             None,
             CertificateCheck::Validate,
         )
@@ -121,7 +120,6 @@ fn restart_from_cache_skips_full_validation() {
                 port,
                 Network::Regtest,
                 Some(persist_path.clone()),
-                Some(0),
                 None,
                 CertificateCheck::Validate,
             ) {
@@ -156,8 +154,8 @@ fn deep_reorg_below_anchor_resyncs() {
     init_logger();
     let (url, port, _electrsd, bitcoind) = bootstrap_electrs();
 
-    // Mine extra blocks so we can anchor the cache above genesis and then
-    // reorg below that anchor.
+    // Mine extra blocks so the reorg below lands under the tip the cache was
+    // synced to.
     generate(&bitcoind, 20);
     let chain_tip = get_block_height(&bitcoind);
     let anchor = chain_tip - 2;
@@ -167,7 +165,6 @@ fn deep_reorg_below_anchor_resyncs() {
         port,
         Network::Regtest,
         None,
-        Some(anchor),
         None,
         CertificateCheck::Validate,
     )

@@ -115,9 +115,6 @@ where
     /// Set by `stop` to idle the worker without spawning a replacement. The
     /// worker checks it alongside the token and self-exits when true.
     stopped: AtomicBool,
-    /// Backfill floor remembered at `start`, reused by `restart`. `None`
-    /// until a worker is spawned.
-    worker: Mutex<Option<BackfillFloor>>,
     /// A block the consumer vouches for: the chain is anchored at it and must
     /// hold it at its height.
     checkpoint: Option<Checkpoint>,
@@ -229,11 +226,6 @@ pub struct MerkleProof {
     /// [`verify_merkle_branch`].
     pub branch: Vec<[u8; MERKLE_HASH_BYTES]>,
     pub pos: u32,
-}
-
-#[derive(Debug)]
-struct BackfillFloor {
-    min_height: Option<u32>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -390,7 +382,6 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
             progress_listeners: Mutex::new(ProgressListeners::default()),
             writer_token: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
-            worker: Mutex::new(None),
             checkpoint: None,
             header_req: Mutex::new(None),
             merkle_req: Mutex::new(None),
@@ -405,9 +396,8 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
     /// dedicated background worker that drives initial sync, applies
     /// incoming tip notifications, and resolves reorgs.
     ///
-    /// `path == None` yields an in-memory store. `min_height == Some(h)`
-    /// snaps the initial backfill down to the nearest 2016-block boundary
-    /// at or below `h`; `None` starts from the server-reported tip.
+    /// `path == None` yields an in-memory store. Without a checkpoint an empty
+    /// store starts one retarget period below the server tip.
     ///
     /// The worker thread holds a `Weak<HeaderStore>` so it exits cleanly
     /// once the last public `Arc` is dropped. `checkpoint` as for
@@ -417,7 +407,6 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
         electrum_port: u16,
         network: Network,
         path: Option<PathBuf>,
-        min_height: Option<u32>,
         checkpoint: Option<Checkpoint>,
         certificate_check: CertificateCheck,
     ) -> Result<Arc<Self>, StartError> {
@@ -426,7 +415,6 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
             Some(electrum_port),
             network,
             path,
-            min_height,
             checkpoint,
             certificate_check,
         )
@@ -446,8 +434,8 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
     /// re-attempt.
     ///
     /// `checkpoint` binds the chain to a block the consumer vouches for: the
-    /// chain is anchored at it, `min_height` then unused, and a chain holding
-    /// another block at its height is refused.
+    /// chain is anchored at it, and a chain holding another block at its
+    /// height is refused.
     ///
     /// # Panics
     ///
@@ -458,7 +446,6 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
         port: Option<u16>,
         network: Network,
         path: Option<PathBuf>,
-        min_height: Option<u32>,
         checkpoint: Option<Checkpoint>,
         certificate_check: CertificateCheck,
     ) -> Result<Arc<Self>, StartError> {
@@ -479,7 +466,7 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
             }
         };
         if let (Some(url), Some(port)) = (url, port) {
-            store.spawn_worker(&url, port, min_height, certificate_check)?;
+            store.spawn_worker(&url, port, certificate_check)?;
         }
         Ok(store)
     }
@@ -487,8 +474,7 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
     /// Reconnect the background worker to `url:port` after the previous
     /// connection died. Clears the stop flag and bumps the writer token so the
     /// superseded worker self-exits and its in-flight mutations become no-ops,
-    /// then spawns a fresh worker (the sole writer under the new token) reusing
-    /// the backfill floor remembered at [`start`](Self::start).
+    /// then spawns a fresh worker (the sole writer under the new token).
     ///
     /// `certificate_check` is the caller's, not remembered: a store that opened
     /// idle never held one, and reconnecting under the default would strand a
@@ -499,24 +485,22 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
         port: u16,
         certificate_check: CertificateCheck,
     ) -> Result<(), StartError> {
-        let min_height = self.remembered_min_height();
         // Close the previous pair rather than leaving its sockets open until
         // the superseded worker times out and drops its request sender.
         self.stop();
         self.stopped.store(false, Ordering::SeqCst);
         self.writer_token.fetch_add(1, Ordering::SeqCst);
-        self.spawn_worker(&url, port, min_height, certificate_check)
+        self.spawn_worker(&url, port, certificate_check)
     }
 
-    /// Connect a fresh worker pair to `url:port` and record the backfill floor
-    /// with the writer token it was spawned under: the header worker that
+    /// Connect a fresh worker pair to `url:port` under the current writer
+    /// token: the header worker that
     /// drives sync and reorg resolution, plus the merkle client the validator
     /// fetches inclusion proofs over.
     fn spawn_worker(
         self: &Arc<Self>,
         url: &str,
         port: u16,
-        min_height: Option<u32>,
         certificate_check: CertificateCheck,
     ) -> Result<(), StartError> {
         let client = connect(url, port, certificate_check)?;
@@ -526,7 +510,6 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
         let merkle = connect(url, port, certificate_check)?;
         let (req_tx, resp_rx) = client.listen_headers::<HeaderRequest, HeaderResponse>();
         let token = self.writer_token.load(Ordering::SeqCst);
-        *self.worker.lock().expect("poisoned") = Some(BackfillFloor { min_height });
         *self.header_req.lock().expect("poisoned") = Some(req_tx.clone());
         self.spawn_merkle_client(merkle, token);
         let weak = Arc::downgrade(self);
@@ -534,7 +517,7 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
         self.header_worker
             .lock()
             .expect("poisoned")
-            .start(move |_| run_worker(weak, network, min_height, token, req_tx, resp_rx));
+            .start(move |_| run_worker(weak, network, token, req_tx, resp_rx));
         Ok(())
     }
 
@@ -636,7 +619,6 @@ where
             progress_listeners: Mutex::new(ProgressListeners::default()),
             writer_token: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
-            worker: Mutex::new(None),
             checkpoint,
             header_req: Mutex::new(None),
             merkle_req: Mutex::new(None),
@@ -1032,16 +1014,6 @@ where
         }
     }
 
-    /// Backfill floor remembered when the worker was spawned, reused by
-    /// `restart` and by the below-floor re-sync in `resolve_reorg`.
-    fn remembered_min_height(&self) -> Option<u32> {
-        self.worker
-            .lock()
-            .expect("poisoned")
-            .as_ref()
-            .and_then(|w| w.min_height)
-    }
-
     /// Lowest stored height (used by the worker to bound reorg walk-back).
     fn min_height(&self) -> Option<u32> {
         self.inner
@@ -1375,9 +1347,8 @@ fn sanity_check(
     if span != headers.len() {
         return Err(InvalidCause::Sanity);
     }
-    // A sparse-anchored cache (min > 0) sits exactly on a retarget boundary
-    // (the previous boundary below the account's min_height), matching
-    // `backfill_floor`: this is what guarantees every retarget boundary at or
+    // A sparse-anchored cache (min > 0) sits exactly on a retarget boundary,
+    // matching `backfill_floor` and the checkpoint: this is what guarantees every retarget boundary at or
     // above the anchor has a full ancestor window. A violation fails loud
     // rather than silently validating with a partial window.
     if min != 0 && min % backfill_chunk(network) != 0 {
@@ -1561,29 +1532,15 @@ fn snap(h: u32, network: Network) -> u32 {
     h - h % chunk
 }
 
-/// Backfill floor: `min_height` (or the server tip when absent) snapped down
-/// to a retarget boundary, then padded down by a full retarget interval so the
-/// anchor lands on the previous retarget boundary. Every retarget boundary at
-/// or above the snapped boundary then has a complete ancestor window for its
+/// Where a chain without a checkpoint starts: the server tip `tip_h` snapped
+/// down to a retarget boundary, then padded down by a full retarget interval
+/// so the anchor lands on the previous boundary. Every retarget boundary at or
+/// above the snapped one then has a complete ancestor window for its
 /// difficulty check. The anchor itself is stored PoW-only (`append_anchor`),
-/// so its own retarget is skipped. Only used without a checkpoint, which is
-/// the anchor otherwise. The handful of headers just above the anchor
-/// keep the anchor-relative MTP relaxation, but they all sit below the
-/// account's `min_height` and are never account relevant. Saturates at zero
-/// near genesis.
-fn backfill_floor(min_height: Option<u32>, tip_h: u32, network: Network) -> u32 {
-    let snapped = snap(min_height.unwrap_or(tip_h), network);
-    snapped.saturating_sub(backfill_chunk(network))
-}
-
-/// True when the stored range cannot be contiguously extended down to `low`
-/// (the wanted floor is below the stored floor, after a lowered birthday)
-/// or up to it (a gap separates the stored tip from `low`).
-fn needs_reanchor(min_stored: Option<u32>, stored_tip: Option<u32>, low: u32) -> bool {
-    match (min_stored, stored_tip) {
-        (Some(min), Some(tip)) => low < min || tip.saturating_add(1) < low,
-        _ => false,
-    }
+/// so its own retarget is skipped, and the handful of headers just above it
+/// keep the anchor-relative MTP relaxation. Saturates at zero near genesis.
+fn backfill_floor(tip_h: u32, network: Network) -> u32 {
+    snap(tip_h, network).saturating_sub(backfill_chunk(network))
 }
 
 const REORG_WALK_CHUNK: u32 = 20;
@@ -1650,7 +1607,6 @@ fn wait_for_replay(weak: &Weak<HeaderStore>, token: u64) -> bool {
 fn run_worker(
     weak: Weak<HeaderStore>,
     network: Network,
-    min_height: Option<u32>,
     token: u64,
     req_tx: mpsc::Sender<HeaderRequest>,
     resp_rx: mpsc::Receiver<HeaderResponse>,
@@ -1704,7 +1660,6 @@ fn run_worker(
             if !initial_sync(
                 &store,
                 network,
-                min_height,
                 token,
                 server_tip,
                 &req_tx,
@@ -1836,7 +1791,6 @@ fn fetch_and_verify_genesis(
 fn initial_sync(
     store: &Arc<HeaderStore>,
     network: Network,
-    min_height: Option<u32>,
     token: u64,
     server_tip: (u32, [u8; Header::SIZE]),
     req_tx: &mpsc::Sender<HeaderRequest>,
@@ -1845,18 +1799,18 @@ fn initial_sync(
 ) -> bool {
     let (tip_h, _) = server_tip;
 
-    // With a checkpoint the chain is anchored at it. A stored range starting
-    // above it cannot reach it and is re-anchored there.
+    // With a checkpoint the chain is anchored at it, without one an empty
+    // store starts one retarget period below the server tip.
     let low = match store.checkpoint {
         Some(checkpoint) => checkpoint.height(),
-        None => backfill_floor(min_height, tip_h, network),
+        None => backfill_floor(tip_h, network),
     };
 
-    // A persisted range that cannot extend down to the wanted floor (lowered
-    // birthday) or up from its tip to it (floor above the stored tip) is
-    // wiped so the first-boot anchor logic below re-anchors at `low`;
-    // headers are a refetchable cache.
-    if needs_reanchor(store.min_height(), store.tip(), low) {
+    // A stored range starting above the wanted floor cannot reach it (the
+    // checkpoint below it, or a server tip behind it): wipe it so the
+    // first-boot anchor logic below re-anchors at `low`; headers are a
+    // refetchable cache.
+    if store.min_height().is_some_and(|min| low < min) {
         log::warn!(
             "HeaderStore::initial_sync: stored range cannot reach floor {low}; wiping and re-anchoring"
         );
@@ -1887,11 +1841,8 @@ fn initial_sync(
         }
     }
 
-    let mut start = store
-        .tip()
-        .map(|t| t.saturating_add(1))
-        .unwrap_or(low)
-        .max(low);
+    // A stored range is continued from its tip.
+    let mut start = store.tip().map(|t| t.saturating_add(1)).unwrap_or(low);
     let progress_end = tip_h.saturating_sub(1);
     let mut progress_started = false;
     if start < tip_h {
@@ -2049,13 +2000,10 @@ fn find_fork_point(
             );
             store.wipe(token);
             // Re-anchor from scratch so the worker self-heals instead of
-            // staying dormant until the next restart. Reuse the backfill
-            // floor remembered at start.
-            let min_height = store.remembered_min_height();
+            // staying dormant until the next restart.
             if initial_sync(
                 store,
                 store.network,
-                min_height,
                 token,
                 (incoming_h, incoming_raw),
                 req_tx,
@@ -2514,20 +2462,6 @@ mod tests {
     }
 
     #[test]
-    fn needs_reanchor_detects_lowered_floor_and_gap() {
-        // Lowered floor: wanted low below the stored floor.
-        assert!(needs_reanchor(Some(4032), Some(4035), 0));
-        // Gap: stored tip cannot extend contiguously up to low.
-        assert!(needs_reanchor(Some(0), Some(3), 2016));
-        // Contiguous resume cases.
-        assert!(!needs_reanchor(Some(0), Some(3), 0));
-        assert!(!needs_reanchor(Some(2016), Some(4031), 2016));
-        assert!(!needs_reanchor(Some(0), Some(3), 4));
-        // Empty store: first-boot anchor logic handles it, no wipe needed.
-        assert!(!needs_reanchor(None, None, 2016));
-    }
-
-    #[test]
     fn worker_waits_for_replay_validation() {
         let chain = build_chain(3);
         let store = store_with_chain(&chain);
@@ -2536,8 +2470,7 @@ mod tests {
         let (req_tx, req_rx) = mpsc::channel::<HeaderRequest>();
         let (resp_tx, resp_rx) = mpsc::channel::<HeaderResponse>();
         let weak = Arc::downgrade(&store);
-        let worker =
-            thread::spawn(move || run_worker(weak, Network::Regtest, None, 0, req_tx, resp_rx));
+        let worker = thread::spawn(move || run_worker(weak, Network::Regtest, 0, req_tx, resp_rx));
 
         // Parked: no Subscribe while replay validation is pending.
         assert!(req_rx.recv_timeout(Duration::from_millis(200)).is_err());
@@ -2568,7 +2501,7 @@ mod tests {
         let token = store.writer_token.load(Ordering::SeqCst);
         let weak = Arc::downgrade(&store);
         let worker =
-            thread::spawn(move || run_worker(weak, Network::Regtest, None, token, req_tx, resp_rx));
+            thread::spawn(move || run_worker(weak, Network::Regtest, token, req_tx, resp_rx));
 
         worker.join().unwrap();
         assert!(
@@ -2589,8 +2522,7 @@ mod tests {
         let (_resp_tx, resp_rx) = mpsc::channel::<HeaderResponse>();
         let weak = Arc::downgrade(&store);
         // Spawned under token 0.
-        let worker =
-            thread::spawn(move || run_worker(weak, Network::Regtest, None, 0, req_tx, resp_rx));
+        let worker = thread::spawn(move || run_worker(weak, Network::Regtest, 0, req_tx, resp_rx));
 
         // Supersede it (as `restart` does) while it is parked on Validating.
         store.writer_token.fetch_add(1, Ordering::SeqCst);
@@ -2793,7 +2725,6 @@ mod tests {
         let ok = initial_sync(
             &store,
             Network::Regtest,
-            None,
             0,
             (10, raw_header(&chain[10])),
             &req_tx,
@@ -2809,40 +2740,41 @@ mod tests {
     }
 
     #[test]
-    fn initial_sync_reanchors_over_gap() {
-        // Persisted rows at 0..=3, but min_height jumped to 4040 (floor
-        // 2016): the gap cannot be extended contiguously, so the store is
-        // wiped and a sparse anchor lands at 2016 via `append_anchor`.
-        let old = build_chain(4);
-        let store = store_with_chain(&old);
-
-        let fresh = build_chain(6);
-        let (req_tx, _req_rx) = mpsc::channel::<HeaderRequest>();
+    fn initial_sync_continues_a_stored_range_from_its_tip() {
+        // Persisted rows at 0..=3 and a server tip at 4100, whose floor would
+        // be 2016: the stored range is kept and synced forward from its tip.
+        let chain = build_chain(4101);
+        let store = store_with_chain(&chain[..4]);
+        let (req_tx, req_rx) = mpsc::channel::<HeaderRequest>();
         let (resp_tx, resp_rx) = mpsc::channel::<HeaderResponse>();
-        resp_tx
-            .send(HeaderResponse::Batch {
-                start: 2016,
-                raws: fresh[0..5].iter().map(raw_header).collect(),
-            })
-            .unwrap();
+        for (start, end) in [(4, 2020), (2020, 4036), (4036, 4100)] {
+            resp_tx
+                .send(HeaderResponse::Batch {
+                    start,
+                    raws: chain[start as usize..end as usize]
+                        .iter()
+                        .map(raw_header)
+                        .collect(),
+                })
+                .unwrap();
+        }
         let mut deferred: VecDeque<(u32, [u8; Header::SIZE])> = VecDeque::new();
 
         let ok = initial_sync(
             &store,
             Network::Regtest,
-            Some(4040),
             0,
-            (2021, raw_header(&fresh[5])),
+            (4100, raw_header(&chain[4100])),
             &req_tx,
             &resp_rx,
             &mut deferred,
         );
 
         assert!(ok);
-        assert_eq!(store.min_height(), Some(2016), "sparse anchor at the floor");
-        assert_eq!(store.tip(), Some(2020));
-        assert_eq!(store.block_hash(2016), Some(fresh[0].block_hash()));
-        assert!(store.block_hash(0).is_none(), "old rows must be wiped");
+        recv_get_headers(&req_rx, 4, 2016);
+        assert_eq!(store.min_height(), Some(0), "stored rows kept");
+        assert_eq!(store.tip(), Some(4099));
+        assert_eq!(store.block_hash(4099), Some(chain[4099].block_hash()));
     }
 
     // The `chunk_start <= min_stored` wipe branch of `find_fork_point`: a
@@ -3110,7 +3042,6 @@ mod tests {
             progress_listeners: Mutex::new(ProgressListeners::default()),
             writer_token: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
-            worker: Mutex::new(None),
             checkpoint: None,
             header_req: Mutex::new(None),
             merkle_req: Mutex::new(None),
@@ -3265,7 +3196,7 @@ mod tests {
         // ancestors above the anchor, failing the length assertion below.
         let network = Network::Bitcoin;
         let chunk = backfill_chunk(network);
-        let floor = backfill_floor(Some(chunk * 2), 0, network);
+        let floor = backfill_floor(chunk * 2, network);
         assert_eq!(floor, chunk);
         let span = header_validator::MTP_WINDOW as u32 + 10;
 
@@ -3875,8 +3806,8 @@ mod tests {
         // A min_height inside the first retarget period snaps to 0, and the
         // retarget-interval padding must saturate rather than underflow.
         let network = Network::Bitcoin;
-        assert_eq!(backfill_floor(Some(5), 0, network), 0);
-        assert_eq!(backfill_floor(None, 0, network), 0);
+        assert_eq!(backfill_floor(5, network), 0);
+        assert_eq!(backfill_floor(0, network), 0);
     }
 
     #[test]
@@ -3888,10 +3819,7 @@ mod tests {
         let network = Network::Bitcoin;
         let chunk = backfill_chunk(network);
         let boundary = chunk * 2;
-        assert_eq!(
-            backfill_floor(Some(boundary + 5), 0, network),
-            boundary - chunk
-        );
+        assert_eq!(backfill_floor(boundary + 5, network), boundary - chunk);
     }
 
     #[test]
@@ -4016,7 +3944,6 @@ mod tests {
             Network::Bitcoin,
             None,
             None,
-            None,
             CertificateCheck::Validate,
         );
     }
@@ -4027,7 +3954,6 @@ mod tests {
             None,
             None,
             Network::Bitcoin,
-            None,
             None,
             Some(mainnet_checkpoint()),
             CertificateCheck::Validate,
@@ -4041,7 +3967,6 @@ mod tests {
             None,
             None,
             Network::Regtest,
-            None,
             None,
             None,
             CertificateCheck::Validate,
@@ -4068,7 +3993,6 @@ mod tests {
             None,
             network,
             path,
-            None,
             Some(checkpoint),
             CertificateCheck::default(),
         )
@@ -4086,7 +4010,7 @@ mod tests {
     #[test]
     fn checkpoint_fixtures_are_one_block() {
         assert_eq!(
-            backfill_floor(Some(TEST_MIN_HEIGHT), 0, Network::Bitcoin),
+            backfill_floor(TEST_MIN_HEIGHT, Network::Bitcoin),
             TEST_CHECKPOINT_HEIGHT
         );
         assert_eq!(
@@ -4313,7 +4237,6 @@ mod tests {
         let ok = initial_sync(
             &store,
             Network::Regtest,
-            Some(4040),
             0,
             (5, raw_header(&chain[5])),
             &req_tx,
@@ -4353,7 +4276,6 @@ mod tests {
         let ok = initial_sync(
             &store,
             Network::Regtest,
-            Some(4040),
             0,
             (4037, raw_header(&fresh[5])),
             &req_tx,
@@ -4399,7 +4321,6 @@ mod tests {
         let ok = initial_sync(
             &store,
             Network::Regtest,
-            Some(4040),
             0,
             (5, raw_header(&chain[5])),
             &req_tx,

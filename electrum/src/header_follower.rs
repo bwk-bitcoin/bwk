@@ -67,9 +67,7 @@ impl<P: OpenScanFromBackend> HeaderFollower<P> {
     /// one, idle otherwise. Headers are always binary-backed, at
     /// [`HEADERS_FILENAME`] under `account_dir`, whenever the wallet persists
     /// at all. `checkpoint` anchors the chain at a block the consumer vouches
-    /// for. Without one, `min_height` snaps the initial backfill down to the
-    /// retarget boundary at or below it, for a wallet that knows how far back
-    /// its history reaches.
+    /// for.
     ///
     /// A configured endpoint that cannot be reached is a [`StartError`]:
     /// header-sync progress gates `Verified` state, so a degraded store must
@@ -79,7 +77,6 @@ impl<P: OpenScanFromBackend> HeaderFollower<P> {
         network: Network,
         persistence: Option<PersistenceKind>,
         account_dir: PathBuf,
-        min_height: Option<u32>,
         checkpoint: Option<Checkpoint>,
         notification: mpsc::Sender<Notification>,
     ) -> Result<Self, StartError> {
@@ -90,15 +87,8 @@ impl<P: OpenScanFromBackend> HeaderFollower<P> {
             Some(e) => (e.url().map(str::to_string), e.port(), e.certificate_check()),
             None => (None, None, CertificateCheck::default()),
         };
-        let store = HeaderStore::start_or_open(
-            url,
-            port,
-            network,
-            path,
-            min_height,
-            checkpoint,
-            certificate_check,
-        )?;
+        let store =
+            HeaderStore::start_or_open(url, port, network, path, checkpoint, certificate_check)?;
         Ok(Self {
             store,
             owned: true,
