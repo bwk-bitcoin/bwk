@@ -132,6 +132,7 @@ fn multi_account_shared_header_store() {
         Network::Regtest,
         None,
         None,
+        None,
         CertificateCheck::Validate,
     )
     .unwrap();
@@ -300,6 +301,7 @@ fn reorg_reconfirms_verified() {
         Network::Regtest,
         None,
         None,
+        None,
         CertificateCheck::Validate,
     )
     .unwrap();
@@ -429,6 +431,7 @@ fn restart_requeues_stranded_merkle_fetch() {
         Network::Regtest,
         None,
         None,
+        None,
         CertificateCheck::Validate,
     )
     .unwrap();
@@ -505,6 +508,7 @@ fn sparse_anchor_above_retarget_boundary_syncs_and_verifies() {
         Network::Regtest,
         None,
         Some(4100),
+        None,
         CertificateCheck::Validate,
     )
     .unwrap();

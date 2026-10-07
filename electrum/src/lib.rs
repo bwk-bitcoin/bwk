@@ -1,4 +1,5 @@
 pub mod address_store;
+pub mod checkpoint;
 pub mod client;
 pub mod coin_state;
 pub mod coin_store;

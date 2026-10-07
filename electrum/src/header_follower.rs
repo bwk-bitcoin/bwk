@@ -22,6 +22,7 @@ use bwk_persist::PersistenceKind;
 use miniscript::bitcoin::Network;
 
 use crate::{
+    checkpoint::Checkpoint,
     config::{Endpoint, HEADERS_FILENAME},
     header_store::{HeaderStore, StartError},
     notification::Notification,
@@ -65,9 +66,10 @@ impl<P: OpenScanFromBackend> HeaderFollower<P> {
     /// Open this wallet's own store: online against `endpoint` when there is
     /// one, idle otherwise. Headers are always binary-backed, at
     /// [`HEADERS_FILENAME`] under `account_dir`, whenever the wallet persists
-    /// at all. `min_height` snaps the initial backfill down to the retarget
-    /// boundary at or below it, for a wallet that knows how far back its
-    /// history reaches.
+    /// at all. `checkpoint` anchors the chain at a block the consumer vouches
+    /// for. Without one, `min_height` snaps the initial backfill down to the
+    /// retarget boundary at or below it, for a wallet that knows how far back
+    /// its history reaches.
     ///
     /// A configured endpoint that cannot be reached is a [`StartError`]:
     /// header-sync progress gates `Verified` state, so a degraded store must
@@ -78,6 +80,7 @@ impl<P: OpenScanFromBackend> HeaderFollower<P> {
         persistence: Option<PersistenceKind>,
         account_dir: PathBuf,
         min_height: Option<u32>,
+        checkpoint: Option<Checkpoint>,
         notification: mpsc::Sender<Notification>,
     ) -> Result<Self, StartError> {
         let path = persistence
@@ -87,8 +90,15 @@ impl<P: OpenScanFromBackend> HeaderFollower<P> {
             Some(e) => (e.url().map(str::to_string), e.port(), e.certificate_check()),
             None => (None, None, CertificateCheck::default()),
         };
-        let store =
-            HeaderStore::start_or_open(url, port, network, path, min_height, certificate_check)?;
+        let store = HeaderStore::start_or_open(
+            url,
+            port,
+            network,
+            path,
+            min_height,
+            checkpoint,
+            certificate_check,
+        )?;
         Ok(Self {
             store,
             owned: true,

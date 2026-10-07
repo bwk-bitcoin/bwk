@@ -10,7 +10,7 @@ use std::{
 
 use bitcoin::{bip32::ChildNumber, Network};
 use bwk::{
-    bwk_electrum::{config::Endpoint, raw_client::CertificateCheck},
+    bwk_electrum::{checkpoint::Checkpoint, config::Endpoint, raw_client::CertificateCheck},
     miniscript::{Descriptor, DescriptorPublicKey},
 };
 use bwk_sign::{bwk_descriptor, hot_signer::HotSigner};
@@ -72,6 +72,12 @@ pub struct Config {
     /// silent-payment scan then has no block time to stamp its txs with.
     #[serde(default = "header_scanner_default")]
     pub header_scanner: bool,
+    /// A block the header chain must contain, supplied by the app. Neither
+    /// `bwk` nor `bwk-sp` ships checkpoint data: one mainnet `(height, hash)`
+    /// the app trusts is enough, the chain is then anchored at it. `None`
+    /// keeps the anchor on proof of work alone. Ignored without a header scanner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_checkpoint: Option<Checkpoint>,
 
     // Sub-accounts
     /// Optional descriptors for embedded standard wallets (segwit, taproot, etc.)
@@ -129,6 +135,7 @@ impl Config {
             dust_limit: None,
             birthday_height: None,
             header_scanner: true,
+            header_checkpoint: None,
             descriptors: Vec::new(),
         }
     }
@@ -179,6 +186,7 @@ impl Config {
             dust_limit: None,
             birthday_height: None,
             header_scanner: true,
+            header_checkpoint: None,
             descriptors: Vec::new(),
         })
     }

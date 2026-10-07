@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use bwk_descriptor::{derivator, descriptor::DescriptorDerivator};
 use bwk_persist::{backend::PersistenceBackend, PersistError, PersistenceKind};
 
-use crate::raw_client::CertificateCheck;
+use crate::{checkpoint::Checkpoint, raw_client::CertificateCheck};
 
 /// Filename for the binary header cache under [`ScannerConfig::account_dir`].
 /// Headers are always binary-backed, independent of `persistence`.
@@ -137,6 +137,12 @@ pub struct ScannerConfig {
     /// merkle proof, a confirmation the server reports is taken as is.
     #[serde(default = "header_scanner_default")]
     pub header_scanner: bool,
+    /// A block the header chain must contain, supplied by the consumer: the
+    /// chain is anchored at it. `None` keeps a sparse anchor on proof of work
+    /// alone. Ignored without a header
+    /// scanner, or when the account shares another's header store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_checkpoint: Option<Checkpoint>,
     pub network: miniscript::bitcoin::Network,
     pub look_ahead: u32,
     pub descriptor: Descriptor<DescriptorPublicKey>,
@@ -163,6 +169,7 @@ impl ScannerConfig {
             endpoint: Endpoint::default(),
             stay_offline: false,
             header_scanner: true,
+            header_checkpoint: None,
             network,
             look_ahead: DEFAULT_LOOK_AHEAD,
             descriptor,

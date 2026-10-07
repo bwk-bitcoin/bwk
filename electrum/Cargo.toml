@@ -24,6 +24,9 @@ test = ["bwk-utils/test", "bwk-persist/test"]
 sp = []
 # Forwards the opt-in sqlite backend, reachable through `ScannerConfig::build_backend`.
 sqlite = ["bwk-persist/sqlite"]
+# Lets a mainnet header store open without a checkpoint, its anchor then
+# resting on proof of work alone.
+no-checkpoint = []
 
 [dependencies]
 miniscript = { workspace = true, features = ["serde", "base64"] }

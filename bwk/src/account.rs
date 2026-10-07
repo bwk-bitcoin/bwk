@@ -221,6 +221,7 @@ impl<P: OpenFromBackend> Account<P> {
                 config.scanner.persistence,
                 config.scanner.account_dir(),
                 None,
+                config.scanner.header_checkpoint,
                 sender.clone(),
             )?),
         };

@@ -48,6 +48,7 @@ fn restart_from_cache_skips_full_validation() {
             Network::Regtest,
             Some(persist_path.clone()),
             Some(0),
+            None,
             CertificateCheck::Validate,
         )
         .unwrap();
@@ -121,6 +122,7 @@ fn restart_from_cache_skips_full_validation() {
                 Network::Regtest,
                 Some(persist_path.clone()),
                 Some(0),
+                None,
                 CertificateCheck::Validate,
             ) {
                 Ok(store) => break store,
@@ -166,6 +168,7 @@ fn deep_reorg_below_anchor_resyncs() {
         Network::Regtest,
         None,
         Some(anchor),
+        None,
         CertificateCheck::Validate,
     )
     .unwrap();

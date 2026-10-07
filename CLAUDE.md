@@ -148,6 +148,9 @@ take the receiver.
 - `sp`: silent-payments notification variants, used by `bwk-sp`.
 - `hwi`: hardware wallet signers.
 - `sqlite`: the SQLite persistence backend.
+- `no-checkpoint`: lets a mainnet header store open without a checkpoint (its
+  anchor then rests on proof of work alone); without it, opening one is an
+  error.
 - `test`: see below.
 
 ## Testing

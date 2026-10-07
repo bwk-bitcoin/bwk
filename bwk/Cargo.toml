@@ -49,6 +49,7 @@ default = []
 sp = ["bwk-electrum/sp"]
 hwi = ["bwk-sign/hwi"]
 sqlite = ["bwk-persist/sqlite"]
+no-checkpoint = ["bwk-electrum/no-checkpoint"]
 test = ["bwk-electrum/test", "bwk-utils/test", "bwk-sign/test", "bwk-tx/test", "bwk-persist/test", "logger"]
 # Installs env_logger through `log::Logger`. Off by default: a consumer with its
 # own logger would otherwise pull env_logger and its timestamp/colour stack.

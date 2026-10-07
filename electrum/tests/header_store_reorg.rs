@@ -43,6 +43,7 @@ fn header_store_follows_tip_and_resolves_reorg() {
         Network::Regtest,
         Some(path),
         Some(base_height),
+        None,
         CertificateCheck::Validate,
     )
     .unwrap();

@@ -23,13 +23,14 @@
 //! height.
 
 use crate::{
+    checkpoint::Checkpoint,
     client::{
         Client, CoinError, CoinRequest, CoinResponse, Error as ClientError, HeaderError,
         HeaderRequest, HeaderResponse, MERKLE_HASH_BYTES,
     },
     fanout::{Fanout, ListenerId},
     header_validator::{self, expected_genesis, Error as ValidatorError},
-    notification::Notification,
+    notification::{Notification, ValidationFailure},
     raw_client::CertificateCheck,
     worker::Worker,
 };
@@ -117,6 +118,9 @@ where
     /// Backfill floor remembered at `start`, reused by `restart`. `None`
     /// until a worker is spawned.
     worker: Mutex<Option<BackfillFloor>>,
+    /// A block the consumer vouches for: the chain is anchored at it and must
+    /// hold it at its height.
+    checkpoint: Option<Checkpoint>,
     /// Request side of the header worker's client, kept so `stop` can close
     /// the connection instead of waiting out the worker's receive timeout.
     header_req: Mutex<Option<mpsc::Sender<HeaderRequest>>>,
@@ -248,6 +252,8 @@ pub enum InvalidCause {
     StoreRead(PersistError),
     #[error("header sanity check failed")]
     Sanity,
+    #[error("header chain does not contain the checkpoint block")]
+    Checkpoint,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -296,6 +302,8 @@ pub(crate) enum MutateError {
     Persist(#[from] PersistError),
     #[error("anchor must be on an empty store at a retarget boundary")]
     BadAnchor,
+    #[error("header at the checkpoint height is not the checkpoint block")]
+    Checkpoint,
 }
 
 #[derive(Debug)]
@@ -322,7 +330,13 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
     /// Backend-backed store. Loads rows through the typed store layer and
     /// starts empty if the stored chain fails to decode.
     pub fn from_backend(network: Network, backend: Arc<dyn PersistenceBackend>) -> Arc<Self> {
-        let store = match RamStore::open(
+        Self::from_store(network, Self::load(backend))
+    }
+
+    fn load(
+        backend: Arc<dyn PersistenceBackend>,
+    ) -> RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]> {
+        match RamStore::open(
             backend.clone(),
             STORE_KEY,
             encode_height,
@@ -344,8 +358,7 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
                 );
                 RamStore::empty(backend, STORE_KEY, encode_height, encode_header)
             }
-        };
-        Self::from_store(network, store)
+        }
     }
 
     /// File-backed store. An open failure is a real environment error (not
@@ -378,6 +391,7 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
             writer_token: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
             worker: Mutex::new(None),
+            checkpoint: None,
             header_req: Mutex::new(None),
             merkle_req: Mutex::new(None),
             merkle: Arc::default(),
@@ -396,26 +410,26 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
     /// at or below `h`; `None` starts from the server-reported tip.
     ///
     /// The worker thread holds a `Weak<HeaderStore>` so it exits cleanly
-    /// once the last public `Arc` is dropped.
+    /// once the last public `Arc` is dropped. `checkpoint` as for
+    /// [`start_or_open`](Self::start_or_open).
     pub fn start(
         electrum_url: String,
         electrum_port: u16,
         network: Network,
         path: Option<PathBuf>,
         min_height: Option<u32>,
+        checkpoint: Option<Checkpoint>,
         certificate_check: CertificateCheck,
     ) -> Result<Arc<Self>, StartError> {
-        let store = match path {
-            Some(p) => Self::from_file(network, p)?,
-            None => Self::new_in_memory(network),
-        };
-
-        // A failure to connect is surfaced to the caller rather than
-        // silently returning a worker-less store: header-sync progress
-        // gates wallet `Verified` state, so the caller must know the store
-        // is degraded and can re-attempt.
-        store.spawn_worker(&electrum_url, electrum_port, min_height, certificate_check)?;
-        Ok(store)
+        Self::start_or_open(
+            Some(electrum_url),
+            Some(electrum_port),
+            network,
+            path,
+            min_height,
+            checkpoint,
+            certificate_check,
+        )
     }
 
     /// Start online against `url`/`port` when both are given, or open
@@ -427,22 +441,47 @@ impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>>
     ///
     /// A missing endpoint is not an error: it opens idle. A failed connect
     /// against a *given* endpoint is surfaced as [`StartError`] rather than
-    /// silently degrading to an idle store, matching [`start`](Self::start).
+    /// silently degrading to an idle store: header-sync progress gates wallet
+    /// `Verified` state, so the caller must know the store is degraded and can
+    /// re-attempt.
+    ///
+    /// `checkpoint` binds the chain to a block the consumer vouches for: the
+    /// chain is anchored at it, `min_height` then unused, and a chain holding
+    /// another block at its height is refused.
+    ///
+    /// # Panics
+    ///
+    /// On mainnet without a checkpoint, unless the `no-checkpoint` feature is
+    /// enabled.
     pub fn start_or_open(
         url: Option<String>,
         port: Option<u16>,
         network: Network,
         path: Option<PathBuf>,
         min_height: Option<u32>,
+        checkpoint: Option<Checkpoint>,
         certificate_check: CertificateCheck,
     ) -> Result<Arc<Self>, StartError> {
+        #[cfg(not(feature = "no-checkpoint"))]
+        assert!(
+            network != Network::Bitcoin || checkpoint.is_some(),
+            "a mainnet header store needs a checkpoint (or the no-checkpoint feature)"
+        );
+        let store = match path {
+            Some(p) => {
+                let backend = HeaderBackend::open(p, Header::SIZE)?;
+                Self::with_checkpoint(network, Self::load(Arc::new(backend)), checkpoint)
+            }
+            None => {
+                let backend: Arc<dyn PersistenceBackend> = Arc::new(NoopBackend);
+                let empty = RamStore::empty(backend, STORE_KEY, encode_height, encode_header);
+                Self::with_checkpoint(network, empty, checkpoint)
+            }
+        };
         if let (Some(url), Some(port)) = (url, port) {
-            return Self::start(url, port, network, path, min_height, certificate_check);
+            store.spawn_worker(&url, port, min_height, certificate_check)?;
         }
-        Ok(match path {
-            Some(p) => Self::from_file(network, p)?,
-            None => Self::new_in_memory(network),
-        })
+        Ok(store)
     }
 
     /// Reconnect the background worker to `url:port` after the previous
@@ -583,6 +622,10 @@ where
     S: Store<Key = u32, Value = [u8; Header::SIZE]> + Send + 'static,
 {
     pub fn from_store(network: Network, store: S) -> Arc<Self> {
+        Self::with_checkpoint(network, store, None)
+    }
+
+    fn with_checkpoint(network: Network, store: S, checkpoint: Option<Checkpoint>) -> Arc<Self> {
         let store = Arc::new(Self {
             network,
             inner: Mutex::new(Inner {
@@ -594,6 +637,7 @@ where
             writer_token: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
             worker: Mutex::new(None),
+            checkpoint,
             header_req: Mutex::new(None),
             merkle_req: Mutex::new(None),
             merkle: Arc::default(),
@@ -621,16 +665,16 @@ where
             self.set_validation_state(HeaderValidationState::Valid);
             return;
         }
-        if !sanity_check(self.network, &snapshot) {
+        if let Err(cause) = sanity_check(self.network, self.checkpoint, &snapshot) {
             // Wipe before publishing Invalid: `wait_for_replay` unparks the
             // worker the moment state leaves `Validating`, so the store must
             // already be empty when the Invalid state (and notification)
             // becomes visible, or the worker could append onto a chain about to
             // be cleared. A clear failure is only surfaced, not acted on.
             if let Err(e) = self.clear_store() {
-                log::error!("HeaderStore::start_replay_validation: clear after sanity fail: {e}");
+                log::error!("HeaderStore::start_replay_validation: clear after {cause}: {e}");
             }
-            self.set_validation_state(HeaderValidationState::Invalid(InvalidCause::Sanity));
+            self.set_validation_state(HeaderValidationState::Invalid(cause));
             self.publish_progress(HeaderProgressEvent::Failed {
                 phase: HeaderProgressPhase::Replay,
             });
@@ -761,6 +805,7 @@ where
                 inner.store.get(&k).ok().flatten()
             });
             header_validator::validate_append(network, &ancestors, h, &incoming, now_secs())?;
+            self.hold_checkpoint(inner, h, &raw)?;
             let was_empty = inner.store.keys()?.next().is_none();
             inner.store.insert(h, raw)?;
             inner.store.flush()?;
@@ -791,11 +836,12 @@ where
     /// sparse chain has no ancestors to link against, so it is anchored by
     /// PoW only rather than by full `validate_append`.
     ///
-    /// Trust model: a sparse anchor is not connected to any pinned
-    /// checkpoint, so a malicious server could serve a fabricated
-    /// low-difficulty chain from the anchor upward. Sparse-start operation
-    /// assumes an honest server for the anchor's chain context; only a
-    /// genesis-anchored chain is fully self-validating.
+    /// Trust model: `bwk` holds no checkpoint of its own. With the consumer's
+    /// [`Checkpoint`] the anchor is that block and must match it. Without a
+    /// checkpoint a
+    /// malicious server could serve a fabricated low-difficulty chain from the
+    /// anchor upward: that mode assumes an honest server for the anchor's chain
+    /// context, and only a genesis-anchored chain is fully self-validating.
     #[cfg(test)]
     pub(crate) fn append_anchor(
         &self,
@@ -818,6 +864,7 @@ where
             if !empty || h % retarget_interval(network) as u32 != 0 {
                 return Err(MutateError::BadAnchor);
             }
+            self.hold_checkpoint(inner, h, &raw)?;
             inner.store.insert(h, raw)?;
             inner.store.flush()?;
             inner.validation_state = HeaderValidationState::Valid;
@@ -873,6 +920,7 @@ where
                         now_secs(),
                     )?;
                 }
+                self.hold_checkpoint(inner, h, raw)?;
                 inner.store.insert(h, *raw)?;
                 ancestors.push_back(header);
                 if ancestors.len() > retarget_interval(network) {
@@ -922,6 +970,7 @@ where
                 inner.store.remove(&key)?;
             }
             for (h, raw) in branch {
+                self.hold_checkpoint(inner, *h, raw)?;
                 inner.store.insert(*h, *raw)?;
             }
             inner.store.flush()?;
@@ -936,6 +985,27 @@ where
             Some(Err(e)) => Err(e),
             None => Ok(()),
         }
+    }
+
+    /// Refuse the chain when `raw` at `h` is another block than the
+    /// consumer's checkpoint: the server serves a chain the consumer does not
+    /// vouch for, so the whole chain is wiped and flagged `Invalid`, not just
+    /// this header dropped. Runs under the writer's lock, before the insert.
+    fn hold_checkpoint(
+        &self,
+        inner: &mut Inner<S>,
+        h: u32,
+        raw: &[u8; Header::SIZE],
+    ) -> Result<(), MutateError> {
+        if holds_checkpoint(self.checkpoint, h, raw) {
+            return Ok(());
+        }
+        log::warn!("HeaderStore: block {h} is not the checkpoint; refusing the chain");
+        clear_inner(inner)?;
+        inner.validation_state = HeaderValidationState::Invalid(InvalidCause::Checkpoint);
+        self.notify_listeners();
+        self.notifications.notify_with(checkpoint_refused);
+        Err(MutateError::Checkpoint)
     }
 
     fn notify_listeners(&self) {
@@ -1055,6 +1125,10 @@ where
     /// by whoever owns the store: a store shared by several consumers reports
     /// to each of them exactly once.
     pub fn register_notifications(&self, sender: mpsc::Sender<Notification>) {
+        // A chain refused on reload, before anyone listened, is reported now.
+        if self.validation_failed_reason() == Some(InvalidCause::Checkpoint) {
+            let _ = sender.send(checkpoint_refused());
+        }
         self.notifications.register_sender(sender);
     }
 
@@ -1271,15 +1345,35 @@ fn decode_ancestors(
     collect_ancestors(incoming_height, max, |k| headers.get(&k).copied())
 }
 
-fn sanity_check(network: Network, headers: &BTreeMap<u32, [u8; Header::SIZE]>) -> bool {
+/// What the consumer gets when the server serves a chain contradicting the
+/// checkpoint, as opposed to a network failure.
+fn checkpoint_refused() -> Notification {
+    Notification::ValidationFailed(ValidationFailure::HeaderStore(InvalidCause::Checkpoint))
+}
+
+/// False when `raw` at `h` is another block than `checkpoint`.
+fn holds_checkpoint(checkpoint: Option<Checkpoint>, h: u32, raw: &[u8; Header::SIZE]) -> bool {
+    checkpoint.is_none_or(|c| {
+        h != c.height() || deserialize::<Header>(raw).is_ok_and(|hdr| hdr.block_hash() == c.hash())
+    })
+}
+
+/// Checks a reloaded chain: contiguous, a sparse start on a retarget
+/// boundary, the network genesis at height 0 and the checkpoint block at its
+/// height when the range holds them.
+fn sanity_check(
+    network: Network,
+    checkpoint: Option<Checkpoint>,
+    headers: &BTreeMap<u32, [u8; Header::SIZE]>,
+) -> Result<(), InvalidCause> {
     if headers.is_empty() {
-        return true;
+        return Ok(());
     }
     let min = *headers.keys().next().expect("non-empty");
     let max = *headers.keys().next_back().expect("non-empty");
     let span = (max - min) as usize + 1;
     if span != headers.len() {
-        return false;
+        return Err(InvalidCause::Sanity);
     }
     // A sparse-anchored cache (min > 0) sits exactly on a retarget boundary
     // (the previous boundary below the account's min_height), matching
@@ -1287,7 +1381,7 @@ fn sanity_check(network: Network, headers: &BTreeMap<u32, [u8; Header::SIZE]>) -
     // above the anchor has a full ancestor window. A violation fails loud
     // rather than silently validating with a partial window.
     if min != 0 && min % backfill_chunk(network) != 0 {
-        return false;
+        return Err(InvalidCause::Sanity);
     }
     if let Some(genesis) = expected_genesis(network) {
         // The genesis row is optional: a cache may legitimately start above
@@ -1297,11 +1391,19 @@ fn sanity_check(network: Network, headers: &BTreeMap<u32, [u8; Header::SIZE]>) -
         if let Some(raw) = headers.get(&0) {
             match deserialize::<Header>(raw) {
                 Ok(hdr) if hdr.block_hash() == genesis => {}
-                _ => return false,
+                _ => return Err(InvalidCause::Sanity),
             }
         }
     }
-    true
+    let contradicts = checkpoint.is_some_and(|c| {
+        headers
+            .get(&c.height())
+            .is_some_and(|raw| !holds_checkpoint(checkpoint, c.height(), raw))
+    });
+    if contradicts {
+        return Err(InvalidCause::Checkpoint);
+    }
+    Ok(())
 }
 
 fn replay_validate(
@@ -1464,8 +1566,9 @@ fn snap(h: u32, network: Network) -> u32 {
 /// anchor lands on the previous retarget boundary. Every retarget boundary at
 /// or above the snapped boundary then has a complete ancestor window for its
 /// difficulty check. The anchor itself is stored PoW-only (`append_anchor`),
-/// so its own retarget is skipped; the handful of headers just above the
-/// anchor keep the anchor-relative MTP relaxation, but they all sit below the
+/// so its own retarget is skipped. Only used without a checkpoint, which is
+/// the anchor otherwise. The handful of headers just above the anchor
+/// keep the anchor-relative MTP relaxation, but they all sit below the
 /// account's `min_height` and are never account relevant. Saturates at zero
 /// near genesis.
 fn backfill_floor(min_height: Option<u32>, tip_h: u32, network: Network) -> u32 {
@@ -1742,7 +1845,12 @@ fn initial_sync(
 ) -> bool {
     let (tip_h, _) = server_tip;
 
-    let low = backfill_floor(min_height, tip_h, network);
+    // With a checkpoint the chain is anchored at it. A stored range starting
+    // above it cannot reach it and is re-anchored there.
+    let low = match store.checkpoint {
+        Some(checkpoint) => checkpoint.height(),
+        None => backfill_floor(min_height, tip_h, network),
+    };
 
     // A persisted range that cannot extend down to the wanted floor (lowered
     // birthday) or up from its tip to it (floor above the stored tip) is
@@ -1859,9 +1967,13 @@ fn apply_one(
         None => true,
     };
     if contiguous {
-        if let Err(e) = store.append(token, h, raw) {
-            log::warn!("HeaderStore::apply_one: append {h}: {e:?}; falling back to reorg path");
-            resolve_reorg(store, token, h, raw, req_tx, resp_rx, deferred);
+        match store.append(token, h, raw) {
+            // The chain was refused whole: there is nothing left to reorg onto.
+            Ok(()) | Err(MutateError::Checkpoint) => {}
+            Err(e) => {
+                log::warn!("HeaderStore::apply_one: append {h}: {e:?}; falling back to reorg path");
+                resolve_reorg(store, token, h, raw, req_tx, resp_rx, deferred);
+            }
         }
         return;
     }
@@ -2999,6 +3111,7 @@ mod tests {
             writer_token: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
             worker: Mutex::new(None),
+            checkpoint: None,
             header_req: Mutex::new(None),
             merkle_req: Mutex::new(None),
             merkle: Arc::default(),
@@ -3109,7 +3222,7 @@ mod tests {
             }
             map.insert(i as u32, raw_header(h));
         }
-        assert!(!sanity_check(Network::Regtest, &map));
+        assert!(sanity_check(Network::Regtest, None, &map).is_err());
     }
 
     #[test]
@@ -3123,7 +3236,7 @@ mod tests {
         for (i, h) in chain.iter().enumerate() {
             map.insert(5 + i as u32, raw_header(h));
         }
-        assert!(!sanity_check(Network::Regtest, &map));
+        assert!(sanity_check(Network::Regtest, None, &map).is_err());
     }
 
     #[test]
@@ -3138,7 +3251,7 @@ mod tests {
         for (i, h) in chain.iter().enumerate() {
             map.insert(floor + i as u32, raw_header(h));
         }
-        assert!(sanity_check(Network::Regtest, &map));
+        assert!(sanity_check(Network::Regtest, None, &map).is_ok());
     }
 
     #[test]
@@ -3826,7 +3939,7 @@ mod tests {
         for (i, h) in chain.iter().enumerate() {
             map.insert(anchor + i as u32, raw_header(h));
         }
-        assert!(sanity_check(Network::Regtest, &map));
+        assert!(sanity_check(Network::Regtest, None, &map).is_ok());
         write_binary(&path, &map);
 
         let store = HeaderStore::from_file(Network::Regtest, path).unwrap();

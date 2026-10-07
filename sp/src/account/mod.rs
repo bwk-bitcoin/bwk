@@ -685,6 +685,7 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
                 // Backfill from the birthday so the worker covers the scan
                 // range, whose confirmation block times the scanner reads here.
                 Some(config.min_birthday_height()),
+                config.header_checkpoint,
                 sender.clone(),
             )?),
         };
