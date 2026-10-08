@@ -574,6 +574,13 @@ impl<P: ScanProfile> ElectrumScanner<P> {
         self.coin_store.lock().expect("poisoned").init(address_tip);
     }
 
+    /// Report the per-coin events as those of the Silent Payments sub-account
+    /// at `origin`, see [`CoinStore::set_origin`].
+    #[cfg(feature = "sp")]
+    pub fn set_origin(&self, origin: crate::notification::CoinOrigin) {
+        self.coin_store.lock().expect("poisoned").set_origin(origin);
+    }
+
     /// Report on `sender` from now on, the stores and the running listener
     /// included.
     pub fn set_sender(&mut self, sender: mpsc::Sender<Notification>) {

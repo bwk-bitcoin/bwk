@@ -149,6 +149,19 @@ pub enum SpNotification {
     /// The chain reorganized above `fork_height`: what the scan recorded above
     /// it was rolled back and is scanned again
     Reorg { fork_height: u32 },
+    /// `outpoint` entered the coin store of the sub-account at `origin`.
+    SubAccountCoinReceived {
+        origin: CoinOrigin,
+        outpoint: OutPoint,
+        amount: Amount,
+        height: Option<u64>,
+    },
+    /// A coin of the sub-account at `origin` turned `Spent`/`BeingSpend`, or
+    /// left its coin store while unspent.
+    SubAccountCoinSpent {
+        origin: CoinOrigin,
+        outpoint: OutPoint,
+    },
 }
 
 #[derive(Debug, Clone)]

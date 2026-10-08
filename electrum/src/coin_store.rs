@@ -14,6 +14,8 @@ use std::{
     sync::{mpsc, Arc, Mutex},
 };
 
+#[cfg(feature = "sp")]
+use crate::notification::{CoinOrigin, SpNotification};
 use crate::{
     address_store::{AddressEntry, AddressStatus, AddressStore, AddressTip},
     coin_state::CoinState,
@@ -219,6 +221,11 @@ pub struct CoinStore<P: ScanProfile = RamProfile<DefaultBackend>> {
     /// `false` until the first `generate()`, whose coins are the baseline the
     /// per-coin notifications diff against.
     generated: bool,
+    /// The sub-account of a Silent Payments account this store holds the
+    /// coins of: when set, the per-coin notifications are its SP variants
+    /// carrying it, in place of `CoinReceived`/`CoinSpent`.
+    #[cfg(feature = "sp")]
+    origin: Option<CoinOrigin>,
     /// Pending claims indexed by server-reported height. A txid lands
     /// here when the server reports it at height H but the HeaderStore
     /// doesn't yet have a header at H; the next CTA resolves it.
@@ -372,6 +379,8 @@ impl<P: ScanProfile> CoinStore<P> {
             notification,
             account,
             generated: false,
+            #[cfg(feature = "sp")]
+            origin: None,
             derivator,
             pending_claims: BTreeMap::new(),
             merkle_in_flight: BTreeSet::new(),
@@ -878,12 +887,7 @@ impl<P: ScanProfile> CoinStore<P> {
         for (outpoint, entry) in &self.store {
             let before = previous.get(outpoint);
             if before.is_none() {
-                events.push(Notification::CoinReceived {
-                    account: self.account.clone(),
-                    outpoint: *outpoint,
-                    amount: entry.coin.txout.value,
-                    height: entry.height(),
-                });
+                events.push(self.coin_received(*outpoint, entry));
             }
             if entry.is_spent() && !before.is_some_and(CoinEntry::is_spent) {
                 events.push(self.coin_spent(*outpoint));
@@ -897,11 +901,42 @@ impl<P: ScanProfile> CoinStore<P> {
         events
     }
 
+    fn coin_received(&self, outpoint: OutPoint, entry: &CoinEntry) -> Notification {
+        let amount = entry.coin.txout.value;
+        let height = entry.height();
+        #[cfg(feature = "sp")]
+        if let Some(origin) = self.origin {
+            return SpNotification::SubAccountCoinReceived {
+                origin,
+                outpoint,
+                amount,
+                height,
+            }
+            .into();
+        }
+        Notification::CoinReceived {
+            account: self.account.clone(),
+            outpoint,
+            amount,
+            height,
+        }
+    }
+
     fn coin_spent(&self, outpoint: OutPoint) -> Notification {
+        #[cfg(feature = "sp")]
+        if let Some(origin) = self.origin {
+            return SpNotification::SubAccountCoinSpent { origin, outpoint }.into();
+        }
         Notification::CoinSpent {
             account: self.account.clone(),
             outpoint,
         }
+    }
+
+    /// Report the per-coin events as those of the sub-account at `origin`.
+    #[cfg(feature = "sp")]
+    pub fn set_origin(&mut self, origin: CoinOrigin) {
+        self.origin = Some(origin);
     }
 
     pub fn populate_tx_metadata(&mut self) {

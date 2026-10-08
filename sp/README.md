@@ -50,10 +50,11 @@ loop {
 ## Sub-account coin events
 
 The BIP32 sub-accounts report on the account's notification channel. A coin
-arriving on or spent from one of them comes as `Notification::CoinReceived` /
-`Notification::CoinSpent`, whose `account` names the sub-account scanner;
-`Account::sub_account_origin(&account)` maps it to the `CoinOrigin` (index and
-kind) it comes from.
+arriving on or spent from one of them comes as
+`Notification::Sp(SpNotification::SubAccountCoinReceived { origin, .. })` /
+`SubAccountCoinSpent { origin, .. }`, where `origin` is the `CoinOrigin` (index
+and kind) of the sub-account: each scanner carries its own, so no lookup on the
+account is needed.
 
 ## Confirmation times
 

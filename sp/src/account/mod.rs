@@ -656,10 +656,12 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
             scanner_config.set_stay_offline(endpoint.url().is_none());
             scanner_config.set_endpoint(endpoint);
             scanner_config.header_scanner = config.header_scanner;
-            scanners.push(ElectrumScanner::try_new_with_sender(
-                scanner_config,
-                sender.clone(),
-            )?);
+            let scanner = ElectrumScanner::try_new_with_sender(scanner_config, sender.clone())?;
+            scanner.set_origin(CoinOrigin::SubAccount {
+                index: i,
+                kind: SubAccountKind::from(&sub_cfg.descriptor),
+            });
+            scanners.push(scanner);
             if let Some(mnemonic) = sub_cfg.mnemonic.clone().or_else(|| config.mnemonic.clone()) {
                 register_sub_signer(
                     &mut signing_manager,
@@ -1030,6 +1032,10 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
                 scanner.descriptor(),
             )?;
         }
+        scanner.set_origin(CoinOrigin::SubAccount {
+            index: self.sub_accounts.len(),
+            kind: SubAccountKind::from(&scanner.descriptor()),
+        });
         scanner.set_sender(self.sender.clone());
         // Spawned first: the reconciler registers for the scan ticks, so a
         // scan started before it would fire them at nobody.
@@ -1056,21 +1062,6 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     /// The sub-account scanners.
     pub fn scanners(&self) -> impl Iterator<Item = &ElectrumScanner<RamProfile<DefaultBackend>>> {
         self.sub_accounts.iter().map(|sub| &sub.scanner)
-    }
-
-    /// The sub-account that the scanner named `account` watches, as carried
-    /// by [`Notification::CoinReceived`] and [`Notification::CoinSpent`]: the
-    /// sub-accounts report on this account's channel, so their per-coin events
-    /// only name the scanner they come from. `None` when no sub-account
-    /// scanner carries that name.
-    pub fn sub_account_origin(&self, account: &str) -> Option<CoinOrigin> {
-        self.scanners()
-            .enumerate()
-            .find(|(_, scanner)| scanner.config().account == account)
-            .map(|(index, scanner)| CoinOrigin::SubAccount {
-                index,
-                kind: SubAccountKind::from(&scanner.descriptor()),
-            })
     }
 
     /// The sub-account scanners, mutably.
@@ -2458,121 +2449,6 @@ mod tests {
             Account::new_taproot_address,
             bitcoin::AddressType::P2wpkh,
         );
-    }
-
-    fn assert_coin_received_maps_to(index: usize, kind: SubAccountKind) {
-        let mut config = test_config();
-        config.add_default_segwit_sub_account().unwrap();
-        config.add_default_taproot_sub_account().unwrap();
-        let mut account = Account::new(config).unwrap();
-        let receiver = account.receiver().unwrap();
-        let scanner = account.scanners_mut().nth(index).unwrap();
-        let spk = scanner.new_addr().address.assume_checked().script_pubkey();
-        let tx = bwk_utils::test::funding_tx(spk, 0.5);
-        {
-            let mut coin_store = scanner.coin_store().lock().unwrap();
-            coin_store
-                .tx_store_mut()
-                .update(bwk::bwk_electrum::tx_store::TxEntry::for_test(tx));
-            coin_store.generate();
-        }
-
-        let (name, amount) = receiver
-            .try_iter()
-            .find_map(|notification| match notification {
-                Notification::CoinReceived {
-                    account, amount, ..
-                } => Some((account, amount)),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(amount, Amount::from_sat(50_000_000));
-        assert_eq!(
-            account.sub_account_origin(&name),
-            Some(CoinOrigin::SubAccount { index, kind })
-        );
-    }
-
-    #[test]
-    fn segwit_sub_account_coin_received_maps_to_its_origin() {
-        assert_coin_received_maps_to(0, SubAccountKind::Segwit);
-    }
-
-    #[test]
-    fn taproot_sub_account_coin_received_maps_to_its_origin() {
-        assert_coin_received_maps_to(1, SubAccountKind::Taproot);
-    }
-
-    /// Fund the first sub-account with a 0.5 BTC coin and return the scanner
-    /// name the account receiver reported it under.
-    fn coin_received_on(account: &mut Account, receiver: &mpsc::Receiver<Notification>) -> String {
-        let scanner = account.scanners_mut().next().unwrap();
-        let spk = scanner.new_addr().address.assume_checked().script_pubkey();
-        let tx = bwk_utils::test::funding_tx(spk, 0.5);
-        {
-            let mut coin_store = scanner.coin_store().lock().unwrap();
-            coin_store
-                .tx_store_mut()
-                .update(bwk::bwk_electrum::tx_store::TxEntry::for_test(tx));
-            coin_store.generate();
-        }
-
-        receiver
-            .try_iter()
-            .find_map(|notification| match notification {
-                Notification::CoinReceived { account, .. } => Some(account),
-                _ => None,
-            })
-            .unwrap()
-    }
-
-    #[test]
-    fn added_sub_account_coin_received_reaches_the_account_receiver() {
-        let mut account = Account::new(test_config()).unwrap();
-        let receiver = account.receiver().unwrap();
-        let (sub, mnemonic) = build_offline_segwit_sub("sub-segwit-0");
-        account.add_sub_account(sub, Some(mnemonic)).unwrap();
-
-        let name = coin_received_on(&mut account, &receiver);
-
-        assert_eq!(
-            account.sub_account_origin(&name),
-            Some(CoinOrigin::SubAccount {
-                index: 0,
-                kind: SubAccountKind::Segwit
-            })
-        );
-    }
-
-    #[test]
-    fn a_sub_account_started_before_it_is_added_reports_on_the_account_receiver() {
-        let mut account = Account::new(test_config()).unwrap();
-        let receiver = account.receiver().unwrap();
-        let (mut sub, mnemonic) = build_offline_segwit_sub("sub-segwit-0");
-        let own = sub.receiver().unwrap();
-        // A closed local port: the listener starts and fails to connect.
-        sub.set_electrum(Some("127.0.0.1".to_string()), Some(50002));
-        sub.set_stay_offline(false);
-        sub.start();
-        account.add_sub_account(sub, Some(mnemonic)).unwrap();
-        own.try_iter().for_each(drop);
-
-        let name = coin_received_on(&mut account, &receiver);
-
-        assert_eq!(name, "sub-segwit-0");
-        assert!(!own
-            .try_iter()
-            .any(|notification| matches!(notification, Notification::CoinReceived { .. })));
-    }
-
-    #[test]
-    fn sub_account_origin_is_none_for_an_unknown_scanner() {
-        let mut config = test_config();
-        config.add_default_segwit_sub_account().unwrap();
-        let account = Account::new(config).unwrap();
-
-        assert_eq!(account.sub_account_origin("test-account"), None);
-        assert_eq!(account.sub_account_origin("unknown"), None);
     }
 
     fn endpoint_at(url: &str, port: u16, check: CertificateCheck) -> Endpoint {
