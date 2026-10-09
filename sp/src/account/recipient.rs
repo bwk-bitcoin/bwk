@@ -635,8 +635,16 @@ mod tests {
     use super::*;
     use crate::{
         core::utils::common::Network as SpNetwork,
-        receiver::bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey},
+        receiver::bitcoin::{
+            bip32::{DerivationPath, Fingerprint, Xpriv, Xpub},
+            secp256k1::{PublicKey, Secp256k1, SecretKey, XOnlyPublicKey},
+            Amount as BtcAmount, OutPoint, Sequence, TxOut, Txid,
+        },
     };
+    use bwk_coin::{derive_descriptor, Coin, CoinSpendInfo, CoinStatus, KeyChain};
+    use bwk_tx::error::Error as TxError;
+    use miniscript::{Descriptor, DescriptorPublicKey};
+    use std::{collections::BTreeMap, str::FromStr};
 
     /// Build a SilentPaymentAddress for `network` from deterministic keys.
     fn sp_address(network: SpNetwork) -> SilentPaymentAddress {
@@ -693,5 +701,228 @@ mod tests {
         let addr = sp_address(SpNetwork::Regtest);
         assert!(b.try_send_to_sp(addr, 10_000).is_ok());
         assert_eq!(b.tx_template.outputs.len(), 1);
+    }
+
+    fn xpriv(seed: u8) -> Xpriv {
+        Xpriv::new_master(Network::Regtest, &[seed; 32]).unwrap()
+    }
+
+    fn xpub(seed: u8) -> Xpub {
+        Xpub::from_priv(&Secp256k1::new(), &xpriv(seed))
+    }
+
+    fn held(seeds: &[u8]) -> BTreeMap<Fingerprint, Xpriv> {
+        let secp = Secp256k1::new();
+        seeds
+            .iter()
+            .map(|seed| (xpriv(*seed).fingerprint(&secp), xpriv(*seed)))
+            .collect()
+    }
+
+    /// A receive coin at index 0 of `descriptor`, paying to its scriptPubKey.
+    fn bip32_coin(descriptor: &str) -> Coin {
+        let descriptor = Descriptor::<DescriptorPublicKey>::from_str(descriptor).unwrap();
+        let script_pubkey = derive_descriptor(&descriptor, KeyChain::Receive, 0)
+            .unwrap()
+            .script_pubkey();
+        Coin {
+            txout: TxOut {
+                value: BtcAmount::from_sat(10_000),
+                script_pubkey,
+            },
+            outpoint: OutPoint::null(),
+            height: Some(1),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            status: CoinStatus::Confirmed,
+            label: None,
+            satisfaction_size: 0,
+            spend_info: CoinSpendInfo::Bip32 {
+                coin_path: (KeyChain::Receive, 0),
+                descriptor,
+            },
+        }
+    }
+
+    fn input_key(coin: &Coin, seeds: &[u8]) -> Result<Option<(SecretKey, bool)>, TxError> {
+        let b_spend = SecretKey::from_slice(&[3u8; 32]).unwrap();
+        bip352_input_key(coin, &b_spend, &held(seeds), &Secp256k1::new())
+    }
+
+    /// The secret at `path` under the master key of `seed`.
+    fn derived_secret(seed: u8, path: &str) -> SecretKey {
+        let path = DerivationPath::from_str(path).unwrap();
+        xpriv(seed)
+            .derive_priv(&Secp256k1::new(), &path)
+            .unwrap()
+            .private_key
+    }
+
+    fn output_key(coin: &Coin) -> XOnlyPublicKey {
+        XOnlyPublicKey::from_slice(&coin.txout.script_pubkey.as_bytes()[2..34]).unwrap()
+    }
+
+    fn assert_single_key(descriptor: &str) {
+        let coin = bip32_coin(descriptor);
+        let (key, is_taproot) = input_key(&coin, &[1]).unwrap().unwrap();
+        assert_eq!(key, derived_secret(1, "m/0/0"));
+        assert!(!is_taproot);
+    }
+
+    fn assert_taproot_key(descriptor: &str) {
+        let coin = bip32_coin(descriptor);
+        let (key, is_taproot) = input_key(&coin, &[1, 2]).unwrap().unwrap();
+        assert!(is_taproot);
+        assert_eq!(
+            key.x_only_public_key(&Secp256k1::new()).0,
+            output_key(&coin)
+        );
+    }
+
+    fn assert_not_eligible(descriptor: &str) {
+        let coin = bip32_coin(descriptor);
+        assert!(matches!(input_key(&coin, &[1, 2]), Ok(None)));
+    }
+
+    #[test]
+    fn bip352_input_key_wpkh() {
+        assert_single_key(&format!("wpkh({}/<0;1>/*)", xpub(1)));
+    }
+
+    #[test]
+    fn bip352_input_key_sh_wpkh() {
+        assert_single_key(&format!("sh(wpkh({}/<0;1>/*))", xpub(1)));
+    }
+
+    #[test]
+    fn bip352_input_key_pkh() {
+        assert_single_key(&format!("pkh({}/<0;1>/*)", xpub(1)));
+    }
+
+    #[test]
+    fn bip352_input_key_skips_wsh() {
+        assert_not_eligible(&format!("wsh(pk({}/<0;1>/*))", xpub(1)));
+    }
+
+    #[test]
+    fn bip352_input_key_skips_sh_wsh() {
+        assert_not_eligible(&format!("sh(wsh(pk({}/<0;1>/*)))", xpub(1)));
+    }
+
+    #[test]
+    fn bip352_input_key_tr_key_only() {
+        assert_taproot_key(&format!("tr({}/<0;1>/*)", xpub(1)));
+    }
+
+    #[test]
+    fn bip352_input_key_tr_with_tree() {
+        assert_taproot_key(&format!("tr({}/<0;1>/*,pk({}/<0;1>/*))", xpub(1), xpub(2)));
+    }
+
+    #[test]
+    fn bip352_input_key_tr_with_tree_differs_from_key_only() {
+        let key_only = bip32_coin(&format!("tr({}/<0;1>/*)", xpub(1)));
+        let with_tree = bip32_coin(&format!("tr({}/<0;1>/*,pk({}/<0;1>/*))", xpub(1), xpub(2)));
+        let (key_only, _) = input_key(&key_only, &[1, 2]).unwrap().unwrap();
+        let (with_tree, _) = input_key(&with_tree, &[1, 2]).unwrap().unwrap();
+        assert_ne!(key_only, with_tree);
+    }
+
+    #[test]
+    fn bip352_input_key_skips_tr_nums_internal_key() {
+        assert_not_eligible(&format!(
+            "tr({},pk({}/<0;1>/*))",
+            hex::encode(NUMS_H),
+            xpub(2)
+        ));
+    }
+
+    #[test]
+    fn bip352_input_key_tr_holding_only_leaf_key_errors() {
+        let coin = bip32_coin(&format!("tr({}/<0;1>/*,pk({}/<0;1>/*))", xpub(1), xpub(2)));
+        assert!(matches!(
+            input_key(&coin, &[2]),
+            Err(TxError::SpPartialSecret)
+        ));
+    }
+
+    #[test]
+    fn bip352_input_key_wpkh_not_held_errors() {
+        let coin = bip32_coin(&format!("wpkh({}/<0;1>/*)", xpub(1)));
+        assert!(matches!(
+            input_key(&coin, &[2]),
+            Err(TxError::SpPartialSecret)
+        ));
+    }
+
+    #[test]
+    fn bip352_input_key_spk_mismatch_errors() {
+        let mut coin = bip32_coin(&format!("wpkh({}/<0;1>/*)", xpub(1)));
+        coin.txout.script_pubkey = bip32_coin(&format!("wpkh({}/<0;1>/*)", xpub(2)))
+            .txout
+            .script_pubkey;
+        assert!(matches!(
+            input_key(&coin, &[1, 2]),
+            Err(TxError::SpPartialSecret)
+        ));
+    }
+
+    /// `coin` spent from an outpoint whose txid is `txid_byte` repeated.
+    fn at(mut coin: Coin, txid_byte: u8) -> Coin {
+        coin.outpoint = OutPoint::new(
+            Txid::from_str(&format!("{txid_byte:02x}").repeat(32)).unwrap(),
+            0,
+        );
+        coin
+    }
+
+    fn partial_secret_of(inputs: &[Coin]) -> Result<SecretKey, TxError> {
+        let b_spend = SecretKey::from_slice(&[3u8; 32]).unwrap();
+        partial_secret(inputs, &b_spend, &held(&[1]), &Secp256k1::new())
+    }
+
+    #[test]
+    fn partial_secret_hashes_the_outpoint_of_an_ineligible_input() {
+        let eligible = at(bip32_coin(&format!("wpkh({}/<0;1>/*)", xpub(1))), 0x11);
+        let ineligible = bip32_coin(&format!("wsh(pk({}/<0;1>/*))", xpub(1)));
+
+        let smallest = partial_secret_of(&[eligible.clone(), at(ineligible.clone(), 0x00)]);
+        let largest = partial_secret_of(&[eligible, at(ineligible.clone(), 0x22)]);
+        assert_ne!(smallest.unwrap(), largest.unwrap());
+
+        assert!(matches!(
+            partial_secret_of(&[ineligible]),
+            Err(TxError::SpPartialSecret)
+        ));
+    }
+
+    const ACCOUNT_PATH: &str = "84'/1'/0'";
+
+    /// The account xpub of `key_seed`, behind the origin of `origin_seed`.
+    fn with_origin(origin_seed: u8, key_seed: u8) -> String {
+        let secp = Secp256k1::new();
+        let path = DerivationPath::from_str(&format!("m/{ACCOUNT_PATH}")).unwrap();
+        let account = xpriv(key_seed).derive_priv(&secp, &path).unwrap();
+        format!(
+            "[{}/{ACCOUNT_PATH}]{}",
+            xpriv(origin_seed).fingerprint(&secp),
+            Xpub::from_priv(&secp, &account)
+        )
+    }
+
+    #[test]
+    fn bip352_input_key_wpkh_with_origin() {
+        let coin = bip32_coin(&format!("wpkh({}/<0;1>/*)", with_origin(1, 1)));
+        let (key, is_taproot) = input_key(&coin, &[1]).unwrap().unwrap();
+        assert_eq!(key, derived_secret(1, &format!("m/{ACCOUNT_PATH}/0/0")));
+        assert!(!is_taproot);
+    }
+
+    #[test]
+    fn bip352_input_key_lying_origin_errors() {
+        let coin = bip32_coin(&format!("wpkh({}/<0;1>/*)", with_origin(1, 2)));
+        assert!(matches!(
+            input_key(&coin, &[1, 2]),
+            Err(TxError::SpPartialSecret)
+        ));
     }
 }
