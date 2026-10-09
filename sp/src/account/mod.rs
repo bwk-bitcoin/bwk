@@ -2231,6 +2231,70 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_internal_key_of_a_taproot_script_path_spend() {
+        let secp = Secp256k1::new();
+        let output_key = SecretKey::from_slice(&[1; 32])
+            .unwrap()
+            .x_only_public_key(&secp)
+            .0;
+        let internal_key = SecretKey::from_slice(&[2; 32])
+            .unwrap()
+            .x_only_public_key(&secp)
+            .0;
+        let mut p2tr = vec![0x51, 0x20];
+        p2tr.extend(output_key.serialize());
+        let prevout = TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(p2tr),
+        };
+        let input_key = |witness: &[Vec<u8>]| {
+            crate::core::receiving::eligible_input_pubkey(
+                &bitcoin::TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::new(),
+                    sequence: bitcoin::Sequence::ZERO,
+                    witness: bitcoin::Witness::from_slice(witness),
+                },
+                &prevout,
+            )
+        };
+        let control_block = |key: [u8; 32]| {
+            let mut control_block = vec![0xc0];
+            control_block.extend(key);
+            control_block
+        };
+        let sig = vec![0; 64];
+        let script = vec![0x51];
+
+        assert_eq!(
+            input_key(&[
+                sig.clone(),
+                script.clone(),
+                control_block(internal_key.serialize())
+            ])
+            .unwrap(),
+            Some(PublicKey::from_x_only_public_key(output_key, Parity::Even))
+        );
+
+        // Read as the control block, the annex would carry a non-NUMS key.
+        assert_eq!(
+            input_key(&[
+                sig.clone(),
+                script.clone(),
+                control_block(crate::core::receiving::NUMS_H),
+                vec![0x50; 33],
+            ])
+            .unwrap(),
+            None
+        );
+
+        assert!(matches!(
+            input_key(&[sig, script, vec![0xc0; 32]]),
+            Err(crate::core::error::Error::InvalidInput(_))
+        ));
+    }
+
+    #[test]
     fn test_notification_variants() {
         let notif = Notification::Sp(SpNotification::StartingScan);
         assert!(matches!(
