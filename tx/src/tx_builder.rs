@@ -902,6 +902,43 @@ mod tests {
     }
 
     #[test]
+    fn test_dust_threshold_default_drops_change() {
+        let (_signer, derivator) = tr_signer();
+        let mut builder = test::builder_from_derivator(derivator);
+        builder.funding_input(9_889);
+        builder.dummy_external_output(5_000);
+
+        let res = builder.simulate();
+        assert!(res.error.is_none());
+        assert_eq!(res.change, None);
+        assert_eq!(res.fees, Some(bitcoin::Amount::from_sat(4_889)));
+
+        let psbt = builder.generate().unwrap();
+        assert_eq!(psbt.unsigned_tx.output.len(), 1);
+        assert_eq!(sum_outputs(&psbt), 5_000);
+    }
+
+    #[test]
+    fn test_dust_threshold_low_keeps_change() {
+        let (_signer, derivator) = tr_signer();
+        let mut builder = test::builder_from_derivator(derivator).dust_threshold(546);
+        builder.funding_input(9_889);
+        builder.dummy_external_output(5_000);
+
+        let res = builder.simulate();
+        assert!(res.error.is_none());
+        assert_eq!(res.change, Some(bitcoin::Amount::from_sat(4_735)));
+        assert_eq!(res.fees, Some(bitcoin::Amount::from_sat(154)));
+
+        let psbt = builder.generate().unwrap();
+        assert_eq!(psbt.unsigned_tx.output.len(), 2);
+        assert_eq!(sum_outputs(&psbt), 9_889 - 154);
+
+        builder.new_template();
+        assert_eq!(builder.tx_template.dust_threshold, 546);
+    }
+
+    #[test]
     fn test_coin_by_outpoint_bypasses_selection() {
         let (_signer, derivator) = wpkh_signer();
         let mut builder = test::builder_from_derivator(derivator.clone());

@@ -890,4 +890,72 @@ mod test {
                 .finalize(None, false, None, Network::Signet, 10, 100_000, false);
         assert!(result.is_ok());
     }
+
+    #[test]
+    fn test_process_fees_dust_threshold() {
+        let weight_wo_change = Weight::from_vb_unchecked(154);
+        let weight_with_change = Weight::from_vb_unchecked(197);
+        let fees = |threshold| {
+            process_fees(
+                Fees::MilliSatsVb(1_000),
+                weight_wo_change,
+                weight_with_change,
+                9_889,
+                5_000,
+                Drain::Change,
+                threshold,
+            )
+        };
+
+        let default = fees(DUST_AMOUNT);
+        assert!(default.error.is_none());
+        assert_eq!(default.change, None);
+        assert_eq!(default.fees, Some(4_889));
+        assert_eq!(default.warnings, vec![Warning::ChangeUnderDust(4_735)]);
+
+        let low = fees(546);
+        assert!(low.error.is_none());
+        assert_eq!(low.change, Some(4_692));
+        assert_eq!(low.fees, Some(197));
+        assert!(low.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_process_fees_raised_dust_threshold() {
+        let fees = |threshold| {
+            process_fees(
+                Fees::Sats(1_000),
+                Weight::ZERO,
+                Weight::ZERO,
+                30_000,
+                10_000,
+                Drain::Change,
+                threshold,
+            )
+        };
+
+        let default = fees(DUST_AMOUNT);
+        assert_eq!(default.change, Some(19_000));
+        assert_eq!(default.fees, Some(1_000));
+
+        let raised = fees(25_000);
+        assert!(raised.error.is_none());
+        assert_eq!(raised.change, None);
+        assert_eq!(raised.fees, Some(20_000));
+        assert_eq!(raised.warnings, vec![Warning::ChangeUnderDust(19_000)]);
+    }
+
+    #[test]
+    fn test_check_missing_change_dust_threshold() {
+        let (_signer, derivator) = tr_signer();
+        let inputs = vec![funding_coin(9_889, &derivator, 1)];
+        let outputs: Vec<Box<dyn RecipientProvider>> = vec![Box::new(external_recipient(5_000))];
+        let fees = Fees::Sats(200);
+
+        assert!(check_missing_change(&inputs, &outputs, &fees, DUST_AMOUNT).is_ok());
+        assert!(matches!(
+            check_missing_change(&inputs, &outputs, &fees, 546),
+            Err(Error::MissingChange { excess: 4_689 })
+        ));
+    }
 }
