@@ -1432,7 +1432,6 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         let all_xprivs = self.master_xprivs();
 
         let sp_provider = Box::new(SpSecretProvider::new(
-            self.coin_store.clone(),
             self.sp_receiver.clone(),
             all_xprivs.clone(),
         ));

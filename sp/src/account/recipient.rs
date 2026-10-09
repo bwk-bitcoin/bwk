@@ -357,14 +357,9 @@ impl RecipientProvider for SpChangeRecipientProvider {
 
 // Batch SP script derivation
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::collections::HashMap;
 
 use crate::receiver::SpReceiver;
-
-use crate::account::coin_store::SpCoinStore;
 
 /// Batch-derive output scripts for all SP outputs in a transaction.
 ///
@@ -432,15 +427,9 @@ fn batch_derive_sp_scripts(
 /// Standalone [`SpPartialSecretProvider`] that can be boxed into a
 /// [`TxBuilder`](bwk_tx::tx_builder::TxBuilder).
 ///
-/// Holds a cloned [`SpReceiver`] and a shared coin store reference to look up
-/// `OwnedOutput` tweaks for selected inputs. Also stores master xprivs from
-/// BIP32 sub-accounts so it can derive secret keys for mixed-input transactions.
-pub struct SpSecretProvider<
-    P: crate::profile::SpStorageProfile = crate::profile::SpRamProfile<
-        bwk::bwk_electrum::profile::DefaultBackend,
-    >,
-> {
-    coin_store: Arc<Mutex<SpCoinStore<P>>>,
+/// Holds a cloned [`SpReceiver`] for the spend key, and the master xprivs of
+/// the sub-accounts to derive the BIP32 input keys.
+pub struct SpSecretProvider {
     client: SpReceiver,
     xprivs: std::collections::BTreeMap<
         crate::receiver::bitcoin::bip32::Fingerprint,
@@ -449,9 +438,8 @@ pub struct SpSecretProvider<
     secp: crate::receiver::bitcoin::secp256k1::Secp256k1<crate::receiver::bitcoin::secp256k1::All>,
 }
 
-impl<P: crate::profile::SpStorageProfile> SpSecretProvider<P> {
+impl SpSecretProvider {
     pub fn new(
-        coin_store: Arc<Mutex<SpCoinStore<P>>>,
         client: SpReceiver,
         xprivs: std::collections::BTreeMap<
             crate::receiver::bitcoin::bip32::Fingerprint,
@@ -459,7 +447,6 @@ impl<P: crate::profile::SpStorageProfile> SpSecretProvider<P> {
         >,
     ) -> Self {
         Self {
-            coin_store,
             client,
             xprivs,
             secp: crate::receiver::bitcoin::secp256k1::Secp256k1::new(),
@@ -498,9 +485,7 @@ impl<P: crate::profile::SpStorageProfile> SpSecretProvider<P> {
     }
 }
 
-impl<P: crate::profile::SpStorageProfile + Send + Sync + 'static> SpPartialSecretProvider
-    for SpSecretProvider<P>
-{
+impl SpPartialSecretProvider for SpSecretProvider {
     // Source: adapted from cygnet3/spdk's selected-input partial-secret logic.
     // See `sp/NOTICE`.
     fn compute_partial_secret(
@@ -514,7 +499,6 @@ impl<P: crate::profile::SpStorageProfile + Send + Sync + 'static> SpPartialSecre
             .try_get_secret_spend_key()
             .map_err(|_| TxError::SpPartialSecret)?;
 
-        let store = self.coin_store.lock().expect("poisoned");
         let mut input_keys = Vec::with_capacity(inputs.len());
         let mut outpoints = Vec::with_capacity(inputs.len());
 
@@ -550,7 +534,6 @@ impl<P: crate::profile::SpStorageProfile + Send + Sync + 'static> SpPartialSecre
             }
         }
 
-        drop(store);
         crate::core::sending::calculate_partial_secret(&input_keys, &outpoints)
             .map_err(|_| TxError::SpPartialSecret)
     }
