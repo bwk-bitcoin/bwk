@@ -4,23 +4,31 @@
 //! Uses newtype wrappers to satisfy the orphan rule.
 
 use crate::{
-    core::utils::common::SilentPaymentAddress,
+    core::{receiving::NUMS_H, utils::common::SilentPaymentAddress},
     receiver::{
-        bitcoin::{key::TapTweak, script::PushBytesBuf, ScriptBuf, TxOut, Weight},
-        RecipientAddress,
+        bitcoin::{
+            bip32::{Fingerprint, Xpriv},
+            key::TapTweak,
+            script::PushBytesBuf,
+            secp256k1::{All, Keypair, Secp256k1, SecretKey},
+            Network, ScriptBuf, TxOut, Weight,
+        },
+        RecipientAddress, SpReceiver,
     },
 };
 
-use bwk_coin::{Coin, CoinSpendInfo};
+use bwk_coin::{derive_descriptor, Coin, CoinSpendInfo};
 use bwk_tx::{
     error::Error as TxError,
     recipient::{FinalizationContext, PsbtOutputInfo, RecipientProvider, SpPartialSecretProvider},
     transaction::Amount,
 };
+use miniscript::{
+    descriptor::{ShInner, Tr},
+    DefiniteDescriptorKey, Descriptor, ToPublicKey,
+};
 
 const TR_OUTPUT_WEIGHT: u64 = 172;
-
-use crate::receiver::bitcoin::Network;
 
 #[derive(Debug, Clone)]
 pub struct SpRecipient {
@@ -357,9 +365,7 @@ impl RecipientProvider for SpChangeRecipientProvider {
 
 // Batch SP script derivation
 
-use std::collections::HashMap;
-
-use crate::receiver::SpReceiver;
+use std::collections::{BTreeMap, HashMap};
 
 /// Batch-derive output scripts for all SP outputs in a transaction.
 ///
@@ -422,6 +428,133 @@ fn batch_derive_sp_scripts(
     }
 }
 
+// BIP352 input keys
+
+/// Sum the BIP352 input keys of `inputs` into the partial secret. The input
+/// hash still covers every outpoint, eligible or not.
+///
+/// Source: adapted from cygnet3/spdk's selected-input partial-secret logic.
+/// See `sp/NOTICE`.
+fn partial_secret(
+    inputs: &[Coin],
+    b_spend: &SecretKey,
+    xprivs: &BTreeMap<Fingerprint, Xpriv>,
+    secp: &Secp256k1<All>,
+) -> Result<SecretKey, TxError> {
+    let mut input_keys = Vec::with_capacity(inputs.len());
+    let mut outpoints = Vec::with_capacity(inputs.len());
+
+    for coin in inputs {
+        outpoints.push((coin.outpoint.txid.to_string(), coin.outpoint.vout));
+        if let Some(key) = bip352_input_key(coin, b_spend, xprivs, secp)? {
+            input_keys.push(key);
+        }
+    }
+
+    crate::core::sending::calculate_partial_secret(&input_keys, &outpoints)
+        .map_err(|_| TxError::SpPartialSecret)
+}
+
+/// The secret key `coin` adds to the BIP352 input sum, and whether it is a
+/// taproot key.
+///
+/// `None` for an input BIP352 receivers leave out of the sum. An error when
+/// the input counts but we cannot produce its key: the SP outputs would then
+/// pay to a key the receiver never finds. A descriptor we cannot derive at the
+/// coin's path errors with [`TxError::Coin`].
+fn bip352_input_key(
+    coin: &Coin,
+    b_spend: &SecretKey,
+    xprivs: &BTreeMap<Fingerprint, Xpriv>,
+    secp: &Secp256k1<All>,
+) -> Result<Option<(SecretKey, bool)>, TxError> {
+    match &coin.spend_info {
+        CoinSpendInfo::Sp { tweak, .. } => sp_input_key(b_spend, tweak).map(Some),
+        CoinSpendInfo::Bip32 {
+            coin_path: (keychain, index),
+            descriptor,
+            ..
+        } => {
+            let descriptor = derive_descriptor(descriptor, *keychain, *index)?;
+            if descriptor.script_pubkey() != coin.txout.script_pubkey {
+                return Err(TxError::SpPartialSecret);
+            }
+            match &descriptor {
+                Descriptor::Pkh(pkh) => single_key_input_key(pkh.as_inner(), xprivs, secp),
+                Descriptor::Wpkh(wpkh) => single_key_input_key(wpkh.as_inner(), xprivs, secp),
+                Descriptor::Sh(sh) => match sh.as_inner() {
+                    ShInner::Wpkh(wpkh) => single_key_input_key(wpkh.as_inner(), xprivs, secp),
+                    ShInner::Wsh(_) | ShInner::SortedMulti(_) | ShInner::Ms(_) => Ok(None),
+                },
+                Descriptor::Tr(tr) => taproot_input_key(tr, xprivs, secp),
+                Descriptor::Bare(_) | Descriptor::Wsh(_) => Ok(None),
+            }
+        }
+    }
+}
+
+fn sp_input_key(b_spend: &SecretKey, tweak: &[u8; 32]) -> Result<(SecretKey, bool), TxError> {
+    let tweak = SecretKey::from_slice(tweak).map_err(|_| TxError::SpPartialSecret)?;
+    let key = b_spend
+        .add_tweak(&tweak.into())
+        .map_err(|_| TxError::SpPartialSecret)?;
+    Ok((key, true))
+}
+
+/// BIP352 skips an uncompressed key.
+fn single_key_input_key(
+    key: &DefiniteDescriptorKey,
+    xprivs: &BTreeMap<Fingerprint, Xpriv>,
+    secp: &Secp256k1<All>,
+) -> Result<Option<(SecretKey, bool)>, TxError> {
+    let pubkey = key.to_public_key();
+    if !pubkey.compressed {
+        return Ok(None);
+    }
+    let secret = held_secret(key, xprivs, secp)?;
+    if secret.public_key(secp) != pubkey.inner {
+        return Err(TxError::SpPartialSecret);
+    }
+    Ok(Some((secret, false)))
+}
+
+/// The output key is the internal key tweaked with the tap tree, whatever
+/// path the input will be spent with.
+fn taproot_input_key(
+    tr: &Tr<DefiniteDescriptorKey>,
+    xprivs: &BTreeMap<Fingerprint, Xpriv>,
+    secp: &Secp256k1<All>,
+) -> Result<Option<(SecretKey, bool)>, TxError> {
+    let internal_key = tr.internal_key();
+    if internal_key.to_x_only_pubkey().serialize() == NUMS_H {
+        return Ok(None);
+    }
+    let secret = held_secret(internal_key, xprivs, secp)?;
+    let spend_info = tr.spend_info();
+    let tweaked = Keypair::from_secret_key(secp, &secret)
+        .tap_tweak(secp, spend_info.merkle_root())
+        .to_keypair();
+    if tweaked.x_only_public_key().0 != spend_info.output_key().to_x_only_public_key() {
+        return Err(TxError::SpPartialSecret);
+    }
+    Ok(Some((tweaked.secret_key(), true)))
+}
+
+fn held_secret(
+    key: &DefiniteDescriptorKey,
+    xprivs: &BTreeMap<Fingerprint, Xpriv>,
+    secp: &Secp256k1<All>,
+) -> Result<SecretKey, TxError> {
+    let xpriv = xprivs
+        .get(&key.master_fingerprint())
+        .ok_or(TxError::SpPartialSecret)?;
+    let path = key.full_derivation_path().ok_or(TxError::SpPartialSecret)?;
+    xpriv
+        .derive_priv(secp, &path)
+        .map(|xpriv| xpriv.private_key)
+        .map_err(|_| TxError::SpPartialSecret)
+}
+
 // SpSecretProvider
 
 /// Standalone [`SpPartialSecretProvider`] that can be boxed into a
@@ -452,90 +585,16 @@ impl SpSecretProvider {
             secp: crate::receiver::bitcoin::secp256k1::Secp256k1::new(),
         }
     }
-
-    /// Derive the secret key for a BIP32 coin if not already set.
-    fn derive_bip32_secret_key(
-        &self,
-        coin: &Coin,
-    ) -> Option<crate::receiver::bitcoin::secp256k1::SecretKey> {
-        let psbt_input = coin.to_psbt_input().ok()?;
-
-        if !psbt_input.bip32_derivation.is_empty() {
-            psbt_input.bip32_derivation.values().find_map(|(fg, path)| {
-                let xpriv = self.xprivs.get(fg)?;
-                xpriv
-                    .derive_priv(&self.secp, path)
-                    .ok()
-                    .map(|k| k.private_key)
-            })
-        } else if !psbt_input.tap_key_origins.is_empty() {
-            psbt_input
-                .tap_key_origins
-                .values()
-                .find_map(|(_, (fg, path))| {
-                    let xpriv = self.xprivs.get(fg)?;
-                    xpriv
-                        .derive_priv(&self.secp, path)
-                        .ok()
-                        .map(|k| k.private_key)
-                })
-        } else {
-            None
-        }
-    }
 }
 
 impl SpPartialSecretProvider for SpSecretProvider {
-    // Source: adapted from cygnet3/spdk's selected-input partial-secret logic.
-    // See `sp/NOTICE`.
-    fn compute_partial_secret(
-        &self,
-        inputs: &[Coin],
-    ) -> Result<crate::receiver::bitcoin::secp256k1::SecretKey, TxError> {
-        use crate::receiver::bitcoin::secp256k1::SecretKey;
-
+    fn compute_partial_secret(&self, inputs: &[Coin]) -> Result<SecretKey, TxError> {
         let b_spend = self
             .client
             .try_get_secret_spend_key()
             .map_err(|_| TxError::SpPartialSecret)?;
 
-        let mut input_keys = Vec::with_capacity(inputs.len());
-        let mut outpoints = Vec::with_capacity(inputs.len());
-
-        for coin in inputs {
-            outpoints.push((coin.outpoint.txid.to_string(), coin.outpoint.vout));
-
-            match &coin.spend_info {
-                CoinSpendInfo::Sp { tweak, .. } => {
-                    let sk = SecretKey::from_slice(tweak).map_err(|_| TxError::SpPartialSecret)?;
-                    let signing_key = b_spend
-                        .add_tweak(&sk.into())
-                        .map_err(|_| TxError::SpPartialSecret)?;
-                    input_keys.push((signing_key, true));
-                }
-                CoinSpendInfo::Bip32 { secret_key, .. } => {
-                    let sk = secret_key
-                        .or_else(|| self.derive_bip32_secret_key(coin))
-                        .ok_or(TxError::CoinNotFound)?;
-                    let is_taproot = coin.txout.script_pubkey.is_p2tr();
-                    if is_taproot {
-                        // BIP32 P2TR outputs have a standard BIP341 taproot tweak.
-                        // The scanner extracts the tweaked output key from scriptPubKey,
-                        // so we must use the tweaked private key for partial secret.
-                        let kp = crate::receiver::bitcoin::secp256k1::Keypair::from_secret_key(
-                            &self.secp, &sk,
-                        );
-                        let tweaked = kp.tap_tweak(&self.secp, None).to_keypair();
-                        input_keys.push((tweaked.secret_key(), true));
-                    } else {
-                        input_keys.push((sk, false));
-                    }
-                }
-            }
-        }
-
-        crate::core::sending::calculate_partial_secret(&input_keys, &outpoints)
-            .map_err(|_| TxError::SpPartialSecret)
+        partial_secret(inputs, &b_spend, &self.xprivs, &self.secp)
     }
 
     fn derive_sp_scripts(
@@ -552,85 +611,15 @@ impl SpPartialSecretProvider for SpSecretProvider {
 #[cfg(feature = "mnemonic")]
 use crate::account::Account;
 
-/// Derive a BIP32 coin's secret key from the SP account's and sub-accounts' master xprivs.
-#[cfg(feature = "mnemonic")]
-fn derive_bip32_key(
-    coin: &Coin,
-    account: &Account,
-) -> Option<crate::receiver::bitcoin::secp256k1::SecretKey> {
-    let secp = crate::receiver::bitcoin::secp256k1::Secp256k1::new();
-    let psbt_input = coin.to_psbt_input().ok()?;
-
-    let xprivs = account.master_xprivs();
-
-    if !psbt_input.bip32_derivation.is_empty() {
-        psbt_input.bip32_derivation.values().find_map(|(fg, path)| {
-            let xpriv = xprivs.get(fg)?;
-            xpriv.derive_priv(&secp, path).ok().map(|k| k.private_key)
-        })
-    } else if !psbt_input.tap_key_origins.is_empty() {
-        psbt_input
-            .tap_key_origins
-            .values()
-            .find_map(|(_, (fg, path))| {
-                let xpriv = xprivs.get(fg)?;
-                xpriv.derive_priv(&secp, path).ok().map(|k| k.private_key)
-            })
-    } else {
-        None
-    }
-}
-
 #[cfg(feature = "mnemonic")]
 impl SpPartialSecretProvider for Account {
-    // Source: adapted from cygnet3/spdk's selected-input partial-secret logic.
-    // See `sp/NOTICE`.
-    fn compute_partial_secret(
-        &self,
-        inputs: &[Coin],
-    ) -> Result<crate::receiver::bitcoin::secp256k1::SecretKey, TxError> {
-        use crate::receiver::bitcoin::secp256k1::SecretKey;
-
+    fn compute_partial_secret(&self, inputs: &[Coin]) -> Result<SecretKey, TxError> {
         let b_spend = self
             .sp_receiver()
             .try_get_secret_spend_key()
             .map_err(|_| TxError::SpPartialSecret)?;
 
-        let mut input_keys = Vec::with_capacity(inputs.len());
-        let mut outpoints = Vec::with_capacity(inputs.len());
-
-        for coin in inputs {
-            outpoints.push((coin.outpoint.txid.to_string(), coin.outpoint.vout));
-
-            match &coin.spend_info {
-                CoinSpendInfo::Sp { tweak, .. } => {
-                    let sk = SecretKey::from_slice(tweak).map_err(|_| TxError::SpPartialSecret)?;
-                    let signing_key = b_spend
-                        .add_tweak(&sk.into())
-                        .map_err(|_| TxError::SpPartialSecret)?;
-                    input_keys.push((signing_key, true));
-                }
-                CoinSpendInfo::Bip32 { secret_key, .. } => {
-                    let sk = secret_key
-                        .or_else(|| derive_bip32_key(coin, self))
-                        .ok_or(TxError::CoinNotFound)?;
-                    let is_taproot = coin.txout.script_pubkey.is_p2tr();
-                    if is_taproot {
-                        let secp = crate::receiver::bitcoin::secp256k1::Secp256k1::new();
-                        let kp = crate::receiver::bitcoin::secp256k1::Keypair::from_secret_key(
-                            &secp, &sk,
-                        );
-                        let tweaked = kp.tap_tweak(&secp, None).to_keypair();
-                        input_keys.push((tweaked.secret_key(), true));
-                    } else {
-                        input_keys.push((sk, false));
-                    }
-                }
-            }
-        }
-
-        crate::core::sending::calculate_partial_secret(&input_keys, &outpoints)
-            .map_err(|_| TxError::SpPartialSecret)
+        partial_secret(inputs, &b_spend, &self.master_xprivs(), &Secp256k1::new())
     }
 
     fn derive_sp_scripts(
