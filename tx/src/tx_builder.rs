@@ -5,6 +5,7 @@ use crate::{
         process_transaction, tx_estimated_weight, Amount, Error, Fees, TransactionResult,
         TxTemplate,
     },
+    DUST_AMOUNT,
 };
 use bitcoin::Psbt;
 use bwk_coin::{Coin, CoinSource};
@@ -55,6 +56,7 @@ impl TxBuilder {
                 inputs: vec![],
                 outputs: vec![],
                 fees: Fees::MilliSatsVb(1_000),
+                dust_threshold: DUST_AMOUNT,
             },
             coin_source: None,
             sp_provider: None,
@@ -77,6 +79,7 @@ impl TxBuilder {
                 inputs: vec![],
                 outputs: vec![],
                 fees: Fees::MilliSatsVb(1_000),
+                dust_threshold: DUST_AMOUNT,
             },
             coin_source: Some(Box::new(BTreeMap::new())),
             sp_provider: None,
@@ -107,6 +110,11 @@ impl TxBuilder {
     }
     pub fn max_fee_amount(mut self, sats: u64) -> Self {
         self.max_fee_amount = sats;
+        self
+    }
+    /// A change or max drain below `sats` goes to the fee instead of an output.
+    pub fn dust_threshold(mut self, sats: u64) -> Self {
+        self.tx_template.dust_threshold = sats;
         self
     }
     pub fn fee(mut self, fee: u64) -> Self {
@@ -151,6 +159,7 @@ impl TxBuilder {
             inputs: vec![],
             outputs: vec![],
             fees: Fees::MilliSatsVb(1_000),
+            dust_threshold: self.tx_template.dust_threshold,
         };
     }
     /// Send <amount> to <address>

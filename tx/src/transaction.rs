@@ -6,7 +6,6 @@ use bwk_coin::{shuffle_coins, Coin, CoinSource};
 use crate::{
     coin_selection::CoinSelector,
     recipient::{FinalizationContext, PsbtOutputInfo, RecipientProvider, SpPartialSecretProvider},
-    DUST_AMOUNT,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
@@ -109,6 +108,7 @@ pub struct TxTemplate {
     pub inputs: Vec<Coin>,
     pub outputs: Vec<Box<dyn RecipientProvider>>,
     pub fees: Fees,
+    pub dust_threshold: u64,
 }
 
 impl Clone for TxTemplate {
@@ -117,6 +117,7 @@ impl Clone for TxTemplate {
             inputs: self.inputs.clone(),
             outputs: self.outputs.iter().map(|o| o.clone_box()).collect(),
             fees: self.fees.clone(),
+            dust_threshold: self.dust_threshold,
         }
     }
 }
@@ -127,6 +128,7 @@ impl std::fmt::Debug for TxTemplate {
             .field("inputs", &self.inputs)
             .field("outputs", &format!("[{} outputs]", self.outputs.len()))
             .field("fees", &self.fees)
+            .field("dust_threshold", &self.dust_threshold)
             .finish()
     }
 }
@@ -305,7 +307,7 @@ impl TxTemplate {
         let (inputs, mut outputs) = self.shuffle_maybe(shuffle, outputs);
 
         if !skip_checks {
-            check_missing_change(&inputs, &outputs, &self.fees)?;
+            check_missing_change(&inputs, &outputs, &self.fees, self.dust_threshold)?;
             check_disproportionate_fee(&inputs, &outputs, max_fee_percent, max_fee_amount)?;
         }
 
@@ -388,6 +390,7 @@ fn check_missing_change(
     inputs: &[Coin],
     outputs: &[Box<dyn RecipientProvider>],
     fees: &Fees,
+    dust_threshold: u64,
 ) -> Result<(), Error> {
     if outputs.iter().any(|o| o.is_change()) {
         return Ok(());
@@ -397,7 +400,7 @@ fn check_missing_change(
     let sum_outputs: u64 = sum_output_amounts(outputs);
     let fee = sum_inputs.saturating_sub(sum_outputs);
 
-    if fee <= DUST_AMOUNT {
+    if fee <= dust_threshold {
         return Ok(());
     }
 
@@ -408,6 +411,7 @@ fn check_missing_change(
                 inputs: inputs.to_vec(),
                 outputs: outputs.iter().map(|o| o.clone_box()).collect(),
                 fees: fees.clone(),
+                dust_threshold,
             };
             let weight = tx_estimated_weight(&temp);
             weight.to_vbytes_ceil() * rate / 1_000
@@ -415,7 +419,7 @@ fn check_missing_change(
     };
 
     let excess = fee.saturating_sub(estimated_fee);
-    if excess > DUST_AMOUNT {
+    if excess > dust_threshold {
         Err(Error::MissingChange { excess })
     } else {
         Ok(())
@@ -517,6 +521,7 @@ pub fn process_fees(
     sum_inputs: u64,
     sum_outputs: u64,
     drain: Drain,
+    dust_threshold: u64,
 ) -> FeeResult {
     let mut result = FeeResult {
         fees: None,
@@ -546,7 +551,7 @@ pub fn process_fees(
         return result;
     }
 
-    let fee = if (fee_allowance - fee_wo_change) < DUST_AMOUNT {
+    let fee = if (fee_allowance - fee_wo_change) < dust_threshold {
         // Enough for fee but not for drain
         let lost = fee_allowance - fee_wo_change;
         match drain {
@@ -559,7 +564,7 @@ pub fn process_fees(
             Drain::None => {}
         }
         fee_allowance
-    } else if (fee_allowance - fee_with_change) < DUST_AMOUNT {
+    } else if (fee_allowance - fee_with_change) < dust_threshold {
         // Create a drain < DUST, so we dont
         let lost = fee_allowance - fee_wo_change;
         match drain {
@@ -698,6 +703,7 @@ pub fn process_transaction(
         inputs_total,
         outputs_total,
         drain,
+        tx_template.dust_threshold,
     );
 
     result.warnings.append(&mut warning);
@@ -737,8 +743,9 @@ pub fn process_transaction(
 #[cfg(all(test, feature = "test"))]
 mod test {
     use super::*;
-    use crate::tx_builder::test::{
-        external_recipient, funding_coin, sum_inputs, sum_outputs, tr_signer,
+    use crate::{
+        tx_builder::test::{external_recipient, funding_coin, sum_inputs, sum_outputs, tr_signer},
+        DUST_AMOUNT,
     };
     use bwk_coin::KeyChain;
     use miniscript::bitcoin;
@@ -757,6 +764,7 @@ mod test {
             inputs: vec![c1, c2],
             outputs: vec![Box::new(r1)],
             fees: Fees::MilliSatsVb(1000),
+            dust_threshold: DUST_AMOUNT,
         };
 
         // Create change recipient prototype for fee estimation
@@ -855,6 +863,7 @@ mod test {
             inputs: vec![c1],
             outputs: vec![Box::new(r1)],
             fees: Fees::Sats(89_000),
+            dust_threshold: DUST_AMOUNT,
         };
 
         let res = process_transaction(template.clone(), None, None);

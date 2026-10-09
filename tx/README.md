@@ -53,5 +53,6 @@ Weighted random selection algorithm that:
 ## Types
 
 - `TxBuilder`: Main builder with fluent API
-- `TxTemplate`: Inputs, outputs, and fee specification
+- `TxTemplate`: Inputs, outputs, fee specification and dust threshold (a
+  change or max drain under it goes to the fee, `DUST_AMOUNT` by default)
 - `Fees`: Fee specification, absolute sats or msat/vB
