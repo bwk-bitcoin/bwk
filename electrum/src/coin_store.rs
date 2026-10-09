@@ -791,7 +791,6 @@ impl<P: ScanProfile> CoinStore<P> {
                         spend_info: CoinSpendInfo::Bip32 {
                             coin_path: (addr.account(), addr.index()),
                             descriptor: descriptor.clone(),
-                            secret_key: None,
                         },
                     };
                     let coin = CoinEntry {

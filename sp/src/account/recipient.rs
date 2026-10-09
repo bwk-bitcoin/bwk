@@ -473,7 +473,6 @@ fn bip352_input_key(
         CoinSpendInfo::Bip32 {
             coin_path: (keychain, index),
             descriptor,
-            ..
         } => {
             let descriptor = derive_descriptor(descriptor, *keychain, *index)?;
             if descriptor.script_pubkey() != coin.txout.script_pubkey {
