@@ -16,10 +16,7 @@ pub mod unified;
 use {
     crate::{
         account::{
-            coin_store::{
-                CoinState, KeyedBip32Source, MergedCoinSource, SpCoinEntry, SpCoinSource,
-                SpCoinStore,
-            },
+            coin_store::{CoinState, MergedCoinSource, SpCoinEntry, SpCoinSource, SpCoinStore},
             config::Config,
             recipient::{SpChangeRecipientProvider, SpSecretProvider},
             tx_store::{header_time, SpTxEntry, SpTxStore},
@@ -53,7 +50,7 @@ use {
         persist::config_store::{ConfigStore, NoopConfigStore},
     },
     bwk_sign::signing_manager::SigningManager,
-    miniscript::{psbt::PsbtExt, Descriptor, DescriptorPublicKey, ForEachKey},
+    miniscript::{psbt::PsbtExt, Descriptor, DescriptorPublicKey},
     std::{
         collections::{BTreeMap, BTreeSet},
         str::FromStr,
@@ -1429,24 +1426,14 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
 
         let sp_source = SpCoinSource::new(self.coin_store.clone());
 
-        let all_xprivs = self.master_xprivs();
-
         let sp_provider = Box::new(SpSecretProvider::new(
             self.sp_receiver.clone(),
-            all_xprivs.clone(),
+            self.master_xprivs(),
         ));
 
-        // Merge coin sources from all sub-accounts, enriching BIP32 coins
-        // with their secret keys for SP partial secret computation. Each
-        // scanner only gets the keys its own descriptor is derived from.
         let bip32_sources: Vec<Box<dyn bwk_coin::CoinSource>> = self
             .scanners()
-            .map(|scanner| {
-                Box::new(KeyedBip32Source::new(
-                    Box::new(scanner.coin_source()),
-                    descriptor_xprivs(&scanner.descriptor(), &all_xprivs),
-                )) as Box<dyn bwk_coin::CoinSource>
-            })
+            .map(|scanner| Box::new(scanner.coin_source()) as Box<dyn bwk_coin::CoinSource>)
             .collect();
         let merged_source = Box::new(MergedCoinSource::new(sp_source, bip32_sources));
 
@@ -1807,24 +1794,6 @@ fn register_sub_signer(
     }
     signing_manager.register_bip32_descriptor(descriptor);
     Ok(())
-}
-
-#[cfg(feature = "mnemonic")]
-/// The subset of `xprivs` that `descriptor` is derived from, keyed by
-/// fingerprint: the only keys able to sign for it.
-fn descriptor_xprivs(
-    descriptor: &Descriptor<DescriptorPublicKey>,
-    xprivs: &BTreeMap<bitcoin::bip32::Fingerprint, bitcoin::bip32::Xpriv>,
-) -> BTreeMap<bitcoin::bip32::Fingerprint, bitcoin::bip32::Xpriv> {
-    let mut out = BTreeMap::new();
-    descriptor.for_each_key(|key| {
-        let fingerprint = key.master_fingerprint();
-        if let Some(xpriv) = xprivs.get(&fingerprint) {
-            out.insert(fingerprint, *xpriv);
-        }
-        true
-    });
-    out
 }
 
 #[cfg(feature = "mnemonic")]
