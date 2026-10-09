@@ -2214,9 +2214,11 @@ mod tests {
             Some(PublicKey::from_x_only_public_key(xonly, Parity::Even))
         );
 
+        let mut nums_control_block = vec![0xc0];
+        nums_control_block.extend(crate::core::receiving::NUMS_H);
         let script_path = txin(
             ScriptBuf::new(),
-            bitcoin::Witness::from_slice(&[vec![0; 64], vec![0x51], vec![0; 33]]),
+            bitcoin::Witness::from_slice(&[vec![0; 64], vec![0x51], nums_control_block]),
         );
         assert_eq!(
             crate::core::receiving::eligible_input_pubkey(

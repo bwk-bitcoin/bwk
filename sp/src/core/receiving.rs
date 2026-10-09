@@ -36,6 +36,12 @@ use serde::{
     Deserialize, Deserializer, Serialize,
 };
 
+/// x coordinate of the BIP341 NUMS point H, an internal key nobody holds.
+pub const NUMS_H: [u8; 32] = [
+    0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a, 0x5e,
+    0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80, 0x3a, 0xc0,
+];
+
 /// Calculate a transaction's BIP352 tweak data from its eligible input keys.
 pub fn calculate_tweak_data(
     input_pubkeys: &[&PublicKey],
@@ -114,8 +120,15 @@ pub fn eligible_input_pubkey(input: &TxIn, prevout: &TxOut) -> Result<Option<Pub
         if stack_len == 0 {
             return Err(Error::InvalidInput("empty P2TR witness".to_string()));
         }
-        if stack_len != 1 {
-            return Ok(None);
+        if stack_len > 1 {
+            // Script path: the control block is the last item, the internal
+            // key its bytes 1..33.
+            let internal_key = witness[stack_len - 1]
+                .get(1..33)
+                .ok_or_else(|| Error::InvalidInput("invalid P2TR control block".to_string()))?;
+            if internal_key == NUMS_H {
+                return Ok(None);
+            }
         }
         let xonly = XOnlyPublicKey::from_slice(&spk[2..34])?;
         return Ok(Some(PublicKey::from_x_only_public_key(xonly, Parity::Even)));
