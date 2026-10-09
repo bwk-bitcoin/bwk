@@ -1284,6 +1284,9 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         } else {
             builder.feerate(feerate_msats_vb)
         };
+        if let Some(sats) = request.dust_threshold {
+            builder = builder.dust_threshold(sats);
+        }
 
         for recip in recipients {
             builder.add_output(recip);

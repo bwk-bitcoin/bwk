@@ -36,6 +36,10 @@ pub struct TxRequest {
     pub fee: u64,
     /// Outpoints to spend. Empty means auto-select (or drain, if any output has `max`).
     pub input_outpoints: Vec<bitcoin::OutPoint>,
+    /// A change or max drain below this goes to the fee. `None` keeps
+    /// [`crate::DUST_AMOUNT`].
+    #[serde(default)]
+    pub dust_threshold: Option<u64>,
 }
 
 /// Result of [`bwk_sp::account::Account::simulate`]: fee, weight, and the

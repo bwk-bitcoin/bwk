@@ -49,6 +49,7 @@ fn multiple_max_outputs_rejected() {
         fee_rate: 1.0,
         fee: 0,
         input_outpoints: vec![],
+        dust_threshold: None,
     };
     match acc.tx_builder_from_request(&request) {
         Err(TxRequestError::MultipleMaxOutputs) => {}
@@ -70,6 +71,7 @@ fn invalid_address_is_typed() {
         fee_rate: 1.0,
         fee: 0,
         input_outpoints: vec![],
+        dust_threshold: None,
     };
     match acc.tx_builder_from_request(&request) {
         Err(TxRequestError::InvalidAddress { address, .. }) => {
@@ -91,6 +93,7 @@ fn send_to(address: &str) -> TxRequest {
         fee_rate: 1.0,
         fee: 0,
         input_outpoints: vec![],
+        dust_threshold: None,
     }
 }
 
@@ -167,6 +170,7 @@ fn manual_outpoint_not_in_wallet_is_coin_not_found() {
         fee_rate: 1.0,
         fee: 0,
         input_outpoints: vec![outpoint],
+        dust_threshold: None,
     };
     match acc.tx_builder_from_request(&request) {
         Err(TxRequestError::CoinNotFound(op)) => assert_eq!(op, outpoint),
@@ -188,6 +192,7 @@ fn auto_select_on_empty_wallet_is_insufficient_funds() {
         fee_rate: 1.0,
         fee: 0,
         input_outpoints: vec![],
+        dust_threshold: None,
     };
     match acc.simulate(&request) {
         Err(TxRequestError::InsufficientFunds) => {}
