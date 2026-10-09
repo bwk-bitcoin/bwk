@@ -2,19 +2,24 @@
 //!
 //! These cover the request-validation paths that don't need actual UTXOs:
 //! address parsing, the multiple-`max` rule, manual-outpoint lookups
-//! against an empty wallet, and the auto-select / insufficient-funds path.
+//! against an empty wallet, the auto-select / insufficient-funds path, and the
+//! request's dust threshold on a builder fed a synthetic coin.
 //! Coin-aware paths (drain, spendable filtering, happy-path PSBT generation)
 //! are exercised by the existing `BlindbitD`-gated integration suite.
 
 mod common;
 
-use bitcoin::{hashes::Hash, Address, Network, OutPoint, ScriptBuf};
+use bitcoin::{
+    bip32::DerivationPath, hashes::Hash, Address, Amount, Network, OutPoint, ScriptBuf, Sequence,
+    TxOut,
+};
+use bwk_coin::{Coin, CoinSpendInfo, CoinStatus, TAPROOT_KEYSPEND_SATISFACTION_WU};
 use bwk_sp::{
     core::utils::common::{Network as SpNetwork, SilentPaymentAddress},
     receiver::error::Error as ReceiverError,
 };
 use bwk_tx::template::{TxOutputSpec, TxRequest, TxRequestError};
-use common::test_account_named;
+use common::{test_account_named, test_outpoint};
 
 fn account() -> bwk_sp::account::Account {
     test_account_named("template-tests", "http://127.0.0.1:1")
@@ -199,4 +204,66 @@ fn auto_select_on_empty_wallet_is_insufficient_funds() {
         Err(other) => panic!("expected InsufficientFunds, got {other:?}"),
         Ok(_) => panic!("expected InsufficientFunds, got Ok"),
     }
+}
+
+fn sp_coin(amount: u64) -> Coin {
+    Coin {
+        txout: TxOut {
+            value: Amount::from_sat(amount),
+            script_pubkey: ScriptBuf::new(),
+        },
+        outpoint: test_outpoint(),
+        height: Some(1),
+        sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+        status: CoinStatus::Confirmed,
+        label: None,
+        satisfaction_size: TAPROOT_KEYSPEND_SATISFACTION_WU,
+        spend_info: CoinSpendInfo::Sp {
+            derivation: DerivationPath::default(),
+            tweak: [0u8; 32],
+        },
+    }
+}
+
+fn send_5000_request(dust_threshold: Option<u64>) -> TxRequest {
+    TxRequest {
+        outputs: vec![TxOutputSpec {
+            address: valid_address(),
+            amount: 5_000,
+            label: None,
+            max: false,
+        }],
+        fee_rate: 1.0,
+        fee: 0,
+        input_outpoints: vec![],
+        dust_threshold,
+    }
+}
+
+#[test]
+fn default_dust_threshold_drops_change_into_fee() {
+    let acc = account();
+    let mut builder = acc
+        .tx_builder_from_request(&send_5000_request(None))
+        .unwrap();
+    builder.add_input(sp_coin(9_889));
+
+    let res = builder.simulate();
+    assert!(res.error.is_none());
+    assert_eq!(res.change, None);
+    assert_eq!(res.fees, Some(Amount::from_sat(4_889)));
+}
+
+#[test]
+fn low_dust_threshold_keeps_change() {
+    let acc = account();
+    let mut builder = acc
+        .tx_builder_from_request(&send_5000_request(Some(546)))
+        .unwrap();
+    builder.add_input(sp_coin(9_889));
+
+    let res = builder.simulate();
+    assert!(res.error.is_none());
+    assert_eq!(res.change, Some(Amount::from_sat(4_735)));
+    assert_eq!(res.fees, Some(Amount::from_sat(154)));
 }
