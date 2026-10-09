@@ -4,16 +4,34 @@
 //! - SP-only inputs (to SP, taproot, segwit, and mixed outputs)
 //! - Mixed SP + BIP32 inputs (to standard outputs)
 //! - Mixed SP + BIP32 inputs (to SP outputs, regression for partial secret)
+//! - BIP32 inputs BIP352 leaves out of the partial secret, or tweaks with a tree
 
 mod common;
 
+use std::str::FromStr;
+
 use bitcoin::Network;
 use bwk::bwk_electrum::coin_store::PaymentType;
+use bwk_coin::Coin;
 use bwk_sign::hot_signer::HotSigner;
-use bwk_sp::account::recipient::{SpRecipientAddress, TxBuilderSpExt};
-use bwk_tx::{recipient::Recipient, transaction::Amount};
+use bwk_sp::{
+    account::{
+        recipient::{SpRecipientAddress, TxBuilderSpExt},
+        Account,
+    },
+    core::receiving::NUMS_H,
+};
+use bwk_tx::{
+    recipient::Recipient,
+    transaction::{Amount, Error as TxError},
+};
+use miniscript::{Descriptor, DescriptorPublicKey};
 
-use common::{test_mnemonic, test_mnemonic_2, TestEnv};
+use common::{add_offline_sub_account, bip32_key, test_mnemonic, test_mnemonic_2, TestEnv};
+
+const TR_INTERNAL_PATH: &str = "m/86'/1'/1'";
+const TR_LEAF_PATH: &str = "m/86'/1'/2'";
+const WSH_PATH: &str = "m/48'/1'/0'/2'";
 
 #[test]
 fn test_transactions() {
@@ -41,6 +59,13 @@ fn test_transactions() {
     test_sp_to_sp_other_and_self(&mut env);
     test_mixed_sp_taproot_to_sp(&mut env);
     test_mixed_sp_segwit_to_sp(&mut env);
+    test_mixed_sp_taptree_to_sp(&mut env);
+    test_mixed_sp_wsh_to_sp(&mut env);
+    test_non_eligible_inputs_to_sp(&mut env);
+}
+
+fn descriptor(descriptor: &str) -> Descriptor<DescriptorPublicKey> {
+    Descriptor::from_str(descriptor).unwrap()
 }
 
 /// Create a drain recipient for a standard address (Amount::Max, no change).
@@ -747,4 +772,95 @@ fn test_mixed_sp_segwit_to_sp(env: &mut TestEnv) {
         !new_outputs.is_empty(),
         "scanner must detect SP output from mixed SP+segwit send"
     );
+}
+
+/// SP + tr(K,{pk(L)}) -> SP address (drain, mixed inputs).
+///
+/// Regression test: the taproot input key must be tweaked with the tap tree,
+/// not with an empty merkle root, or the scanner misses both SP outputs.
+fn test_mixed_sp_taptree_to_sp(env: &mut TestEnv) {
+    let taptree = descriptor(&format!(
+        "tr({},pk({}))",
+        bip32_key(TR_INTERNAL_PATH),
+        bip32_key(TR_LEAF_PATH)
+    ));
+    assert_mixed_sp_to_sp(env, "test-taptree", taptree);
+}
+
+/// SP + wsh(pk(K)) -> SP address (drain, mixed inputs).
+///
+/// Regression test: a P2WSH input is not BIP352-eligible, its key must stay out
+/// of the partial secret, or the scanner misses both SP outputs.
+fn test_mixed_sp_wsh_to_sp(env: &mut TestEnv) {
+    let wsh = descriptor(&format!("wsh(pk({}))", bip32_key(WSH_PATH)));
+    assert_mixed_sp_to_sp(env, "test-wsh", wsh);
+}
+
+/// Spend an SP coin and a coin of `descriptor` to our own SP address, then
+/// check the scanner finds the SP output and the SP change.
+fn assert_mixed_sp_to_sp(
+    env: &mut TestEnv,
+    name: &str,
+    descriptor: Descriptor<DescriptorPublicKey>,
+) {
+    let start_height = env.next_scan_height();
+    let mut account = env.sp_account(name);
+    env.fund_sp(&mut account, 0.1);
+    add_offline_sub_account(&mut account, "sub-custom", descriptor.clone());
+    let coin = env.create_descriptor_coin(descriptor, 0.1);
+
+    let mut builder = account.tx_builder().feerate(1000);
+    builder.send_to_sp(account.sp_address(), 50_000);
+    builder.drain_inputs();
+    builder.add_input(coin);
+    let mut psbt = builder.generate().unwrap();
+    assert_eq!(psbt.unsigned_tx.input.len(), 2);
+    assert_eq!(psbt.unsigned_tx.output.len(), 2);
+    let tx = account.sign_and_finalize(&mut psbt).unwrap();
+    let txid = tx.compute_txid();
+    env.broadcast_and_mine(&tx);
+
+    account
+        .scan_blocks(Some(start_height), Some(env.height))
+        .unwrap();
+    let new_outputs = account
+        .coins()
+        .into_iter()
+        .filter(|(op, _)| op.txid == txid)
+        .count();
+    assert_eq!(
+        new_outputs, 2,
+        "scanner must detect the SP output and the SP change"
+    );
+}
+
+/// Only inputs BIP352 leaves out of the partial secret: there is no key to
+/// derive the SP outputs from, so `generate()` refuses the tx.
+fn test_non_eligible_inputs_to_sp(env: &mut TestEnv) {
+    let account = env.sp_account("test-non-eligible");
+    let wsh_coin = env.create_descriptor_coin(
+        descriptor(&format!("wsh(pk({}))", bip32_key(WSH_PATH))),
+        0.1,
+    );
+    let nums_coin = env.create_descriptor_coin(
+        descriptor(&format!(
+            "tr({},pk({}))",
+            hex::encode(NUMS_H),
+            bip32_key(TR_LEAF_PATH)
+        )),
+        0.1,
+    );
+
+    assert_sp_send_refused(&account, vec![wsh_coin.clone()]);
+    assert_sp_send_refused(&account, vec![nums_coin.clone()]);
+    assert_sp_send_refused(&account, vec![wsh_coin, nums_coin]);
+}
+
+fn assert_sp_send_refused(account: &Account, inputs: Vec<Coin>) {
+    let mut builder = account.tx_builder().feerate(1000);
+    builder.send_to_sp(account.sp_address(), 50_000);
+    for coin in inputs {
+        builder.add_input(coin);
+    }
+    assert!(matches!(builder.generate(), Err(TxError::SpPartialSecret)));
 }

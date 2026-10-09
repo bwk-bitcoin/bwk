@@ -10,6 +10,7 @@
 
 use std::{
     process::Command,
+    str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
@@ -19,7 +20,8 @@ use std::{
 };
 
 use bitcoin::{
-    absolute::Height, hashes::Hash, Amount, OutPoint, ScriptBuf, TxOut, Txid, XOnlyPublicKey,
+    absolute::Height, bip32::DerivationPath, hashes::Hash, Amount, OutPoint, ScriptBuf, TxOut,
+    Txid, XOnlyPublicKey,
 };
 
 use blindbitd::BlindbitD;
@@ -672,8 +674,9 @@ pub fn swap_to_sp(
 // TestEnv: integration test harness
 
 use bwk::bwk_electrum::{config::ScannerConfig, scanner::ElectrumScanner};
-use bwk_coin::{Coin, CoinSpendInfo, CoinStatus, KeyChain};
+use bwk_coin::{derive_descriptor, Coin, CoinSpendInfo, CoinStatus, KeyChain};
 use bwk_sign::hot_signer::HotSigner;
+use miniscript::{Descriptor, DescriptorPublicKey};
 
 /// Mnemonic for BIP32 coins (different from SP mnemonics).
 #[allow(dead_code)]
@@ -681,11 +684,25 @@ pub fn bip32_mnemonic() -> &'static str {
     "legal winner thank year wave sausage worth useful legal winner thank yellow"
 }
 
-/// Attach an offline sub-account watching `signer`'s only descriptor, signed
-/// by the BIP32 mnemonic every sub-account here shares.
+/// The `<0;1>/*` key of the BIP32 mnemonic under the account path `path`, for
+/// use in a descriptor.
+pub fn bip32_key(path: &str) -> String {
+    let signer =
+        HotSigner::new_from_mnemonics(bitcoin::Network::Regtest, bip32_mnemonic()).unwrap();
+    format!(
+        "{}/<0;1>/*",
+        signer.xpub(&DerivationPath::from_str(path).unwrap())
+    )
+}
+
+/// Attach an offline sub-account watching `descriptor`, signed by the BIP32
+/// mnemonic every sub-account here shares.
 #[allow(dead_code)]
-fn add_offline_sub_account(account: &mut bwk_sp::account::Account, name: &str, signer: &HotSigner) {
-    let descriptor = signer.descriptors().into_iter().next().unwrap();
+pub fn add_offline_sub_account(
+    account: &mut bwk_sp::account::Account,
+    name: &str,
+    descriptor: Descriptor<DescriptorPublicKey>,
+) {
     let mut config = ScannerConfig::new(
         descriptor,
         std::path::PathBuf::new(),
@@ -885,7 +902,11 @@ impl TestEnv {
         let signer =
             HotSigner::new_taproot_from_mnemonics(bitcoin::Network::Regtest, bip32_mnemonic())
                 .unwrap();
-        add_offline_sub_account(account, "sub-tr", &signer);
+        add_offline_sub_account(
+            account,
+            "sub-tr",
+            signer.descriptors().into_iter().next().unwrap(),
+        );
     }
 
     /// Add a segwit (P2WPKH) sub-account to an SP account so it can sign
@@ -894,7 +915,11 @@ impl TestEnv {
         let signer =
             HotSigner::new_wpkh_from_mnemonics(bitcoin::Network::Regtest, bip32_mnemonic())
                 .unwrap();
-        add_offline_sub_account(account, "sub-sw", &signer);
+        add_offline_sub_account(
+            account,
+            "sub-sw",
+            signer.descriptors().into_iter().next().unwrap(),
+        );
     }
 
     /// Create a funded taproot coin via bitcoind.
@@ -945,7 +970,22 @@ impl TestEnv {
         let signer =
             HotSigner::new_wpkh_from_mnemonics(bitcoin::Network::Regtest, bip32_mnemonic())
                 .unwrap();
-        let (addr, _) = signer.wpkh_receive_address_and_key(0);
+        self.create_descriptor_coin(signer.descriptors().into_iter().next().unwrap(), btc)
+    }
+
+    /// Create a funded coin at receive index 0 of `descriptor` via bitcoind.
+    ///
+    /// Register the descriptor via `add_offline_sub_account()` so
+    /// `sign_and_finalize()` can sign it.
+    pub fn create_descriptor_coin(
+        &mut self,
+        descriptor: Descriptor<DescriptorPublicKey>,
+        btc: f64,
+    ) -> Coin {
+        let addr = derive_descriptor(&descriptor, KeyChain::Receive, 0)
+            .unwrap()
+            .address(bitcoin::Network::Regtest)
+            .unwrap();
 
         let txid = bwk_utils::test::send(&mut self.bitcoind.client, addr.clone(), btc).unwrap();
         self.mine(1);
@@ -957,7 +997,6 @@ impl TestEnv {
             .unwrap();
         let height = bwk_utils::test::get_tx_height(&mut self.bitcoind.client, txid);
 
-        let descriptor = signer.descriptors().into_iter().next().unwrap();
         let satisfaction = descriptor
             .clone()
             .into_single_descriptors()
