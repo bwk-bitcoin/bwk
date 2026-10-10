@@ -27,7 +27,7 @@ readme = "README.md"
 
 [workspace.dependencies]
 crossbeam = "0.8"
-bwk-hwi = { path = "hwi", default-features = false }
+bwk-hwi = { version = "0.1.0", path = "hwi", default-features = false }
 base64ct = "=1.6.0"
 url = "=2.5.2"
 bip39 = "2.2.0"
@@ -84,4 +84,4 @@ bwk = { path = "bwk" }
 # enum, which keeps the diff and the review surface small. Upstream thiserror is not a
 # direct dependency of this workspace, so its extras (`#[backtrace]`, generics,
 # lifetimes, ...) are unavailable. See error/README.md.
-thiserror = { package = "bwk-error", path = "error" }
+thiserror = { package = "bwk-error", version = "0.1.0", path = "error" }

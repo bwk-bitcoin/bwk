@@ -1,6 +1,6 @@
 [package]
 name = "bwk-error"
-version = "0.0.1"
+version = "0.1.0"
 description = "Derive for error types, covering the subset of thiserror bwk uses"
 documentation = "https://docs.rs/bwk-error"
 readme.workspace = true

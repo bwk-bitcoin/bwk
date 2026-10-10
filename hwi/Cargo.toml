@@ -1,6 +1,6 @@
 [package]
 name = "bwk-hwi"
-version = "0.0.30"
+version = "0.1.0"
 readme = "README.md"
 description = "Hardware wallet interface"
 edition.workspace = true
