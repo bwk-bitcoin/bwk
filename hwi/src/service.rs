@@ -116,7 +116,7 @@ where
         &self.kind
     }
 
-    pub fn get_extended_pubkey(&self, id: Id, path: &DerivationPath) {
+    pub fn get_extended_pubkey(&self, id: Id, path: &DerivationPath, display: bool) {
         let path = path.clone();
         let sender = self.sender.clone();
         let fg = self.fingerprint;
@@ -126,18 +126,21 @@ where
             fg,
             path
         );
-        thread::spawn(move || match (*device).get_extended_pubkey(&path) {
-            Ok(xpub) => {
-                tracing::debug!(
-                    "SupportedDevice[{}]::get_extended_pubkey: success, xpub={}",
-                    fg,
-                    xpub
-                );
-                let _ = sender.send(SigningDeviceMsg::XPub(id, fg, path, xpub).into());
-            }
-            Err(e) => {
-                tracing::debug!("SupportedDevice[{}]::get_extended_pubkey: error={}", fg, e);
-                let _ = sender.send(SigningDeviceMsg::Error(Some(id), e.to_string()).into());
+        thread::spawn(move || {
+            device.display(display);
+            match device.get_extended_pubkey(&path) {
+                Ok(xpub) => {
+                    tracing::debug!(
+                        "SupportedDevice[{}]::get_extended_pubkey: success, xpub={}",
+                        fg,
+                        xpub
+                    );
+                    let _ = sender.send(SigningDeviceMsg::XPub(id, fg, path, xpub).into());
+                }
+                Err(e) => {
+                    tracing::debug!("SupportedDevice[{}]::get_extended_pubkey: error={}", fg, e);
+                    let _ = sender.send(SigningDeviceMsg::Error(Some(id), e.to_string()).into());
+                }
             }
         });
     }

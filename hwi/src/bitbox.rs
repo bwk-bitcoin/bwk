@@ -113,7 +113,7 @@ impl PairingBitbox02 {
 
 pub struct BitBox02 {
     pub network: bitcoin::Network,
-    pub display_xpub: bool,
+    pub display_xpub: Mutex<bool>,
     pub client: PairedBitBox,
     pub policy: Option<Policy>,
 }
@@ -127,7 +127,7 @@ impl std::fmt::Debug for BitBox02 {
 impl BitBox02 {
     pub fn from(paired_bitbox: PairedBitBox) -> Self {
         BitBox02 {
-            display_xpub: false,
+            display_xpub: Mutex::new(false),
             network: bitcoin::Network::Bitcoin,
             client: paired_bitbox,
             policy: None,
@@ -139,8 +139,8 @@ impl BitBox02 {
         self
     }
 
-    pub fn display_xpub(mut self, value: bool) -> Self {
-        self.display_xpub = value;
+    pub fn display_xpub(self, value: bool) -> Self {
+        *self.display_xpub.lock().expect("poisoned") = value;
         self
     }
 
@@ -180,6 +180,7 @@ impl HWI for BitBox02 {
     }
 
     fn get_extended_pubkey(&self, path: &DerivationPath) -> Result<Xpub, HWIError> {
+        let display = *self.display_xpub.lock().expect("poisoned");
         let fg = self
             .client
             .btc_xpub(
@@ -194,10 +195,14 @@ impl HWI for BitBox02 {
                 } else {
                     pb::btc_pub_request::XPubType::Tpub
                 },
-                self.display_xpub,
+                display,
             )
             .map_err(|e| HWIError::Device(e.to_string()))?;
         Xpub::from_str(&fg).map_err(|e| HWIError::Device(e.to_string()))
+    }
+
+    fn display(&self, display: bool) {
+        *self.display_xpub.lock().expect("poisoned") = display;
     }
 
     fn display_address(&self, script: &AddressScript) -> Result<(), HWIError> {

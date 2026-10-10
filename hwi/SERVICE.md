@@ -168,10 +168,10 @@ use std::str::FromStr;
 let devices = service.list();
 for (id, device) in devices {
     if let SigningDevice::Supported(supported) = device {
-        // Request an extended public key
+        // Request an extended public key, pass true to also show it on the device
         // Results arrive via SigningDeviceMsg::XPub
         let path = DerivationPath::from_str("m/84'/0'/0'").unwrap();
-        supported.get_extended_pubkey((), &path);
+        supported.get_extended_pubkey((), &path, false);
 
         // Register a wallet policy
         // Results arrive via SigningDeviceMsg::WalletRegistered
@@ -228,7 +228,7 @@ let service: HwiService<AppMessage, RequestId> = HwiService::new(Network::Bitcoi
 None);
 
 // Later, when making requests:
-// supported.get_extended_pubkey(RequestId(42), &path);
+// supported.get_extended_pubkey(RequestId(42), &path, false);
 
 // When handling responses:
 // SigningDeviceMsg::XPub(RequestId(42), fingerprint, path, xpub)

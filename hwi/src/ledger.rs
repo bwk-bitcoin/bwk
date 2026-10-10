@@ -32,7 +32,7 @@ const CHANGE_INDEX: ChildNumber = ChildNumber::Normal { index: 1 };
 #[derive(Default)]
 struct CommandOptions {
     wallet: Option<(WalletPolicy, Option<[u8; 32]>)>,
-    display_xpub: bool,
+    display_xpub: Mutex<bool>,
 }
 
 pub struct Ledger<T: Transport> {
@@ -42,8 +42,8 @@ pub struct Ledger<T: Transport> {
 }
 
 impl<T: Transport> Ledger<T> {
-    pub fn display_xpub(mut self, display: bool) -> Result<Self, HWIError> {
-        self.options.display_xpub = display;
+    pub fn display_xpub(self, display: bool) -> Result<Self, HWIError> {
+        *self.options.display_xpub.lock().expect("poisoned") = display;
         Ok(self)
     }
 
@@ -88,9 +88,12 @@ impl<T: Transport> HWI for Ledger<T> {
     }
 
     fn get_extended_pubkey(&self, path: &DerivationPath) -> Result<Xpub, HWIError> {
-        Ok(self
-            .client
-            .get_extended_pubkey(path, self.options.display_xpub)?)
+        let display = *self.options.display_xpub.lock().expect("poisoned");
+        Ok(self.client.get_extended_pubkey(path, display)?)
+    }
+
+    fn display(&self, display: bool) {
+        *self.options.display_xpub.lock().expect("poisoned") = display;
     }
 
     fn display_address(&self, script: &AddressScript) -> Result<(), HWIError> {

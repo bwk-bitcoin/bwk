@@ -78,7 +78,7 @@ impl Signer for HwSigner {
     }
 
     fn get_xpub(&self, deriv: DerivationPath, _display: bool) {
-        self.device.get_extended_pubkey((), &deriv);
+        self.device.get_extended_pubkey((), &deriv, false);
     }
 
     fn is_descriptor_registered(&self, descriptor: Descriptor<DescriptorPublicKey>) {
