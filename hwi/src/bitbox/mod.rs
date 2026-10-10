@@ -1,13 +1,15 @@
-use crate::{bip389, parse_version, AddressScript, DeviceKind, Error as HWIError, HWI};
-use api::btc::make_script_config_simple;
-use bitbox_api::{
-    btc::KeyOriginInfo,
-    error::{BitBoxError, Error},
-    keypath::Keypath,
-    noise::{ConfigError, NoiseConfig, NoiseConfigData, NoiseConfigNoCache},
-    pb::{self, BtcScriptConfig},
-    usb::UsbError,
-    PairedBitBox, PairingBitBox,
+use crate::{
+    bip389,
+    bitbox::api::{
+        btc::{make_script_config_simple, KeyOriginInfo},
+        error::{BitBoxError, Error},
+        keypath::Keypath,
+        noise::{ConfigError, NoiseConfig, NoiseConfigData, NoiseConfigNoCache},
+        pb::{self, BtcScriptConfig},
+        usb::UsbError,
+        PairedBitBox, PairingBitBox,
+    },
+    parse_version, AddressScript, DeviceKind, Error as HWIError, HWI,
 };
 use bitcoin::{
     bip32::{ChildNumber, DerivationPath, Fingerprint, Xpub},
@@ -19,12 +21,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-pub use bitbox_api as api;
+pub mod api;
 
 #[derive(Clone)]
 struct Cache(Arc<Mutex<Option<NoiseConfigData>>>);
 
-impl bitbox_api::util::Threading for Cache {}
+impl crate::bitbox::api::util::Threading for Cache {}
 
 impl NoiseConfig for Cache {
     fn read_config(&self) -> Result<NoiseConfigData, ConfigError> {
@@ -57,7 +59,8 @@ impl PairingBitbox02WithLocalCache {
         } else {
             Cache(Arc::new(Mutex::new(None)))
         };
-        let bitbox = bitbox_api::BitBox::from_hid_device(device, Box::new(local_cache.clone()))?;
+        let bitbox =
+            crate::bitbox::api::BitBox::from_hid_device(device, Box::new(local_cache.clone()))?;
         let pairing_bitbox = bitbox.unlock_and_pair()?;
         Ok(PairingBitbox02WithLocalCache {
             client: pairing_bitbox,
@@ -95,7 +98,7 @@ impl PairingBitbox02 {
         pairing: Option<Box<dyn NoiseConfig>>,
     ) -> Result<Self, HWIError> {
         let noise_config = pairing.unwrap_or_else(|| Box::new(NoiseConfigNoCache {}));
-        let bitbox = bitbox_api::BitBox::from_hid_device(device, noise_config)?;
+        let bitbox = crate::bitbox::api::BitBox::from_hid_device(device, noise_config)?;
         let pairing_bitbox = bitbox.unlock_and_pair()?;
         Ok(PairingBitbox02 {
             client: pairing_bitbox,
@@ -469,7 +472,7 @@ pub struct Policy {
 impl From<Policy> for BtcScriptConfig {
     fn from(p: Policy) -> BtcScriptConfig {
         let keys: Vec<KeyOriginInfo> = p.pubkeys.into_iter().map(|k| k.into()).collect();
-        bitbox_api::btc::make_script_config_policy(&p.template, &keys)
+        crate::bitbox::api::btc::make_script_config_policy(&p.template, &keys)
     }
 }
 

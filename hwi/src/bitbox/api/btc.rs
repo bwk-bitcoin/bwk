@@ -1,6 +1,6 @@
 //! Functions and methods related to Bitcoin.
 
-use crate::{
+use crate::bitbox::api::{
     error::Error,
     keypath::Keypath,
     pb::{self, request::Request, response::Response},
@@ -664,7 +664,7 @@ impl PairedBitBox {
                     );
                     let perform_antiklepto = is_inputs_pass2 && !input_is_schnorr;
                     let host_nonce = if perform_antiklepto {
-                        Some(crate::antiklepto::gen_host_nonce()?)
+                        Some(crate::bitbox::api::antiklepto::gen_host_nonce()?)
                     } else {
                         None
                     };
@@ -678,7 +678,10 @@ impl PairedBitBox {
                             script_config_index: tx_input.script_config_index,
                             host_nonce_commitment: host_nonce.as_ref().map(|host_nonce| {
                                 pb::AntiKleptoHostNonceCommitment {
-                                    commitment: crate::antiklepto::host_commit(host_nonce).to_vec(),
+                                    commitment: crate::bitbox::api::antiklepto::host_commit(
+                                        host_nonce,
+                                    )
+                                    .to_vec(),
                                 }
                             }),
                         }))?;
@@ -702,7 +705,7 @@ impl PairedBitBox {
                             if !next_response.has_signature {
                                 return Err(Error::UnexpectedResponse);
                             }
-                            crate::antiklepto::verify_ecdsa(
+                            crate::bitbox::api::antiklepto::verify_ecdsa(
                                 &host_nonce,
                                 &commitment,
                                 &next_response.signature,
@@ -859,13 +862,13 @@ impl PairedBitBox {
     ) -> Result<SignMessageSignature, Error> {
         self.validate_version(">=9.5.0")?;
 
-        let host_nonce = crate::antiklepto::gen_host_nonce()?;
+        let host_nonce = crate::bitbox::api::antiklepto::gen_host_nonce()?;
         let request = pb::BtcSignMessageRequest {
             coin: coin as _,
             script_config: Some(script_config),
             msg: msg.to_vec(),
             host_nonce_commitment: Some(pb::AntiKleptoHostNonceCommitment {
-                commitment: crate::antiklepto::host_commit(&host_nonce).to_vec(),
+                commitment: crate::bitbox::api::antiklepto::host_commit(&host_nonce).to_vec(),
             }),
         };
 
@@ -889,7 +892,7 @@ impl PairedBitBox {
             }
             _ => return Err(Error::UnexpectedResponse),
         };
-        crate::antiklepto::verify_ecdsa(&host_nonce, &signer_commitment, &signature)?;
+        crate::bitbox::api::antiklepto::verify_ecdsa(&host_nonce, &signer_commitment, &signature)?;
 
         let sig = signature[..64].to_vec();
         let recid = signature[64];
@@ -970,7 +973,7 @@ impl PairedBitBox {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keypath::HARDENED;
+    use crate::bitbox::api::keypath::HARDENED;
 
     #[test]
     fn test_payload_from_pkscript() {

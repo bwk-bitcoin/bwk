@@ -1,11 +1,13 @@
 //! Rust BitBox hardware wallet client library (sync fork).
+//!
+//! Fork of bitbox-api (https://github.com/BitBoxSwiss/bitbox-api-rs, Apache-2.0) with async
+//! removed.
 
 pub mod btc;
 pub mod cardano;
 pub mod error;
 pub mod eth;
 pub mod noise;
-#[cfg(feature = "usb")]
 pub mod usb;
 
 mod antiklepto;
@@ -21,7 +23,7 @@ pub mod pb {
     include!("./shiftcrypto.bitbox02.rs");
 }
 
-use crate::error::{BitBoxError, Error};
+use crate::bitbox::api::error::{BitBoxError, Error};
 
 use pb::request::Request;
 use pb::response::Response;
@@ -71,15 +73,14 @@ impl BitBox {
     /// Creates a new BitBox instance. The provided noise config determines how the pairing
     /// information is persisted. Use `usb::get_any_bitbox02()` to find a BitBox02 HID device.
     ///
-    /// Use `bitbox_api::noise::PersistedNoiseConfig::new(...)` to persist the pairing in a JSON file
-    /// (`serde` feature required) or provide your own implementation of the `NoiseConfig` trait.
-    #[cfg(feature = "usb")]
+    /// Use `crate::bitbox::api::noise::PersistedNoiseConfig::new(...)` to persist the pairing in a
+    /// JSON file or provide your own implementation of the `NoiseConfig` trait.
     pub fn from_hid_device(
         device: hidapi::HidDevice,
         noise_config: Box<dyn NoiseConfig>,
     ) -> Result<BitBox, Error> {
         let comm = Box::new(communication::U2fHidCommunication::from(
-            Box::new(crate::usb::HidDevice::new(device)),
+            Box::new(crate::bitbox::api::usb::HidDevice::new(device)),
             communication::FIRMWARE_CMD,
         ));
         Self::from(comm, noise_config)

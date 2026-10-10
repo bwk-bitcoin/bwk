@@ -1,4 +1,4 @@
-use crate::error::Error;
+use crate::bitbox::api::error::Error;
 
 pub const HARDENED: u32 = 0x80000000;
 
@@ -64,59 +64,12 @@ impl From<&bitcoin::bip32::DerivationPath> for Keypath {
     }
 }
 
-impl From<&Keypath> for crate::pb::Keypath {
+impl From<&Keypath> for crate::bitbox::api::pb::Keypath {
     fn from(value: &Keypath) -> Self {
-        crate::pb::Keypath {
+        crate::bitbox::api::pb::Keypath {
             keypath: value.to_vec(),
         }
     }
-}
-
-#[cfg(feature = "wasm")]
-impl<'de> serde::Deserialize<'de> for Keypath {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct KeypathVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for KeypathVisitor {
-            type Value = Keypath;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a string or a number sequence")
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                value.try_into().map_err(serde::de::Error::custom)
-            }
-
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::SeqAccess<'de>,
-            {
-                let mut vec = Vec::<u32>::new();
-                while let Some(elem) = seq.next_element()? {
-                    vec.push(elem);
-                }
-                Ok(Keypath(vec))
-            }
-        }
-
-        deserializer.deserialize_any(KeypathVisitor)
-    }
-}
-
-#[cfg(feature = "wasm")]
-pub fn serde_deserialize<'de, D>(deserializer: D) -> Result<Vec<u32>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::Deserialize;
-    Ok(Keypath::deserialize(deserializer)?.to_vec())
 }
 
 #[cfg(test)]

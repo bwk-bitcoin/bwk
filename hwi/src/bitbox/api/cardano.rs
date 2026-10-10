@@ -1,4 +1,4 @@
-use crate::{
+use crate::bitbox::api::{
     error::Error,
     keypath::Keypath,
     pb::{self, request::Request, response::Response},

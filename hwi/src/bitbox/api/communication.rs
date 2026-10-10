@@ -1,8 +1,7 @@
 use super::u2fframing::{self, U2FFraming};
-use crate::util::Threading;
+use crate::bitbox::api::util::Threading;
 use thiserror::Error;
 
-#[cfg(feature = "usb")]
 pub const FIRMWARE_CMD: u8 = 0x80 + 0x40 + 0x01;
 
 #[derive(Error, Debug)]
@@ -36,7 +35,7 @@ pub struct U2fHidCommunication {
     u2fhid: u2fframing::U2fHid,
 }
 
-impl crate::util::Threading for U2fHidCommunication {}
+impl crate::bitbox::api::util::Threading for U2fHidCommunication {}
 
 impl U2fHidCommunication {
     pub fn from(read_write: Box<dyn ReadWrite>, cmd: u8) -> Self {

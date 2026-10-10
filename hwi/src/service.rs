@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use std::thread::{self, JoinHandle};
 
 #[cfg(feature = "bitbox")]
-use bitbox_api::noise::{ConfigError, NoiseConfig, NoiseConfigData};
+use crate::bitbox::api::noise::{ConfigError, NoiseConfig, NoiseConfigData};
 
 /// Wrapper that implements NoiseConfig by delegating to an Arc<dyn NoiseConfig>.
 /// This allows cloning the Arc and converting it to Box<dyn NoiseConfig> for APIs that require Box.
@@ -41,7 +41,7 @@ use bitbox_api::noise::{ConfigError, NoiseConfig, NoiseConfigData};
 struct ArcNoiseConfig(Arc<dyn NoiseConfig>);
 
 #[cfg(feature = "bitbox")]
-impl bitbox_api::util::Threading for ArcNoiseConfig {}
+impl crate::bitbox::api::util::Threading for ArcNoiseConfig {}
 
 #[cfg(feature = "bitbox")]
 impl NoiseConfig for ArcNoiseConfig {
@@ -665,7 +665,7 @@ fn listen<Message, Id>(
         #[cfg(feature = "bitbox")]
         let bitbox_devices: Vec<_> = list
             .iter()
-            .filter_map(|d| bitbox_api::usb::is_bitbox02(d).then_some(*d))
+            .filter_map(|d| crate::bitbox::api::usb::is_bitbox02(d).then_some(*d))
             .collect();
         #[cfg(feature = "bitbox")]
         tracing::trace!(
@@ -1390,7 +1390,7 @@ fn handle_bitbox02<Message, Id>(
     cleanup_disconnected(sender, handles, &devices, &connected_ids, "bitbox-");
 
     for device_info in list {
-        if bitbox_api::usb::is_bitbox02(device_info) {
+        if crate::bitbox::api::usb::is_bitbox02(device_info) {
             let id = bitbox_id(device_info);
             tracing::trace!(
                 "handle_bitbox02: checking device {} (vid={}, pid={})",

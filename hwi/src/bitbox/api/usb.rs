@@ -11,7 +11,7 @@ const FIRMWARE_PRODUCT_STRING_BITBOX02_NOVA_BTCONLY: &str = "BitBox02 Nova BTC-o
 
 pub(crate) struct HidDevice(Mutex<hidapi::HidDevice>);
 
-impl crate::util::Threading for HidDevice {}
+impl crate::bitbox::api::util::Threading for HidDevice {}
 
 impl HidDevice {
     pub(crate) fn new(device: hidapi::HidDevice) -> Self {

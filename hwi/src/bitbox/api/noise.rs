@@ -1,4 +1,4 @@
-use crate::util::Threading;
+use crate::bitbox::api::util::Threading;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
