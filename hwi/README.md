@@ -59,3 +59,10 @@ A Empty case means the method is unimplemented on the client or device side.
 The `service` module provides automatic device discovery and management with support
 for multiple concurrent consumers. See [SERVICE.md](SERVICE.md) for detailed
 documentation and usage examples.
+
+## License
+
+- bwk code: MIT, see [LICENSE-MIT](LICENSE-MIT)
+- code forked from async-hwi: BSD-3-Clause, see [LICENSE-BSD](LICENSE-BSD)
+- `bitbox::api`, `ledger::bitcoin_client` and `ledger::transport_hidapi`: Apache-2.0, see
+  [LICENSE-APACHE](LICENSE-APACHE)

@@ -5,7 +5,7 @@ description = "HWI CLI"
 version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
-license-file.workspace = true
+license = "MIT AND BSD-3-Clause"
 repository.workspace = true
 keywords.workspace = true
 

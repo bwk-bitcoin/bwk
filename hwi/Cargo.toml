@@ -5,7 +5,7 @@ readme = "README.md"
 description = "Hardware wallet interface"
 edition.workspace = true
 authors.workspace = true
-license-file.workspace = true
+license = "MIT AND BSD-3-Clause AND Apache-2.0"
 repository.workspace = true
 keywords.workspace = true
 

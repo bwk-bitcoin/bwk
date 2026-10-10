@@ -2,6 +2,8 @@
 //!
 //! Fork of bitbox-api (https://github.com/BitBoxSwiss/bitbox-api-rs, Apache-2.0) with async
 //! removed.
+//!
+//! Copyright 2023-2025 Shift Crypto AG, Switzerland.
 
 pub mod btc;
 pub mod cardano;
