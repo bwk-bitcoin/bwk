@@ -13,6 +13,9 @@
 *  See the License for the specific language governing permissions and
 *  limitations under the License.
 ********************************************************************************/
+//! Fork of ledger-transport-hid (https://github.com/Zondax/ledger-rs, Apache-2.0) with async
+//! removed.
+
 pub mod errors;
 
 use byteorder::{BigEndian, ReadBytesExt};

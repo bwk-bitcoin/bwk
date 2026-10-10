@@ -13,7 +13,6 @@ members = [
     "p2p",
     "mitm",
     "hwi", "hwi/cli",
-    "hwi/ledger-transport-hidapi",
     "secp256k1_spscan-sys",
 ]
 

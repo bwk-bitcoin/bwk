@@ -11,7 +11,6 @@ use bitcoin::{
 };
 
 use ledger_apdu::APDUAnswer;
-use ledger_transport_hidapi::TransportNativeHID;
 
 use crate::{
     ledger::bitcoin_client::{
@@ -21,10 +20,12 @@ use crate::{
         psbt::PartialSignature,
         wallet::{Version as WalletVersion, WalletPolicy, WalletPubKey},
     },
+    ledger::transport_hidapi::TransportNativeHID,
     parse_version, utils, AddressScript, DeviceKind, Error as HWIError, HWI,
 };
 
 pub mod bitcoin_client;
+mod transport_hidapi;
 
 pub use hidapi;
 use hidapi::{DeviceInfo, HidApi};

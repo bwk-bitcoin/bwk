@@ -28,7 +28,6 @@ use bitcoin::{
 };
 use crossbeam::channel;
 use hidapi::{DeviceInfo, HidApi};
-use ledger_transport_hidapi::TransportNativeHID;
 use serde::{Deserialize, Serialize};
 use std::thread::{self, JoinHandle};
 
@@ -705,7 +704,8 @@ fn listen<Message, Id>(
         );
 
         #[cfg(feature = "ledger")]
-        let ledger_devices: Vec<_> = TransportNativeHID::list_ledgers(&hid).collect();
+        let ledger_devices: Vec<_> =
+            ledger::Ledger::<ledger::TransportHID>::enumerate(&hid).collect();
         #[cfg(feature = "ledger")]
         tracing::trace!("Found {} Ledger device(s)", ledger_devices.len());
 
