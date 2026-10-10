@@ -10,7 +10,7 @@ repository.workspace = true
 keywords.workspace = true
 
 [[bin]]
-name = "bwkhwi"
+name = "hwi"
 path = "src/bin/hwi.rs"
 
 [dependencies]
