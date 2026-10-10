@@ -6,7 +6,7 @@ use bitcoin::{
     hashes::{sha256, Hash, HashEngine},
 };
 
-use crate::{apdu::ClientCommandCode, merkle::MerkleTree};
+use crate::ledger::bitcoin_client::{apdu::ClientCommandCode, merkle::MerkleTree};
 
 /// Interpreter for the client-side commands.
 /// This struct keeps has methods to keep track of:

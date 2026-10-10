@@ -9,10 +9,9 @@ use bitcoin::{
     secp256k1::ecdsa,
 };
 
-#[cfg(feature = "paranoid_client")]
 use miniscript::{Descriptor, DescriptorPublicKey};
 
-use crate::{
+use crate::ledger::bitcoin_client::{
     apdu::{APDUCommand, StatusWord},
     command,
     error::BitcoinClientError,
@@ -65,7 +64,6 @@ impl<T: Transport> BitcoinClient<T> {
 
     // Verifies that the address that the application returns matches the one independently
     // computed on the client
-    #[cfg(feature = "paranoid_client")]
     fn check_address(
         &self,
         wallet: &WalletPolicy,
@@ -192,11 +190,8 @@ impl<T: Transport> BitcoinClient<T> {
             }
         })?;
 
-        #[cfg(feature = "paranoid_client")]
-        {
-            let device_addr = self.get_wallet_address(wallet, Some(&hmac), false, 0, false)?;
-            self.check_address(wallet, false, 0, &device_addr)?;
-        }
+        let device_addr = self.get_wallet_address(wallet, Some(&hmac), false, 0, false)?;
+        self.check_address(wallet, false, 0, &device_addr)?;
 
         Ok((id, hmac))
     }
@@ -226,10 +221,7 @@ impl<T: Transport> BitcoinClient<T> {
                 })
         })?;
 
-        #[cfg(feature = "paranoid_client")]
-        {
-            self.check_address(wallet, change, address_index, &address)?;
-        }
+        self.check_address(wallet, change, address_index, &address)?;
 
         Ok(address)
     }

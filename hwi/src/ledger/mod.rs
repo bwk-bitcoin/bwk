@@ -13,15 +13,18 @@ use bitcoin::{
 use ledger_apdu::APDUAnswer;
 use ledger_transport_hidapi::TransportNativeHID;
 
-use ledger_bitcoin_client::{
-    apdu::{APDUCommand, StatusWord},
-    client::{BitcoinClient, Transport},
-    error::BitcoinClientError,
-    psbt::PartialSignature,
-    wallet::{Version as WalletVersion, WalletPolicy, WalletPubKey},
+use crate::{
+    ledger::bitcoin_client::{
+        apdu::{APDUCommand, StatusWord},
+        client::{BitcoinClient, Transport},
+        error::BitcoinClientError,
+        psbt::PartialSignature,
+        wallet::{Version as WalletVersion, WalletPolicy, WalletPubKey},
+    },
+    parse_version, utils, AddressScript, DeviceKind, Error as HWIError, HWI,
 };
 
-use crate::{parse_version, utils, AddressScript, DeviceKind, Error as HWIError, HWI};
+pub mod bitcoin_client;
 
 pub use hidapi;
 use hidapi::{DeviceInfo, HidApi};

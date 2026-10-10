@@ -1,6 +1,6 @@
 use core::fmt::Debug;
 
-use crate::{apdu::StatusWord, interpreter::InterpreterError};
+use crate::ledger::bitcoin_client::{apdu::StatusWord, interpreter::InterpreterError};
 
 #[derive(Debug)]
 pub enum BitcoinClientError<T: Debug> {

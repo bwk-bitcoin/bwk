@@ -31,7 +31,7 @@ bitbox = [
 coldcard = ["dep:coldcard", "hidapi", "regex"]
 specter = ["serialport"]
 jade = ["regex", "serde", "serde_bytes", "serde_cbor", "serialport", "ureq"]
-ledger = ["regex", "ledger-bitcoin-client", "ledger-transport-hidapi", "ledger-apdu", "hidapi"]
+ledger = ["regex", "miniscript", "ledger-transport-hidapi", "ledger-apdu", "hidapi"]
 regex = ["dep:regex"]
 service = ["bitbox", "coldcard", "jade", "ledger", "specter", "tracing", "hex", "crossbeam"]
 
@@ -65,7 +65,7 @@ zeroize = { version = "1", optional = true }
 coldcard = { version = "0.13.0", optional = true }
 
 # ledger
-ledger-bitcoin-client = { path = "ledger-bitcoin-client", optional = true }
+miniscript = { version = "12.2", features = ["no-std"], default-features = false, optional = true }
 ledger-apdu = { version = "0.10", optional = true }
 ledger-transport-hidapi = { path = "ledger-transport-hidapi", optional = true }
 

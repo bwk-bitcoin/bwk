@@ -18,7 +18,8 @@ use crate::{
     bitbox::{BitBox02, PairingBitbox02},
     coldcard,
     jade::{self, api::GetInfoResponse, Jade, SerialTransport},
-    ledger, specter, AddressScript, DeviceKind, Error as HWIError, Version, HWI,
+    ledger::{self, bitcoin_client::client::Transport},
+    specter, AddressScript, DeviceKind, Error as HWIError, Version, HWI,
 };
 use bitcoin::{
     bip32::{DerivationPath, Fingerprint, Xpub},
@@ -27,7 +28,6 @@ use bitcoin::{
 };
 use crossbeam::channel;
 use hidapi::{DeviceInfo, HidApi};
-use ledger_bitcoin_client::client::Transport;
 use ledger_transport_hidapi::TransportNativeHID;
 use serde::{Deserialize, Serialize};
 use std::thread::{self, JoinHandle};

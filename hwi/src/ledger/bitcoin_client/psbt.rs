@@ -498,7 +498,7 @@ mod serialize {
 
     macro_rules! impl_psbt_hash_deserialize {
         ($hash_type:ty) => {
-            impl $crate::psbt::serialize::Deserialize for $hash_type {
+            impl $crate::ledger::bitcoin_client::psbt::serialize::Deserialize for $hash_type {
                 fn deserialize(bytes: &[u8]) -> Result<Self, bitcoin::psbt::Error> {
                     <$hash_type>::from_slice(&bytes[..]).map_err(|e| bitcoin::psbt::Error::from(e))
                 }
@@ -508,7 +508,7 @@ mod serialize {
 
     macro_rules! impl_psbt_hash_serialize {
         ($hash_type:ty) => {
-            impl $crate::psbt::serialize::Serialize for $hash_type {
+            impl $crate::ledger::bitcoin_client::psbt::serialize::Serialize for $hash_type {
                 fn serialize(&self) -> Vec<u8> {
                     self.as_byte_array().to_vec()
                 }

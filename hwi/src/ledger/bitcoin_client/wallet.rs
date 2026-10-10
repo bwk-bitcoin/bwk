@@ -8,7 +8,7 @@ use bitcoin::{
     hashes::{sha256, Hash, HashEngine},
 };
 
-use crate::merkle::MerkleTree;
+use crate::ledger::bitcoin_client::merkle::MerkleTree;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Version {
