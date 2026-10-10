@@ -1,0 +1,23 @@
+[package]
+name = "bwk-bip89"
+version = "0.0.1"
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+keywords.workspace = true
+readme.workspace = true
+description = "BIP89 chain code delegation with a tweak accumulator"
+
+[dependencies]
+bip322 = { workspace = true, optional = true }
+miniscript = { workspace = true, optional = true }
+
+[features]
+default = ["rust-bitcoin"]
+rust-bitcoin = ["dep:miniscript", "dep:bip322"]
+
+[dev-dependencies]
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true

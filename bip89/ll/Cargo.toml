@@ -1,0 +1,19 @@
+[package]
+name = "bwk-bip89-ll"
+version = "0.0.1"
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+keywords.workspace = true
+readme.workspace = true
+description = "C ABI for bwk-bip89 over caller-supplied vtables, no_std"
+
+[dependencies]
+bwk-bip89.workspace = true
+
+[dev-dependencies]
+bwk-bip89 = { workspace = true, features = ["rust-bitcoin"] }
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true

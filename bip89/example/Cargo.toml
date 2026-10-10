@@ -1,0 +1,16 @@
+[package]
+name = "bwk-bip89-example"
+version = "0.0.1"
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+keywords.workspace = true
+readme.workspace = true
+description = "A BIP89 signing server and wallet running the protocol end to end"
+publish = false
+
+[dependencies]
+bwk-bip89 = { workspace = true, features = ["rust-bitcoin"] }
+rand.workspace = true
+thiserror.workspace = true

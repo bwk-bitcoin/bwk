@@ -55,6 +55,9 @@ Blindbit).
 | bwk-coin       | Coin domain types shared by bwk-tx and bwk-electrum   |
 | bwk-persist    | KV persistence: Store, RamStore, JSON/SQLite backends |
 | bwk-hwi        | Hardware wallet transport and device drivers          |
+| bwk-bip89      | BIP89 chain code delegation and tweak accumulator,    |
+|                | generic over BitcoinBackend, rust-bitcoin backend     |
+| bwk-bip89-ll   | C ABI over BitcoinBackend vtables                     |
 | bwk-error      | In-house error derive, reached as `thiserror`         |
 | bwk-backoff    | Exponential backoff                                   |
 | bwk-utils      | Test helpers                                          |
@@ -72,6 +75,8 @@ See crate READMEs:
 [bwk-p2p](p2p/README.md),
 [bwk-coin](coin/README.md),
 [bwk-hwi](hwi/README.md),
+[bwk-bip89](bip89/README.md),
+[bwk-bip89-ll](bip89/ll/README.md),
 [bwk-error](error/README.md),
 [bwk-backoff](backoff/README.md),
 [bwk-utils](utils/README.md)

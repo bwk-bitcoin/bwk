@@ -1,0 +1,20 @@
+[package]
+name = "bwk-bip89-cabi"
+version = "0.0.1"
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+keywords.workspace = true
+readme.workspace = true
+description = "C ABI shim for bwk-bip89-ll: a staticlib and cdylib exporting the C binding"
+publish = false
+
+[lib]
+name = "bip89"
+# staticlib for C and firmware builds, cdylib for dynamic loading
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+# the backend-agnostic binding: the caller supplies every primitive through vtables
+bwk-bip89-ll.workspace = true
