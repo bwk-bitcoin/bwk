@@ -358,22 +358,23 @@ impl HotSigner {
                     }
                 }
                 (false, true, true) => {
+                    let mut input_signed = false;
                     match self.sign_input_tapkey(psbt, index, &derivator, &mut cache) {
-                        Ok(()) => {}
-                        Err(Error::SpkNotMatch) => continue,
+                        Ok(()) => input_signed = true,
+                        Err(Error::SpkNotMatch | Error::NotTapKey) => {}
                         Err(e) => return Err(e),
                     }
                     match self.sign_input_taptree(psbt, index, &derivator, &mut cache) {
-                        Ok(()) => {}
-                        Err(Error::SpkNotMatch) => continue,
+                        Ok(()) => input_signed = true,
+                        Err(Error::SpkNotMatch | Error::NotTapTree) => {}
                         Err(e) => return Err(e),
                     }
-                    signed_any = true;
+                    if input_signed {
+                        signed_any = true;
+                    }
                 }
                 (false, false, false) => continue,
-                _ => {
-                    unreachable!()
-                }
+                _ => return Err(Error::MixedSigningInfo),
             }
         }
 
@@ -417,6 +418,9 @@ impl HotSigner {
                 derivation_paths.push(deriv.clone());
             }
         });
+        if derivation_paths.is_empty() {
+            return Err(Error::SpkNotMatch);
+        }
         self.inner_sign_input_segwit(sighash, input, derivation_paths, derivator)?;
         Ok(())
     }
@@ -533,48 +537,49 @@ impl HotSigner {
         // Sign
         if let Some(ref int_key) = input.tap_internal_key {
             if let Some((_, (fg, der_path))) = input.tap_key_origins.get(int_key) {
-                if *fg == self.fingerprint() {
-                    // Check the spk matches
-                    if let Some(wit) = &input.witness_utxo {
-                        let ap = account_path(der_path)?;
-                        let expected_spk = match ap.0 {
-                            false => derivator.receive_at(ap.1),
-                            true => derivator.change_at(ap.1),
-                        }
-                        .script_pubkey();
-                        if wit.script_pubkey != expected_spk {
-                            Err(Error::SpkNotMatch)
-                        } else {
-                            Ok(())
-                        }
-                    } else {
-                        Err(Error::MissingWitnessUtxo)
-                    }?;
-
-                    // Then sign
-                    let sk = self.private_key_at(der_path);
-                    let keypair = secp256k1::Keypair::from_secret_key(self.secp(), &sk);
-                    if keypair.x_only_public_key().0 != *int_key {
-                        return Err(Error::InternalKeyNotMatch);
-                    }
-                    #[allow(deprecated)]
-                    let keypair = keypair
-                        .tap_tweak(self.secp(), input.tap_merkle_root)
-                        .to_inner();
-                    let sighash = cache
-                        .taproot_key_spend_signature_hash(index, &prevouts, sighash_type)
-                        .map_err(|_| Error::InsanePrevouts)?;
-                    let sighash = secp256k1::Message::from_digest_slice(
-                        &sighash.as_raw_hash().to_byte_array(),
-                    )
-                    .expect("Sighash is always 32 bytes.");
-                    let signature = self.secp().sign_schnorr_no_aux_rand(&sighash, &keypair);
-                    let sig = bitcoin::taproot::Signature {
-                        signature,
-                        sighash_type,
-                    };
-                    input.tap_key_sig = Some(sig);
+                if *fg != self.fingerprint() {
+                    return Err(Error::SpkNotMatch);
                 }
+
+                // Check the spk matches
+                if let Some(wit) = &input.witness_utxo {
+                    let ap = account_path(der_path)?;
+                    let expected_spk = match ap.0 {
+                        false => derivator.receive_at(ap.1),
+                        true => derivator.change_at(ap.1),
+                    }
+                    .script_pubkey();
+                    if wit.script_pubkey != expected_spk {
+                        Err(Error::SpkNotMatch)
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    Err(Error::MissingWitnessUtxo)
+                }?;
+
+                // Then sign
+                let sk = self.private_key_at(der_path);
+                let keypair = secp256k1::Keypair::from_secret_key(self.secp(), &sk);
+                if keypair.x_only_public_key().0 != *int_key {
+                    return Err(Error::InternalKeyNotMatch);
+                }
+                #[allow(deprecated)]
+                let keypair = keypair
+                    .tap_tweak(self.secp(), input.tap_merkle_root)
+                    .to_inner();
+                let sighash = cache
+                    .taproot_key_spend_signature_hash(index, &prevouts, sighash_type)
+                    .map_err(|_| Error::InsanePrevouts)?;
+                let sighash =
+                    secp256k1::Message::from_digest_slice(&sighash.as_raw_hash().to_byte_array())
+                        .expect("Sighash is always 32 bytes.");
+                let signature = self.secp().sign_schnorr_no_aux_rand(&sighash, &keypair);
+                let sig = bitcoin::taproot::Signature {
+                    signature,
+                    sighash_type,
+                };
+                input.tap_key_sig = Some(sig);
                 return Ok(());
             }
         }
@@ -601,6 +606,7 @@ impl HotSigner {
         let prevouts = sighash::Prevouts::All(&prevouts);
 
         let input = psbt.inputs.get_mut(index).ok_or(Error::InputIndex)?;
+        let mut signed_any = false;
         for (pubkey, (leaf_hashes, (fg, der_path))) in &input.tap_key_origins {
             if *fg != self.fingerprint() {
                 continue;
@@ -620,9 +626,14 @@ impl HotSigner {
                     sighash_type,
                 };
                 input.tap_script_sigs.insert((*pubkey, *leaf_hash), sig);
+                signed_any = true;
             }
         }
-        Ok(())
+        if signed_any {
+            Ok(())
+        } else {
+            Err(Error::SpkNotMatch)
+        }
     }
 
     /// Returns the [`Fingerprint`] of this [`HotSigner`].
@@ -881,10 +892,17 @@ pub fn account_path(path: &DerivationPath) -> Result<(bool /* is_change */, u32)
 mod tests {
     use super::*;
     use bitcoin::Network;
-    use bwk_descriptor::{derivator::SpkDerivator, descriptor::wpkh};
+    use bwk_descriptor::{
+        derivator::SpkDerivator,
+        descriptor::{tr, wpkh},
+    };
     use bwk_utils::test::{random_output, setup_logger, txid};
     use crossbeam::channel;
-    use miniscript::bitcoin::{absolute::Height, Amount, ScriptBuf, TxIn, Witness};
+    use miniscript::bitcoin::{
+        absolute::Height,
+        taproot::{LeafVersion, TapLeafHash},
+        Amount, ScriptBuf, TxIn, Witness,
+    };
 
     #[test]
     fn test_create_hot_signer_from_xpriv() {
@@ -1256,5 +1274,199 @@ mod tests {
             }
             _ => panic!("Expected DescriptorRegistered notification"),
         }
+    }
+
+    fn base_psbt() -> Psbt {
+        let txin = TxIn {
+            previous_output: bitcoin::OutPoint {
+                txid: txid(),
+                vout: 1,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: bitcoin::Sequence::ZERO,
+            witness: Witness::new(),
+        };
+        let txout = random_output();
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::absolute::LockTime::Blocks(Height::ZERO),
+            input: vec![txin],
+            output: vec![txout],
+        };
+        Psbt::from_unsigned_tx(tx).unwrap()
+    }
+
+    fn new_signer(network: Network) -> HotSigner {
+        HotSigner::new_from_xpriv(
+            network,
+            bip32::Xpriv::new_master(network, &bip39::Mnemonic::generate(12).unwrap().to_seed(""))
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn segwit_input_with_foreign_fingerprint_is_not_signed() {
+        let network = Network::Testnet;
+        let signer = new_signer(network);
+        let other_signer = new_signer(network);
+        let xpub = signer.xpub(&DerivationPath::from_str("m/84'/0'/0'/1'").unwrap());
+        let descriptor = wpkh(xpub);
+
+        let mut psbt = base_psbt();
+        let deriv = &(false, 0);
+        let deriv_p = deriv_path(deriv).unwrap();
+        let pubkey = signer.public_key_at(&deriv_p);
+
+        let derivator = SpkDerivator::new(descriptor.clone(), bitcoin::Network::Regtest).unwrap();
+        psbt.inputs.get_mut(0).unwrap().witness_utxo = Some(bitcoin::TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: derivator.receive_spk_at(deriv.1),
+        });
+        psbt.inputs
+            .get_mut(0)
+            .unwrap()
+            .bip32_derivation
+            .insert(pubkey, (other_signer.fingerprint(), deriv_p));
+
+        let err = signer.inner_sign(&mut psbt, &descriptor).unwrap_err();
+        assert_eq!(err, Error::SigningInfo);
+        assert!(psbt.inputs[0].partial_sigs.is_empty());
+    }
+
+    #[test]
+    fn taproot_input_with_foreign_key_origin_is_not_signed() {
+        let network = Network::Testnet;
+        let signer = new_signer(network);
+        let other_signer = new_signer(network);
+        let xpub = signer.xpub(&DerivationPath::from_str("m/86'/0'/0'/1'").unwrap());
+        let descriptor = tr(xpub);
+
+        let mut psbt = base_psbt();
+        let deriv = &(false, 0);
+        let deriv_p = deriv_path(deriv).unwrap();
+        let sk = signer.private_key_at(&deriv_p);
+        let keypair = secp256k1::Keypair::from_secret_key(signer.secp(), &sk);
+        let internal_key = keypair.x_only_public_key().0;
+
+        let derivator = SpkDerivator::new(descriptor.clone(), bitcoin::Network::Regtest).unwrap();
+        psbt.inputs.get_mut(0).unwrap().witness_utxo = Some(bitcoin::TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: derivator.receive_spk_at(deriv.1),
+        });
+        psbt.inputs.get_mut(0).unwrap().tap_internal_key = Some(internal_key);
+        psbt.inputs.get_mut(0).unwrap().tap_key_origins.insert(
+            internal_key,
+            (vec![], (other_signer.fingerprint(), deriv_p)),
+        );
+
+        let before = psbt.clone();
+        let err = signer.inner_sign(&mut psbt, &descriptor).unwrap_err();
+        assert_eq!(err, Error::SigningInfo);
+        assert!(psbt.inputs[0].tap_key_sig.is_none());
+        assert_eq!(psbt, before);
+    }
+
+    #[test]
+    fn taptree_input_with_no_matching_leaf_is_not_signed() {
+        let network = Network::Testnet;
+        let signer = new_signer(network);
+        let other_signer = new_signer(network);
+        let xpub = signer.xpub(&DerivationPath::from_str("m/86'/0'/0'/1'").unwrap());
+        let descriptor = tr(xpub);
+
+        let mut psbt = base_psbt();
+        let deriv = &(false, 0);
+        let deriv_p = deriv_path(deriv).unwrap();
+
+        let derivator = SpkDerivator::new(descriptor.clone(), bitcoin::Network::Regtest).unwrap();
+        psbt.inputs.get_mut(0).unwrap().witness_utxo = Some(bitcoin::TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: derivator.receive_spk_at(deriv.1),
+        });
+
+        let sk = other_signer.private_key_at(&deriv_p);
+        let keypair = secp256k1::Keypair::from_secret_key(other_signer.secp(), &sk);
+        let leaf_pubkey = keypair.x_only_public_key().0;
+        let leaf_hash = TapLeafHash::from_script(&ScriptBuf::new(), LeafVersion::TapScript);
+        psbt.inputs.get_mut(0).unwrap().tap_key_origins.insert(
+            leaf_pubkey,
+            (vec![leaf_hash], (other_signer.fingerprint(), deriv_p)),
+        );
+
+        let err = signer.inner_sign(&mut psbt, &descriptor).unwrap_err();
+        assert_eq!(err, Error::SigningInfo);
+        assert!(psbt.inputs[0].tap_script_sigs.is_empty());
+    }
+
+    #[test]
+    fn mixed_segwit_and_taproot_metadata_is_rejected() {
+        let network = Network::Testnet;
+        let signer = new_signer(network);
+        let xpub = signer.xpub(&DerivationPath::from_str("m/84'/0'/0'/1'").unwrap());
+        let descriptor = wpkh(xpub);
+
+        let mut psbt = base_psbt();
+        let deriv_p = deriv_path(&(false, 0)).unwrap();
+        let pubkey = signer.public_key_at(&deriv_p);
+        psbt.inputs
+            .get_mut(0)
+            .unwrap()
+            .bip32_derivation
+            .insert(pubkey, (signer.fingerprint(), deriv_p.clone()));
+
+        let sk = signer.private_key_at(&deriv_p);
+        let keypair = secp256k1::Keypair::from_secret_key(signer.secp(), &sk);
+        let leaf_pubkey = keypair.x_only_public_key().0;
+        let leaf_hash = TapLeafHash::from_script(&ScriptBuf::new(), LeafVersion::TapScript);
+        psbt.inputs.get_mut(0).unwrap().tap_key_origins.insert(
+            leaf_pubkey,
+            (vec![leaf_hash], (signer.fingerprint(), deriv_p)),
+        );
+
+        let err = signer.inner_sign(&mut psbt, &descriptor).unwrap_err();
+        assert_eq!(err, Error::MixedSigningInfo);
+    }
+
+    #[test]
+    fn taproot_key_and_script_paths_are_both_attempted() {
+        let network = Network::Testnet;
+        let signer = new_signer(network);
+        let other_signer = new_signer(network);
+        let xpub = signer.xpub(&DerivationPath::from_str("m/86'/0'/0'/1'").unwrap());
+        let descriptor = tr(xpub);
+
+        let mut psbt = base_psbt();
+        let deriv = &(false, 0);
+        let deriv_p = deriv_path(deriv).unwrap();
+
+        let sk_internal = other_signer.private_key_at(&deriv_p);
+        let keypair_internal =
+            secp256k1::Keypair::from_secret_key(other_signer.secp(), &sk_internal);
+        let internal_key = keypair_internal.x_only_public_key().0;
+
+        let leaf_deriv = deriv_path(&(false, 1)).unwrap();
+        let sk_leaf = signer.private_key_at(&leaf_deriv);
+        let keypair_leaf = secp256k1::Keypair::from_secret_key(signer.secp(), &sk_leaf);
+        let leaf_pubkey = keypair_leaf.x_only_public_key().0;
+        let leaf_hash = TapLeafHash::from_script(&ScriptBuf::new(), LeafVersion::TapScript);
+
+        let derivator = SpkDerivator::new(descriptor.clone(), bitcoin::Network::Regtest).unwrap();
+        psbt.inputs.get_mut(0).unwrap().witness_utxo = Some(bitcoin::TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: derivator.receive_spk_at(deriv.1),
+        });
+        psbt.inputs.get_mut(0).unwrap().tap_internal_key = Some(internal_key);
+        psbt.inputs.get_mut(0).unwrap().tap_key_origins.insert(
+            internal_key,
+            (vec![], (other_signer.fingerprint(), deriv_p)),
+        );
+        psbt.inputs.get_mut(0).unwrap().tap_key_origins.insert(
+            leaf_pubkey,
+            (vec![leaf_hash], (signer.fingerprint(), leaf_deriv)),
+        );
+
+        signer.inner_sign(&mut psbt, &descriptor).unwrap();
+        assert!(!psbt.inputs[0].tap_script_sigs.is_empty());
+        assert!(psbt.inputs[0].tap_key_sig.is_none());
     }
 }
