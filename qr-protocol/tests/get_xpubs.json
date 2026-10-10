@@ -1,0 +1,25 @@
+{
+  "vectors": [
+    {
+      "name": "get_xpubs_request_one_path",
+      "description": "Get Xpubs request with a single path m/48'/0'/0'/2'. This is the worked example of the spec.",
+      "direction": "request",
+      "hex": "42495058585801010001010480000030800000008000000080000002",
+      "decode_only": false
+    },
+    {
+      "name": "get_xpubs_request_two_paths",
+      "description": "Get Xpubs request with two paths, m/48'/0'/0'/2' and m/84'/1'/0', so the PATHS count is 2 and the two paths have a different CHILD_COUNT.",
+      "direction": "request",
+      "hex": "4249505858580101000102048000003080000000800000008000000203800000548000000180000000",
+      "decode_only": false
+    },
+    {
+      "name": "get_xpubs_response_ok",
+      "description": "Get Xpubs ok response with one xpub (the 78 raw bytes of xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8), master fingerprint deadbeef, model \"bwk-signer\" padded to 16 bytes, firmware 1.2.3 beta, and capabilities 0x0000000b (bits 0, 1 and 3 set: miniscript segwit v0, miniscript taproot, MuSig2).",
+      "direction": "response",
+      "hex": "42495058585801810001010488b21e000000000000000000873dff81c02f525623fd1fe5167eac3a55a049de3d314bb42ee227ffed37d5080339a36013301597daef41fbe593a02cc513d0b55527ec2df1050e2e8ff49c85c2deadbeef62776b2d7369676e657200000000000000010002000003020000000b",
+      "decode_only": false
+    }
+  ]
+}

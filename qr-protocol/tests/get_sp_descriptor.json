@@ -1,0 +1,16 @@
+{
+  "vectors": [
+    {
+      "name": "get_sp_descriptor_request",
+      "direction": "request",
+      "decode_only": false,
+      "hex": "42495058585801050001"
+    },
+    {
+      "name": "get_sp_descriptor_response",
+      "direction": "response",
+      "decode_only": false,
+      "hex": "424950585858018500010e7370287363616e2c7370656e6429"
+    }
+  ]
+}

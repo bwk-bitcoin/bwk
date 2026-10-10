@@ -39,26 +39,28 @@ tests locally. Commit messages must be single-line and follow existing style
 ## Workspace Crates
 
 ```
-+----------------+-------------------------------------------------------------+
-| Crate          | Purpose                                                     |
-+----------------+-------------------------------------------------------------+
-| bwk            | Main library - Account orchestrator for descriptor-based    |
-|                | wallets (Electrum backend)                                  |
-| bwk-sp         | Silent Payments account orchestrator (BIP352, Blindbit)     |
-| bwk-tx         | Transaction building, coin selection, fee estimation, PSBT  |
-| bwk-electrum   | Electrum protocol client (TCP/SSL), ElectrumScanner, and    |
-|                | the scan stores, the header chain and the reconcile pass    |
-| bwk-sign       | Hot signer, SigningManager for BIP32 key management         |
-| bwk-descriptor | Miniscript descriptor handling, SpkDerivator                |
-| bwk-keys       | Key derivation utilities (OXpriv, OXpub, KeyDerivator)      |
-| bwk-p2p        | Bitcoin P2P network client, DNS seed resolution             |
-| bwk-coin       | Coin domain types shared by bwk-tx and bwk-electrum         |
-| bwk-persist    | KV persistence: Store, RamStore, JSON/SQLite backends       |
-| bwk-hwi        | Hardware wallet transport and device drivers                |
-| bwk-error      | In-house derive for error impls, reached as `thiserror`     |
-| bwk-backoff    | Exponential backoff utility                                 |
-| bwk-utils      | Test helpers (behind `test` feature)                        |
-+----------------+-------------------------------------------------------------+
++-----------------+-------------------------------------------------------------+
+| Crate           | Purpose                                                     |
++-----------------+-------------------------------------------------------------+
+| bwk             | Main library - Account orchestrator for descriptor-based    |
+|                 | wallets (Electrum backend)                                  |
+| bwk-sp          | Silent Payments account orchestrator (BIP352, Blindbit)     |
+| bwk-tx          | Transaction building, coin selection, fee estimation, PSBT  |
+| bwk-electrum    | Electrum protocol client (TCP/SSL), ElectrumScanner, and    |
+|                 | the scan stores, the header chain and the reconcile pass    |
+| bwk-sign        | Hot signer, SigningManager for BIP32 key management         |
+| bwk-descriptor  | Miniscript descriptor handling, SpkDerivator                |
+| bwk-keys        | Key derivation utilities (OXpriv, OXpub, KeyDerivator)      |
+| bwk-p2p         | Bitcoin P2P network client, DNS seed resolution             |
+| bwk-coin        | Coin domain types shared by bwk-tx and bwk-electrum         |
+| bwk-persist     | KV persistence: Store, RamStore, JSON/SQLite backends       |
+| bwk-hwi         | Hardware wallet transport and device drivers                |
+| bwk-error       | In-house derive for error impls, reached as `thiserror`     |
+| bwk-qr          | QR generation, scanning, BBQR framing                       |
+| bwk-qr-protocol | Signing-flow message codec (no_std, no deps, C binding)     |
+| bwk-backoff     | Exponential backoff utility                                 |
+| bwk-utils       | Test helpers (behind `test` feature)                        |
++-----------------+-------------------------------------------------------------+
 ```
 
 See crate READMEs for usage examples:
