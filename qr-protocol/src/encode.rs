@@ -5,7 +5,7 @@ use crate::{
     types::{DerivationPath, Xpub},
     ErrorInfo, MessageType, Request, RequestId, Response, SignResponseKind, DIRECTION_REQUEST,
     DIRECTION_RESPONSE, ERROR_MESSAGE_LEN, MAGIC, MAX_BYTES, MAX_DESCRIPTOR_ALIAS, MAX_VEC,
-    MODEL_LEN, REQUEST_ID_LEN, STATUS_ERROR, STATUS_OK, VERSION,
+    MODEL_LEN, REQUEST_ID_LEN, STATUS_ERROR, STATUS_OK, VENDOR_LEN, VERSION,
 };
 
 pub const MAX_PATH: usize = 255;
@@ -142,6 +142,7 @@ fn encode_sign_request(out: &mut Vec<u8>, request: &request::Sign) -> Result<(),
 fn encode_xpubs_response(out: &mut Vec<u8>, response: &response::Xpubs) -> Result<(), Error> {
     write_vec(out, &response.xpubs, write_xpub)?;
     out.extend_from_slice(&response.fingerprint.0);
+    write_fixed_string(out, &response.vendor, VENDOR_LEN)?;
     write_fixed_string(out, &response.model, MODEL_LEN)?;
     write_version(out, &response.version)?;
     write_capabilities(out, &response.capabilities)

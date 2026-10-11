@@ -71,6 +71,7 @@ const DIRECTION_REQUEST: u8 = 0x0;
 const STATUS_ERROR: u8 = 0x40;
 const STATUS_OK: u8 = 0x0;
 const TYPE_MASK: u8 = 0x3f;
+pub const VENDOR_LEN: usize = 16;
 pub const MODEL_LEN: usize = 16;
 pub const ERROR_MESSAGE_LEN: usize = 32;
 pub const REQUEST_ID_LEN: usize = 2;

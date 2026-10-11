@@ -227,10 +227,14 @@ body.
 
 **Ok response** (`TYPE` = `0x01`, response):
 
-`XPUBS` `FINGERPRINT` `MODEL` `VERSION` `CAPABILITIES`
+`XPUBS` `FINGERPRINT` `VENDOR` `MODEL` `VERSION` `CAPABILITIES`
 
 `XPUBS`: a vector of `XPUB`, in the same order as the request `PATHS`.
 `FINGERPRINT`: the `FINGERPRINT` of the master key. Mandatory.
+`VENDOR`: 16 bytes, a UTF-8 device-vendor string with no `LENGTH` prefix, right-padded
+with `0x00` when shorter than 16 bytes. The value is the bytes up to the first
+`0x00` (or all 16 bytes when none is `0x00`); every byte after it MUST be `0x00`.
+Mandatory.
 `MODEL`: 16 bytes, a UTF-8 device-model string with no `LENGTH` prefix, right-padded
 with `0x00` when shorter than 16 bytes. The value is the bytes up to the first
 `0x00` (or all 16 bytes when none is `0x00`); every byte after it MUST be `0x00`.

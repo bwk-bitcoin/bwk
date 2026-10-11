@@ -63,6 +63,7 @@ fn get_xpubs_messages() -> Vec<(&'static str, Message)> {
             response(response::Body::Xpubs(response::Xpubs {
                 xpubs: vec![xpub()],
                 fingerprint: Fingerprint([0xde, 0xad, 0xbe, 0xef]),
+                vendor: "bwk".to_string(),
                 model: "bwk-signer".to_string(),
                 version: response::FirmwareVersion {
                     major: 1,

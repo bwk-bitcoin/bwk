@@ -6,7 +6,7 @@ use crate::{
     types::{DerivationPath, Fingerprint, PublicKey, Xpub},
     ErrorInfo, Message, MessageType, Request, RequestId, Response, SignResponseKind,
     DIRECTION_RESPONSE, ERROR_MESSAGE_LEN, MAGIC, MAX_DESCRIPTOR_ALIAS, MODEL_LEN, STATUS_ERROR,
-    TYPE_MASK,
+    TYPE_MASK, VENDOR_LEN,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +151,7 @@ fn read_xpubs_response(reader: &mut Reader<'_>) -> Result<response::Xpubs, Error
     Ok(response::Xpubs {
         xpubs: reader.take_vec(read_xpub)?,
         fingerprint: read_fingerprint(reader)?,
+        vendor: reader.take_fixed_string(VENDOR_LEN)?,
         model: reader.take_fixed_string(MODEL_LEN)?,
         version: read_version(reader)?,
         capabilities: read_capabilites(reader)?,

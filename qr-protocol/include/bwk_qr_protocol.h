@@ -24,6 +24,7 @@ extern "C" {
 #define BWK_QR_XPUB_LEN 78
 #define BWK_QR_FINGERPRINT_LEN 4
 #define BWK_QR_PUBLIC_KEY_LEN 33
+#define BWK_QR_VENDOR_LEN 16
 #define BWK_QR_MODEL_LEN 16
 #define BWK_QR_ERROR_MESSAGE_LEN 32
 #define BWK_QR_MAX_PATH 255
@@ -256,6 +257,7 @@ typedef struct {
 typedef struct {
     bwk_qr_xpub_list xpubs;
     uint8_t fingerprint[BWK_QR_FINGERPRINT_LEN];
+    char vendor[BWK_QR_VENDOR_LEN + 1];
     char model[BWK_QR_MODEL_LEN + 1];
     bwk_qr_firmware_version version;
     uint32_t capabilities; /* only the low four bits may be set */

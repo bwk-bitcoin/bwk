@@ -332,6 +332,7 @@ fn xpubs_response_encodes() {
                 xpubs: types::Xpubs {
                     xpubs: list_view(&xpubs),
                     fingerprint: [0xde, 0xad, 0xbe, 0xef],
+                    vendor: fixed("bwk"),
                     model: fixed("bwk-signer"),
                     version: types::FirmwareVersion {
                         major: 1,
@@ -350,6 +351,7 @@ fn xpubs_response_encodes() {
                 body: response::Body::Xpubs(response::Xpubs {
                     xpubs: vec![Xpub([0xab; 78]), Xpub([0xcd; 78])],
                     fingerprint: Fingerprint([0xde, 0xad, 0xbe, 0xef]),
+                    vendor: "bwk".to_string(),
                     model: "bwk-signer".to_string(),
                     version: response::FirmwareVersion {
                         major: 1,
@@ -402,6 +404,7 @@ fn a_model_filling_its_field_keeps_its_terminator() {
                 xpubs: types::Xpubs {
                     xpubs: list_view(&xpubs),
                     fingerprint: [0; 4],
+                    vendor: fixed("bwk"),
                     model: fixed(model),
                     version: types::FirmwareVersion {
                         major: 0,

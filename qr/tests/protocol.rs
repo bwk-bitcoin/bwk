@@ -106,6 +106,7 @@ fn xpubs_response(capabilities: u32) -> protocol::Response {
         body: response::Body::Xpubs(response::Xpubs {
             xpubs: vec![(&xpub()).into(), (&xpub()).into()],
             fingerprint: protocol::types::Fingerprint([0xde, 0xad, 0xbe, 0xef]),
+            vendor: "bwk".to_string(),
             model: "bwk-signer".to_string(),
             version: response::FirmwareVersion {
                 major: 1,
@@ -374,7 +375,7 @@ fn decoder_handles_two_messages_without_reset() {
     let request_frames = encoder.encode_request(&request).unwrap();
     let response_frames = encoder.encode_response(&response).unwrap();
     assert_eq!(request_frames.len(), 5);
-    assert_eq!(response_frames.len(), 13);
+    assert_eq!(response_frames.len(), 14);
 
     let mut decoder = decoder();
     assert_eq!(

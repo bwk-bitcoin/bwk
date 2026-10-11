@@ -38,6 +38,7 @@ impl From<&Body> for MessageType {
 pub struct Xpubs {
     pub xpubs: Vec<Xpub>,
     pub fingerprint: Fingerprint,
+    pub vendor: String,
     pub model: String,
     pub version: FirmwareVersion,
     pub capabilities: Capabilities,

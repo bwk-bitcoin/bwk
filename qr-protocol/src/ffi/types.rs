@@ -5,7 +5,7 @@ use core::{ffi::c_char, ptr};
 
 use crate::{
     types::{FINGERPRINT_LEN, PUBLIC_KEY_LEN, XPUB_LEN},
-    ERROR_MESSAGE_LEN, MODEL_LEN, REQUEST_ID_LEN,
+    ERROR_MESSAGE_LEN, MODEL_LEN, REQUEST_ID_LEN, VENDOR_LEN,
 };
 
 /// A borrowed run of `len` items. A null `ptr` means the field is absent, which is
@@ -176,6 +176,7 @@ pub union ResponseBody {
 pub struct Xpubs {
     pub xpubs: List<[u8; XPUB_LEN]>,
     pub fingerprint: [u8; FINGERPRINT_LEN],
+    pub vendor: [c_char; VENDOR_LEN + 1],
     pub model: [c_char; MODEL_LEN + 1],
     pub version: FirmwareVersion,
     pub capabilities: u32,

@@ -45,7 +45,7 @@ fn the_c_mirror_matches_the_header() {
         RequestBody => 56, 8;
         Request => 64, 8;
         FirmwareVersion => 12, 4;
-        Xpubs => 56, 8;
+        Xpubs => 72, 8;
         SpDescriptor => 8, 8;
         Registration => 32, 8;
         AddressUri => 8, 8;
@@ -58,8 +58,8 @@ fn the_c_mirror_matches_the_header() {
         SignedValue => 16, 8;
         Signed => 24, 8;
         ErrorBody => 34, 1;
-        ResponseBody => 56, 8;
-        Response => 64, 8;
+        ResponseBody => 72, 8;
+        Response => 80, 8;
         Buf => 16, 8;
     }
     assert_eq!(offset_of!(Request, body), 8);
