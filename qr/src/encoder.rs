@@ -13,7 +13,7 @@ impl Encoder {
         if config.bbqr_part_bytes == 0 {
             return Err(Error::ZeroPartSize);
         }
-        #[cfg(feature = "protocol")]
+        #[cfg(feature = "bbqr")]
         {
             // parts render at a pinned version, so a full-size one must fit it
             let probe = bbqr::split(&vec![0; config.bbqr_part_bytes], config.bbqr_part_bytes)?;
@@ -35,7 +35,7 @@ impl Encoder {
 
     #[cfg(feature = "protocol")]
     pub fn encode_request(&self, request: &crate::protocol::Request) -> Result<Vec<Image>, Error> {
-        self.encode_protocol(&crate::protocol::encode_request(request)?)
+        self.encode_bytes(&crate::protocol::encode_request(request)?)
     }
 
     #[cfg(feature = "protocol")]
@@ -43,11 +43,12 @@ impl Encoder {
         &self,
         response: &crate::protocol::Response,
     ) -> Result<Vec<Image>, Error> {
-        self.encode_protocol(&crate::protocol::encode_response(response)?)
+        self.encode_bytes(&crate::protocol::encode_response(response)?)
     }
 
-    #[cfg(feature = "protocol")]
-    fn encode_protocol(&self, data: &[u8]) -> Result<Vec<Image>, Error> {
+    /// Splits any payload into BBQR generic-binary parts, one frame each.
+    #[cfg(feature = "bbqr")]
+    pub fn encode_bytes(&self, data: &[u8]) -> Result<Vec<Image>, Error> {
         let split = bbqr::split(data, self.config.bbqr_part_bytes)?;
         split
             .parts

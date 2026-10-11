@@ -17,7 +17,7 @@ pub enum Error {
     PartTooLarge { bytes: usize, version: u8 },
     #[error("BBQR part is not alphanumeric")]
     PartNotAlphanumeric,
-    #[cfg(feature = "protocol")]
+    #[cfg(feature = "bbqr")]
     #[error(transparent)]
     Bbqr(#[from] bbqr::Error),
     #[cfg(feature = "protocol")]
