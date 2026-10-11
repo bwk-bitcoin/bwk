@@ -45,6 +45,7 @@ unsafe fn xpubs(view: &types::Xpubs) -> Result<response::Xpubs, Error> {
     Ok(response::Xpubs {
         xpubs: view.xpubs.as_slice().iter().copied().map(Xpub).collect(),
         fingerprint: Fingerprint(view.fingerprint),
+        vendor: fixed_string(&view.vendor)?,
         model: fixed_string(&view.model)?,
         version: response::FirmwareVersion {
             major: view.version.major,
