@@ -20,10 +20,12 @@ Features, all on by default:
 - `gen` uses `qrcodegen` to render grayscale QR images. It pulls nothing else.
 - `scan` uses `quircs` to scan grayscale frames. It pulls only quircs' own small
   tree.
-- `protocol` implies `gen` and `scan`, and adds BBQR framing over the
-  signing-flow codec, which lives in `bwk-qr-protocol`. It turns on that crate's
-  `bitcoin` feature, for the adapters between its byte-level types and the
-  `bitcoin` ones.
+- `bbqr` implies `gen` and `scan`, and adds BBQR generic-binary framing for any
+  payload: `Encoder::encode_bytes` splits bytes into frames, and
+  `Decoder::process_raw` joins them back into `Decoded::Bytes`, undecoded.
+- `protocol` implies `bbqr`, and decodes the joined payloads as the signing-flow
+  codec, which lives in `bwk-qr-protocol`. It turns on that crate's `bitcoin`
+  feature, for the adapters between its byte-level types and the `bitcoin` ones.
 
 `Encoder`, `Decoder`, `Config` and `Image` are the whole public surface;
 generation and scanning are crate-internal helpers. `Image` is an 8-bit
@@ -43,7 +45,7 @@ qr/src/
   image.rs    Image, the one raw-data type crossing the API
   gen.rs      QR generation                          (feature: gen)
   scan.rs     grayscale decode                       (feature: scan)
-  encoder.rs  plain text and protocol -> frames      (feature: gen)
+  encoder.rs  plain text, bytes, protocol -> frames  (feature: gen)
   decoder.rs  frames -> Decoded, BBQR reassembly     (feature: scan)
 ```
 
