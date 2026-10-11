@@ -7,6 +7,7 @@ use std::{collections::BTreeSet, str::FromStr};
 use bitcoin::{
     bip32::{self, ChildNumber},
     hashes::Hash,
+    key::TapTweak,
     secp256k1::{All, Keypair, Message, Parity, PublicKey, Scalar, Secp256k1, SecretKey},
     sighash::{Prevouts, SighashCache},
     taproot::Signature,
@@ -105,6 +106,9 @@ pub fn write_input_ecdh_share(
 pub struct SpSigner {
     b_spend: SecretKey,
     network: Network,
+    // The seed's master key, for the eligible inputs it holds by BIP32 (the account's
+    // sub-account coins): their keys count in the ECDH shares too.
+    master: Option<bip32::Xpriv>,
 }
 
 impl SpSigner {
@@ -119,7 +123,11 @@ impl SpSigner {
         let master = bip32::Xpriv::new_master(network, &seed).map_err(|_| Error::Derivation)?;
         let b_spend =
             derive_spend_key(&master, &secp, network, account).map_err(|_| Error::Derivation)?;
-        Ok(Self { b_spend, network })
+        Ok(Self {
+            b_spend,
+            network,
+            master: Some(master),
+        })
     }
 
     pub fn network(&self) -> Network {
@@ -137,6 +145,46 @@ impl SpSigner {
         let tweak = SecretKey::from_slice(&tweak).ok()?;
         let script = bip375::input_script_pubkey(input).ok().flatten()?;
         reconstruct_signing_key(self.b_spend, tweak, &script, secp)
+    }
+
+    /// Derives the key of an eligible input this seed holds by BIP32 (its
+    /// `tap_key_origins` or `bip32_derivation` names this seed's fingerprint), as
+    /// BIP352 sums it: for a taproot input the output key's private key (tweaked
+    /// with its tap tree, `tap_merkle_root`, negated to its even point), the
+    /// derived key otherwise. Only kept when it reproduces the input's eligible
+    /// public key.
+    fn bip32_key(&self, input: &bwk_psbt::Input, secp: &Secp256k1<All>) -> Option<SecretKey> {
+        let master = self.master.as_ref()?;
+        let fingerprint = master.fingerprint(secp);
+        let eligible = bip375::eligible_input_pubkey(input).ok().flatten()?;
+        let script = bip375::input_script_pubkey(input).ok().flatten()?;
+        let origins = input
+            .psbt
+            .tap_key_origins
+            .values()
+            .map(|(_, origin)| origin)
+            .chain(input.psbt.bip32_derivation.values());
+        for (origin_fingerprint, path) in origins {
+            if *origin_fingerprint != fingerprint {
+                continue;
+            }
+            let derived = master.derive_priv(secp, path).ok()?.private_key;
+            let key = if script.is_p2tr() {
+                let tweaked = Keypair::from_secret_key(secp, &derived)
+                    .tap_tweak(secp, input.psbt.tap_merkle_root)
+                    .to_keypair();
+                match tweaked.x_only_public_key().1 {
+                    Parity::Odd => tweaked.secret_key().negate(),
+                    Parity::Even => tweaked.secret_key(),
+                }
+            } else {
+                derived
+            };
+            if key.public_key(secp) == eligible {
+                return Some(key);
+            }
+        }
+        None
     }
 
     /// Whether `owned` covers every BIP352-eligible input in `psbt`, meaning
@@ -244,16 +292,46 @@ impl SpSigner {
 
     pub fn sign(&self, psbt: &mut bwk_psbt::PsbtV2) -> Result<(), Error> {
         let secp = Secp256k1::new();
-        let owned: Vec<(usize, SecretKey)> = psbt
+        let sp_owned: Vec<(usize, SecretKey)> = psbt
             .inputs
             .iter()
             .enumerate()
             .filter_map(|(i, input)| self.reconstruct(input, &secp).map(|sk| (i, sk)))
             .collect();
+        let bip32_owned: Vec<(usize, SecretKey)> = psbt
+            .inputs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !sp_owned.iter().any(|(owned, _)| owned == i))
+            // An input whose own share another signer already wrote is theirs.
+            .filter(|(_, input)| {
+                bwk_psbt::sp::sp_input_ecdh_shares(&input.psbt)
+                    .is_ok_and(|shares| shares.is_empty())
+            })
+            .filter_map(|(i, input)| self.bip32_key(input, &secp).map(|sk| (i, sk)))
+            .collect();
 
-        Self::write_shares(psbt, &owned, &secp)?;
+        // Every eligible input this seed holds counts in the shares, so a spend of
+        // sub-account coins can still pay a silent payment output.
+        let share_keys: Vec<(usize, SecretKey)> =
+            sp_owned.iter().chain(&bip32_owned).copied().collect();
+        Self::write_shares(psbt, &share_keys, &secp)?;
         bip375::complete_output_scripts(psbt).map_err(Error::PsbtV2)?;
-        Self::sign_inputs(psbt, &owned, &secp)
+
+        // A taproot key path held by BIP32 is signed here as well, with the key the
+        // share used; other script types are left to their descriptor's signer.
+        let is_p2tr = |idx: usize| {
+            bip375::input_script_pubkey(&psbt.inputs[idx])
+                .ok()
+                .flatten()
+                .is_some_and(|script| script.is_p2tr())
+        };
+        let to_sign: Vec<(usize, SecretKey)> = sp_owned
+            .iter()
+            .copied()
+            .chain(bip32_owned.iter().copied().filter(|(idx, _)| is_p2tr(*idx)))
+            .collect();
+        Self::sign_inputs(psbt, &to_sign, &secp)
     }
 }
 
@@ -268,6 +346,13 @@ mod tests {
         transaction, Network, OutPoint, ScriptBuf, Sequence, TxOut, Txid, XOnlyPublicKey,
     };
 
+    use bitcoin::{
+        bip32::ChildNumber,
+        secp256k1::Message,
+        sighash::{Prevouts, SighashCache},
+        TapSighashType,
+    };
+
     use crate::{
         account::bip375,
         signer::{Error, SpSigner},
@@ -277,6 +362,7 @@ mod tests {
         SpSigner {
             b_spend: SecretKey::from_slice(&[7u8; 32]).unwrap(),
             network: Network::Regtest,
+            master: None,
         }
     }
 
@@ -429,6 +515,111 @@ mod tests {
         let err = signer.sign(&mut psbt).unwrap_err();
 
         assert!(matches!(err, Error::MissingPrevout(outpoint) if outpoint == foreign_outpoint));
+        assert!(psbt.inputs[0].psbt.tap_key_sig.is_none());
+    }
+
+    const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+        abandon abandon abandon about";
+
+    /// A BIP86 coin of `MNEMONIC`'s seed at m/86'/1'/0'/0/0, its origin in
+    /// `tap_key_origins`, as a sub-account spend carries it.
+    fn bip86_input(outpoint_byte: u8) -> bwk_psbt::Input {
+        use bitcoin::{
+            bip32::{DerivationPath, Xpriv},
+            key::TapTweak,
+        };
+        use std::str::FromStr;
+        let secp = Secp256k1::new();
+        let seed = crate::receiver::bip39::Mnemonic::from_str(MNEMONIC)
+            .unwrap()
+            .to_seed("");
+        let master = Xpriv::new_master(Network::Regtest, &seed).unwrap();
+        let path = DerivationPath::from_str("m/86'/1'/0'/0/0").unwrap();
+        let internal = master.derive_priv(&secp, &path).unwrap().private_key;
+        let (internal_x, _) = internal.public_key(&secp).x_only_public_key();
+        let (output_key, _) = internal_x.tap_tweak(&secp, None);
+        let mut psbt_input = bitcoin::psbt::Input {
+            witness_utxo: Some(TxOut {
+                value: bitcoin::Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::new_p2tr_tweaked(output_key),
+            }),
+            tap_internal_key: Some(internal_x),
+            ..Default::default()
+        };
+        psbt_input
+            .tap_key_origins
+            .insert(internal_x, (vec![], (master.fingerprint(&secp), path)));
+        bwk_psbt::Input {
+            previous_output: OutPoint {
+                txid: Txid::from_byte_array([outpoint_byte; 32]),
+                vout: 0,
+            },
+            sequence: Sequence::MAX,
+            required_time_lock_time: None,
+            required_height_lock_time: None,
+            psbt: psbt_input,
+        }
+    }
+
+    #[test]
+    fn a_bip32_coin_pays_a_silent_payment_output() {
+        let signer = SpSigner::from_mnemonic(
+            MNEMONIC,
+            Network::Regtest,
+            ChildNumber::from_hardened_idx(0).unwrap(),
+        )
+        .unwrap();
+        let mut psbt = empty_psbt(vec![bip86_input(9)]);
+        let secp = Secp256k1::new();
+        let scan_key = SecretKey::from_slice(&[11u8; 32])
+            .unwrap()
+            .public_key(&secp);
+        let spend_key = SecretKey::from_slice(&[12u8; 32])
+            .unwrap()
+            .public_key(&secp);
+        let mut output = bitcoin::psbt::Output::default();
+        bwk_psbt::sp::set_sp_v0_output(&mut output, scan_key, spend_key, None);
+        psbt.outputs.push(bwk_psbt::Output {
+            amount: bitcoin::Amount::from_sat(90_000),
+            script_pubkey: None,
+            psbt: output,
+        });
+
+        signer.sign(&mut psbt).unwrap();
+
+        // The coin's key made the share, the output script is derived and the coin
+        // is signed with its output key.
+        assert!(bwk_psbt::sp::sp_global_ecdh_share_v2(&psbt, scan_key)
+            .unwrap()
+            .is_some());
+        assert!(psbt.outputs[0].script_pubkey.is_some());
+        bip375::validate(&psbt).unwrap();
+        let signature = psbt.inputs[0].psbt.tap_key_sig.expect("the coin is signed");
+        let tx = psbt.unsigned_tx().unwrap();
+        let prevouts = vec![psbt.inputs[0].psbt.witness_utxo.clone().unwrap()];
+        let sighash = SighashCache::new(&tx)
+            .taproot_key_spend_signature_hash(0, &Prevouts::All(&prevouts), TapSighashType::Default)
+            .unwrap();
+        let output_key =
+            XOnlyPublicKey::from_slice(&prevouts[0].script_pubkey.as_bytes()[2..34]).unwrap();
+        secp.verify_schnorr(
+            &signature.signature,
+            &Message::from_digest(sighash.to_byte_array()),
+            &output_key,
+        )
+        .expect("the signature verifies against the coin's output key");
+    }
+
+    #[test]
+    fn a_foreign_bip32_coin_is_not_owned() {
+        let signer = SpSigner::from_mnemonic(
+            "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
+            Network::Regtest,
+            ChildNumber::from_hardened_idx(0).unwrap(),
+        )
+        .unwrap();
+        let mut psbt = empty_psbt(vec![bip86_input(9)]);
+        signer.sign(&mut psbt).unwrap();
         assert!(psbt.inputs[0].psbt.tap_key_sig.is_none());
     }
 }
