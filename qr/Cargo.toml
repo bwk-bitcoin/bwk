@@ -22,4 +22,5 @@ bitcoin = { workspace = true }
 default = ["gen", "scan", "protocol"]
 gen = ["dep:qrcodegen"]
 scan = ["dep:quircs"]
-protocol = ["gen", "scan", "dep:bbqr", "dep:bwk-qr-protocol"]
+bbqr = ["gen", "scan", "dep:bbqr"]
+protocol = ["bbqr", "dep:bwk-qr-protocol"]

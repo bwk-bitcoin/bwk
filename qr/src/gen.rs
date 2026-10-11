@@ -38,7 +38,7 @@ pub fn encode_text(data: &str, level: CorrectionLevel, max_version: u8) -> Resul
     .map_err(|_| Error::TooLong)
 }
 
-#[cfg(feature = "protocol")]
+#[cfg(feature = "bbqr")]
 pub fn encode_alphanumeric(data: &str, version: u8) -> Result<Image, Error> {
     if !QrSegment::is_alphanumeric(data) {
         return Err(Error::PartNotAlphanumeric);
