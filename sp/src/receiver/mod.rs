@@ -371,6 +371,45 @@ mod tests {
         );
     }
 
+    /// The recipe a signer follows for a silent payment Address Verification request
+    /// (bwk-qr-protocol `DescriptorBody::SpKeys`): from its own seed, derive the scan
+    /// and spend keys at the paths the request names, then encode the address.
+    #[test]
+    fn sp_keys_text_rebuilds_the_receiving_address() {
+        let secp = Secp256k1::new();
+        let network = Network::Signet;
+        let account = bip32::ChildNumber::from_hardened_idx(0).unwrap();
+        let receiver = SpReceiver::new_from_mnemonic(test_mnemonic(), network).unwrap();
+
+        let seed = test_mnemonic().to_seed("");
+        let master_xpriv = bip32::Xpriv::new_master(network, &seed).unwrap();
+        let text = bwk_qr_protocol::types::SpKeys {
+            fingerprint: master_xpriv.fingerprint(&secp),
+            spend_path: spend_path(network, account),
+            scan_path: scan_path(network, account),
+        }
+        .to_string();
+
+        // the signer's side: only the text and its seed
+        let keys: bwk_qr_protocol::types::SpKeys = text.parse().unwrap();
+        assert_eq!(keys.fingerprint, master_xpriv.fingerprint(&secp));
+        let scan_sk = master_xpriv
+            .derive_priv(&secp, &keys.scan_path)
+            .unwrap()
+            .private_key;
+        let spend_pk = master_xpriv
+            .derive_priv(&secp, &keys.spend_path)
+            .unwrap()
+            .private_key
+            .public_key(&secp);
+        let rebuilt = SpReceiver::new(scan_sk, spend_pk, network).unwrap();
+
+        assert_eq!(
+            rebuilt.get_receiving_address(),
+            receiver.get_receiving_address()
+        );
+    }
+
     #[test]
     fn bip352_paths_match_bip352() {
         let account = bip32::ChildNumber::from_hardened_idx(0).unwrap();
