@@ -214,6 +214,7 @@ fn read_descriptor_body(reader: &mut Reader<'_>) -> Result<request::DescriptorBo
             keys: reader.take_vec(Reader::take_string)?,
             policy: reader.take_string()?,
         }),
+        request::DESCRIPTOR_SP_KEYS => Ok(request::DescriptorBody::SpKeys(reader.take_string()?)),
         value => Err(Error::UnknownDescriptorForm(value)),
     }
 }

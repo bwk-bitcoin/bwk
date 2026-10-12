@@ -25,6 +25,8 @@ pub enum Error {
     Xpub(bitcoin::bip32::Error),
     PublicKey(bitcoin::key::FromSliceError),
     UncompressedPublicKey,
+    /// A silent payment keys string that is not `<fingerprint>|<spend_path>|<scan_path>`.
+    SpKeys,
 }
 
 #[cfg(feature = "bitcoin")]
@@ -34,6 +36,9 @@ impl core::fmt::Display for Error {
             Self::Xpub(e) => write!(f, "invalid xpub: {e}"),
             Self::PublicKey(e) => write!(f, "invalid public key: {e}"),
             Self::UncompressedPublicKey => f.write_str("public key is not compressed"),
+            Self::SpKeys => {
+                f.write_str("silent payment keys are not <fingerprint>|<spend_path>|<scan_path>")
+            }
         }
     }
 }
@@ -107,5 +112,59 @@ impl TryFrom<&PublicKey> for bitcoin::PublicKey {
 
     fn try_from(key: &PublicKey) -> Result<Self, Error> {
         Self::from_slice(&key.0).map_err(Error::PublicKey)
+    }
+}
+
+/// The keys a [`DescriptorBody::SpKeys`](crate::request::DescriptorBody::SpKeys) names:
+/// a silent payment account's master fingerprint and the BIP-32 paths of its BIP-352
+/// spend and scan keys, written `<fingerprint>|<spend_path>|<scan_path>`.
+#[cfg(feature = "bitcoin")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpKeys {
+    pub fingerprint: bitcoin::bip32::Fingerprint,
+    pub spend_path: bitcoin::bip32::DerivationPath,
+    pub scan_path: bitcoin::bip32::DerivationPath,
+}
+
+#[cfg(feature = "bitcoin")]
+impl core::fmt::Display for SpKeys {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{}|m/{}|m/{}",
+            self.fingerprint, self.spend_path, self.scan_path
+        )
+    }
+}
+
+#[cfg(feature = "bitcoin")]
+impl core::str::FromStr for SpKeys {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut parts = s.split('|');
+        let (Some(fingerprint), Some(spend_path), Some(scan_path), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(Error::SpKeys);
+        };
+        // both paths start at the master key: "m/..."
+        let path = |text: &str| {
+            text.strip_prefix("m/")
+                .and_then(|_| text.parse::<bitcoin::bip32::DerivationPath>().ok())
+                .ok_or(Error::SpKeys)
+        };
+        Ok(Self {
+            fingerprint: fingerprint.parse().map_err(|_| Error::SpKeys)?,
+            spend_path: path(spend_path)?,
+            scan_path: path(scan_path)?,
+        })
+    }
+}
+
+#[cfg(feature = "bitcoin")]
+impl From<&SpKeys> for crate::request::DescriptorBody {
+    fn from(keys: &SpKeys) -> Self {
+        Self::SpKeys(alloc::string::ToString::to_string(keys))
     }
 }
