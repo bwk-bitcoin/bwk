@@ -52,7 +52,8 @@ enum bwk_qr_message_type {
 /* Closed: the decoder rejects any other value. */
 enum bwk_qr_descriptor_form {
     BWK_QR_DESCRIPTOR_BIP380 = 0x01,
-    BWK_QR_DESCRIPTOR_BIP388 = 0x02
+    BWK_QR_DESCRIPTOR_BIP388 = 0x02,
+    BWK_QR_DESCRIPTOR_SP_KEYS = 0x03
 };
 
 /* Closed: the decoder rejects any other value. */
@@ -188,6 +189,7 @@ typedef struct {
 typedef union {
     const char *bip380;
     bwk_qr_bip388 bip388;
+    const char *sp_keys; /* "<fingerprint>|<spend_path>|<scan_path>" */
 } bwk_qr_descriptor_value;
 
 typedef struct {

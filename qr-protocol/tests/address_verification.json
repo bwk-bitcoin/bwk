@@ -8,6 +8,13 @@
       "decode_only": false
     },
     {
+      "name": "address_verification_sp_request",
+      "description": "Address Verification request for a silent payment address: the alias \"main\", an empty DERIV (no label), the address sp1qxyz, a FORM 0x03 descriptor 73c5da0a|m/352'/1'/0'/0'/0|m/352'/1'/0'/1'/0 (silent payment keys) and no POR.",
+      "direction": "request",
+      "hex": "42495058585801030001046d61696e0001077370317178797a01032c37336335646130617c6d2f333532272f31272f30272f30272f307c6d2f333532272f31272f30272f31272f3000",
+      "decode_only": false
+    },
+    {
       "name": "address_verification_response_uri",
       "description": "Address Verification ok response with URI present and equal to bitcoin:bc1qxyz. This is the worked example of the spec.",
       "direction": "response",

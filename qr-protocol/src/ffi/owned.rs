@@ -144,6 +144,9 @@ impl Keep {
                     policy: self.string(policy)?,
                 },
             },
+            request::DescriptorBody::SpKeys(keys) => types::DescriptorValue {
+                sp_keys: self.string(keys)?,
+            },
         };
         Ok(types::DescriptorBody {
             tag: body.value(),

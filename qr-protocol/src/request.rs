@@ -71,7 +71,14 @@ pub struct Descriptor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DescriptorBody {
     Bip380(String),
-    Bip388 { keys: Vec<String>, policy: String },
+    Bip388 {
+        keys: Vec<String>,
+        policy: String,
+    },
+    /// A silent payment account's keys, as `<fingerprint>|<spend_path>|<scan_path>`
+    /// (e.g. `73c5da0a|m/352'/1'/0'/0'/0|m/352'/1'/0'/1'/0`): enough for the signer to
+    /// rebuild the account's `sp()` descriptor from its seed, with no secret on the wire.
+    SpKeys(String),
 }
 
 impl DescriptorBody {
@@ -79,9 +86,11 @@ impl DescriptorBody {
         match self {
             Self::Bip380(_) => DESCRIPTOR_BIP380,
             Self::Bip388 { .. } => DESCRIPTOR_BIP388,
+            Self::SpKeys(_) => DESCRIPTOR_SP_KEYS,
         }
     }
 }
 
 pub const DESCRIPTOR_BIP380: u8 = 0x01;
 pub const DESCRIPTOR_BIP388: u8 = 0x02;
+pub const DESCRIPTOR_SP_KEYS: u8 = 0x03;

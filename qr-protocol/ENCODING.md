@@ -88,6 +88,7 @@ step has bit 31 set, `index | 0x80000000`).
 | 0x00  | Reserved              |
 | 0x01  | BIP-380 descriptor    |
 | 0x02  | BIP-388 wallet policy |
+| 0x03  | Silent payment keys   |
 +-------+-----------------------+
 ```
 
@@ -98,6 +99,15 @@ step has bit 31 set, `index | 0x80000000`).
   - `KEYS`: a vector of `STRING`, the key information, each a BIP-380 key expression
     referenced by `@0`, `@1`, ... in `POLICY`.
   - `POLICY`: a `STRING`, the descriptor template with `@i` key placeholders.
+
+- `0x03`: a `STRING`, a silent payment account's keys as
+  `<fingerprint>|<spend_path>|<scan_path>`: the key's master fingerprint as 8
+  lowercase hex characters, then the BIP-32 paths of the BIP-352 spend and scan keys,
+  each written `m/` followed by its steps with `'` marking a hardened step. Example:
+  `73c5da0a|m/352'/1'/0'/0'/0|m/352'/1'/0'/1'/0`. It carries no key material: the
+  signer derives both keys from its own seed, which is enough to rebuild the
+  account's BIP-392 `sp()` descriptor. A signer MUST refuse it when the fingerprint
+  is not its own. Used only by Address Verification.
 
 Note: `KEYS` must be sorted following the `@n` order.
 
@@ -325,6 +335,18 @@ body field.
 `DESCRIPTOR`: OPTIONAL `DESCRIPTOR_BODY`, the full descriptor / wallet policy (for
 stateless devices).
 `POR`: OPTIONAL `BYTES`, a proof of registration (for stateless devices).
+
+A silent payment address is verified with a `DESCRIPTOR` of `FORM` `0x03`
+(silent payment keys) instead of a descriptor, and no `POR`:
+- `DESCRIPTOR_ALIAS`: the account's alias, for display only; nothing is registered.
+- `DERIV`: the BIP-352 label. Empty for the account's base address; one step `m`
+  for the address labelled `m` (`m` ≥ 1, as label `0` is reserved for change).
+- `ADDRESS`: the expected silent payment address.
+
+The signer derives the spend and scan keys at the given paths, applies the label
+tweak when `DERIV` has one, encodes the address for its network, shows it, and
+answers with a `URI` holding it, or with the error `0x08` when it differs from
+`ADDRESS`. Only a signer advertising capability bit 2 accepts it.
 
 **Ok response** (`TYPE` = `0x03`, response):
 

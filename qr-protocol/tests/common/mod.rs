@@ -28,6 +28,10 @@ pub fn bip380() -> request::DescriptorBody {
     request::DescriptorBody::Bip380("wpkh([00000000/84h/1h/0h]xpub/0/*)".to_string())
 }
 
+pub fn sp_keys() -> request::DescriptorBody {
+    request::DescriptorBody::SpKeys("73c5da0a|m/352'/1'/0'/0'/0|m/352'/1'/0'/1'/0".to_string())
+}
+
 pub fn bip388() -> request::DescriptorBody {
     request::DescriptorBody::Bip388 {
         keys: vec![

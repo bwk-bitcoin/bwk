@@ -133,7 +133,8 @@ pub struct Descriptor {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DescriptorBody {
-    /// `DESCRIPTOR_BIP380` or `DESCRIPTOR_BIP388`, which selects the `value` arm.
+    /// `DESCRIPTOR_BIP380`, `DESCRIPTOR_BIP388` or `DESCRIPTOR_SP_KEYS`, which selects
+    /// the `value` arm.
     pub tag: u8,
     pub value: DescriptorValue,
 }
@@ -143,6 +144,7 @@ pub struct DescriptorBody {
 pub union DescriptorValue {
     pub bip380: *const c_char,
     pub bip388: Bip388,
+    pub sp_keys: *const c_char,
 }
 
 #[repr(C)]

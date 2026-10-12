@@ -19,7 +19,7 @@ use bwk_qr_protocol::{
     ERROR_MESSAGE_LEN, MODEL_LEN, REQUEST_ID_LEN,
 };
 
-use common::{bip380, bip388};
+use common::{bip380, bip388, sp_keys};
 
 const ID: [u8; REQUEST_ID_LEN] = [42; REQUEST_ID_LEN];
 
@@ -226,6 +226,29 @@ fn verify_address_view_with_every_option_present() {
         assert_eq!(text(body.address), "bc1qxyz");
         assert!(!body.descriptor.is_null());
         assert_eq!(body.proof.as_slice(), &[0x5a; 4]);
+        bwk_qr_request_free(view);
+    }
+}
+
+#[test]
+fn verify_address_view_with_silent_payment_keys() {
+    unsafe {
+        let request = request(request::Body::VerifyAddress(request::VerifyAddress {
+            descriptor_alias: "main".to_string(),
+            derivation_path: DerivationPath(vec![]),
+            address: Some("sp1qxyz".to_string()),
+            descriptor: Some(sp_keys()),
+            proof: None,
+        }));
+        let view = view(&request);
+        let body = (*view).body.verify_address;
+        assert!(body.derivation_path.as_slice().is_empty());
+        let descriptor = body.descriptor;
+        assert_eq!((*descriptor).tag, request::DESCRIPTOR_SP_KEYS);
+        assert_eq!(
+            text((*descriptor).value.sp_keys),
+            "73c5da0a|m/352'/1'/0'/0'/0|m/352'/1'/0'/1'/0"
+        );
         bwk_qr_request_free(view);
     }
 }

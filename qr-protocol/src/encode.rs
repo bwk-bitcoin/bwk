@@ -221,6 +221,7 @@ fn write_descriptor_body(out: &mut Vec<u8>, body: &request::DescriptorBody) -> R
             write_vec(out, keys, write_string)?;
             write_string(out, policy)
         }
+        request::DescriptorBody::SpKeys(value) => write_string(out, value),
     }
 }
 

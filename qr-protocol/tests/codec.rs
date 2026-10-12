@@ -333,3 +333,45 @@ fn every_error_message_is_terminated_and_uniquely_coded() {
     );
     assert_eq!(reader::Error::Truncated.to_string(), "truncated field");
 }
+
+#[cfg(feature = "bitcoin")]
+mod sp_keys {
+    use bwk_qr_protocol::{request::DescriptorBody, types::SpKeys};
+
+    const TEXT: &str = "73c5da0a|m/352'/1'/0'/0'/0|m/352'/1'/0'/1'/0";
+
+    #[test]
+    fn round_trips_through_its_text() {
+        let keys: SpKeys = TEXT.parse().unwrap();
+        assert_eq!(keys.fingerprint.to_string(), "73c5da0a");
+        assert_eq!(keys.spend_path, "m/352'/1'/0'/0'/0".parse().unwrap());
+        assert_eq!(keys.scan_path, "m/352'/1'/0'/1'/0".parse().unwrap());
+        assert_eq!(keys.to_string(), TEXT);
+        assert_eq!(
+            DescriptorBody::from(&keys),
+            DescriptorBody::SpKeys(TEXT.to_string())
+        );
+    }
+
+    #[test]
+    fn reads_h_as_hardened() {
+        let keys: SpKeys = "73c5da0a|m/352h/1h/0h/0h/0|m/352h/1h/0h/1h/0"
+            .parse()
+            .unwrap();
+        assert_eq!(keys.to_string(), TEXT);
+    }
+
+    #[test]
+    fn refuses_malformed_text() {
+        for text in [
+            "",
+            "73c5da0a|m/352'/1'/0'/0'/0",
+            "73c5da0a|m/352'/1'/0'/0'/0|m/352'/1'/0'/1'/0|extra",
+            "73c5da0|m/352'/1'/0'/0'/0|m/352'/1'/0'/1'/0",
+            "73c5da0a|352'/1'/0'/0'/0|m/352'/1'/0'/1'/0",
+            "73c5da0a|m/352'/1'/0'/0'/0|m/x",
+        ] {
+            assert!(text.parse::<SpKeys>().is_err(), "{text:?} parsed");
+        }
+    }
+}
