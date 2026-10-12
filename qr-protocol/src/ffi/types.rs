@@ -4,7 +4,7 @@
 use core::{ffi::c_char, ptr};
 
 use crate::{
-    types::{FINGERPRINT_LEN, PUBLIC_KEY_LEN, XPUB_LEN},
+    types::{EXTENDED_KEY_LEN, FINGERPRINT_LEN, PUBLIC_KEY_LEN},
     ERROR_MESSAGE_LEN, MODEL_LEN, REQUEST_ID_LEN, VENDOR_LEN,
 };
 
@@ -77,23 +77,24 @@ pub struct Request {
 
 #[repr(C)]
 pub union RequestBody {
-    pub get_xpubs: GetXpubs,
+    pub get_keys: GetKeys,
     pub register_descriptor: RegisterDescriptor,
     pub verify_address: VerifyAddress,
     pub sign: Sign,
-    pub get_sp_descriptor: GetSpDescriptor,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct GetXpubs {
-    pub derivation_paths: List<Path>,
+pub struct GetKeys {
+    pub keys: List<KeyRequest>,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct GetSpDescriptor {
-    pub _unused: u8,
+pub struct KeyRequest {
+    pub derivation_path: Path,
+    /// A `KeyKind` wire code.
+    pub kind: u8,
 }
 
 #[repr(C)]
@@ -165,29 +166,22 @@ pub struct Response {
 
 #[repr(C)]
 pub union ResponseBody {
-    pub xpubs: Xpubs,
+    pub keys: Keys,
     pub registration: Registration,
     pub address_uri: AddressUri,
     pub signed: Signed,
-    pub sp_descriptor: SpDescriptor,
     pub error: ErrorBody,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct Xpubs {
-    pub xpubs: List<[u8; XPUB_LEN]>,
+pub struct Keys {
+    pub keys: List<[u8; EXTENDED_KEY_LEN]>,
     pub fingerprint: [u8; FINGERPRINT_LEN],
     pub vendor: [c_char; VENDOR_LEN + 1],
     pub model: [c_char; MODEL_LEN + 1],
     pub version: FirmwareVersion,
     pub capabilities: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct SpDescriptor {
-    pub descriptor: *const c_char,
 }
 
 #[repr(C)]

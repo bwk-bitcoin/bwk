@@ -7,7 +7,7 @@ use bwk_qr_protocol::{
     Message, MessageType, Request, RequestId, Response, MAX_DESCRIPTOR_ALIAS, REQUEST_ID_LEN,
 };
 
-use common::{path, xpub};
+use common::{key_request, xpub};
 
 // MAGIC is 6 bytes, so VERSION sits at index 6 and MSG_TYPE right after it
 const VERSION_OFFSET: usize = 6;
@@ -16,25 +16,31 @@ const HEADER_LEN: usize = MSG_TYPE_OFFSET + 1 + REQUEST_ID_LEN;
 // STORED's value follows the header, the alias "main" as a STRING (1 + 4),
 // REGISTERED (1 + 1), and STORED's own presence byte
 const STORED_VALUE_OFFSET: usize = HEADER_LEN + 5 + 2 + 1;
+// the first KIND of get_keys_request() follows the KEYS count and its path m/48'/0'/0'/2'
+// (CHILD_COUNT + 4 steps of 4 bytes)
+const FIRST_KEY_KIND_OFFSET: usize = HEADER_LEN + 1 + 1 + 4 * 4;
 
 fn id() -> RequestId {
     RequestId([42; REQUEST_ID_LEN])
 }
 
-fn get_xpubs_request() -> Request {
+fn get_keys_request() -> Request {
     Request {
         id: id(),
-        body: request::Body::GetXpubs(request::GetXpubs {
-            derivation_paths: vec![path("m/48'/0'/0'/2'"), path("m/84'/1'/0'")],
+        body: request::Body::GetKeys(request::GetKeys {
+            keys: vec![
+                key_request("m/48'/0'/0'/2'", request::KeyKind::Public),
+                key_request("m/84'/1'/0'", request::KeyKind::Public),
+            ],
         }),
     }
 }
 
-fn xpubs_response(capabilities: u32) -> Response {
+fn keys_response(capabilities: u32) -> Response {
     Response {
         id: id(),
-        body: response::Body::Xpubs(response::Xpubs {
-            xpubs: vec![xpub()],
+        body: response::Body::Keys(response::Keys {
+            keys: vec![xpub()],
             fingerprint: Fingerprint([0xde, 0xad, 0xbe, 0xef]),
             vendor: "bwk".to_string(),
             model: "bwk-signer".to_string(),
@@ -45,22 +51,6 @@ fn xpubs_response(capabilities: u32) -> Response {
                 flag: response::ReleaseFlag::ReleaseCandidate,
             },
             capabilities: response::Capabilities(capabilities),
-        }),
-    }
-}
-
-fn get_sp_descriptor_request() -> Request {
-    Request {
-        id: id(),
-        body: request::Body::GetSpDescriptor(request::GetSpDescriptor {}),
-    }
-}
-
-fn sp_descriptor_response() -> Response {
-    Response {
-        id: id(),
-        body: response::Body::SpDescriptor(response::SpDescriptor {
-            descriptor: "sp(scan,spend)".to_string(),
         }),
     }
 }
@@ -100,7 +90,7 @@ fn register_descriptor_request(alias: String) -> Request {
 
 #[test]
 fn decode_accepts_a_version_one_blob() {
-    let request = get_xpubs_request();
+    let request = get_keys_request();
     let bytes = encode_request(&request).unwrap();
     assert_eq!(bytes[VERSION_OFFSET], 1);
     assert_eq!(decode(&bytes), Ok(Message::Request(request)));
@@ -108,7 +98,7 @@ fn decode_accepts_a_version_one_blob() {
 
 #[test]
 fn decode_ignores_trailing_bytes_of_a_newer_version() {
-    let request = get_xpubs_request();
+    let request = get_keys_request();
     let mut bytes = encode_request(&request).unwrap();
     bytes[VERSION_OFFSET] = 2;
     bytes.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
@@ -117,7 +107,7 @@ fn decode_ignores_trailing_bytes_of_a_newer_version() {
 
 #[test]
 fn decode_ignores_trailing_bytes_at_version_one() {
-    let request = get_xpubs_request();
+    let request = get_keys_request();
     let mut bytes = encode_request(&request).unwrap();
     bytes.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
     assert_eq!(decode(&bytes), Ok(Message::Request(request)));
@@ -125,21 +115,21 @@ fn decode_ignores_trailing_bytes_at_version_one() {
 
 #[test]
 fn decode_rejects_version_zero() {
-    let mut bytes = encode_request(&get_xpubs_request()).unwrap();
+    let mut bytes = encode_request(&get_keys_request()).unwrap();
     bytes[VERSION_OFFSET] = 0;
     assert_eq!(decode(&bytes), Err(decode::Error::ReservedVersion));
 }
 
 #[test]
 fn decode_rejects_wrong_magic() {
-    let mut bytes = encode_request(&get_xpubs_request()).unwrap();
+    let mut bytes = encode_request(&get_keys_request()).unwrap();
     bytes[0] = b'X';
     assert_eq!(decode(&bytes), Err(decode::Error::InvalidMagic));
 }
 
 #[test]
 fn decode_rejects_a_truncated_field() {
-    let bytes = encode_request(&get_xpubs_request()).unwrap();
+    let bytes = encode_request(&get_keys_request()).unwrap();
     assert_eq!(
         decode(&bytes[..bytes.len() - 1]),
         Err(decode::Error::Read(reader::Error::Truncated))
@@ -148,29 +138,28 @@ fn decode_rejects_a_truncated_field() {
 
 #[test]
 fn decode_rejects_an_unknown_message_type() {
-    let mut bytes = encode_request(&get_xpubs_request()).unwrap();
+    let mut bytes = encode_request(&get_keys_request()).unwrap();
     bytes[MSG_TYPE_OFFSET] = 0x09;
     assert_eq!(decode(&bytes), Err(decode::Error::UnknownMessageType(0x09)));
 }
 
 #[test]
-fn get_sp_descriptor_round_trips() {
-    let request = get_sp_descriptor_request();
-    assert_eq!(
-        decode(&encode_request(&request).unwrap()),
-        Ok(Message::Request(request))
-    );
+fn decode_rejects_the_reserved_message_type_five() {
+    let mut bytes = encode_request(&get_keys_request()).unwrap();
+    bytes[MSG_TYPE_OFFSET] = 0x05;
+    assert_eq!(decode(&bytes), Err(decode::Error::UnknownMessageType(0x05)));
+}
 
-    let response = sp_descriptor_response();
-    assert_eq!(
-        decode(&encode_response(&response).unwrap()),
-        Ok(Message::Response(response))
-    );
+#[test]
+fn decode_rejects_an_unknown_key_kind() {
+    let mut bytes = encode_request(&get_keys_request()).unwrap();
+    bytes[FIRST_KEY_KIND_OFFSET] = 0x02;
+    assert_eq!(decode(&bytes), Err(decode::Error::UnknownKeyKind(0x02)));
 }
 
 #[test]
 fn decode_rejects_error_status_on_a_request() {
-    let mut bytes = encode_request(&get_xpubs_request()).unwrap();
+    let mut bytes = encode_request(&get_keys_request()).unwrap();
     bytes[MSG_TYPE_OFFSET] |= 0x40;
     assert_eq!(decode(&bytes), Err(decode::Error::ErrorStatusOnRequest));
 }
@@ -200,8 +189,8 @@ fn decode_rejects_a_string_holding_a_nul() {
 
 #[test]
 fn decode_rejects_an_oversized_vector_without_allocating_it() {
-    let mut bytes = encode_request(&get_xpubs_request()).unwrap();
-    // the derivation path count is the first body byte, after the header
+    let mut bytes = encode_request(&get_keys_request()).unwrap();
+    // the KEYS count is the first body byte, after the header
     bytes[HEADER_LEN] = 0xfd;
     bytes.splice(HEADER_LEN + 1..HEADER_LEN + 1, [0xff, 0x0f]);
     assert_eq!(
@@ -213,7 +202,7 @@ fn decode_rejects_an_oversized_vector_without_allocating_it() {
 #[test]
 fn encode_rejects_reserved_capability_bits() {
     assert_eq!(
-        encode_response(&xpubs_response(0x0000_0010)),
+        encode_response(&keys_response(0x0000_0010)),
         Err(encode::Error::ReservedCapabilityBits(0x0000_0010))
     );
 }
@@ -262,8 +251,8 @@ fn decode_rejects_an_oversized_descriptor_alias() {
 
 #[test]
 fn encode_rejects_a_fixed_string_holding_a_nul() {
-    let mut response = xpubs_response(0);
-    let response::Body::Xpubs(body) = &mut response.body else {
+    let mut response = keys_response(0);
+    let response::Body::Keys(body) = &mut response.body else {
         unreachable!()
     };
     body.model = "bwk\0signer".to_string();
@@ -294,6 +283,7 @@ fn every_error_message_is_terminated_and_uniquely_coded() {
         decode::Error::UnknownDescriptorForm(0),
         decode::Error::UnknownSignatureKind(0),
         decode::Error::UnknownSignResponseKind(0),
+        decode::Error::UnknownKeyKind(0),
     ];
     let encode_errors = [
         encode::Error::PathTooLong(0),
@@ -373,5 +363,60 @@ mod sp_keys {
         ] {
             assert!(text.parse::<SpKeys>().is_err(), "{text:?} parsed");
         }
+    }
+}
+
+#[cfg(feature = "bitcoin")]
+mod extended_key {
+    use bitcoin::{bip32, hex::DisplayHex, secp256k1::Secp256k1};
+    use bwk_qr_protocol::types::{Error, ExtendedKey};
+
+    use crate::common::{bitcoin_xpriv, bitcoin_xpub};
+
+    const XPRIV_HEX: &str = "0488ade4000000000000000000873dff81c02f525623fd1fe5167eac3a55a049de3d314bb42ee227ffed37d50800e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35";
+    const XPUB_HEX: &str = "0488b21e000000000000000000873dff81c02f525623fd1fe5167eac3a55a049de3d314bb42ee227ffed37d5080339a36013301597daef41fbe593a02cc513d0b55527ec2df1050e2e8ff49c85c2";
+
+    #[test]
+    fn the_xpriv_fixture_is_the_xpub_fixtures_private_key() {
+        assert_eq!(
+            bip32::Xpub::from_priv(&Secp256k1::new(), &bitcoin_xpriv()),
+            bitcoin_xpub()
+        );
+    }
+
+    #[test]
+    fn xpriv_round_trips() {
+        let key = ExtendedKey::from(&bitcoin_xpriv());
+        assert_eq!(key.0.to_lower_hex_string(), XPRIV_HEX);
+        assert_eq!(bip32::Xpriv::try_from(&key), Ok(bitcoin_xpriv()));
+    }
+
+    #[test]
+    fn xpub_round_trips() {
+        let key = ExtendedKey::from(&bitcoin_xpub());
+        assert_eq!(key.0.to_lower_hex_string(), XPUB_HEX);
+        assert_eq!(bip32::Xpub::try_from(&key), Ok(bitcoin_xpub()));
+    }
+
+    #[test]
+    fn an_xpriv_is_not_read_as_an_xpub() {
+        let key = ExtendedKey::from(&bitcoin_xpriv());
+        assert_eq!(
+            bip32::Xpub::try_from(&key),
+            Err(Error::ExtendedKey(bip32::Error::UnknownVersion([
+                0x04, 0x88, 0xad, 0xe4
+            ])))
+        );
+    }
+
+    #[test]
+    fn an_xpub_is_not_read_as_an_xpriv() {
+        let key = ExtendedKey::from(&bitcoin_xpub());
+        assert_eq!(
+            bip32::Xpriv::try_from(&key),
+            Err(Error::ExtendedKey(bip32::Error::UnknownVersion([
+                0x04, 0x88, 0xb2, 0x1e
+            ])))
+        );
     }
 }

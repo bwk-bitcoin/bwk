@@ -12,9 +12,9 @@
 
 This document defines the byte encoding of the signing-flow messages exchanged
 between a **wallet** (online software) and a **signer** (offline device) in the
-miniscript context: Get Xpubs, Register Descriptor, Address Verification,
-Signing, Get SP Descriptor and their exact byte layout. It is the
-authoritative byte-level contract two implementations must agree on.
+miniscript context: Get Keys, Register Descriptor, Address Verification, Signing
+and their exact byte layout. It is the authoritative byte-level contract two
+implementations must agree on.
 
 The encoding is **transport agnostic**: a `MESSAGE` is a self-contained byte
 string, and how it is delivered (animated QR via BBQR, NFC, a file, a socket) is
@@ -61,8 +61,10 @@ a language whose strings are nul-terminated without silently truncating it.
 
 `FINGERPRINT`: 4 bytes, the BIP-32 master key fingerprint.
 
-`XPUB`: 78 bytes, the BIP-32 extended public key serialization (4 version +
-1 depth + 4 parent fingerprint + 4 child number + 32 chain code + 33 key).
+`EXTENDED_KEY`: 78 bytes, the BIP-32 serialization of an extended public or private
+key (4 version + 1 depth + 4 parent fingerprint + 4 child number + 32 chain code +
+33 key). A private key carries `0x00` followed by its 32-byte key in place of the
+33-byte public key, and its own version bytes, so both have the same length.
 
 `PSBT`: a `BYTES` (`LENGTH` followed by `LENGTH` raw bytes) whose content is the
 BIP-174 binary serialization. Base64 is NOT used on the wire.
@@ -153,15 +155,14 @@ Bits (bit 7 is the MSB):
 | Value | Type                 |
 +-------+----------------------+
 | 0x00  | Reserved             |
-| 0x01  | Get Xpubs            |
+| 0x01  | Get Keys             |
 | 0x02  | Register Descriptor  |
 | 0x03  | Address Verification |
 | 0x04  | Signing              |
-| 0x05  | Get SP Descriptor    |
 +-------+----------------------+
 ```
 
-Values `0x06`–`0x3F` are reserved. A parser MUST reject an unknown `TYPE`, and
+Values `0x05`–`0x3F` are reserved. A parser MUST reject an unknown `TYPE`, and
 MUST reject `STATUS` = `1` on a request (`DIRECTION` = `0`).
 
 #### Request Id
@@ -207,13 +208,14 @@ from the C binding return codes documented in `README.md` and
 | 0x09      | Nothing to sign / no matching key for any input      |
 | 0x0A      | Invalid or unparsable PSBT                           |
 | 0x0B      | Internal device error                                |
-| 0x0C–0xFE | Reserved for future standard codes                   |
+| 0x0C      | Private key export refused (Get Keys)                |
+| 0x0D–0xFE | Reserved for future standard codes                   |
 | 0xFF      | Vendor-specific (meaning carried by `ERROR_MESSAGE`) |
 +-----------+------------------------------------------------------+
 ```
 
-`0x00` is reserved and MUST NOT be sent. `0x01`–`0x0B` are the standard codes above;
-`0x0C`–`0xFE` are reserved for future standard codes. `0xFF` is vendor-specific: the
+`0x00` is reserved and MUST NOT be sent. `0x01`–`0x0C` are the standard codes above;
+`0x0D`–`0xFE` are reserved for future standard codes. `0xFF` is vendor-specific: the
 code alone is not meaningful, so `ERROR_MESSAGE` carries the description. A receiver
 MUST NOT reject an unrecognized `ERROR`; `STATUS` = `1` already denotes an error,
 and it SHOULD fall back to `ERROR_MESSAGE`.
@@ -227,19 +229,53 @@ introduced (see Versioning); within a version they appear in listed order.
 The message definitions below give each type's request body and ok response
 body.
 
-### Get Xpubs
+### Get Keys
 
 **Request** (`TYPE` = `0x01`, request):
 
-`PATHS`
+`KEYS`
 
-`PATHS`: a vector of `DERIVATION_PATH`, the paths to derive xpubs at.
+`KEYS`: a vector of `KEY_REQUEST`, the keys to derive.
+
+`KEY_REQUEST` follows this format:
+
+`DERIVATION_PATH` `KIND`
+
+`DERIVATION_PATH`: the path of the key from the master key.
+`KIND`: 1-byte unsigned integer selecting the key returned at that path.
+
+```
++-----------+-------------------------------+
+| Value     | Definition                    |
++-----------+-------------------------------+
+| 0x00      | Public: extended public key   |
+| 0x01      | Private: extended private key |
+| 0x02–0xFF | Reserved                      |
++-----------+-------------------------------+
+```
+
+Values `0x02`–`0xFF` are reserved; a parser MUST reject them.
+
+A signer MUST refuse a `KEY_REQUEST` of `KIND` `0x01` unless its path is a BIP-352
+scan key path or under it: `m/352'/coin'/account'/1'` and deeper, with `coin` and
+`account` hardened. Exporting the scan key reveals the account's incoming silent
+payments but cannot spend them; any other private key spends funds. A signer
+without the Silent Payments capability (bit 2) MUST refuse any `KIND` `0x01`. A
+signer refusing a `KEY_REQUEST` refuses the whole request with an error response,
+`ERROR` `0x0C`, never a partial answer. The signer SHOULD tell the user, before
+exporting, that the key reveals incoming payments but cannot spend them.
+
+A silent payment wallet asks for the spend key public and the scan key private
+(e.g. `m/352'/0'/0'/0'` `KIND` `0x00` and `m/352'/0'/0'/1'` `KIND` `0x01`) and builds
+the BIP-392 `sp()` descriptor itself, alongside any other xpubs (e.g. `m/86'/0'/0'`,
+`m/84'/0'/0'`) in the same request.
 
 **Ok response** (`TYPE` = `0x01`, response):
 
-`XPUBS` `FINGERPRINT` `VENDOR` `MODEL` `VERSION` `CAPABILITIES`
+`KEYS` `FINGERPRINT` `VENDOR` `MODEL` `VERSION` `CAPABILITIES`
 
-`XPUBS`: a vector of `XPUB`, in the same order as the request `PATHS`.
+`KEYS`: a vector of `EXTENDED_KEY`, one per request `KEY_REQUEST` in the same
+order, each of the `KIND` requested.
 `FINGERPRINT`: the `FINGERPRINT` of the master key. Mandatory.
 `VENDOR`: 16 bytes, a UTF-8 device-vendor string with no `LENGTH` prefix, right-padded
 with `0x00` when shorter than 16 bytes. The value is the bytes up to the first
@@ -441,20 +477,6 @@ coordinator rebuilds it from the descriptor at finalize time.
 Spending an output received via silent payments is an ordinary taproot key-path
 spend, so `0x02` (tapkey) already covers it.
 
-### Get SP Descriptor
-
-**Request** (`TYPE` = `0x05`, request):
-
-The request body is empty.
-
-**Ok response** (`TYPE` = `0x05`, response):
-
-`DESCRIPTOR`
-
-`DESCRIPTOR`: a `STRING` holding a BIP-392 `sp()` descriptor. The scan key must be
-private because a wallet needs it to detect incoming silent payments, while the
-spend key may be public.
-
 ### Versioning
 
 `BODY` is encoded append-only: fields are ordered by the `VERSION` in which they
@@ -518,18 +540,19 @@ parser MUST NOT reserve room for it before the items have been read.
 
 Bytes are shown space-separated in hex.
 
-Get Xpubs request, one path `m/48'/0'/0'/2'`:
+Get Keys request, the public key at `m/48'/0'/0'/2'`:
 ```
 42 49 50 58 58 58    MAGIC "BIPXXX"
 01                   VERSION = 1
-01                   MSG_TYPE: request, ok, TYPE 0x01 (Get Xpubs)
+01                   MSG_TYPE: request, ok, TYPE 0x01 (Get Keys)
 00 01                REQUEST_ID (2 bytes)
-01                   PATHS: vector count = 1
+01                   KEYS: vector count = 1
 04                   CHILD_COUNT = 4
 80 00 00 30          48' = 0x80000030 (big-endian)
 80 00 00 00          0'  = 0x80000000
 80 00 00 00          0'  = 0x80000000
 80 00 00 02          2'  = 0x80000002
+00                   KIND = 0x00 (public)
 ```
 
 Address Verification response, `URI = "bitcoin:bc1qxyz"`:
@@ -551,11 +574,10 @@ The `0x83` `MSG_TYPE` byte is `DIRECTION` 1 (response) | `STATUS` 0 (ok) |
 Machine-checkable vectors are produced alongside the codec implementation and
 checked into `qr-protocol/tests/`:
 
-- `get_xpubs.json`: Get Xpubs request/response.
+- `get_keys.json`: Get Keys request/response.
 - `register_descriptor.json`: Register Descriptor request/response, each `FORM`.
 - `address_verification.json`: Address Verification request/response.
 - `signing.json`: Signing request and both response `KIND`s.
-- `get_sp_descriptor.json`: Get SP Descriptor request/response.
 - `errors.json`: error responses (`STATUS` = `1`), standard and vendor codes.
 - `versioning.json`: forward compatibility, a message whose `VERSION` is above 1
   and which carries trailing bytes a version-1 parser does not know.
@@ -566,10 +588,10 @@ Every file holds one JSON object with a single `vectors` array:
 {
   "vectors": [
     {
-      "name": "get_xpubs_request_one_path",
-      "description": "Get Xpubs request with a single path m/48'/0'/0'/2'. This is the worked example of the spec.",
+      "name": "get_keys_request_one_path",
+      "description": "Get Keys request for the extended public key at m/48'/0'/0'/2', so a single KEY_REQUEST whose KIND is 0x00 (public). This is the worked example of the spec.",
       "direction": "request",
-      "hex": "4249505858580101000102030405060708090a0b0c0d0e0f010480000030800000008000000080000002",
+      "hex": "4249505858580101000101048000003080000000800000008000000200",
       "decode_only": false
     }
   ]

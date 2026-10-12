@@ -14,7 +14,7 @@ use bwk_qr_protocol::{
         Error, OK,
     },
     request, response,
-    types::{DerivationPath, Fingerprint, PublicKey, Xpub},
+    types::{DerivationPath, ExtendedKey, Fingerprint, PublicKey},
     ErrorInfo, Message, MessageType, Request, RequestId, Response, SignResponseKind,
     ERROR_MESSAGE_LEN, MODEL_LEN, REQUEST_ID_LEN,
 };
@@ -31,8 +31,8 @@ fn path() -> DerivationPath {
     DerivationPath(vec![0x8000_0030, 0x8000_0000, 7])
 }
 
-fn xpub() -> Xpub {
-    Xpub([0xab; 78])
+fn extended_key() -> ExtendedKey {
+    ExtendedKey([0xab; 78])
 }
 
 fn request(body: request::Body) -> Request {
@@ -135,30 +135,33 @@ unsafe fn text(ptr: *const c_char) -> String {
 }
 
 #[test]
-fn get_xpubs_request_view() {
+fn get_keys_request_view() {
     unsafe {
-        let request = request(request::Body::GetXpubs(request::GetXpubs {
-            derivation_paths: vec![path(), DerivationPath(vec![])],
+        let request = request(request::Body::GetKeys(request::GetKeys {
+            keys: vec![
+                request::KeyRequest {
+                    derivation_path: path(),
+                    kind: request::KeyKind::Public,
+                },
+                request::KeyRequest {
+                    derivation_path: DerivationPath(vec![]),
+                    kind: request::KeyKind::Private,
+                },
+            ],
         }));
         let view = view(&request);
         assert_eq!((*view).id, ID);
-        assert_eq!((*view).message_type, MessageType::GetXpubs.value());
+        assert_eq!((*view).message_type, MessageType::GetKeys.value());
 
-        let paths = (*view).body.get_xpubs.derivation_paths.as_slice();
-        assert_eq!(paths.len(), 2);
-        assert_eq!(paths[0].as_slice(), &[0x8000_0030, 0x8000_0000, 7]);
-        assert_eq!(paths[1].len, 0);
-        bwk_qr_request_free(view);
-    }
-}
-
-#[test]
-fn get_sp_descriptor_request_view() {
-    unsafe {
-        let request = request(request::Body::GetSpDescriptor(request::GetSpDescriptor {}));
-        let view = view(&request);
-        assert_eq!((*view).id, ID);
-        assert_eq!((*view).message_type, MessageType::GetSpDescriptor.value());
+        let keys = (*view).body.get_keys.keys.as_slice();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(
+            keys[0].derivation_path.as_slice(),
+            &[0x8000_0030, 0x8000_0000, 7]
+        );
+        assert_eq!(keys[0].kind, request::KeyKind::Public.value());
+        assert_eq!(keys[1].derivation_path.len, 0);
+        assert_eq!(keys[1].kind, request::KeyKind::Private.value());
         bwk_qr_request_free(view);
     }
 }
@@ -345,15 +348,15 @@ fn an_absent_want_kind_is_negative() {
 }
 
 #[test]
-fn xpubs_response_encodes() {
+fn keys_response_encodes() {
     unsafe {
-        let xpubs = [[0xab; 78], [0xcd; 78]];
+        let keys = [[0xab; 78], [0xcd; 78]];
         let view = response_view(
-            MessageType::GetXpubs.value(),
+            MessageType::GetKeys.value(),
             false,
             types::ResponseBody {
-                xpubs: types::Xpubs {
-                    xpubs: list_view(&xpubs),
+                keys: types::Keys {
+                    keys: list_view(&keys),
                     fingerprint: [0xde, 0xad, 0xbe, 0xef],
                     vendor: fixed("bwk"),
                     model: fixed("bwk-signer"),
@@ -371,8 +374,8 @@ fn xpubs_response_encodes() {
             encoded(&view),
             Response {
                 id: id(),
-                body: response::Body::Xpubs(response::Xpubs {
-                    xpubs: vec![Xpub([0xab; 78]), Xpub([0xcd; 78])],
+                body: response::Body::Keys(response::Keys {
+                    keys: vec![ExtendedKey([0xab; 78]), ExtendedKey([0xcd; 78])],
                     fingerprint: Fingerprint([0xde, 0xad, 0xbe, 0xef]),
                     vendor: "bwk".to_string(),
                     model: "bwk-signer".to_string(),
@@ -390,42 +393,17 @@ fn xpubs_response_encodes() {
 }
 
 #[test]
-fn sp_descriptor_response_encodes() {
-    unsafe {
-        let descriptor = CString::new("sp(scan,spend)").unwrap();
-        let view = response_view(
-            MessageType::GetSpDescriptor.value(),
-            false,
-            types::ResponseBody {
-                sp_descriptor: types::SpDescriptor {
-                    descriptor: descriptor.as_ptr(),
-                },
-            },
-        );
-        assert_eq!(
-            encoded(&view),
-            Response {
-                id: id(),
-                body: response::Body::SpDescriptor(response::SpDescriptor {
-                    descriptor: "sp(scan,spend)".to_string(),
-                }),
-            }
-        );
-    }
-}
-
-#[test]
 fn a_model_filling_its_field_keeps_its_terminator() {
     unsafe {
         let model = "0123456789abcdef";
         assert_eq!(model.len(), MODEL_LEN);
-        let xpubs = [xpub().0];
+        let keys = [extended_key().0];
         let view = response_view(
-            MessageType::GetXpubs.value(),
+            MessageType::GetKeys.value(),
             false,
             types::ResponseBody {
-                xpubs: types::Xpubs {
-                    xpubs: list_view(&xpubs),
+                keys: types::Keys {
+                    keys: list_view(&keys),
                     fingerprint: [0; 4],
                     vendor: fixed("bwk"),
                     model: fixed(model),
@@ -439,8 +417,8 @@ fn a_model_filling_its_field_keeps_its_terminator() {
                 },
             },
         );
-        let response::Body::Xpubs(body) = encoded(&view).body else {
-            panic!("not an xpubs response")
+        let response::Body::Keys(body) = encoded(&view).body else {
+            panic!("not a keys response")
         };
         assert_eq!(body.model, model);
     }
@@ -687,8 +665,11 @@ fn decode_rejects_a_response_blob() {
 #[test]
 fn decode_reports_the_codec_error() {
     unsafe {
-        let bytes = encode_request(&request(request::Body::GetXpubs(request::GetXpubs {
-            derivation_paths: vec![path()],
+        let bytes = encode_request(&request(request::Body::GetKeys(request::GetKeys {
+            keys: vec![request::KeyRequest {
+                derivation_path: path(),
+                kind: request::KeyKind::Public,
+            }],
         })))
         .unwrap();
         assert_eq!(

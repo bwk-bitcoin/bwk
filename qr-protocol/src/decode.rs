@@ -3,7 +3,7 @@ use alloc::{string::String, vec::Vec};
 use crate::{
     reader::{self, Reader},
     request, response,
-    types::{DerivationPath, Fingerprint, PublicKey, Xpub},
+    types::{DerivationPath, ExtendedKey, Fingerprint, PublicKey},
     ErrorInfo, Message, MessageType, Request, RequestId, Response, SignResponseKind,
     DIRECTION_RESPONSE, ERROR_MESSAGE_LEN, MAGIC, MAX_DESCRIPTOR_ALIAS, MODEL_LEN, STATUS_ERROR,
     TYPE_MASK, VENDOR_LEN,
@@ -18,6 +18,7 @@ pub enum Error {
     UnknownDescriptorForm(u8),
     UnknownSignatureKind(u8),
     UnknownSignResponseKind(u8),
+    UnknownKeyKind(u8),
     Read(reader::Error),
 }
 
@@ -31,6 +32,7 @@ impl Error {
             Self::UnknownDescriptorForm(_) => error_info!(204, "unknown descriptor form"),
             Self::UnknownSignatureKind(_) => error_info!(205, "unknown signature kind"),
             Self::UnknownSignResponseKind(_) => error_info!(206, "unknown signing response kind"),
+            Self::UnknownKeyKind(_) => error_info!(207, "unknown key kind"),
             Self::Read(inner) => inner.info(),
         }
     }
@@ -61,9 +63,9 @@ pub fn decode(bytes: &[u8]) -> Result<Message, Error> {
     let id = RequestId(reader.take_array()?);
     // The error flag is already known to be clear on a request.
     let decoded = match (response, error, message_type) {
-        (false, _, MessageType::GetXpubs) => Message::Request(Request {
+        (false, _, MessageType::GetKeys) => Message::Request(Request {
             id,
-            body: request::Body::GetXpubs(read_get_xpubs_request(&mut reader)?),
+            body: request::Body::GetKeys(read_get_keys_request(&mut reader)?),
         }),
         (false, _, MessageType::RegisterDescriptor) => Message::Request(Request {
             id,
@@ -77,17 +79,13 @@ pub fn decode(bytes: &[u8]) -> Result<Message, Error> {
             id,
             body: request::Body::Sign(read_sign_request(&mut reader)?),
         }),
-        (false, _, MessageType::GetSpDescriptor) => Message::Request(Request {
-            id,
-            body: request::Body::GetSpDescriptor(request::GetSpDescriptor {}),
-        }),
         (true, true, _) => Message::Response(Response {
             id,
             body: response::Body::Error(read_error_response(&mut reader, message_type)?),
         }),
-        (true, false, MessageType::GetXpubs) => Message::Response(Response {
+        (true, false, MessageType::GetKeys) => Message::Response(Response {
             id,
-            body: response::Body::Xpubs(read_xpubs_response(&mut reader)?),
+            body: response::Body::Keys(read_keys_response(&mut reader)?),
         }),
         (true, false, MessageType::RegisterDescriptor) => Message::Response(Response {
             id,
@@ -101,10 +99,6 @@ pub fn decode(bytes: &[u8]) -> Result<Message, Error> {
             id,
             body: response::Body::Signed(read_signed_response(&mut reader)?),
         }),
-        (true, false, MessageType::GetSpDescriptor) => Message::Response(Response {
-            id,
-            body: response::Body::SpDescriptor(read_sp_descriptor_response(&mut reader)?),
-        }),
     };
     Ok(decoded)
 }
@@ -116,9 +110,9 @@ fn read_magic(reader: &mut Reader<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-fn read_get_xpubs_request(reader: &mut Reader<'_>) -> Result<request::GetXpubs, Error> {
-    Ok(request::GetXpubs {
-        derivation_paths: reader.take_vec(read_path)?,
+fn read_get_keys_request(reader: &mut Reader<'_>) -> Result<request::GetKeys, Error> {
+    Ok(request::GetKeys {
+        keys: reader.take_vec(read_key_request)?,
     })
 }
 
@@ -147,20 +141,14 @@ fn read_sign_request(reader: &mut Reader<'_>) -> Result<request::Sign, Error> {
     })
 }
 
-fn read_xpubs_response(reader: &mut Reader<'_>) -> Result<response::Xpubs, Error> {
-    Ok(response::Xpubs {
-        xpubs: reader.take_vec(read_xpub)?,
+fn read_keys_response(reader: &mut Reader<'_>) -> Result<response::Keys, Error> {
+    Ok(response::Keys {
+        keys: reader.take_vec(read_extended_key)?,
         fingerprint: read_fingerprint(reader)?,
         vendor: reader.take_fixed_string(VENDOR_LEN)?,
         model: reader.take_fixed_string(MODEL_LEN)?,
         version: read_version(reader)?,
         capabilities: read_capabilites(reader)?,
-    })
-}
-
-fn read_sp_descriptor_response(reader: &mut Reader<'_>) -> Result<response::SpDescriptor, Error> {
-    Ok(response::SpDescriptor {
-        descriptor: reader.take_string()?,
     })
 }
 
@@ -241,6 +229,13 @@ fn read_signature(reader: &mut Reader<'_>) -> Result<response::SignatureEntry, E
     }
 }
 
+fn read_key_request(reader: &mut Reader<'_>) -> Result<request::KeyRequest, Error> {
+    Ok(request::KeyRequest {
+        derivation_path: read_path(reader)?,
+        kind: request::KeyKind::try_from(reader.take_u8()?)?,
+    })
+}
+
 fn read_path(reader: &mut Reader<'_>) -> Result<DerivationPath, Error> {
     let count = reader.take_u8()? as usize;
     let mut children = Vec::new();
@@ -254,8 +249,8 @@ fn read_descriptor_alias(reader: &mut Reader<'_>) -> Result<String, Error> {
     Ok(reader.take_string_with_limit(MAX_DESCRIPTOR_ALIAS)?)
 }
 
-fn read_xpub(reader: &mut Reader<'_>) -> Result<Xpub, Error> {
-    Ok(Xpub(reader.take_array()?))
+fn read_extended_key(reader: &mut Reader<'_>) -> Result<ExtendedKey, Error> {
+    Ok(ExtendedKey(reader.take_array()?))
 }
 
 fn read_fingerprint(reader: &mut Reader<'_>) -> Result<Fingerprint, Error> {

@@ -102,11 +102,10 @@ pub enum Message {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageType {
-    GetXpubs,
+    GetKeys,
     RegisterDescriptor,
     AddressVerification,
     Signing,
-    GetSpDescriptor,
 }
 
 impl MessageType {
@@ -118,11 +117,10 @@ impl MessageType {
 impl From<MessageType> for u8 {
     fn from(message_type: MessageType) -> Self {
         match message_type {
-            MessageType::GetXpubs => 0x01,
+            MessageType::GetKeys => 0x01,
             MessageType::RegisterDescriptor => 0x02,
             MessageType::AddressVerification => 0x03,
             MessageType::Signing => 0x04,
-            MessageType::GetSpDescriptor => 0x05,
         }
     }
 }
@@ -132,11 +130,10 @@ impl TryFrom<u8> for MessageType {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0x01 => Ok(Self::GetXpubs),
+            0x01 => Ok(Self::GetKeys),
             0x02 => Ok(Self::RegisterDescriptor),
             0x03 => Ok(Self::AddressVerification),
             0x04 => Ok(Self::Signing),
-            0x05 => Ok(Self::GetSpDescriptor),
             _ => Err(decode::Error::UnknownMessageType(value)),
         }
     }
@@ -213,37 +210,21 @@ mod tests {
     }
 
     #[test]
-    fn get_xpubs_request_round_trips() {
+    fn get_keys_request_round_trips() {
         let request = Request {
             id: id(),
-            body: request::Body::GetXpubs(request::GetXpubs {
-                derivation_paths: vec![(&"m/48'/0'/0'/2'"
-                    .parse::<bitcoin::bip32::DerivationPath>()
-                    .unwrap())
-                    .into()],
+            body: request::Body::GetKeys(request::GetKeys {
+                keys: vec![request::KeyRequest {
+                    derivation_path: (&"m/48'/0'/0'/2'"
+                        .parse::<bitcoin::bip32::DerivationPath>()
+                        .unwrap())
+                        .into(),
+                    kind: request::KeyKind::Public,
+                }],
             }),
         };
         let encoded = encode_request(&request).unwrap();
         assert_eq!(decode(&encoded).unwrap(), Message::Request(request));
-    }
-
-    #[test]
-    fn sp_descriptor_round_trips() {
-        let request = Request {
-            id: id(),
-            body: request::Body::GetSpDescriptor(request::GetSpDescriptor {}),
-        };
-        let encoded = encode_request(&request).unwrap();
-        assert_eq!(decode(&encoded).unwrap(), Message::Request(request));
-
-        let response = Response {
-            id: id(),
-            body: response::Body::SpDescriptor(response::SpDescriptor {
-                descriptor: "sp(scan,spend)".to_string(),
-            }),
-        };
-        let encoded = encode_response(&response).unwrap();
-        assert_eq!(decode(&encoded).unwrap(), Message::Response(response));
     }
 
     #[test]
