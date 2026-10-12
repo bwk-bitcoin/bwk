@@ -91,20 +91,29 @@ fn round_trip_response(response: protocol::Response) {
     );
 }
 
-fn get_xpubs_request() -> protocol::Request {
+fn get_keys_request() -> protocol::Request {
     protocol::Request {
         id: id(),
-        body: request::Body::GetXpubs(request::GetXpubs {
-            derivation_paths: vec![path("m/48'/0'/0'/2'"), path("m/84'/1'/0'")],
+        body: request::Body::GetKeys(request::GetKeys {
+            keys: vec![
+                request::KeyRequest {
+                    derivation_path: path("m/48'/0'/0'/2'"),
+                    kind: request::KeyKind::Public,
+                },
+                request::KeyRequest {
+                    derivation_path: path("m/352'/1'/0'/1'"),
+                    kind: request::KeyKind::Private,
+                },
+            ],
         }),
     }
 }
 
-fn xpubs_response(capabilities: u32) -> protocol::Response {
+fn keys_response(capabilities: u32) -> protocol::Response {
     protocol::Response {
         id: id(),
-        body: response::Body::Xpubs(response::Xpubs {
-            xpubs: vec![(&xpub()).into(), (&xpub()).into()],
+        body: response::Body::Keys(response::Keys {
+            keys: vec![(&xpub()).into(), (&xpub()).into()],
             fingerprint: protocol::types::Fingerprint([0xde, 0xad, 0xbe, 0xef]),
             vendor: "bwk".to_string(),
             model: "bwk-signer".to_string(),
@@ -207,13 +216,13 @@ fn protocol_response_round_trips_through_one_frame() {
 }
 
 #[test]
-fn get_xpubs_request_round_trips() {
-    round_trip_request(get_xpubs_request());
+fn get_keys_request_round_trips() {
+    round_trip_request(get_keys_request());
 }
 
 #[test]
-fn xpubs_response_round_trips() {
-    round_trip_response(xpubs_response(0x0000_000b));
+fn keys_response_round_trips() {
+    round_trip_response(keys_response(0x0000_000b));
 }
 
 #[test]
@@ -371,7 +380,7 @@ fn progress_reports_seen_and_total() {
 fn decoder_handles_two_messages_without_reset() {
     let encoder = frame_encoder();
     let request = sign_request();
-    let response = xpubs_response(0x0000_000b);
+    let response = keys_response(0x0000_000b);
     let request_frames = encoder.encode_request(&request).unwrap();
     let response_frames = encoder.encode_response(&response).unwrap();
     assert_eq!(request_frames.len(), 5);

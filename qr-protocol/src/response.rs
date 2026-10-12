@@ -1,17 +1,16 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::{
-    types::{Fingerprint, PublicKey, Xpub},
+    types::{ExtendedKey, Fingerprint, PublicKey},
     MessageType,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Body {
-    Xpubs(Xpubs),
+    Keys(Keys),
     Registration(Registration),
     AddressUri(AddressUri),
     Signed(Signed),
-    SpDescriptor(SpDescriptor),
     Error(ErrorBody),
 }
 
@@ -24,29 +23,23 @@ impl Body {
 impl From<&Body> for MessageType {
     fn from(body: &Body) -> Self {
         match body {
-            Body::Xpubs(_) => Self::GetXpubs,
+            Body::Keys(_) => Self::GetKeys,
             Body::Registration(_) => Self::RegisterDescriptor,
             Body::AddressUri(_) => Self::AddressVerification,
             Body::Signed(_) => Self::Signing,
-            Body::SpDescriptor(_) => Self::GetSpDescriptor,
             Body::Error(e) => e.message_type,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Xpubs {
-    pub xpubs: Vec<Xpub>,
+pub struct Keys {
+    pub keys: Vec<ExtendedKey>,
     pub fingerprint: Fingerprint,
     pub vendor: String,
     pub model: String,
     pub version: FirmwareVersion,
     pub capabilities: Capabilities,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpDescriptor {
-    pub descriptor: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +165,7 @@ pub enum Error {
     NothingToSign,
     InvalidPsbt,
     InternalError,
+    PrivateKeyExportRefused,
     Vendor,
     Unknown(u8),
 }
@@ -196,6 +190,7 @@ impl From<Error> for u8 {
             Error::NothingToSign => 0x09,
             Error::InvalidPsbt => 0x0a,
             Error::InternalError => 0x0b,
+            Error::PrivateKeyExportRefused => 0x0c,
             Error::Vendor => 0xff,
             Error::Unknown(value) => value,
         }
@@ -216,6 +211,7 @@ impl From<u8> for Error {
             0x09 => Self::NothingToSign,
             0x0a => Self::InvalidPsbt,
             0x0b => Self::InternalError,
+            0x0c => Self::PrivateKeyExportRefused,
             0xff => Self::Vendor,
             value => Self::Unknown(value),
         }

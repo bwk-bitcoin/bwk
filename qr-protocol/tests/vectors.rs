@@ -10,7 +10,7 @@ use bitcoin::{
 use bwk_qr_protocol::{self as protocol, request, response, types::Fingerprint, Message};
 use serde_json::Value;
 
-use common::{bip380, bip388, bitcoin_xpub, path, sp_keys, xpub};
+use common::{bip380, bip388, bitcoin_xpub, key_request, path, sp_keys, xpriv, xpub};
 
 fn id() -> protocol::RequestId {
     protocol::RequestId([0, 1])
@@ -44,24 +44,29 @@ fn register_descriptor_request(descriptor: Option<request::DescriptorBody>) -> M
     ))
 }
 
-fn get_xpubs_messages() -> Vec<(&'static str, Message)> {
+fn get_keys_messages() -> Vec<(&'static str, Message)> {
     vec![
         (
-            "get_xpubs_request_one_path",
-            request(request::Body::GetXpubs(request::GetXpubs {
-                derivation_paths: vec![path("m/48'/0'/0'/2'")],
+            "get_keys_request_one_path",
+            request(request::Body::GetKeys(request::GetKeys {
+                keys: vec![key_request("m/48'/0'/0'/2'", request::KeyKind::Public)],
             })),
         ),
         (
-            "get_xpubs_request_two_paths",
-            request(request::Body::GetXpubs(request::GetXpubs {
-                derivation_paths: vec![path("m/48'/0'/0'/2'"), path("m/84'/1'/0'")],
+            "get_keys_request_silent_payment_and_xpubs",
+            request(request::Body::GetKeys(request::GetKeys {
+                keys: vec![
+                    key_request("m/352'/1'/0'/0'", request::KeyKind::Public),
+                    key_request("m/352'/1'/0'/1'", request::KeyKind::Private),
+                    key_request("m/86'/1'/0'", request::KeyKind::Public),
+                    key_request("m/84'/1'/0'", request::KeyKind::Public),
+                ],
             })),
         ),
         (
-            "get_xpubs_response_ok",
-            response(response::Body::Xpubs(response::Xpubs {
-                xpubs: vec![xpub()],
+            "get_keys_response_ok",
+            response(response::Body::Keys(response::Keys {
+                keys: vec![xpub(), xpriv()],
                 fingerprint: Fingerprint([0xde, 0xad, 0xbe, 0xef]),
                 vendor: "bwk".to_string(),
                 model: "bwk-signer".to_string(),
@@ -71,22 +76,7 @@ fn get_xpubs_messages() -> Vec<(&'static str, Message)> {
                     patch: 3,
                     flag: response::ReleaseFlag::Beta,
                 },
-                capabilities: response::Capabilities(0x0000_000b),
-            })),
-        ),
-    ]
-}
-
-fn get_sp_descriptor_messages() -> Vec<(&'static str, Message)> {
-    vec![
-        (
-            "get_sp_descriptor_request",
-            request(request::Body::GetSpDescriptor(request::GetSpDescriptor {})),
-        ),
-        (
-            "get_sp_descriptor_response",
-            response(response::Body::SpDescriptor(response::SpDescriptor {
-                descriptor: "sp(scan,spend)".to_string(),
+                capabilities: response::Capabilities(0x0000_000f),
             })),
         ),
     ]
@@ -226,10 +216,18 @@ fn error_messages() -> Vec<(&'static str, Message)> {
             })),
         ),
         (
+            "error_response_private_key_export_refused",
+            response(response::Body::Error(response::ErrorBody {
+                message_type: protocol::MessageType::GetKeys,
+                error: response::Error::PrivateKeyExportRefused,
+                message: "private key export refused".to_string(),
+            })),
+        ),
+        (
             "error_response_reserved_code",
             response(response::Body::Error(response::ErrorBody {
-                message_type: protocol::MessageType::GetXpubs,
-                error: response::Error::Unknown(0x0c),
+                message_type: protocol::MessageType::GetKeys,
+                error: response::Error::Unknown(0x0d),
                 message: "code added after version 1".to_string(),
             })),
         ),
@@ -239,9 +237,9 @@ fn error_messages() -> Vec<(&'static str, Message)> {
 fn versioning_messages() -> Vec<(&'static str, Message)> {
     vec![
         (
-            "versioning_get_xpubs_request_version_two",
-            request(request::Body::GetXpubs(request::GetXpubs {
-                derivation_paths: vec![path("m/48'/0'/0'/2'")],
+            "versioning_get_keys_request_version_two",
+            request(request::Body::GetKeys(request::GetKeys {
+                keys: vec![key_request("m/48'/0'/0'/2'", request::KeyKind::Public)],
             })),
         ),
         (
@@ -299,16 +297,8 @@ fn check_vector(vector: &Value, message: &Message) {
 }
 
 #[test]
-fn get_xpubs_vectors() {
-    check(include_str!("get_xpubs.json"), &get_xpubs_messages());
-}
-
-#[test]
-fn get_sp_descriptor_vectors() {
-    check(
-        include_str!("get_sp_descriptor.json"),
-        &get_sp_descriptor_messages(),
-    );
+fn get_keys_vectors() {
+    check(include_str!("get_keys.json"), &get_keys_messages());
 }
 
 #[test]

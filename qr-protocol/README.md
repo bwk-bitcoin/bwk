@@ -7,7 +7,7 @@ nothing else. Framing (BBQR) and QR rendering live in `bwk-qr`.
 The crate is `no_std` plus `alloc` and pulls no dependency in its default
 configuration, so a bare-metal signer can vendor it as-is. `bitcoin` types are
 deliberately absent: every one of them is a fixed-size array or an opaque blob on the
-wire, so the codec carries `Xpub([u8; 78])`, `Fingerprint([u8; 4])`,
+wire, so the codec carries `ExtendedKey([u8; 78])`, `Fingerprint([u8; 4])`,
 `PublicKey([u8; 33])`, `DerivationPath(Vec<u32>)` and a plain `Vec<u8>` for the PSBT.
 That keeps `secp256k1-sys` and its vendored C off the firmware build.
 

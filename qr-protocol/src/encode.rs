@@ -2,7 +2,7 @@ use alloc::{string::String, vec::Vec};
 
 use crate::{
     request, response,
-    types::{DerivationPath, Xpub},
+    types::{DerivationPath, ExtendedKey},
     ErrorInfo, MessageType, Request, RequestId, Response, SignResponseKind, DIRECTION_REQUEST,
     DIRECTION_RESPONSE, ERROR_MESSAGE_LEN, MAGIC, MAX_BYTES, MAX_DESCRIPTOR_ALIAS, MAX_VEC,
     MODEL_LEN, REQUEST_ID_LEN, STATUS_ERROR, STATUS_OK, VENDOR_LEN, VERSION,
@@ -10,7 +10,7 @@ use crate::{
 
 pub const MAX_PATH: usize = 255;
 pub const MAX_PATCH: u32 = 0x00ff_ffff;
-const ERROR_CODE_FUTURE_MIN: u8 = 0x0c;
+const ERROR_CODE_FUTURE_MIN: u8 = 0x0d;
 const ERROR_CODE_FUTURE_MAX: u8 = 0xfe;
 const CAPABILITIES_MASK: u32 = 0x0000_000f;
 
@@ -84,29 +84,27 @@ fn envelope(message_type: MessageType, response: bool, error: bool, id: RequestI
 
 fn encode_request_body(out: &mut Vec<u8>, body: &request::Body) -> Result<(), Error> {
     match body {
-        request::Body::GetXpubs(request) => encode_get_xpubs_request(out, request),
+        request::Body::GetKeys(request) => encode_get_keys_request(out, request),
         request::Body::RegisterDescriptor(request) => {
             encode_register_descriptor_request(out, request)
         }
         request::Body::VerifyAddress(request) => encode_verify_address_request(out, request),
         request::Body::Sign(request) => encode_sign_request(out, request),
-        request::Body::GetSpDescriptor(_) => Ok(()),
     }
 }
 
 fn encode_response_body(out: &mut Vec<u8>, body: &response::Body) -> Result<(), Error> {
     match body {
-        response::Body::Xpubs(response) => encode_xpubs_response(out, response),
+        response::Body::Keys(response) => encode_keys_response(out, response),
         response::Body::Registration(response) => encode_registration_response(out, response),
         response::Body::AddressUri(response) => encode_address_uri_response(out, response),
         response::Body::Signed(response) => encode_signed_response(out, response),
-        response::Body::SpDescriptor(response) => encode_sp_descriptor_response(out, response),
         response::Body::Error(response) => encode_error_response(out, response),
     }
 }
 
-fn encode_get_xpubs_request(out: &mut Vec<u8>, request: &request::GetXpubs) -> Result<(), Error> {
-    write_vec(out, &request.derivation_paths, write_path)
+fn encode_get_keys_request(out: &mut Vec<u8>, request: &request::GetKeys) -> Result<(), Error> {
+    write_vec(out, &request.keys, write_key_request)
 }
 
 fn encode_register_descriptor_request(
@@ -139,20 +137,13 @@ fn encode_sign_request(out: &mut Vec<u8>, request: &request::Sign) -> Result<(),
     })
 }
 
-fn encode_xpubs_response(out: &mut Vec<u8>, response: &response::Xpubs) -> Result<(), Error> {
-    write_vec(out, &response.xpubs, write_xpub)?;
+fn encode_keys_response(out: &mut Vec<u8>, response: &response::Keys) -> Result<(), Error> {
+    write_vec(out, &response.keys, write_extended_key)?;
     out.extend_from_slice(&response.fingerprint.0);
     write_fixed_string(out, &response.vendor, VENDOR_LEN)?;
     write_fixed_string(out, &response.model, MODEL_LEN)?;
     write_version(out, &response.version)?;
     write_capabilities(out, &response.capabilities)
-}
-
-fn encode_sp_descriptor_response(
-    out: &mut Vec<u8>,
-    response: &response::SpDescriptor,
-) -> Result<(), Error> {
-    write_string(out, &response.descriptor)
 }
 
 fn encode_registration_response(
@@ -286,6 +277,12 @@ fn write_signature_header(out: &mut Vec<u8>, input_index: u32, kind: u8) {
     out.push(kind);
 }
 
+fn write_key_request(out: &mut Vec<u8>, key: &request::KeyRequest) -> Result<(), Error> {
+    write_path(out, &key.derivation_path)?;
+    out.push(key.kind.value());
+    Ok(())
+}
+
 fn write_path(out: &mut Vec<u8>, path: &DerivationPath) -> Result<(), Error> {
     if path.0.len() > MAX_PATH {
         return Err(Error::PathTooLong(path.0.len()));
@@ -297,8 +294,8 @@ fn write_path(out: &mut Vec<u8>, path: &DerivationPath) -> Result<(), Error> {
     Ok(())
 }
 
-fn write_xpub(out: &mut Vec<u8>, xpub: &Xpub) -> Result<(), Error> {
-    out.extend_from_slice(&xpub.0);
+fn write_extended_key(out: &mut Vec<u8>, key: &ExtendedKey) -> Result<(), Error> {
+    out.extend_from_slice(&key.0);
     Ok(())
 }
 

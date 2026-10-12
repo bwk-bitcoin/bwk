@@ -21,7 +21,7 @@ extern "C" {
 
 #define BWK_QR_REQUEST_ID_LEN 2
 #define BWK_QR_MAX_DESCRIPTOR_ALIAS 32
-#define BWK_QR_XPUB_LEN 78
+#define BWK_QR_EXTENDED_KEY_LEN 78
 #define BWK_QR_FINGERPRINT_LEN 4
 #define BWK_QR_PUBLIC_KEY_LEN 33
 #define BWK_QR_VENDOR_LEN 16
@@ -42,11 +42,16 @@ extern "C" {
 
 /* Closed: the decoder rejects any other value. */
 enum bwk_qr_message_type {
-    BWK_QR_MESSAGE_GET_XPUBS = 0x01,
+    BWK_QR_MESSAGE_GET_KEYS = 0x01,
     BWK_QR_MESSAGE_REGISTER_DESCRIPTOR = 0x02,
     BWK_QR_MESSAGE_ADDRESS_VERIFICATION = 0x03,
-    BWK_QR_MESSAGE_SIGNING = 0x04,
-    BWK_QR_MESSAGE_GET_SP_DESCRIPTOR = 0x05
+    BWK_QR_MESSAGE_SIGNING = 0x04
+};
+
+/* Closed: the decoder rejects any other value. */
+enum bwk_qr_key_kind {
+    BWK_QR_KEY_PUBLIC = 0x00,
+    BWK_QR_KEY_PRIVATE = 0x01
 };
 
 /* Closed: the decoder rejects any other value. */
@@ -78,7 +83,7 @@ enum bwk_qr_release_flag {
 };
 
 /* Open: a value outside this list passes through as an unknown code, and must sit in
- * 0x0c..=0xfe to encode. */
+ * 0x0d..=0xfe to encode. */
 enum bwk_qr_response_error {
     BWK_QR_RESPONSE_ERROR_USER_DECLINED = 0x01,
     BWK_QR_RESPONSE_ERROR_UNSUPPORTED_VERSION = 0x02,
@@ -91,6 +96,7 @@ enum bwk_qr_response_error {
     BWK_QR_RESPONSE_ERROR_NOTHING_TO_SIGN = 0x09,
     BWK_QR_RESPONSE_ERROR_INVALID_PSBT = 0x0a,
     BWK_QR_RESPONSE_ERROR_INTERNAL = 0x0b,
+    BWK_QR_RESPONSE_ERROR_PRIVATE_KEY_EXPORT_REFUSED = 0x0c,
     BWK_QR_RESPONSE_ERROR_VENDOR = 0xff
 };
 
@@ -125,6 +131,7 @@ enum bwk_qr_status {
     BWK_QR_ERR_UNKNOWN_DESCRIPTOR_FORM = 204,
     BWK_QR_ERR_UNKNOWN_SIGNATURE_KIND = 205,
     BWK_QR_ERR_UNKNOWN_SIGN_RESPONSE_KIND = 206,
+    BWK_QR_ERR_UNKNOWN_KEY_KIND = 207,
 
     BWK_QR_ERR_PATH_TOO_LONG = 300,
     BWK_QR_ERR_PATCH_TOO_LARGE = 301,
@@ -160,23 +167,29 @@ typedef struct {
 } bwk_qr_path;
 
 typedef struct {
-    const bwk_qr_path *ptr;
+    bwk_qr_path derivation_path;
+    uint8_t kind; /* BWK_QR_KEY_* */
+} bwk_qr_key_request;
+
+typedef struct {
+    const bwk_qr_key_request *ptr;
     size_t len;
-} bwk_qr_path_list;
+} bwk_qr_key_request_list;
 
 typedef struct {
     const char *const *ptr;
     size_t len;
 } bwk_qr_string_list;
 
+/* BIP-32 serialization of an extended public or private key. */
 typedef struct {
-    uint8_t bytes[BWK_QR_XPUB_LEN];
-} bwk_qr_xpub;
+    uint8_t bytes[BWK_QR_EXTENDED_KEY_LEN];
+} bwk_qr_extended_key;
 
 typedef struct {
-    const bwk_qr_xpub *ptr;
+    const bwk_qr_extended_key *ptr;
     size_t len;
-} bwk_qr_xpub_list;
+} bwk_qr_extended_key_list;
 
 /* Strings are UTF-8 and NUL-terminated. The codec rejects an interior NUL on both
  * sides, so a string never carries one. A NULL pointer means the field is absent. */
@@ -209,12 +222,8 @@ typedef struct {
 } bwk_qr_descriptor_list;
 
 typedef struct {
-    bwk_qr_path_list derivation_paths;
-} bwk_qr_get_xpubs;
-
-typedef struct {
-    uint8_t _unused;
-} bwk_qr_get_sp_descriptor;
+    bwk_qr_key_request_list keys;
+} bwk_qr_get_keys;
 
 typedef struct {
     const char *descriptor_alias;
@@ -236,11 +245,10 @@ typedef struct {
 } bwk_qr_sign;
 
 typedef union {
-    bwk_qr_get_xpubs get_xpubs;
+    bwk_qr_get_keys get_keys;
     bwk_qr_register_descriptor register_descriptor;
     bwk_qr_verify_address verify_address;
     bwk_qr_sign sign;
-    bwk_qr_get_sp_descriptor get_sp_descriptor;
 } bwk_qr_request_body;
 
 typedef struct {
@@ -257,17 +265,13 @@ typedef struct {
 } bwk_qr_firmware_version;
 
 typedef struct {
-    bwk_qr_xpub_list xpubs;
+    bwk_qr_extended_key_list keys; /* one per request key, in request order */
     uint8_t fingerprint[BWK_QR_FINGERPRINT_LEN];
     char vendor[BWK_QR_VENDOR_LEN + 1];
     char model[BWK_QR_MODEL_LEN + 1];
     bwk_qr_firmware_version version;
     uint32_t capabilities; /* only the low four bits may be set */
-} bwk_qr_xpubs;
-
-typedef struct {
-    const char *descriptor;
-} bwk_qr_sp_descriptor;
+} bwk_qr_keys;
 
 typedef struct {
     const char *descriptor_alias;
@@ -328,11 +332,10 @@ typedef struct {
 } bwk_qr_error_body;
 
 typedef union {
-    bwk_qr_xpubs xpubs;
+    bwk_qr_keys keys;
     bwk_qr_registration registration;
     bwk_qr_address_uri address_uri;
     bwk_qr_signed signed_body;
-    bwk_qr_sp_descriptor sp_descriptor;
     bwk_qr_error_body error;
 } bwk_qr_response_body;
 

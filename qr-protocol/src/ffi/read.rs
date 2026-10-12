@@ -10,7 +10,7 @@ use core::ffi::{c_char, CStr};
 use crate::{
     ffi::{types, Error},
     response,
-    types::{Fingerprint, PublicKey, Xpub},
+    types::{ExtendedKey, Fingerprint, PublicKey},
     MessageType, RequestId, Response, SignResponseKind,
 };
 
@@ -22,7 +22,7 @@ pub unsafe fn response(view: &types::Response) -> Result<Response, Error> {
         response::Body::Error(error_body(message_type, &view.body.error)?)
     } else {
         match message_type {
-            MessageType::GetXpubs => response::Body::Xpubs(xpubs(&view.body.xpubs)?),
+            MessageType::GetKeys => response::Body::Keys(keys(&view.body.keys)?),
             MessageType::RegisterDescriptor => {
                 response::Body::Registration(registration(&view.body.registration)?)
             }
@@ -30,9 +30,6 @@ pub unsafe fn response(view: &types::Response) -> Result<Response, Error> {
                 uri: optional_string(view.body.address_uri.uri)?,
             }),
             MessageType::Signing => response::Body::Signed(signed(&view.body.signed)?),
-            MessageType::GetSpDescriptor => {
-                response::Body::SpDescriptor(sp_descriptor(&view.body.sp_descriptor)?)
-            }
         }
     };
     Ok(Response {
@@ -41,9 +38,15 @@ pub unsafe fn response(view: &types::Response) -> Result<Response, Error> {
     })
 }
 
-unsafe fn xpubs(view: &types::Xpubs) -> Result<response::Xpubs, Error> {
-    Ok(response::Xpubs {
-        xpubs: view.xpubs.as_slice().iter().copied().map(Xpub).collect(),
+unsafe fn keys(view: &types::Keys) -> Result<response::Keys, Error> {
+    Ok(response::Keys {
+        keys: view
+            .keys
+            .as_slice()
+            .iter()
+            .copied()
+            .map(ExtendedKey)
+            .collect(),
         fingerprint: Fingerprint(view.fingerprint),
         vendor: fixed_string(&view.vendor)?,
         model: fixed_string(&view.model)?,
@@ -54,12 +57,6 @@ unsafe fn xpubs(view: &types::Xpubs) -> Result<response::Xpubs, Error> {
             flag: view.version.flag.into(),
         },
         capabilities: response::Capabilities(view.capabilities),
-    })
-}
-
-unsafe fn sp_descriptor(view: &types::SpDescriptor) -> Result<response::SpDescriptor, Error> {
-    Ok(response::SpDescriptor {
-        descriptor: string(view.descriptor)?,
     })
 }
 

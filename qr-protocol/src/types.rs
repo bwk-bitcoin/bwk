@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-pub const XPUB_LEN: usize = 78;
+pub const EXTENDED_KEY_LEN: usize = 78;
 pub const FINGERPRINT_LEN: usize = 4;
 pub const PUBLIC_KEY_LEN: usize = 33;
 
@@ -8,9 +8,11 @@ pub const PUBLIC_KEY_LEN: usize = 33;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DerivationPath(pub Vec<u32>);
 
-/// A serialized extended public key, the form BIP-32 base58-encodes.
+/// The 78-byte BIP-32 serialization of an extended public or private key, the form
+/// BIP-32 base58-encodes. A private one carries `0x00 || 32-byte key` in place of the
+/// 33-byte public key, and its own version bytes, so both have the same length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Xpub(pub [u8; XPUB_LEN]);
+pub struct ExtendedKey(pub [u8; EXTENDED_KEY_LEN]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fingerprint(pub [u8; FINGERPRINT_LEN]);
@@ -22,7 +24,7 @@ pub struct PublicKey(pub [u8; PUBLIC_KEY_LEN]);
 #[cfg(feature = "bitcoin")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    Xpub(bitcoin::bip32::Error),
+    ExtendedKey(bitcoin::bip32::Error),
     PublicKey(bitcoin::key::FromSliceError),
     UncompressedPublicKey,
     /// A silent payment keys string that is not `<fingerprint>|<spend_path>|<scan_path>`.
@@ -33,7 +35,7 @@ pub enum Error {
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Xpub(e) => write!(f, "invalid xpub: {e}"),
+            Self::ExtendedKey(e) => write!(f, "invalid extended key: {e}"),
             Self::PublicKey(e) => write!(f, "invalid public key: {e}"),
             Self::UncompressedPublicKey => f.write_str("public key is not compressed"),
             Self::SpKeys => {
@@ -65,18 +67,34 @@ impl From<&DerivationPath> for bitcoin::bip32::DerivationPath {
 }
 
 #[cfg(feature = "bitcoin")]
-impl From<&bitcoin::bip32::Xpub> for Xpub {
+impl From<&bitcoin::bip32::Xpub> for ExtendedKey {
     fn from(xpub: &bitcoin::bip32::Xpub) -> Self {
         Self(xpub.encode())
     }
 }
 
 #[cfg(feature = "bitcoin")]
-impl TryFrom<&Xpub> for bitcoin::bip32::Xpub {
+impl From<&bitcoin::bip32::Xpriv> for ExtendedKey {
+    fn from(xpriv: &bitcoin::bip32::Xpriv) -> Self {
+        Self(xpriv.encode())
+    }
+}
+
+#[cfg(feature = "bitcoin")]
+impl TryFrom<&ExtendedKey> for bitcoin::bip32::Xpub {
     type Error = Error;
 
-    fn try_from(xpub: &Xpub) -> Result<Self, Error> {
-        Self::decode(&xpub.0).map_err(Error::Xpub)
+    fn try_from(key: &ExtendedKey) -> Result<Self, Error> {
+        Self::decode(&key.0).map_err(Error::ExtendedKey)
+    }
+}
+
+#[cfg(feature = "bitcoin")]
+impl TryFrom<&ExtendedKey> for bitcoin::bip32::Xpriv {
+    type Error = Error;
+
+    fn try_from(key: &ExtendedKey) -> Result<Self, Error> {
+        Self::decode(&key.0).map_err(Error::ExtendedKey)
     }
 }
 

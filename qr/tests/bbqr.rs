@@ -73,11 +73,16 @@ fn raw_decode_keeps_plain_codes_as_text() {
 #[cfg(feature = "protocol")]
 #[test]
 fn protocol_payload_stays_undecoded_on_the_raw_path() {
-    use bwk_qr::protocol::{self, request};
+    use bwk_qr::protocol::{self, request, types::DerivationPath};
 
     let request = protocol::Request {
         id: protocol::RequestId([7; protocol::REQUEST_ID_LEN]),
-        body: request::Body::GetSpDescriptor(request::GetSpDescriptor {}),
+        body: request::Body::GetKeys(request::GetKeys {
+            keys: vec![request::KeyRequest {
+                derivation_path: DerivationPath(vec![0x8000_0054, 0x8000_0001, 0x8000_0000]),
+                kind: request::KeyKind::Public,
+            }],
+        }),
     };
     let message = protocol::encode_request(&request).unwrap();
     let frames = frame_encoder().encode_request(&request).unwrap();
