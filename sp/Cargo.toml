@@ -144,6 +144,7 @@ ureq = { workspace = true, features = ["gzip", "native-tls", "vendored"] }
 
 [dev-dependencies]
 blindbitd = { workspace = true, features = ["electrum"] }
+bwk-qr-protocol = { workspace = true, features = ["bitcoin"] }
 bwk = { workspace = true, features = ["sp", "test"] }
 bwk-utils = { workspace = true, features = ["test"] }
 bwk-sign = { workspace = true, features = ["test"] }
