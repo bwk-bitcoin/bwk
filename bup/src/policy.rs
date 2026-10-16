@@ -7,21 +7,25 @@ use std::{
 };
 
 use bwk_descriptor::wallet::{WalletDescriptor, WalletKey};
+#[cfg(feature = "musig")]
+use bwk_keys::musig::MusigKey;
 use miniscript::{
-    bitcoin::absolute::LOCK_TIME_THRESHOLD,
+    bitcoin::{absolute::LOCK_TIME_THRESHOLD, bip32::ChildNumber},
     descriptor::{TapTree, Tr},
     policy::Semantic as SemanticPolicy,
     {Descriptor, DescriptorPublicKey},
 };
 
+#[cfg(feature = "musig")]
+use crate::musig::musig_participants;
 use crate::{
     key_role::{KeyRoleError, KeyType},
     multipath::{
         assign_start_indices, get_multipath_index, group_taptree_leaves, plain_key, LeafEntry,
-        NUMS_MARKER_MULTIPATH,
+        NUMS_BLOCK_START,
     },
     nums::{bip341_nums, unspendable_internal_key},
-    parse::{compute_satisfaction_wu, infer_policy_type, oxpub, TR_KEY_PATH_WU},
+    parse::{compute_satisfaction_wu, infer_policy_type, is_primary_only, oxpub, TR_KEY_PATH_WU},
     path::{
         Locktime, LocktimeError, NestedSide, OXpub, Path, Semantic, SemanticError, TapPosition,
     },
@@ -31,29 +35,27 @@ use crate::{
 #[cfg(feature = "musig")]
 pub const MAX_LEAVES: usize = 32;
 
-/// Recognise an internal key tagged with `NUMS_MARKER_MULTIPATH` and the BIP-341 NUMS
-/// pubkey. The marker is a structural contract by design: short-circuits before the
-/// legacy chain-code recompute, so a foreign descriptor that reuses the marker on a
-/// NUMS-keyed internal key is treated as unspendable regardless of derivation. Legacy
-/// detection (chain-code recompute) still runs as a fallback for older descriptors.
-fn is_new_style_nums(key: &WalletKey) -> bool {
+/// Recognise a NUMS slot: the BIP-341 NUMS pubkey on two single-step unhardened paths
+/// inside the NUMS block (`NUMS_BLOCK_START` and up). The block is a structural contract by
+/// design: short-circuits before the legacy chain-code recompute, so a foreign descriptor
+/// that puts a NUMS-keyed internal key in the block is treated as unspendable whatever its
+/// chain code. Legacy detection (chain-code recompute) still runs as a fallback for older
+/// descriptors.
+fn is_nums_slot(key: &WalletKey) -> bool {
     let Some(DescriptorPublicKey::MultiXPub(m)) = plain_key(key) else {
         return false;
     };
-    if m.xkey.public_key != bip341_nums() {
-        return false;
-    }
     let paths = m.derivation_paths.paths();
-    paths.len() == 2
-        && paths[0].len() == 1
-        && paths[1].len() == 1
-        && u32::from(paths[0][0]) == NUMS_MARKER_MULTIPATH[0]
-        && u32::from(paths[1][0]) == NUMS_MARKER_MULTIPATH[1]
+    m.xkey.public_key == bip341_nums()
+        && paths.len() == 2
+        && paths
+            .iter()
+            .all(|p| matches!(p[..], [ChildNumber::Normal { index }] if index >= NUMS_BLOCK_START))
 }
 
-fn extract_leaves<'a>(
-    tap_tree: &'a TapTree<WalletKey>,
-) -> Result<Vec<LeafEntry<'a>>, crate::multipath::MultipathError> {
+/// The non-padding leaves of `tap_tree` with their multipath indices. With `musig`, a
+/// derive-then-aggregate musig() key is `MusigDerivation`.
+fn extract_leaves<'a>(tap_tree: &'a TapTree<WalletKey>) -> Result<Vec<LeafEntry<'a>>, PolicyError> {
     let mut entries = Vec::new();
     for (idx, (depth, ms)) in tap_tree.iter().enumerate() {
         if is_nums_padding_leaf(ms) {
@@ -61,6 +63,12 @@ fn extract_leaves<'a>(
         }
         let mut indices = Vec::new();
         for k in ms.iter_pk() {
+            #[cfg(feature = "musig")]
+            if let MusigKey::Musig(aggregate) = &k {
+                if aggregate.derives_cosigners() {
+                    return Err(PolicyError::MusigDerivation);
+                }
+            }
             indices.push(get_multipath_index(&k)?);
         }
         entries.push(LeafEntry {
@@ -74,8 +82,9 @@ fn extract_leaves<'a>(
 }
 
 /// Structural match for a compiler-emitted NUMS padding leaf: a single `pk` over
-/// a NUMS-pubkey'd `MultiXPub`. Parsing accepts any valid miniscript, so this
-/// drops the leaf without verifying the chain-code chain, so a foreign descriptor
+/// a NUMS-pubkey'd `MultiXPub`, on a NUMS slot or in the legacy chain-code-only form.
+/// Parsing accepts any valid miniscript, so this drops the leaf without checking its
+/// derivation or chain code, so a foreign descriptor
 /// with an intentional `pk(NUMS)` leaf is silently dropped here. `compile`
 /// enforces stricter rules: `OXpub::validate` rejects NUMS at the signer-key
 /// boundary, so we never produce real `pk(NUMS)` signer leaves.
@@ -108,14 +117,20 @@ pub enum PolicyType {
     /// [`PolicyType::CsvWithMandatoryKey`]; mixing the two flavors in the same policy
     /// falls into [`PolicyType::Unknown`].
     CsvWithNestedMandatory,
+    /// A lone locktime-free primary path ([`Semantic::Single`] or [`Semantic::Multi`]) and
+    /// no recovery: a plain single key or shared wallet. Compiles like the primary path of
+    /// the other types: a `Single`, or with `musig` an n-of-n `Multi`, becomes the internal
+    /// key with no tap tree; any other `Multi` sits in the tap tree under the NUMS internal
+    /// key (with `musig`, its C(n,m) `pk(musig(S))` leaves).
+    PrimaryOnly,
     /// Path set the typed classifier (`Csv` / `Cltv` / `CsvWithMandatoryKey`) doesn't recognise.
     /// Produced by `Policy::from_descriptor` when the descriptor can't be folded into a typed
     /// shape, and acceptable to `Policy::new` for consumers building arbitrary path sets.
     /// Compile-readiness is checked structurally per-path (`Semantic::validate` +
     /// `Locktime::validate`) without policy-level invariants like the single-primary rule.
     Unknown,
-    /// Parser-only verdict for path sets that can never be a valid policy (no recovery,
-    /// mixed locktime flavors, etc.). Not constructable via [`Policy::new`].
+    /// Parser-only verdict for path sets that can never be a valid policy (no recovery
+    /// beside anything but a lone primary path, mixed locktime flavors, etc.). Not constructable via [`Policy::new`].
     Invalid,
 }
 
@@ -172,8 +187,12 @@ pub enum PolicyError {
     /// A key appears in both `mandatory_keys` and `keys` of a [`Semantic::MultiMandatory`]
     /// or [`Semantic::MultiMandatoryNested`] path. The two sets must be disjoint.
     MandatoryCosignerOverlap,
+    /// A signer appears twice in the `keys` or the `mandatory_keys` of a `Multi`,
+    /// [`Semantic::MultiMandatory`] or [`Semantic::MultiMandatoryNested`] path.
+    RepeatedKey,
     /// `Policy` cannot be constructed with `PolicyType::Invalid` - that variant is only produced
-    /// by the parser when the path set has no recovery or mixes locktime flavors.
+    /// by the parser when the path set has no recovery (and is not [`PolicyType::PrimaryOnly`])
+    /// or mixes locktime flavors.
     InvalidNotConstructable,
     /// `Semantic::Unknown` is the parser-only escape hatch for descriptors we can't
     /// classify. Consumers must use [`crate::path::Semantic::Custom`] to embed an
@@ -231,6 +250,8 @@ pub enum PolicyError {
         xpub: miniscript::bitcoin::bip32::Xpub,
         index: u32,
     },
+    /// More padding leaves than the NUMS block has slots for.
+    TooManyPaddingLeaves { count: usize, max: usize },
     /// More tap leaves than `MAX_LEAVES`, padding excluded.
     #[cfg(feature = "musig")]
     TooManyLeaves { count: usize, max: usize },
@@ -397,6 +418,14 @@ impl fmt::Display for PolicyError {
                 f,
                 "a key appears in both mandatory_keys and keys of a MultiMandatory or MultiMandatoryNested path; the two sets must be disjoint"
             ),
+            Self::RepeatedKey => write!(
+                f,
+                "a key appears more than once in the keys or mandatory_keys of a path; every signer must be distinct"
+            ),
+            Self::TooManyPaddingLeaves { count, max } => write!(
+                f,
+                "policy needs {count} padding leaves, more than the {max} NUMS slots"
+            ),
             #[cfg(feature = "musig")]
             Self::TooManyLeaves { count, max } => write!(
                 f,
@@ -485,6 +514,7 @@ impl From<SemanticError> for PolicyError {
                 cosigner_count,
             },
             SemanticError::MandatoryCosignerOverlap => PolicyError::MandatoryCosignerOverlap,
+            SemanticError::RepeatedKey => PolicyError::RepeatedKey,
             SemanticError::InvalidKey(e) => PolicyError::InvalidSignerKey(e),
         }
     }
@@ -521,6 +551,26 @@ fn is_internal_key_semantic(semantic: &Semantic) -> bool {
         Semantic::Multi { keys, threshold } => *threshold == keys.len(),
         _ => false,
     }
+}
+
+/// The semantic of a spendable internal key: `Single` for a plain key with an origin, with
+/// `musig` an n-of-n `Multi` over the participants of a musig() of two or more keys,
+/// `Unknown` otherwise.
+fn internal_key_semantic(key: &WalletKey) -> Result<Semantic, PolicyError> {
+    #[cfg(feature = "musig")]
+    if let MusigKey::Musig(aggregate) = key {
+        let (keys, _) = musig_participants(aggregate)?;
+        if keys.len() >= 2 {
+            let threshold = keys.len();
+            return Ok(Semantic::Multi { keys, threshold });
+        }
+    }
+    Ok(match oxpub(key) {
+        Some(o) => Semantic::Single(o),
+        None => Semantic::Unknown {
+            policy: SemanticPolicy::Key(key.clone()),
+        },
+    })
 }
 
 /// A Tr-only Liana policy. Carries its [`Path`]s, an optional cached compiled
@@ -568,12 +618,20 @@ impl Policy {
     /// Walks the descriptor:
     /// 1. **Internal key.** If the Tr internal key is *not* the deterministic NUMS unspendable,
     ///    record it as a `Path { semantic: Single, locktime: None, position: InternalKey }`.
+    ///    With `musig`, a `musig(all)/<a;a+1>/*` internal key of two or more participants is
+    ///    recorded as an n-of-n `Semantic::Multi` over them.
     /// 2. **Tap tree leaves.** Enumerate `(index, depth, miniscript)` for each leaf, group
     ///    by multipath group, and try to classify each group as a [`Semantic`] shape with an
-    ///    optional `older()` / `after()` locktime.
+    ///    optional `older()` / `after()` locktime. With `musig`, groups of `pk(musig(S))`
+    ///    leaves (and of two or more one-plain-key leaves) lift to `Multi`,
+    ///    `MultiMandatory` or `MultiMandatoryNested` over their key sets, and must sit in
+    ///    the zone of their leaves (see `parse::group_to_path`).
     /// 3. **Sort paths** by ascending multipath group.
     /// 4. **Infer `PolicyType`** from the resulting path set.
     /// 5. **Cache** the descriptor.
+    ///
+    /// With `musig`, a derive-then-aggregate musig() (`musig(K/<0;1>/*, ..)`), as a leaf key
+    /// or the internal key, is `MusigDerivation`.
     ///
     /// Accepts any valid miniscript descriptor; `Policy::compile` enforces stricter
     /// rules. Notably, this does not check cross-path multipath uniqueness: two
@@ -588,26 +646,22 @@ impl Policy {
         let mut paths: Vec<Path> = Vec::new();
 
         // Skip the internal key when it's the deterministic NUMS unspendable. Two
-        // detection paths: the cheap marker check (new-style NUMS carries
-        // `NUMS_MARKER_MULTIPATH`), and the legacy chain-code recompute.
+        // detection paths: the cheap NUMS block check, and the legacy chain-code recompute.
         let internal_key = tr.internal_key();
-        let is_unspendable = is_new_style_nums(internal_key)
+        let is_unspendable = is_nums_slot(internal_key)
             || unspendable_internal_key(tr).as_ref() == Some(internal_key);
         if !is_unspendable {
-            let semantic = if let Some(o) = oxpub(internal_key) {
-                Semantic::Single(o)
-            } else {
-                Semantic::Unknown {
-                    policy: SemanticPolicy::Key(internal_key.clone()),
-                }
-            };
-            let mut p = Path::new(semantic, Locktime::None, TapPosition::InternalKey);
+            let mut p = Path::new(
+                internal_key_semantic(internal_key)?,
+                Locktime::None,
+                TapPosition::InternalKey,
+            );
             p.set_satisfaction_wu(Some(TR_KEY_PATH_WU));
             paths.push(p);
         }
 
         if let Some(tap_tree) = tr.tap_tree() {
-            let leaves = extract_leaves(tap_tree).map_err(PolicyError::from)?;
+            let leaves = extract_leaves(tap_tree)?;
             paths.extend(group_taptree_leaves(leaves)?);
         }
 
@@ -842,6 +896,7 @@ impl Policy {
     /// Tap leaves this policy compiles to, padding excluded: every path's leaves except
     /// the internal key path's (the path at `TapPosition::InternalKey`, else the one
     /// `compile` promotes).
+    /// Saturates at `usize::MAX` like [`Path::leaf_count`].
     pub fn leaf_count(&self) -> usize {
         let internal_key = self
             .paths
@@ -852,8 +907,7 @@ impl Policy {
             .iter()
             .enumerate()
             .filter(|(idx, _)| Some(*idx) != internal_key)
-            .map(|(_, p)| p.leaf_count())
-            .sum()
+            .fold(0usize, |acc, (_, p)| acc.saturating_add(p.leaf_count()))
     }
 
     /// Every signer key with the role its origin carries (None when it has none).
@@ -946,6 +1000,7 @@ fn validate_paths_for_type(paths: &[Path], policy_type: PolicyType) -> Result<()
         PolicyType::Cltv => validate_cltv_paths(paths),
         PolicyType::CsvWithMandatoryKey => validate_csv_with_mandatory_paths(paths),
         PolicyType::CsvWithNestedMandatory => validate_csv_with_nested_mandatory_paths(paths),
+        PolicyType::PrimaryOnly => validate_primary_only_paths(paths),
         PolicyType::Unknown => validate_unknown_paths(paths),
         PolicyType::Invalid => Err(PolicyError::InvalidNotConstructable),
     }
@@ -970,6 +1025,25 @@ fn validate_unknown_paths(paths: &[Path]) -> Result<(), PolicyError> {
         p.semantic().validate()?;
         p.locktime().validate()?;
     }
+    Ok(())
+}
+
+/// PrimaryOnly: the single-primary rule with no recovery, so exactly one path, locktime-free,
+/// a `Single` or `Multi`.
+fn validate_primary_only_paths(paths: &[Path]) -> Result<(), PolicyError> {
+    let primary_count = paths
+        .iter()
+        .filter(|p| matches!(p.locktime(), Locktime::None))
+        .count();
+    if primary_count != 1 {
+        return Err(PolicyError::InvalidPrimaryCount(primary_count));
+    }
+    if !is_primary_only(paths) {
+        return Err(PolicyError::InconsistentPathsForType(
+            PolicyType::PrimaryOnly,
+        ));
+    }
+    paths[0].semantic().validate()?;
     Ok(())
 }
 
@@ -1158,24 +1232,35 @@ mod tests {
     };
     #[cfg(feature = "musig")]
     use crate::{
+        multipath::{deriv_paths_starting_at, wallet_key},
         musig::{musig_aggregate, musig_key, musig_leaf, musig_participants, participant_key},
+        parse::oxpub_to_key,
         test_keys::{test_key, test_keys},
     };
     use bwk_descriptor::wallet::WalletKeyExt;
     #[cfg(feature = "musig")]
-    use bwk_descriptor::{musig::musig_descriptor_to_string, wallet::WalletDescriptorExt};
+    use bwk_descriptor::{
+        musig::{musig_descriptor_to_string, parse_musig_descriptor},
+        wallet::WalletDescriptorExt,
+    };
     #[cfg(feature = "musig")]
-    use bwk_keys::{derivator::KeyDerivator, musig::MusigKey};
-    #[cfg(feature = "musig")]
-    use miniscript::bitcoin::{
-        bip32::DerivationPath,
-        hashes::{sha256, Hash},
-        Network,
+    use bwk_keys::{
+        derivator::KeyDerivator,
+        musig::{MusigAggregate, MusigKey},
     };
     use miniscript::{
-        bitcoin::{absolute, relative},
+        bitcoin::{absolute, bip32, relative},
         policy::Liftable,
         DescriptorPublicKey, ForEachKey, Miniscript, Tap,
+    };
+    #[cfg(feature = "musig")]
+    use miniscript::{
+        bitcoin::{
+            bip32::DerivationPath,
+            hashes::{sha256, Hash},
+            Network, NetworkKind,
+        },
+        policy::Concrete as ConcretePolicy,
     };
     use std::str::FromStr;
 
@@ -1399,7 +1484,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "musig", ignore = "reader does not lift musig leaves yet")]
     fn csv_with_mandatory_round_trip() {
         // 1 mandatory + 2 cosigners, choosing 1 per leaf, total threshold 2. That gives
         // 2 leaves at <1536;1537> and <1538;1539> in the CsvWithMandatory role zone, which
@@ -1543,7 +1627,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "musig", ignore = "reader does not lift musig leaves yet")]
     fn non_pow2_mandatory_leaves_round_trip_at_same_depth() {
         // 1 mandatory + 3 cosigners, threshold 2 (1 mandatory + 1 cosigner per leaf).
         // Picking 1 of 3 cosigners gives 3 leaves, which is not a power of 2. The
@@ -1724,8 +1807,7 @@ mod tests {
     }
 
     #[test]
-    fn padding_leaves_chain_via_sha256() {
-        use miniscript::bitcoin::{bip32, hashes::sha256, hashes::Hash};
+    fn padding_leaves_share_the_nums_xpub_on_their_own_slots() {
         // 1 mandatory + 5 cosigners, threshold 2 → C(5, 1) = 5 leaves. With auto-promoted
         // primary (single-key), the recovery subtree is size 8 with `m = 3` so the
         // canonical compaction exposes 2 free chunks (size 1 at depth 3, size 2 at
@@ -1767,36 +1849,65 @@ mod tests {
             _ => panic!("expected Tr"),
         };
 
-        let padding_chain_codes: Vec<bip32::ChainCode> = tr
+        let seed = match plain_key(&crate::nums::unspendable_internal_key(tr).expect("legacy key"))
+        {
+            Some(DescriptorPublicKey::MultiXPub(m)) => m.xkey,
+            _ => panic!("legacy key is not a MultiXPub"),
+        };
+        let padding: Vec<(miniscript::bitcoin::bip32::Xpub, Vec<u32>)> = tr
             .tap_tree()
             .as_ref()
             .expect("tap tree present")
             .iter()
-            .filter_map(|(_, ms)| {
-                if !is_nums_padding_leaf(ms) {
-                    return None;
-                }
-                let key = ms.iter_pk().next()?;
-                let DescriptorPublicKey::MultiXPub(m) = plain_key(&key)? else {
-                    return None;
+            .filter(|(_, ms)| is_nums_padding_leaf(ms))
+            .map(|(_, ms)| {
+                let key = ms.iter_pk().next().expect("padding leaf has a key");
+                assert!(is_nums_slot(&key));
+                let Some(DescriptorPublicKey::MultiXPub(m)) = plain_key(&key) else {
+                    panic!("padding key is not MultiXPub")
                 };
-                Some(m.xkey.chain_code)
+                let indices = m
+                    .derivation_paths
+                    .paths()
+                    .iter()
+                    .map(|p| u32::from(p[0]))
+                    .collect();
+                (m.xkey, indices)
             })
             .collect();
-        assert!(
-            padding_chain_codes.len() >= 2,
-            "expected at least 2 padding leaves to exercise chaining, got {}",
-            padding_chain_codes.len()
+        assert_eq!(
+            padding,
+            vec![
+                (seed, vec![0x7FFF_FFFC, 0x7FFF_FFFD]),
+                (seed, vec![0x7FFF_FFFA, 0x7FFF_FFFB]),
+            ]
         );
-        for w in padding_chain_codes.windows(2) {
-            let prev_bytes = w[0].to_bytes();
-            let expected: [u8; 32] = sha256::Hash::hash(prev_bytes.as_ref()).to_byte_array();
-            assert_eq!(
-                w[1].to_bytes(),
-                expected,
-                "consecutive padding leaves must chain via sha256"
-            );
-        }
+        let parsed = Policy::from_descriptor(&desc).unwrap();
+        assert_eq!(parsed.policy_type(), PolicyType::CsvWithMandatoryKey);
+        assert_eq!(parsed.paths().len(), 2);
+    }
+
+    #[test]
+    fn nums_slot_needs_nums_pubkey_and_block_index() {
+        let nums = "tpubD6NzVbkrYhZ4XTMDrtAPvFkBZU6pZNcufLmGNVsh3A78g653rPBBEYwcJ3mXqnpastrSEG4cQqNpYFUwoZoJZsKooNZdvu2EiPVnJnt7c9d";
+        let key = |s: &str| crate::multipath::wallet_key(DescriptorPublicKey::from_str(s).unwrap());
+        assert!(is_nums_slot(&key(&format!(
+            "{nums}/<2147483646;2147483647>/*"
+        ))));
+        assert!(is_nums_slot(&key(&format!(
+            "{nums}/<2147483392;2147483393>/*"
+        ))));
+        assert!(!is_nums_slot(&key(&format!(
+            "{nums}/<2147483390;2147483391>/*"
+        ))));
+        assert!(!is_nums_slot(&key(&format!("{nums}/<0;1>/*"))));
+        assert!(!is_nums_slot(&key(&format!(
+            "{nums}/<2147483646';2147483647'>/*"
+        ))));
+        assert!(!is_nums_slot(&key(&format!(
+            "{}/<2147483646;2147483647>/*",
+            k1().xkey
+        ))));
     }
 
     #[test]
@@ -2724,6 +2835,109 @@ mod tests {
         assert!(matches!(err, PolicyError::MandatoryCosignerOverlap));
     }
 
+    /// `A` again under another origin, and another xpub under `A`'s origin: both are `A`.
+    fn same_signer_variants(a: &OXpub, other: &OXpub) -> [OXpub; 3] {
+        let fingerprint = bip32::Fingerprint::from([9, 9, 9, 9]);
+        [
+            a.clone(),
+            OXpub::new(Some((fingerprint, bip32::DerivationPath::master())), a.xkey),
+            OXpub::new(a.origin.clone(), other.xkey),
+        ]
+    }
+
+    #[test]
+    fn multi_validate_rejects_repeated_key() {
+        let (a, b) = (k1(), k2());
+        let (c, _, _) = cks_3();
+        for repeated in same_signer_variants(&a, &c) {
+            let s = Semantic::Multi {
+                keys: vec![a.clone(), repeated, b.clone()],
+                threshold: 2,
+            };
+            assert_eq!(s.validate(), Err(crate::path::SemanticError::RepeatedKey));
+        }
+    }
+
+    #[test]
+    fn mandatory_validate_rejects_repeated_key() {
+        let (a, b) = (k1(), k2());
+        let (c, d, e) = cks_3();
+        for repeated in same_signer_variants(&a, &e) {
+            let in_mandatory = Semantic::MultiMandatory {
+                mandatory_keys: vec![a.clone(), repeated.clone()],
+                keys: vec![c.clone(), d.clone()],
+                threshold: 3,
+            };
+            let in_cosigners = Semantic::MultiMandatory {
+                mandatory_keys: vec![b.clone()],
+                keys: vec![a.clone(), repeated],
+                threshold: 2,
+            };
+            for s in [in_mandatory, in_cosigners] {
+                assert_eq!(s.validate(), Err(crate::path::SemanticError::RepeatedKey));
+            }
+        }
+    }
+
+    #[test]
+    fn nested_mandatory_validate_rejects_repeated_key() {
+        let (a, b) = (k1(), k2());
+        let (c, d, e) = cks_3();
+        for repeated in same_signer_variants(&a, &e) {
+            let in_mandatory = Semantic::MultiMandatoryNested {
+                mandatory_keys: vec![a.clone(), repeated.clone()],
+                mandatory_threshold: 1,
+                keys: vec![b.clone(), c.clone(), d.clone()],
+                threshold: 2,
+            };
+            let in_cosigners = Semantic::MultiMandatoryNested {
+                mandatory_keys: vec![b.clone(), c.clone()],
+                mandatory_threshold: 1,
+                keys: vec![a.clone(), repeated, d.clone()],
+                threshold: 2,
+            };
+            for s in [in_mandatory, in_cosigners] {
+                assert_eq!(s.validate(), Err(crate::path::SemanticError::RepeatedKey));
+            }
+        }
+    }
+
+    #[test]
+    fn mandatory_validate_rejects_same_signer_overlap() {
+        // `A` under another origin among the cosigners is still `A`.
+        let (a, b) = (k1(), k2());
+        let (c, _, _) = cks_3();
+        let [_, other_origin, _] = same_signer_variants(&a, &c);
+        let s = Semantic::MultiMandatory {
+            mandatory_keys: vec![a, b],
+            keys: vec![other_origin, c],
+            threshold: 3,
+        };
+        assert_eq!(
+            s.validate(),
+            Err(crate::path::SemanticError::MandatoryCosignerOverlap)
+        );
+    }
+
+    #[test]
+    fn policy_new_rejects_repeated_key() {
+        let primary = Path::new(
+            Semantic::Single(primary_key()),
+            Locktime::None,
+            TapPosition::InternalKey,
+        );
+        let recovery = Path::new(
+            Semantic::Multi {
+                keys: vec![k1(), k1(), k2()],
+                threshold: 2,
+            },
+            Locktime::Relative(relative::LockTime::from_height(144)),
+            TapPosition::TapTree(vec![]),
+        );
+        let err = Policy::new(vec![primary, recovery], PolicyType::Csv).unwrap_err();
+        assert!(matches!(err, PolicyError::RepeatedKey));
+    }
+
     #[test]
     fn nested_mandatory_starting_index_relative_only() {
         let (m1, m2) = mks_2();
@@ -2761,7 +2975,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "musig", ignore = "reader does not lift musig leaves yet")]
     fn csv_with_nested_mandatory_round_trip() {
         // Smallest distinct-frequency canonical case: m=2, mt=1, n=3, t=2 → 6 leaves.
         let (m1, m2) = mks_2();
@@ -2958,6 +3171,113 @@ mod tests {
         Locktime::Absolute(absolute::LockTime::from_height(height).unwrap())
     }
 
+    // PrimaryOnly
+
+    /// The `Tr` of a compiled descriptor.
+    fn tr_parts(desc: &WalletDescriptor) -> &Tr<WalletKey> {
+        let Descriptor::Tr(tr) = desc else {
+            panic!("expected Tr");
+        };
+        tr
+    }
+
+    #[test]
+    fn primary_only_single_key_round_trip() {
+        let primary = Path::new(
+            Semantic::Single(k1()),
+            Locktime::None,
+            TapPosition::TapTree(vec![]),
+        );
+        let mut policy = Policy::new(vec![primary], PolicyType::PrimaryOnly).unwrap();
+        let desc = policy.compile().unwrap().clone();
+        let tr = tr_parts(&desc);
+        assert!(tr.tap_tree().is_none());
+        assert_eq!(oxpub(tr.internal_key()).unwrap().xkey, k1().xkey);
+        let parsed = Policy::from_descriptor(&desc).unwrap();
+        assert_eq!(parsed.policy_type(), PolicyType::PrimaryOnly);
+        assert_eq!(parsed.paths().len(), 1);
+        assert!(matches!(
+            parsed.paths()[0].position(),
+            TapPosition::InternalKey
+        ));
+        match parsed.paths()[0].semantic() {
+            Semantic::Single(k) => assert_eq!(k.xkey, k1().xkey),
+            other => panic!("expected Single primary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn primary_only_two_locktime_free_paths_stay_invalid() {
+        let paths = vec![
+            Path::new(
+                Semantic::Single(k1()),
+                Locktime::None,
+                TapPosition::InternalKey,
+            ),
+            Path::new(
+                Semantic::Single(k2()),
+                Locktime::None,
+                TapPosition::TapTree(vec![]),
+            ),
+        ];
+        assert_eq!(infer_policy_type(&paths), PolicyType::Invalid);
+        assert!(matches!(
+            Policy::new(paths, PolicyType::PrimaryOnly),
+            Err(PolicyError::InvalidPrimaryCount(2))
+        ));
+    }
+
+    #[test]
+    fn primary_only_rejects_recovery() {
+        let paths = vec![
+            Path::new(
+                Semantic::Single(k1()),
+                Locktime::None,
+                TapPosition::InternalKey,
+            ),
+            Path::new(
+                Semantic::Single(k2()),
+                rel(144),
+                TapPosition::TapTree(vec![]),
+            ),
+        ];
+        assert!(matches!(
+            Policy::new(paths, PolicyType::PrimaryOnly),
+            Err(PolicyError::InconsistentPathsForType(
+                PolicyType::PrimaryOnly
+            ))
+        ));
+    }
+
+    /// Plain build: an m-of-n primary with no recovery is one script leaf under the NUMS
+    /// internal key, and reads back as `PrimaryOnly`.
+    #[cfg(not(feature = "musig"))]
+    #[test]
+    fn primary_only_multi_a_round_trip() {
+        let (c1, c2, c3) = cks_3();
+        for threshold in [2, 3] {
+            let semantic = Semantic::Multi {
+                keys: vec![c1.clone(), c2.clone(), c3.clone()],
+                threshold,
+            };
+            let primary = Path::new(
+                semantic.clone(),
+                Locktime::None,
+                TapPosition::TapTree(vec![]),
+            );
+            let mut policy = Policy::new(vec![primary], PolicyType::PrimaryOnly).unwrap();
+            let desc = policy.compile().unwrap().clone();
+            let tr = tr_parts(&desc);
+            assert!(is_nums_slot(tr.internal_key()));
+            assert_eq!(tr.tap_tree().as_ref().unwrap().iter().count(), 1, "{desc}");
+            let parsed = Policy::from_descriptor(&desc).unwrap();
+            assert_eq!(parsed.policy_type(), PolicyType::PrimaryOnly);
+            assert_eq!(parsed.paths().len(), 1);
+            assert_eq!(parsed.paths()[0].semantic(), &semantic);
+            assert_eq!(parsed.paths()[0].locktime(), &Locktime::None);
+        }
+    }
+
     // Csv
 
     #[test]
@@ -2991,7 +3311,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "musig", ignore = "reader does not lift musig leaves yet")]
     fn csv_single_primary_multi_recovery_round_trip() {
         let primary_k = k1();
         let (c1, c2, c3) = cks_3();
@@ -3028,7 +3347,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "musig", ignore = "reader does not lift musig leaves yet")]
     fn csv_multi_primary_single_recovery_round_trip() {
         // Multi primary stays in TapTree (no auto-promotion); NUMS internal key.
         let (m1, m2) = mks_2();
@@ -3075,7 +3393,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "musig", ignore = "reader does not lift musig leaves yet")]
     fn csv_multi_primary_multi_recovery_round_trip() {
         let (m1, m2) = mks_2();
         let m3 = extra_key();
@@ -3209,7 +3526,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "musig", ignore = "reader does not lift musig leaves yet")]
     fn cltv_single_primary_multi_recovery_round_trip() {
         let primary_k = k1();
         let (c1, c2, c3) = cks_3();
@@ -3247,7 +3563,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "musig", ignore = "reader does not lift musig leaves yet")]
     fn cltv_multi_primary_single_recovery_round_trip() {
         let (m1, m2) = mks_2();
         let m3 = extra_key();
@@ -3294,7 +3609,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "musig", ignore = "reader does not lift musig leaves yet")]
     fn cltv_multi_primary_multi_recovery_round_trip() {
         let (m1, m2) = mks_2();
         let m3 = extra_key();
@@ -3391,7 +3705,6 @@ mod tests {
     // CsvWithMandatoryKey
 
     #[test]
-    #[cfg_attr(feature = "musig", ignore = "reader does not lift musig leaves yet")]
     fn csv_with_mandatory_multi_primary_round_trip() {
         // Multi primary stays in TapTree (NUMS internal). Recovery is the mandatory path.
         let (mp1, mp2) = mks_2();
@@ -3452,7 +3765,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "musig", ignore = "reader does not lift musig leaves yet")]
     fn csv_with_mandatory_larger_threshold_round_trip() {
         // m=2, n=2, t=3 → each leaf is 2 mandatory + 1 cosigner; C(2,1) = 2 leaves.
         let (m1, m2) = mks_2();
@@ -3496,7 +3808,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "musig", ignore = "reader does not lift musig leaves yet")]
     fn csv_with_mandatory_plus_single_recovery_round_trip() {
         // CsvWithMandatoryKey policy with a mandatory recovery + a plain Single recovery
         // at a distinct relative height. Both round-trip.
@@ -3559,7 +3870,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "musig", ignore = "reader does not lift musig leaves yet")]
     fn csv_with_two_mandatory_recoveries_round_trip() {
         // Two distinct MultiMandatory recoveries under PolicyType::CsvWithMandatoryKey.
         let m_a = k1();
@@ -3612,7 +3922,6 @@ mod tests {
     // CsvWithNestedMandatory
 
     #[test]
-    #[cfg_attr(feature = "musig", ignore = "reader does not lift musig leaves yet")]
     fn csv_with_nested_mandatory_multi_primary_round_trip() {
         let (mp1, mp2) = mks_2();
         let mp3 = extra_key();
@@ -3676,7 +3985,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "musig", ignore = "reader does not lift musig leaves yet")]
     fn csv_with_nested_mandatory_larger_shape_round_trip() {
         // m=3, mt=1, n=3, t=2 → mt*n = 3 < t*m = 6 (canonical); C(3,1) * C(3,2) = 9 leaves.
         let m1 = k1();
@@ -3725,7 +4033,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "musig", ignore = "reader does not lift musig leaves yet")]
     fn csv_with_nested_mandatory_plus_single_recovery_round_trip() {
         let m1 = k1();
         let m2 = k2();
@@ -3789,7 +4096,6 @@ mod tests {
     // Unknown
 
     #[test]
-    #[cfg_attr(feature = "musig", ignore = "reader does not lift musig leaves yet")]
     fn unknown_cltv_with_mandatory_renewable_round_trip() {
         // MultiMandatory + AbsoluteRenewable lands in zone 7; PolicyType inferred as Unknown.
         let mandatory = k1();
@@ -3834,7 +4140,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "musig", ignore = "reader does not lift musig leaves yet")]
     fn unknown_cltv_with_mandatory_foreign_round_trip() {
         // MultiMandatory + Absolute (unaligned) → zone 8; PolicyType inferred as Unknown.
         let mandatory = k1();
@@ -3879,7 +4184,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "musig", ignore = "reader does not lift musig leaves yet")]
     fn unknown_mixed_mandatory_flavors_round_trip() {
         // Mixing MultiMandatory and MultiMandatoryNested in the same Relative policy
         // forces PolicyType::Unknown. Both recoveries round-trip preserved.
@@ -4318,7 +4622,7 @@ mod tests {
         let k = test_keys(4);
         let mut policy = two_of_three_primary_policy();
         let desc = policy.compile().unwrap().clone();
-        assert!(is_new_style_nums(tr_of(&desc).internal_key()));
+        assert!(is_nums_slot(tr_of(&desc).internal_key()));
         let leaves = non_padding_leaves(&desc);
         assert_eq!(leaves.len(), 4);
         assert_eq!(
@@ -4346,6 +4650,74 @@ mod tests {
         assert_eq!(primary.leaf_count(), 3);
         assert_eq!(primary.cursor_increment(), 8);
         assert_eq!(policy.leaf_count(), 4);
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_primary_only_two_of_three_nums_three_leaves() {
+        let k = test_keys(3);
+        let policy = Policy::new(
+            vec![tap_path(multi(k.clone(), 2), Locktime::None)],
+            PolicyType::PrimaryOnly,
+        )
+        .unwrap();
+        let mut compiled = policy.clone();
+        let desc = compiled.compile().unwrap().clone();
+        assert!(is_nums_slot(tr_of(&desc).internal_key()));
+        let leaves = non_padding_leaves(&desc);
+        assert_eq!(leaves.len(), 3);
+        assert_eq!(
+            leaf_participants(&leaves[0]),
+            (vec![k[0].clone(), k[1].clone()], 512)
+        );
+        assert_eq!(
+            leaf_participants(&leaves[1]),
+            (vec![k[0].clone(), k[2].clone()], 514)
+        );
+        assert_eq!(
+            leaf_participants(&leaves[2]),
+            (vec![k[1].clone(), k[2].clone()], 516)
+        );
+        let parsed = musig_checked_round_trip(policy);
+        assert_eq!(parsed.policy_type(), PolicyType::PrimaryOnly);
+        assert_eq!(parsed.paths()[0].semantic(), &multi(k, 2));
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_primary_only_three_of_three_internal_key_no_tree() {
+        let k = test_keys(3);
+        let policy = Policy::new(
+            vec![tap_path(multi(k.clone(), 3), Locktime::None)],
+            PolicyType::PrimaryOnly,
+        )
+        .unwrap();
+        let mut compiled = policy.clone();
+        let desc = compiled.compile().unwrap().clone();
+        let tr = tr_of(&desc);
+        assert!(tr.tap_tree().is_none());
+        assert_eq!(participants(tr.internal_key()), (k.clone(), 512));
+        assert!(musig_descriptor_to_string(&desc, true).contains("/<512;513>/*"));
+        let parsed = musig_checked_round_trip(policy);
+        assert_eq!(parsed.policy_type(), PolicyType::PrimaryOnly);
+        assert!(matches!(
+            parsed.paths()[0].position(),
+            TapPosition::InternalKey
+        ));
+        assert_eq!(parsed.paths()[0].semantic(), &multi(k, 3));
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_primary_only_respects_leaf_cap() {
+        // 3-of-7 is C(7,3) = 35 leaves.
+        assert!(matches!(
+            Policy::new(
+                vec![tap_path(multi(test_keys(7), 3), Locktime::None)],
+                PolicyType::PrimaryOnly,
+            ),
+            Err(PolicyError::TooManyLeaves { count: 35, max: 32 })
+        ));
     }
 
     #[cfg(feature = "musig")]
@@ -4470,6 +4842,41 @@ mod tests {
         assert!(matches!(
             Policy::new(leaf_cap_paths(5, 3), PolicyType::Csv),
             Err(PolicyError::TooManyLeaves { count: 33, max: 32 })
+        ));
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_leaf_cap_rejects_huge_binomial() {
+        let k = test_keys(65);
+        let paths = vec![
+            tap_path(multi(k[..63].to_vec(), 29), Locktime::None),
+            tap_path(multi(k[63..].to_vec(), 2), rel(144)),
+        ];
+        assert!(matches!(
+            Policy::new(paths, PolicyType::Csv),
+            // C(63, 29) primary leaves plus the recovery's 2-of-2 leaf.
+            Err(PolicyError::TooManyLeaves {
+                count: 759_510_004_936_100_356,
+                max: 32
+            })
+        ));
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_leaf_cap_rejects_overflowing_binomial() {
+        let k = test_keys(70);
+        let paths = vec![
+            tap_path(multi(k[..68].to_vec(), 34), Locktime::None),
+            tap_path(multi(k[68..].to_vec(), 2), rel(144)),
+        ];
+        assert!(matches!(
+            Policy::new(paths, PolicyType::Csv),
+            Err(PolicyError::TooManyLeaves {
+                count: usize::MAX,
+                max: 32
+            })
         ));
     }
 
@@ -4668,6 +5075,547 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(MUSIG_EXAMPLES_PATH).unwrap(),
             musig_examples()
+        );
+    }
+
+    // MuSig2 read back
+
+    /// Compile `policy`, print the descriptor as BIP-390 text, parse it back and read it.
+    #[cfg(feature = "musig")]
+    fn musig_round_trip(policy: &mut Policy) -> Policy {
+        let desc = policy.compile().unwrap();
+        let text = musig_descriptor_to_string(desc, true);
+        let reparsed = parse_musig_descriptor(&text).unwrap();
+        assert_eq!(&reparsed, desc);
+        Policy::from_descriptor(&reparsed).unwrap()
+    }
+
+    /// Same semantic, the mandatory key lists compared as sets (the reader sorts them).
+    #[cfg(feature = "musig")]
+    fn same_semantic(compiled: &Semantic, parsed: &Semantic) -> bool {
+        match (compiled, parsed) {
+            (
+                Semantic::MultiMandatory {
+                    keys,
+                    mandatory_keys,
+                    threshold,
+                },
+                Semantic::MultiMandatory {
+                    keys: parsed_keys,
+                    mandatory_keys: parsed_mandatory_keys,
+                    threshold: parsed_threshold,
+                },
+            ) => {
+                threshold == parsed_threshold
+                    && keyset(keys) == keyset(parsed_keys)
+                    && keyset(mandatory_keys) == keyset(parsed_mandatory_keys)
+            }
+            (
+                Semantic::MultiMandatoryNested {
+                    mandatory_keys,
+                    mandatory_threshold,
+                    keys,
+                    threshold,
+                },
+                Semantic::MultiMandatoryNested {
+                    mandatory_keys: parsed_mandatory_keys,
+                    mandatory_threshold: parsed_mandatory_threshold,
+                    keys: parsed_keys,
+                    threshold: parsed_threshold,
+                },
+            ) => {
+                mandatory_threshold == parsed_mandatory_threshold
+                    && threshold == parsed_threshold
+                    && keyset(keys) == keyset(parsed_keys)
+                    && keyset(mandatory_keys) == keyset(parsed_mandatory_keys)
+            }
+            _ => compiled == parsed,
+        }
+    }
+
+    #[cfg(feature = "musig")]
+    fn assert_same_policy(compiled: &Policy, parsed: &Policy) {
+        assert_eq!(parsed.policy_type(), compiled.policy_type());
+        assert_eq!(parsed.paths().len(), compiled.paths().len());
+        for path in compiled.paths() {
+            let internal = matches!(path.position(), TapPosition::InternalKey);
+            let matching = parsed
+                .paths()
+                .iter()
+                .filter(|p| {
+                    p.locktime() == path.locktime()
+                        && matches!(p.position(), TapPosition::InternalKey) == internal
+                        && same_semantic(path.semantic(), p.semantic())
+                })
+                .count();
+            assert_eq!(matching, 1, "{path:?} in {:?}", parsed.paths());
+        }
+        assert_eq!(parsed.key_types(), compiled.key_types());
+    }
+
+    /// Round trip `policy` and check the read-back policy is the compiled one.
+    #[cfg(feature = "musig")]
+    fn musig_checked_round_trip(mut policy: Policy) -> Policy {
+        let parsed = musig_round_trip(&mut policy);
+        assert_same_policy(&policy, &parsed);
+        parsed
+    }
+
+    /// The parsed path at `locktime`.
+    #[cfg(feature = "musig")]
+    fn path_at<'a>(policy: &'a Policy, locktime: &Locktime) -> &'a Path {
+        policy
+            .paths()
+            .iter()
+            .find(|p| p.locktime() == locktime)
+            .unwrap()
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_round_trip_two_of_two_internal_key() {
+        let parsed = musig_checked_round_trip(two_of_two_primary_policy());
+        let primary = &parsed.paths()[0];
+        assert!(matches!(primary.position(), TapPosition::InternalKey));
+        assert_eq!(
+            primary.semantic(),
+            &multi(vec![test_key(1), test_key(2)], 2)
+        );
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_round_trip_two_of_three_leaves() {
+        let parsed = musig_checked_round_trip(two_of_three_primary_policy());
+        let primary = path_at(&parsed, &Locktime::None);
+        assert!(matches!(primary.position(), TapPosition::TapTree(_)));
+        assert_eq!(primary.semantic(), &multi(test_keys(3), 2));
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_round_trip_three_of_five_leaves() {
+        let parsed = musig_checked_round_trip(three_of_five_primary_policy());
+        assert_eq!(
+            path_at(&parsed, &Locktime::None).semantic(),
+            &multi(test_keys(5), 3)
+        );
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_round_trip_two_of_two_timelocked_leaf() {
+        let parsed = musig_checked_round_trip(two_of_two_recovery_policy());
+        assert_eq!(
+            path_at(&parsed, &rel(144)).semantic(),
+            &multi(vec![test_key(2), test_key(3)], 2)
+        );
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_round_trip_one_of_two_plain_leaves() {
+        let parsed = musig_checked_round_trip(one_of_two_recovery_policy());
+        assert_eq!(
+            path_at(&parsed, &rel(144)).semantic(),
+            &multi(vec![test_key(2), test_key(3)], 1)
+        );
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_round_trip_mandatory() {
+        let parsed = musig_checked_round_trip(mandatory_policy());
+        assert_eq!(parsed.policy_type(), PolicyType::CsvWithMandatoryKey);
+        assert!(matches!(
+            path_at(&parsed, &rel(144)).semantic(),
+            Semantic::MultiMandatory { threshold: 2, .. }
+        ));
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_round_trip_nested_mandatory() {
+        let parsed = musig_checked_round_trip(nested_mandatory_policy());
+        assert_eq!(parsed.policy_type(), PolicyType::CsvWithNestedMandatory);
+        assert!(matches!(
+            path_at(&parsed, &rel(144)).semantic(),
+            Semantic::MultiMandatoryNested {
+                mandatory_threshold: 1,
+                threshold: 2,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_round_trip_thirty_two_leaves() {
+        let parsed = musig_checked_round_trip(leaf_cap_32_policy());
+        let k = test_keys(14);
+        assert_eq!(
+            path_at(&parsed, &Locktime::None).semantic(),
+            &multi(k[..6].to_vec(), 3)
+        );
+        assert_eq!(
+            path_at(&parsed, &rel(144)).semantic(),
+            &multi(k[6..10].to_vec(), 2)
+        );
+        assert_eq!(
+            path_at(&parsed, &rel(288)).semantic(),
+            &multi(k[10..].to_vec(), 2)
+        );
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_round_trip_key_roles() {
+        let internal = test_account(1, 0).role_key(KeyType::Internal, 0).unwrap();
+        let external = test_account(2, 0).role_key(KeyType::External, 0).unwrap();
+        let cosigner = test_account(3, 0).role_key(KeyType::Cosigner, 0).unwrap();
+        let safety_net = test_account(4, 0);
+        let safety_net_0 = safety_net.role_key(KeyType::SafetyNet, 0).unwrap();
+        let safety_net_1 = safety_net.role_key(KeyType::SafetyNet, 1).unwrap();
+        let policy = Policy::new(
+            vec![
+                tap_path(
+                    multi(
+                        vec![internal.clone(), external.clone(), cosigner.clone()],
+                        2,
+                    ),
+                    Locktime::None,
+                ),
+                tap_path(
+                    multi(vec![safety_net_0.clone(), safety_net_1.clone()], 2),
+                    rel(144),
+                ),
+            ],
+            PolicyType::Csv,
+        )
+        .unwrap();
+        let parsed = musig_checked_round_trip(policy);
+        assert_eq!(
+            parsed.key_types(),
+            BTreeMap::from([
+                (internal, Some(KeyType::Internal)),
+                (external, Some(KeyType::External)),
+                (cosigner, Some(KeyType::Cosigner)),
+                (safety_net_0, Some(KeyType::SafetyNet)),
+                (safety_net_1, Some(KeyType::SafetyNet)),
+            ])
+        );
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_examples_read_back() {
+        let keys: Vec<OXpub> = MUSIG_EXAMPLES_MNEMONICS
+            .iter()
+            .map(|(_, mnemonic)| musig_example_key(mnemonic))
+            .collect();
+        let (a, b) = (keys[0].clone(), keys[1].clone());
+        let text = std::fs::read_to_string(MUSIG_EXAMPLES_PATH).unwrap();
+        let policies: Vec<Policy> = text
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("descriptor: "))
+            .map(|desc| Policy::from_descriptor(&parse_musig_descriptor(desc).unwrap()).unwrap())
+            .collect();
+        assert_eq!(policies.len(), 2);
+
+        let first = &policies[0];
+        assert_eq!(first.paths().len(), 1);
+        assert_eq!(first.paths()[0].locktime(), &Locktime::None);
+        assert_eq!(first.paths()[0].semantic(), &multi(keys.clone(), 2));
+
+        let second = &policies[1];
+        assert_eq!(second.policy_type(), PolicyType::Csv);
+        assert_eq!(second.paths().len(), 2);
+        let primary = &second.paths()[0];
+        assert!(matches!(primary.position(), TapPosition::InternalKey));
+        assert_eq!(primary.semantic(), &multi(vec![a.clone(), b], 2));
+        assert_eq!(path_at(second, &rel(144)).semantic(), &Semantic::Single(a));
+
+        for policy in &policies {
+            assert!(policy
+                .key_types()
+                .values()
+                .all(|role| *role == Some(KeyType::Cosigner)));
+        }
+    }
+
+    /// `key/<start;start+1>/*` as a plain wallet key.
+    #[cfg(feature = "musig")]
+    fn plain_wallet_key(key: &OXpub, start: u32) -> WalletKey {
+        wallet_key(oxpub_to_key(key, deriv_paths_starting_at(start)))
+    }
+
+    /// `musig(keys/<start;start+1>/*)`: derive then aggregate.
+    #[cfg(feature = "musig")]
+    fn derived_musig_key(keys: &[OXpub], start: u32) -> WalletKey {
+        let cosigners = keys
+            .iter()
+            .map(|k| oxpub_to_key(k, deriv_paths_starting_at(start)))
+            .collect();
+        MusigKey::Musig(MusigAggregate::new(cosigners, None, NetworkKind::Main).unwrap())
+    }
+
+    #[cfg(feature = "musig")]
+    fn pk_leaf(key: WalletKey) -> Miniscript<WalletKey, Tap> {
+        ConcretePolicy::Key(key).compile::<Tap>().unwrap()
+    }
+
+    /// `tr(internal, leaves)`, the leaves in DFS order.
+    #[cfg(feature = "musig")]
+    fn tr_descriptor(
+        internal: WalletKey,
+        leaves: Vec<Miniscript<WalletKey, Tap>>,
+    ) -> WalletDescriptor {
+        let tree = leaves
+            .into_iter()
+            .map(|leaf| TapTree::Leaf(std::sync::Arc::new(leaf)))
+            .reduce(TapTree::combine)
+            .unwrap();
+        Descriptor::Tr(Tr::new(internal, Some(tree)).unwrap())
+    }
+
+    /// `tr(D/<0;1>/*, pk(musig(S)/<a;a+1>/*)...)` for each `(S, a)`.
+    #[cfg(feature = "musig")]
+    fn musig_leaves_descriptor(leaves: &[(Vec<OXpub>, u32)]) -> WalletDescriptor {
+        tr_descriptor(
+            plain_wallet_key(&test_key(4), 0),
+            leaves
+                .iter()
+                .map(|(keys, start)| musig_leaf(keys, *start).unwrap())
+                .collect(),
+        )
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_reader_refuses_derive_then_aggregate() {
+        let (a, b, c) = (test_key(1), test_key(2), test_key(3));
+        let leaf = tr_descriptor(
+            plain_wallet_key(&c, 0),
+            vec![pk_leaf(derived_musig_key(&[a.clone(), b.clone()], 512))],
+        );
+        let err = Policy::from_descriptor(&leaf).unwrap_err();
+        assert!(matches!(err, PolicyError::MusigDerivation), "got {err:?}");
+
+        let internal = tr_descriptor(
+            derived_musig_key(&[a, b], 0),
+            vec![pk_leaf(plain_wallet_key(&c, 1024))],
+        );
+        let err = Policy::from_descriptor(&internal).unwrap_err();
+        assert!(matches!(err, PolicyError::MusigDerivation), "got {err:?}");
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_reader_rejects_incomplete_multi() {
+        let (a, b, c) = (test_key(1), test_key(2), test_key(3));
+        let desc = musig_leaves_descriptor(&[(vec![a.clone(), b], 512), (vec![a, c], 514)]);
+        let err = Policy::from_descriptor(&desc).unwrap_err();
+        assert!(
+            matches!(err, PolicyError::UnrecognizedLeafGroup),
+            "got {err:?}"
+        );
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_reader_rejects_repeated_subset() {
+        let (a, b, c) = (test_key(1), test_key(2), test_key(3));
+        // The repeat written in the same order, then in the other order.
+        for repeat in [vec![a.clone(), b.clone()], vec![b.clone(), a.clone()]] {
+            let desc = musig_leaves_descriptor(&[
+                (vec![a.clone(), b.clone()], 512),
+                (repeat, 514),
+                (vec![a.clone(), c.clone()], 516),
+            ]);
+            let err = Policy::from_descriptor(&desc).unwrap_err();
+            assert!(
+                matches!(err, PolicyError::UnrecognizedLeafGroup),
+                "got {err:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_reader_checks_the_zone_of_the_last_leaf() {
+        let (a, b, c) = (test_key(1), test_key(2), test_key(3));
+        let subsets = [vec![a.clone(), b.clone()], vec![a, c.clone()], vec![b, c]];
+        let read = |first: u32| {
+            let leaves: Vec<(Vec<OXpub>, u32)> = (0u32..)
+                .zip(&subsets)
+                .map(|(i, set)| (set.clone(), first + 2 * i))
+                .collect();
+            Policy::from_descriptor(&musig_leaves_descriptor(&leaves))
+        };
+        // 1018 to 1022 sit in the zone of 512; 1020 to 1024 cross into the next one.
+        let parsed = read(1018).unwrap();
+        assert!(
+            parsed
+                .paths()
+                .iter()
+                .any(|p| matches!(p.semantic(), Semantic::Multi { threshold: 2, .. })),
+            "got {:?}",
+            parsed.paths()
+        );
+        let crossing = read(1020);
+        assert!(
+            matches!(crossing, Err(PolicyError::UnrecognizedLeafGroup)),
+            "got {crossing:?}"
+        );
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_reader_rejects_mixed_subset_sizes() {
+        let (a, b, c) = (test_key(1), test_key(2), test_key(3));
+        let desc =
+            musig_leaves_descriptor(&[(vec![a.clone(), b.clone()], 512), (vec![a, b, c], 514)]);
+        let err = Policy::from_descriptor(&desc).unwrap_err();
+        assert!(
+            matches!(err, PolicyError::UnrecognizedLeafGroup),
+            "got {err:?}"
+        );
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_reader_lone_leaf_out_of_zone_is_unknown() {
+        let desc = musig_leaves_descriptor(&[(vec![test_key(1), test_key(2)], 3072)]);
+        let parsed = Policy::from_descriptor(&desc).unwrap();
+        let leaf = parsed
+            .paths()
+            .iter()
+            .find(|p| matches!(p.position(), TapPosition::TapTree(_)))
+            .unwrap();
+        assert!(
+            matches!(leaf.semantic(), Semantic::Unknown { .. }),
+            "got {:?}",
+            leaf.semantic()
+        );
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_reader_reads_script_multisig() {
+        let (a, b, c) = (test_key(1), test_key(2), test_key(3));
+        let [a, b, c] = [a, b, c].map(|k| participant_key(&k));
+        let (b, c) = (format!("{b}/<1024;1025>/*"), format!("{c}/<1024;1025>/*"));
+        // The plain build's 2-of-2 leaf, then the multi_a form.
+        for recovery in [
+            format!("and_v(v:and_v(v:pk({b}),pk({c})),older(144))"),
+            format!("and_v(v:multi_a(2,{b},{c}),older(144))"),
+        ] {
+            let text = format!("tr({a}/<512;513>/*,{recovery})");
+            let parsed =
+                Policy::from_descriptor(&WalletDescriptor::from_str(&text).unwrap()).unwrap();
+            assert_eq!(parsed.policy_type(), PolicyType::Csv);
+            let Semantic::Multi { keys, threshold } = path_at(&parsed, &rel(144)).semantic() else {
+                panic!("expected a Multi recovery, got {:?}", parsed.paths());
+            };
+            assert_eq!(*threshold, 2);
+            assert_eq!(keyset(keys), keyset(&[test_key(2), test_key(3)]));
+        }
+    }
+
+    /// `tr(D/<0;1>/*, and_v(v:pk(musig(S)/<a;a+1>/*),older(144))...)`, the starts `a`
+    /// walking the zone `zone` two by two.
+    #[cfg(feature = "musig")]
+    fn musig_older_descriptor(zone: u32, sets: &[Vec<OXpub>]) -> WalletDescriptor {
+        let leaves = (0u32..)
+            .zip(sets)
+            .map(|(i, set)| {
+                let key = musig_key(set, zone + 2 * i).unwrap();
+                Miniscript::from_str(&format!("and_v(v:pk({key}),older(144))")).unwrap()
+            })
+            .collect();
+        tr_descriptor(plain_wallet_key(&test_key(9), 0), leaves)
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_reader_rejects_repeated_mandatory_subset() {
+        let [m, a, b, c, d] = [5, 1, 2, 3, 4].map(test_key);
+        let set = |x: &OXpub, y: &OXpub| vec![m.clone(), x.clone(), y.clone()];
+        let complete = [
+            set(&a, &b),
+            set(&a, &c),
+            set(&a, &d),
+            set(&b, &c),
+            set(&b, &d),
+            set(&c, &d),
+        ];
+        let parsed = Policy::from_descriptor(&musig_older_descriptor(1536, &complete)).unwrap();
+        assert!(
+            matches!(
+                path_at(&parsed, &rel(144)).semantic(),
+                Semantic::MultiMandatory { threshold: 3, .. }
+            ),
+            "got {:?}",
+            parsed.paths()
+        );
+
+        // Every key keeps its frequency, but M+AD and M+BC are missing.
+        let repeated = [
+            set(&a, &b),
+            set(&a, &b),
+            set(&c, &d),
+            set(&c, &d),
+            set(&a, &c),
+            set(&b, &d),
+        ];
+        let err = Policy::from_descriptor(&musig_older_descriptor(1536, &repeated)).unwrap_err();
+        assert!(
+            matches!(err, PolicyError::UnrecognizedLeafGroup),
+            "got {err:?}"
+        );
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_reader_rejects_unbalanced_nested_family() {
+        let [m1, m2, a, b, c] = [5, 6, 1, 2, 3].map(test_key);
+        let set = |keys: &[&OXpub]| keys.iter().map(|k| (*k).clone()).collect::<Vec<_>>();
+        let complete = [
+            set(&[&m1, &a, &b]),
+            set(&[&m1, &a, &c]),
+            set(&[&m1, &b, &c]),
+            set(&[&m2, &a, &b]),
+            set(&[&m2, &a, &c]),
+            set(&[&m2, &b, &c]),
+        ];
+        let parsed = Policy::from_descriptor(&musig_older_descriptor(4608, &complete)).unwrap();
+        assert!(
+            matches!(
+                path_at(&parsed, &rel(144)).semantic(),
+                Semantic::MultiMandatoryNested {
+                    mandatory_threshold: 1,
+                    threshold: 2,
+                    ..
+                }
+            ),
+            "got {:?}",
+            parsed.paths()
+        );
+
+        // Distinct sets with the frequencies of the 1-of-2 and 2-of-3 product, but M1M2A
+        // holds two mandatory keys and ABC none.
+        let unbalanced = [
+            set(&[&m1, &m2, &a]),
+            set(&[&a, &b, &c]),
+            set(&[&m1, &b, &c]),
+            set(&[&m2, &b, &c]),
+            set(&[&m1, &a, &b]),
+            set(&[&m2, &a, &c]),
+        ];
+        let err = Policy::from_descriptor(&musig_older_descriptor(4608, &unbalanced)).unwrap_err();
+        assert!(
+            matches!(err, PolicyError::UnrecognizedLeafGroup),
+            "got {err:?}"
         );
     }
 }

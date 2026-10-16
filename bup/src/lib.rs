@@ -20,6 +20,7 @@ pub mod tree_builder;
 pub use key_role::{Bip87Account, KeyRoleError, KeyType};
 pub use multipath::{get_multipath_index, MultipathError};
 pub use nums::{bip341_nums, unspendable_internal_key};
+pub use parse::infer_policy_type;
 pub use path::{
     cltv_align, is_cltv_aligned, Leaf, Locktime, OXpub, OXpubError, Path, Semantic, TapPosition,
     CLTV_ALIGNMENT, MULTIPATH_SEMANTIC_FACTOR,

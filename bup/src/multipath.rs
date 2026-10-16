@@ -41,13 +41,24 @@ pub(crate) fn wallet_key(key: DescriptorPublicKey) -> WalletKey {
     MusigKey::Plain(key)
 }
 
-/// Marker multipath used on the NUMS internal key emitted by `Policy::compile`. The two
-/// largest unhardened indices (`2^31 - 2` and `2^31 - 1`) tag the internal key as
-/// unspendable-by-construction so the parser can detect it without recomputing the
-/// chain-code hash. The chain-code algorithm itself stays byte-identical to
-/// `analysis::unspendable_internal_xpub`, so the legacy detection path also still
-/// recognises it.
-pub(super) const NUMS_MARKER_MULTIPATH: [u32; 2] = [0x7FFF_FFFE, 0x7FFF_FFFF];
+/// Lowest index of the reserved NUMS block `[0x7FFF_FF00, 0x7FFF_FFFF]`. Every unspendable
+/// key `Policy::compile` emits (internal key and padding leaves) is the one NUMS xpub, each
+/// slot on its own two-leg multipath inside this block, so a reader spots a NUMS slot by
+/// its public key and an index at or above this bound. The block sits far above every zone.
+pub(super) const NUMS_BLOCK_START: u32 = 0x7FFF_FF00;
+
+/// First index of NUMS slot 0, the internal key: `<0x7FFF_FFFE;0x7FFF_FFFF>`. Slot `k` takes
+/// `<0x7FFF_FFFE-2k;0x7FFF_FFFF-2k>`.
+const NUMS_SLOT_0: u32 = 0x7FFF_FFFE;
+
+/// NUMS slots the block holds: slot 0 for the internal key, 1 to 127 for padding leaves.
+pub(super) const NUMS_SLOTS: usize = 128;
+
+/// The multipath of NUMS slot `slot`, see [`NUMS_SLOT_0`].
+pub(super) fn nums_slot_paths(slot: usize) -> descriptor::DerivPaths {
+    assert!(slot < NUMS_SLOTS, "NUMS slot {slot} outside the block");
+    deriv_paths_starting_at(NUMS_SLOT_0 - 2 * slot as u32)
+}
 
 /// `<a;a+1>` multipath `DerivPaths` starting at `start`.
 pub(super) fn deriv_paths_starting_at(start: u32) -> descriptor::DerivPaths {
@@ -393,7 +404,29 @@ mod tests {
 
     #[cfg(feature = "musig")]
     use crate::multipath::{deriv_paths_starting_at, key_indices, MultipathError};
-    use crate::multipath::{get_multipath_index, plain_key, wallet_key};
+    use crate::multipath::{
+        get_multipath_index, nums_slot_paths, plain_key, wallet_key, NUMS_BLOCK_START, NUMS_SLOTS,
+    };
+
+    #[test]
+    fn nums_slots_fill_the_block() {
+        let indices = |slot| -> Vec<u32> {
+            nums_slot_paths(slot)
+                .paths()
+                .iter()
+                .map(|p| u32::from(p[0]))
+                .collect()
+        };
+        assert_eq!(indices(0), vec![0x7FFF_FFFE, 0x7FFF_FFFF]);
+        assert_eq!(indices(1), vec![0x7FFF_FFFC, 0x7FFF_FFFD]);
+        assert_eq!(indices(NUMS_SLOTS - 1), vec![NUMS_BLOCK_START, 0x7FFF_FF01]);
+    }
+
+    #[test]
+    #[should_panic(expected = "NUMS slot 128 outside the block")]
+    fn nums_slot_past_the_block_panics() {
+        nums_slot_paths(NUMS_SLOTS);
+    }
 
     const KEY_4_5: &str = "[abcdef01]xpub6Eze7yAT3Y1wGrnzedCNVYDXUqa9NmHVWck5emBaTbXtURbe1NWZbK9bsz1TiVE7Cz341PMTfYgFw1KdLWdzcM1UMFTcdQfCYhhXZ2HJvTW/<4;5>/*";
 

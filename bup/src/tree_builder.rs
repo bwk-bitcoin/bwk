@@ -21,7 +21,7 @@ use miniscript::{
 };
 
 use crate::{
-    multipath::{deriv_paths_starting_at, plain_key, wallet_key, NUMS_MARKER_MULTIPATH},
+    multipath::{deriv_paths_starting_at, nums_slot_paths, wallet_key, NUMS_SLOTS},
     nums::{bip341_nums, chain_code_xkey},
     parse::oxpub_to_key,
     path::{Path, Semantic, TapPosition},
@@ -215,7 +215,7 @@ impl<T: Clone> TreeBuilder<T> {
 
     /// Replace every Free slot with a single-leaf sub-subtree at the slot's depth.
     /// The padding closure is called once per Free slot in DFS order, so the caller
-    /// can chain state (e.g. successive sha256s of a chain code) across calls.
+    /// can number the padding leaves.
     pub(super) fn fill_free_with<F: FnMut() -> T>(&mut self, mut pad_fn: F) {
         if self.subtrees.is_empty() {
             return;
@@ -478,26 +478,32 @@ pub(super) fn build(
                 _ => unreachable!("validated by sanitize"),
             }
         }
-        None => wallet_key(nums_descriptor_key(network, seed)),
+        None => wallet_key(nums_descriptor_key(network, seed, 0)),
     };
 
-    let internal_key_is_nums = matches!(
-        plain_key(&internal_key),
-        Some(DescriptorPublicKey::MultiXPub(m)) if m.xkey.public_key == bip341_nums()
-    );
-    let mut chain = if internal_key_is_nums {
-        chain_advance(seed)
-    } else {
-        seed
-    };
+    check_padding_fits(&builder)?;
+    let mut slot = 0;
     builder.fill_free_with(|| {
-        let leaf = nums_pk_leaf(network, chain);
-        chain = chain_advance(chain);
-        leaf
+        slot += 1;
+        nums_pk_leaf(network, seed, slot)
     });
 
     let tap_tree = builder.into_tree().map(into_tap_tree);
     Ok((internal_key, tap_tree))
+}
+
+/// Every padding leaf of `builder` needs its own NUMS slot: slot 0 is the internal
+/// key's, padding leaves take slots 1 and up.
+fn check_padding_fits<T: Clone>(builder: &TreeBuilder<T>) -> Result<(), PolicyError> {
+    let mut padding = 0;
+    builder.dfs_slots(|s| padding += usize::from(matches!(s, DfsSlot::Free)));
+    if padding >= NUMS_SLOTS {
+        return Err(PolicyError::TooManyPaddingLeaves {
+            count: padding,
+            max: NUMS_SLOTS - 1,
+        });
+    }
+    Ok(())
 }
 
 fn nums_seed_chain_code(builder: &TreeBuilder<Miniscript<WalletKey, Tap>>) -> bip32::ChainCode {
@@ -531,7 +537,14 @@ fn network_from_paths(paths: &[Path]) -> Option<NetworkKind> {
         .next()
 }
 
-fn nums_descriptor_key(network: NetworkKind, chain_code: bip32::ChainCode) -> DescriptorPublicKey {
+/// The NUMS xpub on NUMS slot `slot` (see `multipath::NUMS_BLOCK_START`). Every slot shares
+/// the one chain code: Ledger refuses two keys with one public key, and Coldcard merges
+/// them under one chain code, so distinct chain codes per slot break both devices.
+fn nums_descriptor_key(
+    network: NetworkKind,
+    chain_code: bip32::ChainCode,
+    slot: usize,
+) -> DescriptorPublicKey {
     let xpub = bip32::Xpub {
         public_key: bip341_nums(),
         chain_code,
@@ -540,31 +553,23 @@ fn nums_descriptor_key(network: NetworkKind, chain_code: bip32::ChainCode) -> De
         child_number: 0.into(),
         network,
     };
-    let derivation_paths = descriptor::DerivPaths::new(vec![
-        [bip32::ChildNumber::from_normal_idx(NUMS_MARKER_MULTIPATH[0]).expect("non-hardened")][..]
-            .into(),
-        [bip32::ChildNumber::from_normal_idx(NUMS_MARKER_MULTIPATH[1]).expect("non-hardened")][..]
-            .into(),
-    ])
-    .expect("two paths");
     DescriptorPublicKey::MultiXPub(descriptor::DescriptorMultiXKey {
         origin: None,
         xkey: xpub,
-        derivation_paths,
+        derivation_paths: nums_slot_paths(slot),
         wildcard: descriptor::Wildcard::Unhardened,
     })
 }
 
-fn nums_pk_leaf(network: NetworkKind, chain_code: bip32::ChainCode) -> Miniscript<WalletKey, Tap> {
-    let key = nums_descriptor_key(network, chain_code);
+fn nums_pk_leaf(
+    network: NetworkKind,
+    chain_code: bip32::ChainCode,
+    slot: usize,
+) -> Miniscript<WalletKey, Tap> {
+    let key = nums_descriptor_key(network, chain_code, slot);
     ConcretePolicy::Key(wallet_key(key))
         .compile::<Tap>()
         .expect("pk(NUMS) compiles trivially")
-}
-
-fn chain_advance(c: bip32::ChainCode) -> bip32::ChainCode {
-    let next: [u8; 32] = sha256::Hash::hash(c.to_bytes().as_ref()).to_byte_array();
-    bip32::ChainCode::from(&next)
 }
 
 #[cfg(test)]
@@ -1083,6 +1088,28 @@ mod tests {
                 }
             }
         };
+    }
+
+    #[test]
+    fn padding_leaves_must_fit_the_nums_slots() {
+        // A path of 129 leaves fills 256 slots, leaving 7 free chunks; each later one
+        // takes a chunk and leaves 7 of its own: 7 + 6 * (paths - 1) free slots.
+        let leaves: Vec<u32> = (0..129).collect();
+        let builder = |paths: usize| {
+            let mut b: TreeBuilder<u32> = TreeBuilder::new();
+            for i in 0..paths {
+                b.place_path(&leaves, i + 1 < paths).unwrap();
+            }
+            b
+        };
+        assert!(check_padding_fits(&builder(21)).is_ok());
+        assert!(matches!(
+            check_padding_fits(&builder(22)),
+            Err(PolicyError::TooManyPaddingLeaves {
+                count: 133,
+                max: 127
+            })
+        ));
     }
 
     /// Run a sequence of `place_path` calls and assert the placement-state diagram

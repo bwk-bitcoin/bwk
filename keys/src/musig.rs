@@ -202,27 +202,36 @@ fn check_derived_cosigner(key: &DescriptorPublicKey) -> Result<(), Error> {
     }
 }
 
-/// BIP-389: the paths of a multipath derivation differ at one step only, with
-/// distinct values there.
+/// BIP-389: the paths of a multipath derivation have one length, are distinct and
+/// differ at one step only.
 fn check_multipath_step(paths: &[DerivationPath]) -> Result<(), Error> {
     if paths.len() < 2 {
         return Ok(());
     }
-    let differing: Vec<usize> = (0..paths[0].len())
+    if paths.iter().any(|path| path.len() != paths[0].len()) {
+        return Err(Error::InvalidShape("multipath paths of different lengths"));
+    }
+    if (1..paths.len()).any(|i| paths[..i].contains(&paths[i])) {
+        return Err(Error::InvalidShape("duplicate multipath values"));
+    }
+    let differing = (0..paths[0].len())
         .filter(|&i| paths.iter().any(|path| path[i] != paths[0][i]))
-        .collect();
-    let [step] = differing.as_slice() else {
+        .count();
+    if differing != 1 {
         return Err(Error::InvalidShape(
             "multipath paths must differ at exactly one step",
         ));
-    };
-    let mut values: Vec<ChildNumber> = paths.iter().map(|path| path[*step]).collect();
-    values.sort();
-    values.dedup();
-    if values.len() != paths.len() {
-        return Err(Error::InvalidShape("duplicate multipath values"));
     }
     Ok(())
+}
+
+/// True when `key` ends with a hardened wildcard (`/*h`).
+fn has_hardened_wildcard(key: &DescriptorPublicKey) -> bool {
+    match key {
+        DescriptorPublicKey::Single(_) => false,
+        DescriptorPublicKey::XPub(xpub) => xpub.wildcard == Wildcard::Hardened,
+        DescriptorPublicKey::MultiXPub(xpub) => xpub.wildcard == Wildcard::Hardened,
+    }
 }
 
 /// Derivation after aggregation: `musig(...)/<0;1>/*`.
@@ -259,8 +268,8 @@ pub struct MusigAggregate {
 
 impl MusigAggregate {
     /// Checks the BIP-390 shape rules, then KeySort and KeyAgg when no cosigner is
-    /// ranged. A cosigner with a hardened step is rejected: without its private key
-    /// it can never be derived.
+    /// ranged. A cosigner with a hardened step or wildcard is rejected: without its
+    /// private key it can never be derived.
     pub fn new(
         cosigners: Vec<DescriptorPublicKey>,
         derivation: Option<MusigDerivation>,
@@ -279,6 +288,12 @@ impl MusigAggregate {
             if key.has_hardened_step() {
                 return Err(Error::InvalidShape("hardened step in a musig() key"));
             }
+            if has_hardened_wildcard(key) {
+                return Err(Error::InvalidShape("hardened wildcard in a musig() key"));
+            }
+            if let DescriptorPublicKey::MultiXPub(xpub) = key {
+                check_multipath_step(xpub.derivation_paths.paths())?;
+            }
         }
         match &derivation {
             Some(derivation) => {
@@ -288,11 +303,7 @@ impl MusigAggregate {
                 for key in &cosigners {
                     check_derived_cosigner(key)?;
                 }
-                let paths = derivation.paths.paths();
-                if paths.iter().any(|path| path.len() != paths[0].len()) {
-                    return Err(Error::InvalidShape("multipath paths of different lengths"));
-                }
-                check_multipath_step(paths)?;
+                check_multipath_step(derivation.paths.paths())?;
             }
             None => {
                 let mut lengths = cosigners
@@ -912,12 +923,13 @@ mod tests {
         NetworkKind,
     };
     use miniscript::{
-        descriptor::{SinglePub, SinglePubKey},
+        descriptor::{DerivPaths, SinglePub, SinglePubKey, Wildcard},
         DefiniteDescriptorKey, Descriptor, DescriptorPublicKey, MiniscriptKey, ToPublicKey,
     };
 
     use crate::musig::{
-        synthetic, DefiniteMusigAggregate, DefiniteMusigKey, Error, MusigAggregate, MusigKey,
+        synthetic, DefiniteMusigAggregate, DefiniteMusigKey, Error, MusigAggregate,
+        MusigDerivation, MusigKey,
     };
 
     const SINGLE: &str =
@@ -1191,26 +1203,86 @@ mod tests {
         let x2_ranged = format!("{X2}/*");
         let x1_multipath = format!("{X1}/<0;1>");
         let x1_hardened = format!("{X1}/0h");
+        let x1_hardened_wildcard = format!("{X1}/0/*h");
+        let x1_same_branches = format!("{X1}/<0;0>/*");
+        let x2_multipath = format!("{X2}/<0;1>/*");
         let x_only_key = &P3[2..];
         for (err, expected) in [
-            (musig_err(&[P3, R2, R3], "/0/0"), "InvalidShape"),
-            (musig_err(&[&x1_ranged, X2], "/0/*"), "InvalidShape"),
-            (musig_err(&[&x1_multipath, X2], "/<2;3>"), "InvalidShape"),
-            (musig_err(&[X1, X2], "/0h/*"), "HardenedDerivation"),
-            (musig_err(&[X1, X2], "/0/*h"), "HardenedDerivation"),
-            (musig_err(&[&x1_ranged, &x2_ranged], "/1/2"), "InvalidShape"),
-            (MusigKey::from_str("musig||").unwrap_err(), "Parse"),
-            (musig_err(&[x_only_key, P1], ""), "InvalidShape"),
-            (musig_err(&[X1, X2], "/<0;0;1>/*"), "InvalidShape"),
-            (musig_err(&[&x1_hardened, X2], ""), "InvalidShape"),
+            (
+                musig_err(&[P3, R2, R3], "/0/0"),
+                Error::InvalidShape("derivation after musig() needs xpub keys"),
+            ),
+            (
+                musig_err(&[&x1_ranged, X2], "/0/*"),
+                Error::InvalidShape("ranged key inside a derived musig()"),
+            ),
+            (
+                musig_err(&[&x1_multipath, X2], "/<2;3>"),
+                Error::InvalidShape("multipath key inside a derived musig()"),
+            ),
+            (musig_err(&[X1, X2], "/0h/*"), Error::HardenedDerivation),
+            (musig_err(&[X1, X2], "/0/*h"), Error::HardenedDerivation),
+            (
+                musig_err(&[&x1_ranged, &x2_ranged], "/1/2"),
+                Error::InvalidShape("ranged key inside a derived musig()"),
+            ),
+            (
+                MusigKey::from_str("musig||").unwrap_err(),
+                Error::Parse("empty key".into()),
+            ),
+            (
+                musig_err(&[x_only_key, P1], ""),
+                Error::InvalidShape("x-only key in musig()"),
+            ),
+            (
+                musig_err(&[X1, X2], "/<0;0;1>/*"),
+                Error::InvalidShape("duplicate multipath values"),
+            ),
+            (
+                musig_err(&[X1, X2], "/<0;0>/*"),
+                Error::InvalidShape("duplicate multipath values"),
+            ),
+            (
+                musig_err(&[&x1_hardened, X2], ""),
+                Error::InvalidShape("hardened step in a musig() key"),
+            ),
+            (
+                musig_err(&[&x1_hardened_wildcard, X2], ""),
+                Error::InvalidShape("hardened wildcard in a musig() key"),
+            ),
+            (
+                musig_err(&[&x1_same_branches, &x2_multipath], ""),
+                Error::InvalidShape("duplicate multipath values"),
+            ),
         ] {
-            let kind = match err {
-                Error::Parse(_) => "Parse",
-                Error::InvalidShape(_) => "InvalidShape",
-                Error::HardenedDerivation => "HardenedDerivation",
-                e => panic!("unexpected {e:?}"),
+            assert_eq!(err, expected);
+        }
+    }
+
+    #[test]
+    fn multipath_derivation_shape_is_checked() {
+        let keys = vec![
+            DescriptorPublicKey::from_str(X1).unwrap(),
+            DescriptorPublicKey::from_str(X2).unwrap(),
+        ];
+        for (paths, expected) in [
+            (
+                vec![path("m/0/1"), path("m/1/2")],
+                "multipath paths must differ at exactly one step",
+            ),
+            (
+                vec![path("m/0"), path("m/1/2")],
+                "multipath paths of different lengths",
+            ),
+        ] {
+            let derivation = MusigDerivation {
+                paths: DerivPaths::new(paths).unwrap(),
+                wildcard: Wildcard::Unhardened,
             };
-            assert_eq!(kind, expected, "{err}");
+            assert_eq!(
+                MusigAggregate::new(keys.clone(), Some(derivation), NetworkKind::Main),
+                Err(Error::InvalidShape(expected))
+            );
         }
     }
 

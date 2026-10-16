@@ -35,22 +35,37 @@ pub fn is_cltv_aligned(target: u32) -> bool {
     target != 0 && (target & (CLTV_ALIGNMENT - 1)) == 0
 }
 
-/// Binomial coefficient `C(n, k)`. Returns `1` for `k == 0` and `0` for `k > n`. Avoids
-/// overflow by alternating multiply/divide on running symmetric `min(k, n-k)`.
-pub(crate) fn count_combinations(n: usize, k: usize) -> usize {
+/// Binomial coefficient `C(n, k)`, `None` when it does not fit in `usize`. Returns
+/// `Some(1)` for `k == 0` and `Some(0)` for `k > n`. Walks `C(n, i)` for `i` up to
+/// `min(k, n-k)`: every step is increasing, so each one fits whenever the result does,
+/// and the `u128` product of one step with `n - i` cannot overflow.
+pub(crate) fn count_combinations(n: usize, k: usize) -> Option<usize> {
     if k > n {
-        return 0;
+        return Some(0);
     }
     let k = k.min(n - k);
-    (0..k).fold(1usize, |acc, i| acc * (n - i) / (i + 1))
+    (0..k).try_fold(1usize, |acc, i| {
+        usize::try_from(acc as u128 * (n - i) as u128 / (i + 1) as u128).ok()
+    })
 }
 
-/// Whether any [`OXpub`] appears in both `mandatory_keys` and `keys`. Used by
-/// [`Semantic::validate`] to enforce disjoint sets on `MultiMandatory` and
-/// `MultiMandatoryNested` paths.
+/// Leaves of a `MultiMandatoryNested` path: `C(m, mt) * C(n, t)`, `None` when it does
+/// not fit in `usize`.
+pub(crate) fn count_nested_combinations(m: usize, mt: usize, n: usize, t: usize) -> Option<usize> {
+    count_combinations(m, mt)?.checked_mul(count_combinations(n, t)?)
+}
+
+/// Whether a signer of `mandatory_keys` is also one of `keys` (see
+/// [`OXpub::is_same_signer`]). Used by [`Semantic::validate`] to enforce disjoint sets
+/// on `MultiMandatory` and `MultiMandatoryNested` paths.
 fn has_mandatory_cosigner_overlap(mandatory_keys: &[OXpub], keys: &[OXpub]) -> bool {
-    let mset: std::collections::BTreeSet<&OXpub> = mandatory_keys.iter().collect();
-    keys.iter().any(|k| mset.contains(k))
+    keys.iter()
+        .any(|k| mandatory_keys.iter().any(|m| m.is_same_signer(k)))
+}
+
+/// Whether a signer appears twice in `keys` (see [`OXpub::is_same_signer`]).
+fn has_repeated_key(keys: &[OXpub]) -> bool {
+    (1..keys.len()).any(|i| keys[..i].iter().any(|k| k.is_same_signer(&keys[i])))
 }
 
 /// Signer identity: the HD origin (fingerprint + derivation path) and master xpub, stripped
@@ -67,6 +82,12 @@ impl OXpub {
         xkey: bip32::Xpub,
     ) -> Self {
         Self { origin, xkey }
+    }
+
+    /// Whether `self` and `other` are one signer: the same xpub, or the same origin
+    /// (fingerprint and path) whatever the xpub.
+    pub fn is_same_signer(&self, other: &OXpub) -> bool {
+        self.xkey == other.xkey || (self.origin.is_some() && self.origin == other.origin)
     }
 
     /// Reject xpubs that can't represent a real signer:
@@ -226,6 +247,11 @@ pub enum SemanticError {
     /// among the cosigners is structurally degenerate (the cosigner sig is
     /// indistinguishable from the mandatory one).
     MandatoryCosignerOverlap,
+    /// A signer appears twice in the `keys` or the `mandatory_keys` of a
+    /// [`Semantic::Multi`], [`Semantic::MultiMandatory`] or
+    /// [`Semantic::MultiMandatoryNested`] path (see [`OXpub::is_same_signer`]). With
+    /// `musig` a repeated key lets one signer stand for several.
+    RepeatedKey,
     /// One of the path's keys is not a real signer key (NUMS or zeroed chain code).
     InvalidKey(OXpubError),
 }
@@ -330,7 +356,7 @@ impl Semantic {
     }
 
     /// Structural sanity check: `Multi` / `MultiMandatory` thresholds must be in range,
-    /// and every signer key (`OXpub`) must pass [`OXpub::validate`] (no NUMS, no zeroed
+    /// no signer may appear twice in a key set, and every signer key (`OXpub`) must pass [`OXpub::validate`] (no NUMS, no zeroed
     /// chain code). `Or`, `Unknown`, and `Custom` carry no thresholds or `OXpub` keys to
     /// check; they pass unconditionally. `Or` and `Unknown` are uncompilable; `Custom`
     /// compiles by reissuing multipath indices on its embedded miniscript.
@@ -349,6 +375,9 @@ impl Semantic {
                         threshold: *threshold,
                         key_count: keys.len(),
                     });
+                }
+                if has_repeated_key(keys) {
+                    return Err(SemanticError::RepeatedKey);
                 }
                 Ok(())
             }
@@ -369,6 +398,9 @@ impl Semantic {
                 if has_mandatory_cosigner_overlap(mandatory_keys, keys) {
                     return Err(SemanticError::MandatoryCosignerOverlap);
                 }
+                if has_repeated_key(mandatory_keys) || has_repeated_key(keys) {
+                    return Err(SemanticError::RepeatedKey);
+                }
                 Ok(())
             }
             Semantic::MultiMandatoryNested {
@@ -383,6 +415,9 @@ impl Semantic {
                 let t = *threshold;
                 if has_mandatory_cosigner_overlap(mandatory_keys, keys) {
                     return Err(SemanticError::MandatoryCosignerOverlap);
+                }
+                if has_repeated_key(mandatory_keys) || has_repeated_key(keys) {
+                    return Err(SemanticError::RepeatedKey);
                 }
                 // Strict subsets on both sides: equality collapses to MultiMandatory.
                 if mt == 0 || mt >= m {
@@ -530,7 +565,8 @@ impl Path {
     /// the compiler can't emit (`Or`, `Unknown`) or for an out-of-range mandatory-key
     /// threshold. `Custom` always expands into a single tap-leaf. A `Multi` is one leaf
     /// without `musig`, and one leaf per `threshold`-subset of its keys with it (`0` for
-    /// a threshold of `0` or above the key count).
+    /// a threshold of `0` or above the key count). Saturates at `usize::MAX` when the
+    /// count does not fit, so it stays above any leaf cap.
     pub fn leaf_count(&self) -> usize {
         match &self.semantic {
             Semantic::Single(_) | Semantic::Custom(_) => 1,
@@ -541,7 +577,7 @@ impl Path {
                 if *threshold == 0 {
                     return 0;
                 }
-                count_combinations(keys.len(), *threshold)
+                count_combinations(keys.len(), *threshold).unwrap_or(usize::MAX)
             }
             Semantic::MultiMandatory {
                 keys,
@@ -553,7 +589,7 @@ impl Path {
                 if *threshold <= m || *threshold > m + n {
                     return 0;
                 }
-                count_combinations(n, threshold - m)
+                count_combinations(n, threshold - m).unwrap_or(usize::MAX)
             }
             Semantic::MultiMandatoryNested {
                 mandatory_keys,
@@ -568,7 +604,7 @@ impl Path {
                 if mt == 0 || mt >= m || t == 0 || t >= n {
                     return 0;
                 }
-                count_combinations(m, mt) * count_combinations(n, t)
+                count_nested_combinations(m, mt, n, t).unwrap_or(usize::MAX)
             }
             Semantic::Or(_) | Semantic::Unknown { .. } => 0,
         }
@@ -742,5 +778,25 @@ mod tests {
             TapPosition::TapTree(vec![Leaf(0)]),
         );
         assert_eq!(p.satisfaction_wu(), None);
+    }
+
+    #[test]
+    fn count_combinations_exact_up_to_usize() {
+        assert_eq!(count_combinations(3, 0), Some(1));
+        assert_eq!(count_combinations(2, 3), Some(0));
+        assert_eq!(count_combinations(5, 3), Some(10));
+        // The step products of these overflow `usize`, the counts do not.
+        assert_eq!(count_combinations(63, 29), Some(759_510_004_936_100_355));
+        assert_eq!(count_combinations(64, 32), Some(1_832_624_140_942_590_534));
+        assert_eq!(count_combinations(67, 33), Some(14_226_520_737_620_288_370));
+    }
+
+    #[test]
+    fn count_combinations_none_past_usize() {
+        assert_eq!(count_combinations(68, 34), None);
+        assert_eq!(count_combinations(200, 100), None);
+        assert_eq!(count_nested_combinations(4, 2, 5, 3), Some(60));
+        assert_eq!(count_nested_combinations(40, 20, 41, 20), None);
+        assert_eq!(count_nested_combinations(68, 34, 2, 1), None);
     }
 }
