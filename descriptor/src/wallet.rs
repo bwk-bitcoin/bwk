@@ -286,7 +286,9 @@ mod tests {
 
     use crate::wallet::{to_wallet, WalletDescriptor, WalletDescriptorExt};
     #[cfg(feature = "musig")]
-    use crate::{derivator::Error as DerivatorError, wallet::WalletKeyExt};
+    use crate::{
+        derivator::Error as DerivatorError, musig::parse_musig_descriptor, wallet::WalletKeyExt,
+    };
 
     const XPUB1: &str = "tpubDDxT9mkZzWwkKwpGT5fY6iiM9muYTPkTx6Eig8dpHR7TChuGGCWYAHVmpW1ciido5RiFWwjzYsF1GZHkEHg2nrYp3zNtx3QQRkznyLhQ77x";
     const XPUB2: &str = "tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B";
@@ -417,5 +419,21 @@ mod tests {
             musig(&[&x1_multipath, &x2_single], "").check_derivation(bitcoin),
             Err(DerivatorError::NotMultiXpub)
         ));
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn wallet_descriptor_ext_musig_arms() {
+        let d =
+            parse_musig_descriptor(&format!("tr({XPUB1}/<0;1>/*,pk(musig({X1},{X2})/<0;1>/*))"))
+                .unwrap();
+        assert_eq!(d.single_paths().unwrap().len(), 2);
+        let keys = d.plain_keys();
+        assert_eq!(keys.len(), 3);
+        for key in [format!("{XPUB1}/<0;1>/*"), X1.to_string(), X2.to_string()] {
+            assert!(keys.contains(&DescriptorPublicKey::from_str(&key).unwrap()));
+        }
+        assert!(d.has_musig());
+        assert!(!to_wallet(tr_with_leaf()).has_musig());
     }
 }

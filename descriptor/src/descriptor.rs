@@ -10,11 +10,13 @@ use miniscript::{
 };
 
 #[cfg(feature = "musig")]
-use crate::musig::MusigDescriptor;
+use crate::musig::{musig_descriptor_to_string, parse_musig_descriptor, MusigDescriptor};
+#[cfg(not(feature = "musig"))]
+use crate::wallet::WalletKey;
 use crate::{
     derivator::SpkDerivator,
     sp_descriptor::SpDescriptor,
-    wallet::{to_wallet, WalletDescriptor, WalletDescriptorExt, WalletKey, WalletKeyExt},
+    wallet::{to_wallet, WalletDescriptor, WalletDescriptorExt, WalletKeyExt},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -221,9 +223,12 @@ impl FromStr for Descriptor {
                 .map(|d| Descriptor::Sp(Box::new(d)))
                 .map_err(|e| Error::Parse(e.to_string()))
         } else {
-            miniscript::Descriptor::<WalletKey>::from_str(s)
-                .map(|d| Descriptor::Miniscript(Box::new(d)))
-                .map_err(|e| Error::Parse(e.to_string()))
+            #[cfg(not(feature = "musig"))]
+            let descriptor = miniscript::Descriptor::<WalletKey>::from_str(s)
+                .map_err(|e| Error::Parse(e.to_string()))?;
+            #[cfg(feature = "musig")]
+            let descriptor = parse_musig_descriptor(s)?;
+            Ok(Descriptor::Miniscript(Box::new(descriptor)))
         }
     }
 }
@@ -231,12 +236,17 @@ impl FromStr for Descriptor {
 impl fmt::Display for Descriptor {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            #[cfg(not(feature = "musig"))]
             Descriptor::Miniscript(d) => {
                 if f.alternate() {
                     write!(f, "{d:#}")
                 } else {
                     write!(f, "{d}")
                 }
+            }
+            #[cfg(feature = "musig")]
+            Descriptor::Miniscript(d) => {
+                write!(f, "{}", musig_descriptor_to_string(d, !f.alternate()))
             }
             Descriptor::Sp(d) => {
                 if f.alternate() {
@@ -298,6 +308,8 @@ mod tests {
     use std::{collections::BTreeSet, str::FromStr};
 
     use bwk_keys::keys::OXpub;
+    #[cfg(feature = "musig")]
+    use miniscript::descriptor::checksum::desc_checksum;
     use miniscript::{
         bitcoin::{
             self,
@@ -512,5 +524,63 @@ mod tests {
 
         let no_origin = Descriptor::from_str(&miniscript_str(None)).unwrap();
         assert_eq!(no_origin.fingerprint(), None);
+    }
+
+    #[test]
+    fn plain_descriptor_prints_byte_identical() {
+        let tr = format!("tr([00000000/86'/0'/0']{XPUB}/<0;1>/*)");
+        for s in [miniscript_str(Some("9d69155f")), tr] {
+            let d = Descriptor::from_str(&s).unwrap();
+            let expected = miniscript::Descriptor::<DescriptorPublicKey>::from_str(&s).unwrap();
+            assert_eq!(d.to_string(), expected.to_string());
+            assert_eq!(format!("{d:#}"), format!("{expected:#}"));
+            assert!(!d.is_musig());
+        }
+    }
+
+    // BIP-390 test vector xpubs (mainnet).
+    #[cfg(feature = "musig")]
+    const X1: &str = "xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL";
+    #[cfg(feature = "musig")]
+    const X2: &str = "xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y";
+
+    #[cfg(feature = "musig")]
+    fn musig_str() -> String {
+        format!("tr(musig([aabbccdd/87'/0'/0']{X1},[11223344/87'/0'/0']{X2})/<0;1>/*)")
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn descriptor_parses_and_prints_musig() {
+        let s = musig_str();
+        let d = Descriptor::from_str(&s).unwrap();
+        assert!(d.is_musig());
+        assert_eq!(d.to_string(), format!("{s}#{}", desc_checksum(&s).unwrap()));
+        assert_eq!(format!("{d:#}"), s);
+        assert_eq!(
+            d.fingerprint(),
+            Some(Fingerprint::from_str("aabbccdd").unwrap())
+        );
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn serde_roundtrips_musig() {
+        let d = Descriptor::from_str(&musig_str()).unwrap();
+        let json = serde_json::to_string(&d).unwrap();
+        assert_eq!(json, serde_json::to_string(&d.to_string()).unwrap());
+        assert!(json.contains("musig("));
+        let parsed: Descriptor = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, d);
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_outside_tr_is_refused_by_descriptor() {
+        assert!(Descriptor::from_str(&format!("wsh(pk(musig({X1},{X2})/<0;1>/*))")).is_err());
+        assert_eq!(
+            Descriptor::from_str(&format!("pkh(musig({X1},{X2}))")),
+            Err(Error::MusigOutsideTr)
+        );
     }
 }

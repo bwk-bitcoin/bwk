@@ -94,6 +94,20 @@ offers for `DescriptorPublicKey`. `updater::update_input` and
 `updater::update_output` fill PSBT inputs and outputs from a derived wallet
 descriptor.
 
+## MuSig2 Descriptors
+
+Under the `musig` feature, `musig` parses and prints BIP-390 `musig()` key
+expressions. miniscript cannot split `musig(K1,...,Kn)`, so before parsing bwk
+rewrites each one into the token `musig|K1|...|Kn|` (`to_token_form`), and
+`MusigKey` prints and parses that token form, which is what
+`miniscript::Descriptor<MusigKey>` round-trips through. The standard BIP-390
+text, with a checksum computed over it, comes out of `Descriptor` (`Display`,
+serde) and `musig_descriptor_to_string`; `parse_musig_descriptor` reads it back
+and verifies the checksum. `musig()` is only accepted inside `tr()`, anything
+else is `Error::MusigOutsideTr`. `musig_tr` builds the key path descriptor
+`tr(musig(...)/<0;1>/*)` from cosigner xpubs. A descriptor without `musig()`
+prints exactly as without the feature.
+
 ## Silent Payment Keys
 
 `sp_key` encodes a silent payment key pair as one bech32m string, the form

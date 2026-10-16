@@ -198,6 +198,11 @@ mod tests {
         derivator::{Error, SpkDerivator},
         wallet::to_wallet,
     };
+    #[cfg(feature = "musig")]
+    use crate::{
+        musig::parse_musig_descriptor,
+        wallet::{WalletDescriptor, WalletDescriptorExt},
+    };
 
     const XPUB: &str = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
     const TPUB: &str = "tpubDDxT9mkZzWwkKwpGT5fY6iiM9muYTPkTx6Eig8dpHR7TChuGGCWYAHVmpW1ciido5RiFWwjzYsF1GZHkEHg2nrYp3zNtx3QQRkznyLhQ77x";
@@ -214,5 +219,32 @@ mod tests {
             SpkDerivator::new(to_wallet(d), Network::Regtest),
             Err(Error::WrongNetwork)
         ));
+    }
+
+    #[cfg(feature = "musig")]
+    const TPUB2: &str = "tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B";
+
+    #[cfg(feature = "musig")]
+    fn musig_tr(suffix: &str) -> WalletDescriptor {
+        parse_musig_descriptor(&format!("tr(musig({TPUB},{TPUB2}){suffix})")).unwrap()
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn spk_derivator_derives_musig_addresses() {
+        let d = musig_tr("/<0;1>/*");
+        let derivator = SpkDerivator::new(d.clone(), Network::Regtest).unwrap();
+        let singles = d.single_paths().unwrap();
+        let receive = derivator.receive_spk_at(0);
+        let change = derivator.change_spk_at(0);
+        assert_eq!(receive, singles[0].derive_at(0).unwrap().script_pubkey());
+        assert_eq!(change, singles[1].derive_at(0).unwrap().script_pubkey());
+        assert_ne!(receive, change);
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn spk_derivator_refuses_single_path_musig() {
+        assert!(SpkDerivator::new(musig_tr("/0/*"), Network::Regtest).is_err());
     }
 }
