@@ -24,6 +24,9 @@ extern "C" {
 #define BWK_QR_EXTENDED_KEY_LEN 78
 #define BWK_QR_FINGERPRINT_LEN 4
 #define BWK_QR_PUBLIC_KEY_LEN 33
+#define BWK_QR_MUSIG_PUB_NONCE_LEN 66
+#define BWK_QR_MUSIG_PARTIAL_SIG_LEN 32
+#define BWK_QR_TAP_LEAF_HASH_LEN 32
 #define BWK_QR_VENDOR_LEN 16
 #define BWK_QR_MODEL_LEN 16
 #define BWK_QR_ERROR_MESSAGE_LEN 32
@@ -71,7 +74,9 @@ enum bwk_qr_sign_response_kind {
 enum bwk_qr_signature_kind {
     BWK_QR_SIGNATURE_ECDSA = 0x01,
     BWK_QR_SIGNATURE_TAP_KEY = 0x02,
-    BWK_QR_SIGNATURE_TAP_SCRIPT = 0x03
+    BWK_QR_SIGNATURE_TAP_SCRIPT = 0x03,
+    BWK_QR_SIGNATURE_MUSIG_PUB_NONCE = 0x04,
+    BWK_QR_SIGNATURE_MUSIG_PARTIAL_SIG = 0x05
 };
 
 /* Open: a value outside this list is a newer flag and passes through unchanged. */
@@ -83,7 +88,7 @@ enum bwk_qr_release_flag {
 };
 
 /* Open: a value outside this list passes through as an unknown code, and must sit in
- * 0x0d..=0xfe to encode. */
+ * 0x0e..=0xfe to encode. */
 enum bwk_qr_response_error {
     BWK_QR_RESPONSE_ERROR_USER_DECLINED = 0x01,
     BWK_QR_RESPONSE_ERROR_UNSUPPORTED_VERSION = 0x02,
@@ -97,6 +102,7 @@ enum bwk_qr_response_error {
     BWK_QR_RESPONSE_ERROR_INVALID_PSBT = 0x0a,
     BWK_QR_RESPONSE_ERROR_INTERNAL = 0x0b,
     BWK_QR_RESPONSE_ERROR_PRIVATE_KEY_EXPORT_REFUSED = 0x0c,
+    BWK_QR_RESPONSE_ERROR_MUSIG_SESSION = 0x0d,
     BWK_QR_RESPONSE_ERROR_VENDOR = 0xff
 };
 
@@ -299,10 +305,28 @@ typedef struct {
     bwk_qr_bytes signature;
 } bwk_qr_tap_script;
 
+typedef struct {
+    uint8_t participant[BWK_QR_PUBLIC_KEY_LEN];
+    uint8_t aggregate[BWK_QR_PUBLIC_KEY_LEN];
+    uint8_t has_leaf_hash; /* 0 or 1 */
+    uint8_t leaf_hash[BWK_QR_TAP_LEAF_HASH_LEN];
+    uint8_t nonce[BWK_QR_MUSIG_PUB_NONCE_LEN];
+} bwk_qr_musig_pub_nonce;
+
+typedef struct {
+    uint8_t participant[BWK_QR_PUBLIC_KEY_LEN];
+    uint8_t aggregate[BWK_QR_PUBLIC_KEY_LEN];
+    uint8_t has_leaf_hash; /* 0 or 1 */
+    uint8_t leaf_hash[BWK_QR_TAP_LEAF_HASH_LEN];
+    uint8_t signature[BWK_QR_MUSIG_PARTIAL_SIG_LEN];
+} bwk_qr_musig_partial_sig;
+
 typedef union {
     bwk_qr_ecdsa ecdsa;
     bwk_qr_tap_key tap_key;
     bwk_qr_tap_script tap_script;
+    bwk_qr_musig_pub_nonce musig_pub_nonce;
+    bwk_qr_musig_partial_sig musig_partial_sig;
 } bwk_qr_signature_value;
 
 typedef struct {

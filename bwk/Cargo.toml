@@ -55,3 +55,5 @@ test = ["bwk-electrum/test", "bwk-utils/test", "bwk-sign/test", "bwk-tx/test", "
 # Installs env_logger through `log::Logger`. Off by default: a consumer with its
 # own logger would otherwise pull env_logger and its timestamp/colour stack.
 logger = ["dep:env_logger"]
+# MuSig2 wallets: `WalletKey` becomes `MusigKey` across the graph.
+musig = ["bwk-sign/musig", "bwk-descriptor/musig"]

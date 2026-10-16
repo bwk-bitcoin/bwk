@@ -1,0 +1,23 @@
+[package]
+name = "bwk-musig"
+version = "0.0.1"
+description = "MuSig2 (BIP-327) key aggregation, nonces and partial signatures"
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+keywords.workspace = true
+readme.workspace = true
+
+[dependencies]
+secp256k1-musig = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+
+[features]
+default = ["rust-bitcoin"]
+rust-bitcoin = ["dep:secp256k1-musig", "dep:thiserror"]
+
+[dev-dependencies]
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true

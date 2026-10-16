@@ -1,5 +1,7 @@
 //! Native BIP370 PSBTv2 support.
 
+#[cfg(feature = "musig")]
+pub mod musig;
 pub mod sp;
 
 use std::collections::{BTreeMap, BTreeSet};

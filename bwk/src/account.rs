@@ -52,6 +52,39 @@ pub enum Error {
     SignerNotReady,
     #[error("signing error: {0}")]
     Signing(#[from] manager::Error),
+    #[error("finalize failed: {0}")]
+    Finalize(String),
+    #[cfg(feature = "musig")]
+    #[error("musig: {0}")]
+    Musig(String),
+    #[cfg(feature = "musig")]
+    #[error("no such spend path")]
+    UnknownSpendPath,
+}
+
+/// How an input is spent: the key path or one tap leaf.
+#[cfg(feature = "musig")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SpendPath {
+    KeyPath,
+    Leaf(bitcoin::taproot::TapLeafHash),
+}
+
+/// One spend path of the account descriptor, as the leaf picker shows it.
+#[cfg(feature = "musig")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpendLeaf {
+    pub path: SpendPath,
+    /// Master fingerprints of the keys that sign it (the musig subset, or the one key).
+    pub signers: Vec<bitcoin::bip32::Fingerprint>,
+    /// `older()` blocks on the leaf.
+    pub relative: Option<u16>,
+    /// `after()` height on the leaf.
+    pub absolute: Option<u32>,
+    /// Every given coin's timelock on this path is met at the current tip.
+    pub spendable: bool,
+    /// Witness weight of one input spent this way, control block included.
+    pub satisfaction_wu: u64,
 }
 
 /// Well-known name of the hot manager an `Account` attaches at construction
@@ -1093,6 +1126,55 @@ impl<P: ScanProfile> Account<P> {
     }
 }
 
+// Spend paths, MuSig2 status and finalize
+#[allow(unused_variables)]
+impl<P: ScanProfile> Account<P> {
+    /// Every spend path of the descriptor, key path first then leaves in DFS order,
+    /// `spendable` evaluated for `outpoints` against the current tip.
+    #[cfg(feature = "musig")]
+    pub fn spend_leaves(&self, outpoints: &[bitcoin::OutPoint]) -> Result<Vec<SpendLeaf>, Error> {
+        todo!()
+    }
+
+    /// Keeps only `path` in every input: drops the other leaves' `tap_scripts`, their
+    /// leaf hashes in `tap_key_origins`, and the 0x1a entries of aggregates `path`
+    /// does not use. Called on the prepared PSBT before round 1.
+    #[cfg(feature = "musig")]
+    pub fn restrict_spend_path(
+        &self,
+        psbt: &mut bitcoin::Psbt,
+        path: SpendPath,
+    ) -> Result<(), Error> {
+        todo!()
+    }
+
+    /// The account's descriptor (standard text through Display).
+    pub fn descriptor(&self) -> Descriptor {
+        todo!()
+    }
+
+    /// Signing progress of `psbt` per cosigner, cosigners from the account descriptor.
+    #[cfg(feature = "musig")]
+    pub fn musig_status(
+        &self,
+        psbt: &bitcoin::Psbt,
+    ) -> Result<bwk_sign::musig::MusigStatus, Error> {
+        todo!()
+    }
+
+    /// Aggregates complete partial signatures; the count aggregated.
+    #[cfg(feature = "musig")]
+    pub fn aggregate_musig(&self, psbt: &mut bitcoin::Psbt) -> Result<usize, Error> {
+        todo!()
+    }
+
+    /// Aggregates musig partial signatures (under `musig`), then miniscript finalize,
+    /// then extracts.
+    pub fn finalize(&self, psbt: &mut bitcoin::Psbt) -> Result<bitcoin::Transaction, Error> {
+        todo!()
+    }
+}
+
 impl<P: ScanProfile> AccountHistory for Account<P> {
     fn tx_contributions(&self) -> BTreeMap<Txid, TxContribution> {
         self.scanner.tx_contributions()
@@ -1182,7 +1264,7 @@ impl<P: OpenScanFromBackend> Account<P> {
 mod tests {
     use super::*;
     use bip39::Mnemonic;
-    use bwk_descriptor::descriptor::ScriptType;
+    use bwk_descriptor::{descriptor::ScriptType, wallet::to_wallet};
     use bwk_persist::{config_store::FileConfigStore, storage::Store, PersistenceKind};
     use bwk_sign::{hot_signer::HotSigner, identity::SignerState};
     use miniscript::{
@@ -1232,7 +1314,7 @@ mod tests {
             Some(mnemonic.to_string()),
             "acct".to_string(),
             Network::Regtest,
-            ScriptType::Descriptor(Box::new(single_path)),
+            ScriptType::Descriptor(Box::new(to_wallet(single_path))),
             PathBuf::default(),
             ".bwk".to_string(),
             None,
@@ -1501,7 +1583,7 @@ mod tests {
         let signer =
             HotSigner::new_from_mnemonics(Network::Regtest, &mnemonic.to_string()).unwrap();
         let xpub = signer.xpub(&DerivationPath::from_str("m/84'/0'/0'/1").unwrap());
-        let descriptor = bwk_descriptor::descriptor::wpkh(xpub);
+        let descriptor = to_wallet(bwk_descriptor::descriptor::wpkh(xpub));
         let dir = TempDir::new().unwrap();
         let mut config = Config::new(
             None,

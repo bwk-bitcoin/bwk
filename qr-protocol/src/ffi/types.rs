@@ -4,7 +4,10 @@
 use core::{ffi::c_char, ptr};
 
 use crate::{
-    types::{EXTENDED_KEY_LEN, FINGERPRINT_LEN, PUBLIC_KEY_LEN},
+    types::{
+        EXTENDED_KEY_LEN, FINGERPRINT_LEN, MUSIG_PARTIAL_SIG_LEN, MUSIG_PUB_NONCE_LEN,
+        PUBLIC_KEY_LEN, TAP_LEAF_HASH_LEN,
+    },
     ERROR_MESSAGE_LEN, MODEL_LEN, REQUEST_ID_LEN, VENDOR_LEN,
 };
 
@@ -241,6 +244,8 @@ pub union SignatureValue {
     pub ecdsa: Ecdsa,
     pub tap_key: TapKey,
     pub tap_script: TapScript,
+    pub musig_pub_nonce: MusigPubNonce,
+    pub musig_partial_sig: MusigPartialSig,
 }
 
 #[repr(C)]
@@ -262,6 +267,27 @@ pub struct TapScript {
     pub xonly_public_key: [u8; 32],
     pub tap_leaf_hash: [u8; 32],
     pub signature: Bytes,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MusigPubNonce {
+    pub participant: [u8; PUBLIC_KEY_LEN],
+    pub aggregate: [u8; PUBLIC_KEY_LEN],
+    /// 0 or 1.
+    pub has_leaf_hash: u8,
+    pub leaf_hash: [u8; TAP_LEAF_HASH_LEN],
+    pub nonce: [u8; MUSIG_PUB_NONCE_LEN],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MusigPartialSig {
+    pub participant: [u8; PUBLIC_KEY_LEN],
+    pub aggregate: [u8; PUBLIC_KEY_LEN],
+    pub has_leaf_hash: u8,
+    pub leaf_hash: [u8; TAP_LEAF_HASH_LEN],
+    pub signature: [u8; MUSIG_PARTIAL_SIG_LEN],
 }
 
 #[repr(C)]

@@ -839,6 +839,7 @@ mod test {
         DUST_AMOUNT,
     };
     use bwk_coin::KeyChain;
+    use bwk_descriptor::wallet::WalletDescriptorExt;
     use miniscript::bitcoin;
 
     #[test]
@@ -861,12 +862,11 @@ mod test {
         // Create change recipient prototype for fee estimation
         let change_proto = crate::recipient::Recipient {
             address: descriptor
-                .clone()
-                .into_single_descriptors()
+                .single_paths()
                 .unwrap()
                 .get(1)
                 .unwrap()
-                .at_derivation_index(0)
+                .derive_at(0)
                 .unwrap()
                 .address(Network::Signet)
                 .unwrap()
@@ -893,12 +893,11 @@ mod test {
         // Test finalize with change
         let change_index = 1u32;
         let change_addr = descriptor
-            .clone()
-            .into_single_descriptors()
+            .single_paths()
             .unwrap()
             .get(1)
             .unwrap()
-            .at_derivation_index(change_index)
+            .derive_at(change_index)
             .unwrap()
             .address(Network::Signet)
             .unwrap();

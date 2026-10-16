@@ -27,6 +27,16 @@ pub enum Error {
     SpDescriptor,
     #[cfg(feature = "sp")]
     SpSigning,
+    #[cfg(feature = "musig")]
+    MusigSession,
+    #[cfg(feature = "musig")]
+    MusigNonces,
+    #[cfg(feature = "musig")]
+    MusigPartialSig(usize),
+    #[cfg(feature = "musig")]
+    Musig(bwk_musig::Error),
+    #[cfg(feature = "musig")]
+    MusigField,
 }
 
 impl Display for Error {
@@ -61,6 +71,18 @@ impl Display for Error {
             Error::SpDescriptor => write!(f, "silent payment descriptors are not signable yet"),
             #[cfg(feature = "sp")]
             Error::SpSigning => write!(f, "Failed to sign SP input"),
+            #[cfg(feature = "musig")]
+            Error::MusigSession => write!(f, "MuSig2 session missing or mismatch"),
+            #[cfg(feature = "musig")]
+            Error::MusigNonces => write!(f, "MuSig2 nonces missing from cosigners"),
+            #[cfg(feature = "musig")]
+            Error::MusigPartialSig(index) => {
+                write!(f, "invalid MuSig2 partial signature on input {index}")
+            }
+            #[cfg(feature = "musig")]
+            Error::Musig(e) => write!(f, "MuSig2 error: {e}"),
+            #[cfg(feature = "musig")]
+            Error::MusigField => write!(f, "invalid MuSig2 PSBT field"),
         }
     }
 }

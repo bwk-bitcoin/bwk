@@ -47,6 +47,8 @@ tests locally. Commit messages must be single-line and follow existing style
 | bwk-sp          | Silent Payments account orchestrator (BIP352, Blindbit)     |
 | bwk-tx          | Transaction building, coin selection, fee estimation, PSBT  |
 | bwk-psbt        | Native PSBTv2 (BIP370), silent-payment fields (BIP375/376)  |
+| bwk-musig       | MuSig2 (BIP-327) key aggregation, nonces, partial           |
+|                 | signatures; no_std backend trait                            |
 | bwk-electrum    | Electrum protocol client (TCP/SSL), ElectrumScanner, and    |
 |                 | the scan stores, the header chain and the reconcile pass    |
 | bwk-sign        | Signers and signing managers: hot, hardware, remote         |
@@ -158,6 +160,8 @@ attached signing manager under `Notification::Signer`). Call
 - `no-checkpoint`: lets a mainnet header store open without a checkpoint (its
   anchor then rests on proof of work alone); without it, opening one is an
   error.
+- `musig`: MuSig2 wallets: `WalletKey` becomes `MusigKey`, BIP-373 fields, hot
+  signer rounds; forwarded by bwk-keys, bwk-psbt, bwk-descriptor, bwk-sign.
 - `test`: see below.
 
 ## Testing

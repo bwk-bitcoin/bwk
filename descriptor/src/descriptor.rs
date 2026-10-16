@@ -9,7 +9,13 @@ use miniscript::{
     DescriptorPublicKey, ForEachKey,
 };
 
-use crate::{derivator::SpkDerivator, sp_descriptor::SpDescriptor};
+#[cfg(feature = "musig")]
+use crate::musig::MusigDescriptor;
+use crate::{
+    derivator::SpkDerivator,
+    sp_descriptor::SpDescriptor,
+    wallet::{to_wallet, WalletDescriptor, WalletDescriptorExt, WalletKey, WalletKeyExt},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
@@ -23,12 +29,15 @@ pub enum Error {
     NotSp,
     #[error("{0}")]
     Parse(String),
+    #[cfg(feature = "musig")]
+    #[error("musig() is only allowed inside tr()")]
+    MusigOutsideTr,
 }
 
 pub enum ScriptType {
     Segwit(ChildNumber /* account */),
     Taproot(ChildNumber /* account */),
-    Descriptor(Box<miniscript::Descriptor<DescriptorPublicKey>>),
+    Descriptor(Box<WalletDescriptor>),
 }
 
 impl ScriptType {
@@ -36,18 +45,18 @@ impl ScriptType {
         self,
         network: bitcoin::Network,
         xpub: X,
-    ) -> Result<miniscript::Descriptor<DescriptorPublicKey>, Error>
+    ) -> Result<WalletDescriptor, Error>
     where
         X: Fn(DerivationPath) -> OXpub,
     {
         match self {
             ScriptType::Segwit(acc) => {
                 let deriv = wpkh_path(network, acc)?;
-                Ok(wpkh(xpub(deriv)))
+                Ok(to_wallet(wpkh(xpub(deriv))))
             }
             ScriptType::Taproot(acc) => {
                 let deriv = tr_path(network, acc)?;
-                Ok(tr(xpub(deriv)))
+                Ok(to_wallet(tr(xpub(deriv))))
             }
             ScriptType::Descriptor(descriptor) => Ok(*descriptor),
         }
@@ -117,7 +126,7 @@ pub trait DescriptorDerivator {
     fn spk_derivator(&self, network: bitcoin::Network) -> Result<SpkDerivator, Self::Error>;
 }
 
-impl DescriptorDerivator for miniscript::Descriptor<DescriptorPublicKey> {
+impl DescriptorDerivator for WalletDescriptor {
     type Error = crate::derivator::Error;
     fn spk_derivator(
         &self,
@@ -132,16 +141,17 @@ impl DescriptorDerivator for miniscript::Descriptor<DescriptorPublicKey> {
 ///
 /// This type shares its short name with `miniscript::Descriptor`. The convention
 /// used across the workspace is to import this one as `Descriptor` via
-/// `use bwk_descriptor::descriptor::Descriptor;`, and to write the miniscript one
-/// out in full as `miniscript::Descriptor<DescriptorPublicKey>`.
+/// `use bwk_descriptor::descriptor::Descriptor;`. The wallet descriptor is
+/// `bwk_descriptor::wallet::WalletDescriptor`; the raw miniscript one stays
+/// `miniscript::Descriptor<DescriptorPublicKey>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Descriptor {
-    Miniscript(Box<miniscript::Descriptor<DescriptorPublicKey>>),
+    Miniscript(Box<WalletDescriptor>),
     Sp(Box<SpDescriptor>),
 }
 
 impl Descriptor {
-    pub fn as_miniscript(&self) -> Option<&miniscript::Descriptor<DescriptorPublicKey>> {
+    pub fn as_miniscript(&self) -> Option<&WalletDescriptor> {
         match self {
             Descriptor::Miniscript(d) => Some(d),
             Descriptor::Sp(_) => None,
@@ -159,7 +169,7 @@ impl Descriptor {
         matches!(self, Descriptor::Sp(_))
     }
 
-    pub fn into_miniscript(self) -> Result<miniscript::Descriptor<DescriptorPublicKey>, Error> {
+    pub fn into_miniscript(self) -> Result<WalletDescriptor, Error> {
         match self {
             Descriptor::Miniscript(d) => Ok(*d),
             Descriptor::Sp(_) => Err(Error::NotMiniscript),
@@ -170,28 +180,35 @@ impl Descriptor {
         format!("{self:#}")
     }
 
+    /// Walks `WalletKeyExt::plain_keys`.
     pub fn fingerprint(&self) -> Option<bip32::Fingerprint> {
         match self {
             Descriptor::Sp(d) => d.fingerprint(),
             Descriptor::Miniscript(d) => {
                 let mut fingerprint = None;
                 d.for_any_key(|key| {
-                    let origin = match key {
-                        DescriptorPublicKey::Single(k) => k.origin.as_ref(),
-                        DescriptorPublicKey::XPub(k) => k.origin.as_ref(),
-                        DescriptorPublicKey::MultiXPub(k) => k.origin.as_ref(),
-                    };
-                    match origin {
-                        Some((fg, _)) => {
-                            fingerprint = Some(*fg);
-                            true
+                    WalletKeyExt::plain_keys(key).iter().any(|key| {
+                        let origin = match key {
+                            DescriptorPublicKey::Single(k) => k.origin.as_ref(),
+                            DescriptorPublicKey::XPub(k) => k.origin.as_ref(),
+                            DescriptorPublicKey::MultiXPub(k) => k.origin.as_ref(),
+                        };
+                        match origin {
+                            Some((fg, _)) => {
+                                fingerprint = Some(*fg);
+                                true
+                            }
+                            None => false,
                         }
-                        None => false,
-                    }
+                    })
                 });
                 fingerprint
             }
         }
+    }
+
+    pub fn is_musig(&self) -> bool {
+        self.as_miniscript().is_some_and(|d| d.has_musig())
     }
 }
 
@@ -204,7 +221,7 @@ impl FromStr for Descriptor {
                 .map(|d| Descriptor::Sp(Box::new(d)))
                 .map_err(|e| Error::Parse(e.to_string()))
         } else {
-            miniscript::Descriptor::<DescriptorPublicKey>::from_str(s)
+            miniscript::Descriptor::<WalletKey>::from_str(s)
                 .map(|d| Descriptor::Miniscript(Box::new(d)))
                 .map_err(|e| Error::Parse(e.to_string()))
         }
@@ -259,6 +276,13 @@ impl<'de> serde::Deserialize<'de> for Descriptor {
 
 impl From<miniscript::Descriptor<DescriptorPublicKey>> for Descriptor {
     fn from(d: miniscript::Descriptor<DescriptorPublicKey>) -> Self {
+        Descriptor::Miniscript(Box::new(to_wallet(d)))
+    }
+}
+
+#[cfg(feature = "musig")]
+impl From<MusigDescriptor> for Descriptor {
+    fn from(d: MusigDescriptor) -> Self {
         Descriptor::Miniscript(Box::new(d))
     }
 }
@@ -284,7 +308,10 @@ mod tests {
         DescriptorPublicKey,
     };
 
-    use crate::descriptor::{tr_path, wpkh_path, Descriptor, Error, ScriptType};
+    use crate::{
+        descriptor::{tr_path, wpkh_path, Descriptor, Error, ScriptType},
+        wallet::to_wallet,
+    };
 
     const XPUB: &str = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
 
@@ -320,7 +347,9 @@ mod tests {
         let given = format!("pkh([00000000/44'/0'/0']{XPUB}/<0;1>/*)");
         let descriptor = miniscript::Descriptor::<DescriptorPublicKey>::from_str(&given).unwrap();
         assert_eq!(
-            descriptor_for(ScriptType::Descriptor(Box::new(descriptor.clone()))),
+            descriptor_for(ScriptType::Descriptor(Box::new(to_wallet(
+                descriptor.clone()
+            )))),
             descriptor.to_string()
         );
     }
@@ -419,7 +448,7 @@ mod tests {
     fn serde_is_a_bare_string() {
         let s = miniscript_str(Some("9d69155f"));
         let inner = miniscript::Descriptor::<DescriptorPublicKey>::from_str(&s).unwrap();
-        let d = Descriptor::Miniscript(Box::new(inner.clone()));
+        let d = Descriptor::Miniscript(Box::new(to_wallet(inner.clone())));
         assert_eq!(
             serde_json::to_string(&d).unwrap(),
             serde_json::to_string(&inner).unwrap()

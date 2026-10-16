@@ -2,6 +2,8 @@ use std::{collections::BTreeSet, str::FromStr};
 
 use crossbeam::channel;
 
+#[cfg(feature = "musig")]
+use crate::musig::MusigSessionStore;
 use crate::{
     error::Error,
     send,
@@ -10,6 +12,7 @@ use crate::{
 use bwk_descriptor::{
     derivator::SpkDerivator,
     descriptor::{tr, tr_path, wpkh, wpkh_path, Descriptor},
+    wallet::{WalletDescriptor, WalletDescriptorExt},
 };
 use bwk_keys::{
     derivator::KeyDerivator,
@@ -32,7 +35,7 @@ use {
             secp256k1::{self, All, Message},
             sighash, EcdsaSighashType, NetworkKind, Psbt,
         },
-        DescriptorPublicKey, ForEachKey,
+        DescriptorPublicKey,
     },
 };
 
@@ -61,7 +64,7 @@ impl Signer for HotSigner {
             send!(self, Error(Error::SpDescriptor));
             return;
         };
-        let wrong_network = inner.for_any_key(|k| match k {
+        let wrong_network = inner.plain_keys().iter().any(|k| match k {
             DescriptorPublicKey::Single(_) => true,
             DescriptorPublicKey::XPub(key) => match (self.network, key.xkey.network) {
                 (bitcoin::Network::Bitcoin, NetworkKind::Main) => false,
@@ -114,6 +117,8 @@ pub struct HotSigner {
     descriptors: BTreeSet<Descriptor>,
     network: bitcoin::Network,
     sender: Option<channel::Sender<SignerNotif>>,
+    #[cfg(feature = "musig")]
+    musig_sessions: MusigSessionStore,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +165,8 @@ impl HotSigner {
             descriptors: BTreeSet::new(),
             network,
             sender: None,
+            #[cfg(feature = "musig")]
+            musig_sessions: MusigSessionStore::new(),
         }
     }
 
@@ -179,6 +186,8 @@ impl HotSigner {
             descriptors: BTreeSet::new(),
             network,
             sender: None,
+            #[cfg(feature = "musig")]
+            musig_sessions: MusigSessionStore::new(),
         })
     }
 
@@ -254,7 +263,20 @@ impl HotSigner {
             descriptors: BTreeSet::new(),
             network,
             sender: None,
+            #[cfg(feature = "musig")]
+            musig_sessions: MusigSessionStore::new(),
         })
+    }
+
+    /// Shares `sessions` with this signer, so a signer rebuilt per call keeps them.
+    #[cfg(feature = "musig")]
+    pub fn set_musig_sessions(&mut self, sessions: MusigSessionStore) {
+        self.musig_sessions = sessions;
+    }
+
+    #[cfg(feature = "musig")]
+    pub fn musig_sessions(&self) -> MusigSessionStore {
+        self.musig_sessions.clone()
     }
 
     /// Registers a descriptor for the signer.
@@ -338,11 +360,7 @@ impl HotSigner {
         }
     }
 
-    pub fn sign_v2(
-        &self,
-        psbt: &mut PsbtV2,
-        descriptor: &miniscript::Descriptor<DescriptorPublicKey>,
-    ) -> Result<(), Error> {
+    pub fn sign_v2(&self, psbt: &mut PsbtV2, descriptor: &WalletDescriptor) -> Result<(), Error> {
         let mut v0 = validated_v0(psbt)?;
         self.inner_sign(&mut v0, descriptor)?;
         set_v0_maps(psbt, v0);
@@ -366,11 +384,7 @@ impl HotSigner {
         Ok(tx)
     }
 
-    pub fn inner_sign(
-        &self,
-        psbt: &mut Psbt,
-        descriptor: &miniscript::Descriptor<DescriptorPublicKey>,
-    ) -> Result<(), Error> {
+    pub fn inner_sign(&self, psbt: &mut Psbt, descriptor: &WalletDescriptor) -> Result<(), Error> {
         let mut cache = sighash::SighashCache::new(psbt.unsigned_tx.clone());
         let derivator = SpkDerivator::new(descriptor.clone(), self.network).unwrap();
         let mut signed_any = false;
@@ -976,6 +990,7 @@ mod tests {
         derivator::SpkDerivator,
         descriptor::{tr, wpkh},
         sp_descriptor::SpDescriptor,
+        wallet::to_wallet,
     };
     use bwk_utils::test::{random_output, setup_logger, txid};
     use crossbeam::channel;
@@ -1060,7 +1075,7 @@ mod tests {
                 .unwrap();
         let signer = HotSigner::new_from_xpriv(network, xpriv);
         let xpub = signer.xpub(&DerivationPath::from_str("m/84'/0'/0'/1'").unwrap());
-        let descriptor = wpkh(xpub);
+        let descriptor = to_wallet(wpkh(xpub));
 
         let txin = TxIn {
             previous_output: bitcoin::OutPoint {
@@ -1152,7 +1167,7 @@ mod tests {
         let network = Network::Regtest;
         let signer = new_signer(network);
         let derivation_path = DerivationPath::from_str("m/84'/0'/0'/0").unwrap();
-        let descriptor = wpkh(signer.xpub(&derivation_path));
+        let descriptor = to_wallet(wpkh(signer.xpub(&derivation_path)));
         let derivator = SpkDerivator::new(descriptor.clone(), network).unwrap();
         let mut psbt = base_psbt();
         let deriv = (false, 0);
@@ -1189,7 +1204,7 @@ mod tests {
         let network = Network::Regtest;
         let signer = new_signer(network);
         let account_path = DerivationPath::from_str("m/84'/0'/0'/0").unwrap();
-        let descriptor = wpkh(signer.xpub(&account_path));
+        let descriptor = to_wallet(wpkh(signer.xpub(&account_path)));
         let derivator = SpkDerivator::new(descriptor.clone(), network).unwrap();
         let derivation_path = deriv_path(&(false, 0)).unwrap();
         let secp = secp256k1::Secp256k1::new();
@@ -1235,7 +1250,7 @@ mod tests {
         let signer = new_signer(network);
         let foreign = new_signer(network);
         let account_path = DerivationPath::from_str("m/86'/0'/0'/0").unwrap();
-        let descriptor = tr(signer.xpub(&account_path));
+        let descriptor = to_wallet(tr(signer.xpub(&account_path)));
         let derivator = SpkDerivator::new(descriptor.clone(), network).unwrap();
         let deriv = deriv_path(&(false, 0)).unwrap();
         let internal_key = signer.public_key_at(&deriv).x_only_public_key().0;
@@ -1266,7 +1281,7 @@ mod tests {
         let network = Network::Regtest;
         let signer = new_signer(network);
         let account_path = DerivationPath::from_str("m/86'/0'/0'/0").unwrap();
-        let descriptor = tr(signer.xpub(&account_path));
+        let descriptor = to_wallet(tr(signer.xpub(&account_path)));
         let derivator = SpkDerivator::new(descriptor.clone(), network).unwrap();
         let deriv = deriv_path(&(false, 0)).unwrap();
         let pubkey = signer.public_key_at(&deriv);
@@ -1437,7 +1452,7 @@ mod tests {
             .unwrap(),
         );
         let derivation_path = DerivationPath::from_str("m/84'/0'/0'/0").unwrap();
-        let descriptor = wpkh(signer.xpub(&derivation_path));
+        let descriptor = to_wallet(wpkh(signer.xpub(&derivation_path)));
 
         signer.init(sender);
         let notif = mock.receiver.recv().unwrap();
@@ -1543,7 +1558,7 @@ mod tests {
         let signer = new_signer(network);
         let other_signer = new_signer(network);
         let xpub = signer.xpub(&DerivationPath::from_str("m/84'/0'/0'/1'").unwrap());
-        let descriptor = wpkh(xpub);
+        let descriptor = to_wallet(wpkh(xpub));
 
         let mut psbt = base_psbt();
         let deriv = &(false, 0);
@@ -1572,7 +1587,7 @@ mod tests {
         let signer = new_signer(network);
         let other_signer = new_signer(network);
         let xpub = signer.xpub(&DerivationPath::from_str("m/86'/0'/0'/1'").unwrap());
-        let descriptor = tr(xpub);
+        let descriptor = to_wallet(tr(xpub));
 
         let mut psbt = base_psbt();
         let deriv = &(false, 0);
@@ -1605,7 +1620,7 @@ mod tests {
         let signer = new_signer(network);
         let other_signer = new_signer(network);
         let xpub = signer.xpub(&DerivationPath::from_str("m/86'/0'/0'/1'").unwrap());
-        let descriptor = tr(xpub);
+        let descriptor = to_wallet(tr(xpub));
 
         let mut psbt = base_psbt();
         let deriv = &(false, 0);
@@ -1636,7 +1651,7 @@ mod tests {
         let network = Network::Testnet;
         let signer = new_signer(network);
         let xpub = signer.xpub(&DerivationPath::from_str("m/84'/0'/0'/1'").unwrap());
-        let descriptor = wpkh(xpub);
+        let descriptor = to_wallet(wpkh(xpub));
 
         let mut psbt = base_psbt();
         let deriv_p = deriv_path(&(false, 0)).unwrap();
@@ -1666,7 +1681,7 @@ mod tests {
         let signer = new_signer(network);
         let other_signer = new_signer(network);
         let xpub = signer.xpub(&DerivationPath::from_str("m/86'/0'/0'/1'").unwrap());
-        let descriptor = tr(xpub);
+        let descriptor = to_wallet(tr(xpub));
 
         let mut psbt = base_psbt();
         let deriv = &(false, 0);

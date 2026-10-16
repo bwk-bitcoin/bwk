@@ -23,6 +23,7 @@ use {
     bwk_descriptor::{
         derivator::SpkDerivator,
         descriptor::{tr_path, wpkh_path},
+        wallet::{to_wallet, WalletDescriptorExt},
     },
     bwk_sign::{hot_signer::HotSigner, signer::Signer},
     bwk_utils::test::{
@@ -550,17 +551,14 @@ pub mod test {
     pub fn builder_from_derivator(derivator: SpkDerivator) -> TxBuilder {
         let descriptor = derivator.descriptor();
         let network = {
-            use miniscript::ForEachKey;
             let is_mainnet = descriptor
-                .clone()
-                .into_single_descriptors()
+                .single_paths()
                 .expect("multipath")
                 .get(1)
                 .expect("multipath")
-                .for_any_key(|k| match k {
-                    DescriptorPublicKey::XPub(k) => k.xkey.network.is_mainnet(),
-                    _ => false,
-                });
+                .plain_keys()
+                .iter()
+                .any(|k| matches!(k, DescriptorPublicKey::XPub(x) if x.xkey.network.is_mainnet()));
             if is_mainnet {
                 Network::Bitcoin
             } else {
@@ -568,12 +566,11 @@ pub mod test {
             }
         };
         let address = descriptor
-            .clone()
-            .into_single_descriptors()
+            .single_paths()
             .expect("multipath")
             .get(1)
             .expect("multipath")
-            .at_derivation_index(0)
+            .derive_at(0)
             .expect("derivation")
             .address(network)
             .expect("address");
@@ -648,7 +645,7 @@ pub mod test {
         );
         let desccriptor =
             Descriptor::<DescriptorPublicKey>::from_str(&descr_str).expect("hardcoded descriptor");
-        let derivator = SpkDerivator::new(desccriptor, nw).unwrap();
+        let derivator = SpkDerivator::new(to_wallet(desccriptor), nw).unwrap();
         signer.register_descriptor(derivator.descriptor().into());
         (signer, derivator)
     }

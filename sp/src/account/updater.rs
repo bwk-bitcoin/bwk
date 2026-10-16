@@ -59,6 +59,7 @@ mod tests {
         transaction, Amount, OutPoint, ScriptBuf, Sequence, TxOut, Txid,
     };
     use bwk_coin::{Coin, CoinSpendInfo, CoinStatus, KeyChain};
+    use bwk_sign::bwk_descriptor::wallet::to_wallet;
     use bwk_tx::{error::Error, recipient::SpUpdater};
     use miniscript::{Descriptor, DescriptorPublicKey};
 
@@ -96,8 +97,9 @@ mod tests {
         let secp = Secp256k1::new();
         let xpriv = Xpriv::new_master(bitcoin::Network::Regtest, &[7u8; 32]).unwrap();
         let xpub = Xpub::from_priv(&secp, &xpriv);
-        let descriptor =
-            Descriptor::<DescriptorPublicKey>::from_str(&format!("wpkh({xpub}/<0;1>/*)")).unwrap();
+        let descriptor = to_wallet(
+            Descriptor::<DescriptorPublicKey>::from_str(&format!("wpkh({xpub}/<0;1>/*)")).unwrap(),
+        );
         Coin {
             txout: TxOut {
                 value: Amount::from_sat(10_000),

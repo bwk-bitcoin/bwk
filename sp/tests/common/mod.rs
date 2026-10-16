@@ -32,7 +32,11 @@ use bwk_utils::{
 use crossbeam::channel;
 
 use bwk_sign::{
-    bwk_descriptor::{descriptor::Descriptor, sp_descriptor::SpDescriptor},
+    bwk_descriptor::{
+        descriptor::Descriptor,
+        sp_descriptor::SpDescriptor,
+        wallet::{WalletDescriptor, WalletDescriptorExt},
+    },
     hot_signer::HotSigner,
     identity::{SignerId, SignerInfo},
     manager::{self, SigningManager},
@@ -726,7 +730,6 @@ use bwk::bwk_electrum::{
     scanner::ElectrumScanner,
 };
 use bwk_coin::{derive_descriptor, Coin, CoinSpendInfo, CoinStatus, KeyChain};
-use miniscript::DescriptorPublicKey;
 
 /// Mnemonic for BIP32 coins (different from SP mnemonics).
 #[allow(dead_code)]
@@ -751,7 +754,7 @@ pub fn bip32_key(path: &str) -> String {
 pub fn add_offline_sub_account(
     account: &mut bwk_sp::account::Account,
     name: &str,
-    descriptor: miniscript::Descriptor<DescriptorPublicKey>,
+    descriptor: WalletDescriptor,
 ) {
     let mut config = ScannerConfig::new(
         descriptor.into(),
@@ -1054,11 +1057,7 @@ impl TestEnv {
     ///
     /// Register the descriptor via `add_offline_sub_account()` so
     /// `sign_and_finalize()` can sign it.
-    pub fn create_descriptor_coin(
-        &mut self,
-        descriptor: miniscript::Descriptor<DescriptorPublicKey>,
-        btc: f64,
-    ) -> Coin {
+    pub fn create_descriptor_coin(&mut self, descriptor: WalletDescriptor, btc: f64) -> Coin {
         let addr = derive_descriptor(&descriptor, KeyChain::Receive, 0)
             .unwrap()
             .address(bitcoin::Network::Regtest)
@@ -1075,8 +1074,7 @@ impl TestEnv {
         let height = bwk_utils::test::get_tx_height(&mut self.bitcoind.client, txid);
 
         let satisfaction = descriptor
-            .clone()
-            .into_single_descriptors()
+            .single_paths()
             .unwrap()
             .first()
             .unwrap()

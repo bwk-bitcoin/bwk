@@ -6,6 +6,8 @@ pub mod hwi;
 pub mod hwi_manager;
 pub mod identity;
 pub mod manager;
+#[cfg(feature = "musig")]
+pub mod musig;
 pub mod protocol;
 pub mod remote_manager;
 pub mod signer;
@@ -17,6 +19,8 @@ pub use bwk_descriptor;
 #[cfg(all(feature = "hwi", not(target_os = "android")))]
 pub use bwk_hwi;
 pub use bwk_keys;
+#[cfg(feature = "musig")]
+pub use bwk_musig;
 pub use crossbeam;
 pub use miniscript;
 pub use serde;

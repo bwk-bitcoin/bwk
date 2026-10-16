@@ -221,6 +221,8 @@ fn write_signature(out: &mut Vec<u8>, entry: &response::SignatureEntry) -> Resul
         response::SignatureEntry::Ecdsa { .. } => write_ecdsa_signature(out, entry),
         response::SignatureEntry::TapKey { .. } => write_tap_key_signature(out, entry),
         response::SignatureEntry::TapScript { .. } => write_tap_script_signature(out, entry),
+        response::SignatureEntry::MusigPubNonce { .. } => write_musig_pub_nonce(out, entry),
+        response::SignatureEntry::MusigPartialSig { .. } => write_musig_partial_sig(out, entry),
     }
 }
 
@@ -270,6 +272,19 @@ fn write_tap_script_signature(
     out.extend_from_slice(xonly_public_key);
     out.extend_from_slice(tap_leaf_hash);
     write_bytes(out, signature)
+}
+
+#[allow(unused_variables, clippy::ptr_arg)]
+fn write_musig_pub_nonce(out: &mut Vec<u8>, entry: &response::SignatureEntry) -> Result<(), Error> {
+    todo!()
+}
+
+#[allow(unused_variables, clippy::ptr_arg)]
+fn write_musig_partial_sig(
+    out: &mut Vec<u8>,
+    entry: &response::SignatureEntry,
+) -> Result<(), Error> {
+    todo!()
 }
 
 fn write_signature_header(out: &mut Vec<u8>, input_index: u32, kind: u8) {

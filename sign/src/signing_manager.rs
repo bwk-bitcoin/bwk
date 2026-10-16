@@ -5,14 +5,11 @@ use std::{
 
 use crossbeam::channel;
 
-use bwk_descriptor::descriptor::Descriptor;
+use bwk_descriptor::{descriptor::Descriptor, wallet::WalletDescriptor};
 
-use miniscript::{
-    bitcoin::{
-        self,
-        bip32::{self, DerivationPath},
-    },
-    DescriptorPublicKey,
+use miniscript::bitcoin::{
+    self,
+    bip32::{self, DerivationPath},
 };
 
 use crate::{
@@ -64,11 +61,7 @@ impl ParsedPsbt {
         }
     }
 
-    fn sign(
-        self,
-        hot: &HotSigner,
-        descriptor: &miniscript::Descriptor<DescriptorPublicKey>,
-    ) -> Result<Vec<u8>, error::Error> {
+    fn sign(self, hot: &HotSigner, descriptor: &WalletDescriptor) -> Result<Vec<u8>, error::Error> {
         match self {
             Self::V0(mut psbt) => {
                 hot.inner_sign(&mut psbt, descriptor)?;

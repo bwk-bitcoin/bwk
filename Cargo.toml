@@ -15,6 +15,7 @@ members = [
     "p2p",
     "mitm",
     "psbt",
+    "musig",
     "hwi", "hwi/cli",
     "secp256k1_spscan-sys",
 ]
@@ -70,6 +71,10 @@ secp256k1 = { version = "0.29.1", features = ["rand", "global-context"] }
 bitcoin_hashes = "0.13.0"
 bech32 = "0.9"
 ureq = { version = "3.3", default-features = false }
+# rust-secp256k1 with the musig module, as bark/ark-lib uses it; bitcoin 0.32 stays on
+# secp256k1 0.29, conversions go through bytes. Phase 1 adjusts the feature names to
+# what 0.33 publishes.
+secp256k1-musig = { package = "secp256k1", version = "0.33", default-features = false, features = ["std", "global-context"] }
 
 # bwk crates
 bwk-electrum = { path = "electrum" }
@@ -85,6 +90,7 @@ bwk-p2p = { path = "p2p" }
 bwk-qr = { path = "qr" }
 bwk-qr-protocol = { path = "qr-protocol" }
 bwk-psbt = { path = "psbt" }
+bwk-musig = { path = "musig", default-features = false }
 bwk = { path = "bwk" }
 # bwk-error is the in-house derive. Aliasing the package as `thiserror` is deliberate,
 # not an oversight: error definitions across the tree keep reading `thiserror::Error`,

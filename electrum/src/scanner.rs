@@ -25,12 +25,9 @@ use std::{
 };
 
 use bwk_coin::{Coin, KeyChain};
-use bwk_descriptor::derivator::SpkDerivator;
+use bwk_descriptor::{derivator::SpkDerivator, wallet::WalletDescriptor};
 use bwk_persist::{backend::PersistenceBackend, storage::Store};
-use miniscript::{
-    bitcoin::{self, OutPoint, Txid},
-    Descriptor, DescriptorPublicKey,
-};
+use miniscript::bitcoin::{self, OutPoint, Txid};
 
 use crate::{
     address_store::{AddressEntry, AddressStatus, AddressTip},
@@ -251,7 +248,7 @@ impl<P: ScanProfile> ElectrumScanner<P> {
         self.config.account.clone()
     }
 
-    pub fn descriptor(&self) -> Descriptor<DescriptorPublicKey> {
+    pub fn descriptor(&self) -> WalletDescriptor {
         self.config
             .miniscript_descriptor()
             .cloned()

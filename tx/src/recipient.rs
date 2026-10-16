@@ -3,12 +3,12 @@ use miniscript::{
         self, absolute, address::NetworkUnchecked, secp256k1::PublicKey, Address, Network,
         ScriptBuf, TxOut, Weight,
     },
-    psbt::PsbtExt,
-    Descriptor, DescriptorPublicKey,
+    DescriptorPublicKey,
 };
 use serde::{Deserialize, Serialize};
 
 use bwk_coin::{derive_descriptor, ChangeTip, Coin, KeyChain};
+use bwk_descriptor::wallet::{WalletDescriptor, WalletDescriptorExt};
 
 use crate::{error::Error, transaction::Amount};
 
@@ -96,7 +96,7 @@ pub enum PsbtOutputInfo {
     /// Descriptor-based wallets (BIP32 derivation paths)
     Bip32 {
         origin: (KeyChain, u32),
-        descriptor: Descriptor<DescriptorPublicKey>,
+        descriptor: WalletDescriptor,
     },
     /// Silent Payment outputs (BIP375)
     /// Contains PSBT_OUT_SP_V0_INFO (scan + spend pubkeys) and optional PSBT_OUT_SP_V0_LABEL
@@ -115,7 +115,7 @@ pub struct Recipient {
     pub amount: Amount,
     pub label: Option<String>,
     pub origin: Option<(KeyChain, u32 /* index */)>,
-    pub descriptor: Option<Descriptor<DescriptorPublicKey>>,
+    pub descriptor: Option<WalletDescriptor>,
 }
 
 impl From<&Recipient> for TxOut {
@@ -179,7 +179,7 @@ impl Recipient {
             outputs: vec![bitcoin::psbt::Output::default()],
         };
 
-        PsbtExt::update_output_with_descriptor(&mut dummy_psbt, 0, &descr)
+        bwk_descriptor::updater::update_output(&mut dummy_psbt, 0, &descr)
             .map_err(|_| Error::Update)?;
 
         Ok(dummy_psbt.outputs[0].clone())
@@ -227,18 +227,14 @@ impl RecipientProvider for Recipient {
     }
 
     fn network(&self) -> Network {
-        use miniscript::ForEachKey;
-
         if let Some(descriptor) = &self.descriptor {
             let is_mainnet = descriptor
-                .clone()
-                .into_single_descriptors()
+                .single_paths()
                 .ok()
                 .and_then(|d| d.first().cloned())
                 .map(|d| {
-                    d.for_any_key(|k| match k {
-                        DescriptorPublicKey::XPub(k) => k.xkey.network.is_mainnet(),
-                        _ => false,
+                    d.plain_keys().iter().any(|k| {
+                        matches!(k, DescriptorPublicKey::XPub(x) if x.xkey.network.is_mainnet())
                     })
                 })
                 .unwrap_or(false);
@@ -275,14 +271,14 @@ impl ChangeTip for LocalTipUpdater {
 /// The type parameter is erased when boxed into `Box<dyn RecipientProvider>`.
 pub struct ChangeRecipientProvider<T: ChangeTip> {
     tip_updater: T,
-    descriptor: Descriptor<DescriptorPublicKey>,
+    descriptor: WalletDescriptor,
     network: Network,
     amount: Amount,
     current_index: Option<u32>,
 }
 
 impl ChangeRecipientProvider<LocalTipUpdater> {
-    pub fn new(descriptor: Descriptor<DescriptorPublicKey>, network: Network) -> Self {
+    pub fn new(descriptor: WalletDescriptor, network: Network) -> Self {
         Self {
             tip_updater: LocalTipUpdater::new(0),
             descriptor,
@@ -301,7 +297,7 @@ impl ChangeRecipientProvider<LocalTipUpdater> {
 impl<T: ChangeTip> ChangeRecipientProvider<T> {
     pub fn new_with_updater(
         tip_updater: T,
-        descriptor: Descriptor<DescriptorPublicKey>,
+        descriptor: WalletDescriptor,
         network: Network,
     ) -> Self {
         Self {
@@ -330,12 +326,11 @@ impl<T: ChangeTip + Clone + 'static> RecipientProvider for ChangeRecipientProvid
     fn output_weight(&self) -> Weight {
         let script = self
             .descriptor
-            .clone()
-            .into_single_descriptors()
+            .single_paths()
             .expect("multipath")
             .get(1)
             .expect("change descriptor")
-            .at_derivation_index(0)
+            .derive_at(0)
             .expect("derivation")
             .address(self.network)
             .expect("address")
@@ -352,12 +347,11 @@ impl<T: ChangeTip + Clone + 'static> RecipientProvider for ChangeRecipientProvid
         self.current_index = Some(index);
 
         self.descriptor
-            .clone()
-            .into_single_descriptors()
+            .single_paths()
             .expect("multipath")
             .get(1)
             .expect("change descriptor")
-            .at_derivation_index(index)
+            .derive_at(index)
             .expect("derivation")
             .address(self.network)
             .expect("address")

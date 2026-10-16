@@ -15,4 +15,9 @@ doctest = false
 [dependencies]
 bip39.workspace = true
 bitcoin.workspace = true
+bwk-musig = { workspace = true, optional = true, features = ["rust-bitcoin"] }
+miniscript = { workspace = true, optional = true }
 thiserror.workspace = true
+
+[features]
+musig = ["dep:miniscript", "dep:bwk-musig"]

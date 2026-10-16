@@ -1,7 +1,7 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::{
-    types::{ExtendedKey, Fingerprint, PublicKey},
+    types::{ExtendedKey, Fingerprint, PublicKey, MUSIG_PARTIAL_SIG_LEN, MUSIG_PUB_NONCE_LEN},
     MessageType,
 };
 
@@ -129,6 +129,20 @@ pub enum SignatureEntry {
         tap_leaf_hash: [u8; 32],
         signature: Vec<u8>,
     },
+    MusigPubNonce {
+        input_index: u32,
+        participant: PublicKey,
+        aggregate: PublicKey,
+        leaf_hash: Option<[u8; 32]>,
+        nonce: [u8; MUSIG_PUB_NONCE_LEN],
+    },
+    MusigPartialSig {
+        input_index: u32,
+        participant: PublicKey,
+        aggregate: PublicKey,
+        leaf_hash: Option<[u8; 32]>,
+        signature: [u8; MUSIG_PARTIAL_SIG_LEN],
+    },
 }
 
 impl SignatureEntry {
@@ -137,6 +151,8 @@ impl SignatureEntry {
             Self::Ecdsa { .. } => SIGNATURE_ECDSA,
             Self::TapKey { .. } => SIGNATURE_TAP_KEY,
             Self::TapScript { .. } => SIGNATURE_TAP_SCRIPT,
+            Self::MusigPubNonce { .. } => SIGNATURE_MUSIG_PUB_NONCE,
+            Self::MusigPartialSig { .. } => SIGNATURE_MUSIG_PARTIAL_SIG,
         }
     }
 }
@@ -144,6 +160,8 @@ impl SignatureEntry {
 pub const SIGNATURE_ECDSA: u8 = 0x01;
 pub const SIGNATURE_TAP_KEY: u8 = 0x02;
 pub const SIGNATURE_TAP_SCRIPT: u8 = 0x03;
+pub const SIGNATURE_MUSIG_PUB_NONCE: u8 = 0x04;
+pub const SIGNATURE_MUSIG_PARTIAL_SIG: u8 = 0x05;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorBody {
@@ -166,6 +184,7 @@ pub enum Error {
     InvalidPsbt,
     InternalError,
     PrivateKeyExportRefused,
+    MusigSession,
     Vendor,
     Unknown(u8),
 }
@@ -191,6 +210,7 @@ impl From<Error> for u8 {
             Error::InvalidPsbt => 0x0a,
             Error::InternalError => 0x0b,
             Error::PrivateKeyExportRefused => 0x0c,
+            Error::MusigSession => 0x0d,
             Error::Vendor => 0xff,
             Error::Unknown(value) => value,
         }

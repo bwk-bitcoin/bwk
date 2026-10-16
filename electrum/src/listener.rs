@@ -540,19 +540,20 @@ mod tests {
         tx_store::{Inclusion, TxStore},
     };
     use bwk_coin::CoinStatus;
-    use bwk_descriptor::{derivator::SpkDerivator, descriptor::wpkh};
+    use bwk_descriptor::{
+        derivator::SpkDerivator,
+        descriptor::wpkh,
+        wallet::{to_wallet, WalletDescriptor},
+    };
     use bwk_persist::backend::{noop::NoopBackend, PersistenceBackend};
     use bwk_sign::{bip39::Mnemonic, hot_signer::HotSigner};
     use bwk_utils::test::{funding_tx, setup_logger, spending_tx};
-    use miniscript::{
-        bitcoin::{
-            self,
-            bip32::DerivationPath,
-            block::{Header, Version},
-            hashes::Hash,
-            CompactTarget, Network, OutPoint, TxMerkleNode,
-        },
-        Descriptor, DescriptorPublicKey,
+    use miniscript::bitcoin::{
+        self,
+        bip32::DerivationPath,
+        block::{Header, Version},
+        hashes::Hash,
+        CompactTarget, Network, OutPoint, TxMerkleNode,
     };
     use std::{
         collections::BTreeMap,
@@ -568,12 +569,12 @@ mod tests {
     };
 
     /// A fresh wpkh descriptor and its derivator, for a store no test shares.
-    fn throwaway_descriptor() -> (Descriptor<DescriptorPublicKey>, SpkDerivator) {
+    fn throwaway_descriptor() -> (WalletDescriptor, SpkDerivator) {
         let network = Network::Regtest;
         let mnemo = Mnemonic::generate(12).unwrap();
         let signer = HotSigner::new_from_mnemonics(network, &mnemo.to_string()).unwrap();
         let xpub = signer.xpub(&DerivationPath::from_str("m/84'/0'/0'/1").unwrap());
-        let descriptor = wpkh(xpub);
+        let descriptor = to_wallet(wpkh(xpub));
         let derivator = SpkDerivator::new(descriptor.clone(), network).unwrap();
         (descriptor, derivator)
     }

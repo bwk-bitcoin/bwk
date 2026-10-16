@@ -199,6 +199,7 @@ fn dispatch_error(e: bwk::account::Error) -> AccountError {
         bwk::account::Error::ManagerAlreadyAttached => {
             unreachable!("signing dispatch never attaches a manager")
         }
+        e => unreachable!("signing dispatch never reports {e}"),
     }
 }
 

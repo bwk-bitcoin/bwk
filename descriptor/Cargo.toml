@@ -10,9 +10,13 @@ readme.workspace = true
 
 [dependencies]
 bwk-keys.workspace = true
+bwk-psbt = { workspace = true, optional = true }
 miniscript = { workspace = true, features = ["serde"] }
 serde.workspace = true
 thiserror.workspace = true
+
+[features]
+musig = ["bwk-keys/musig", "dep:bwk-psbt", "bwk-psbt/musig"]
 
 [dev-dependencies]
 serde_json.workspace = true

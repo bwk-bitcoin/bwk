@@ -77,8 +77,22 @@ with or without a checksum, and answers `as_miniscript`, `as_sp`, `is_sp`,
 `into_miniscript` and `fingerprint`.
 
 The name is deliberately the same as `miniscript::Descriptor`. The convention
-across the workspace is to import this one as `Descriptor` and to spell the
-miniscript one out in full as `miniscript::Descriptor<DescriptorPublicKey>`.
+across the workspace is to import this one as `Descriptor`. The wallet descriptor
+is `wallet::WalletDescriptor`; the raw miniscript one stays
+`miniscript::Descriptor<DescriptorPublicKey>`.
+
+## Wallet Key
+
+`wallet::WalletKey` is the key type every wallet descriptor uses:
+`DescriptorPublicKey`, or `bwk_keys::musig::MusigKey` under the `musig` feature
+(a plain key is then `MusigKey::Plain`). `WalletDescriptor` and
+`WalletDefiniteDescriptor` are the matching miniscript descriptors, and
+`to_wallet` converts a plain `miniscript::Descriptor<DescriptorPublicKey>` into
+one. The `WalletDescriptorExt` (`single_paths`, `derive_at`, `plain_keys`,
+`has_musig`) and `WalletKeyExt` traits stand in for the calls miniscript only
+offers for `DescriptorPublicKey`. `updater::update_input` and
+`updater::update_output` fill PSBT inputs and outputs from a derived wallet
+descriptor.
 
 ## Silent Payment Keys
 
@@ -115,8 +129,7 @@ fails.
 
 ## DescriptorDerivator Trait
 
-Extension trait on `miniscript::Descriptor<DescriptorPublicKey>` for creating
-`SpkDerivator`:
+Extension trait on `WalletDescriptor` for creating `SpkDerivator`:
 ```rust
 use bwk_descriptor::descriptor::DescriptorDerivator;
 

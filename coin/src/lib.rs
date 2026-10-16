@@ -3,11 +3,8 @@
 //! These describe what scanning finds and what spending consumes, so they sit
 //! below both `bwk-electrum` and `bwk-tx` rather than inside either.
 
-use miniscript::{
-    bitcoin::{self, absolute, key::rand, psbt, Psbt, ScriptBuf, TxIn, Witness},
-    psbt::PsbtExt,
-    DefiniteDescriptorKey, Descriptor, DescriptorPublicKey,
-};
+use bwk_descriptor::wallet::{WalletDefiniteDescriptor, WalletDescriptor, WalletDescriptorExt};
+use miniscript::bitcoin::{self, absolute, key::rand, psbt, Psbt, ScriptBuf, TxIn, Witness};
 use serde::{Deserialize, Serialize};
 
 /// Errors constructing or converting a [`Coin`].
@@ -76,7 +73,7 @@ pub enum CoinSpendInfo {
     /// Descriptor-based coin (standard wallets)
     Bip32 {
         coin_path: (KeyChain, u32),
-        descriptor: Descriptor<DescriptorPublicKey>,
+        descriptor: WalletDescriptor,
     },
     /// Silent Payment coin (BIP352)
     Sp { tweak: [u8; 32] },
@@ -166,7 +163,7 @@ impl Coin {
     fn spk_to_psbt_input(
         &self,
         coin_path: (KeyChain, u32),
-        descriptor: &Descriptor<DescriptorPublicKey>,
+        descriptor: &WalletDescriptor,
     ) -> Result<psbt::Input, Error> {
         let inp = psbt::Input {
             witness_utxo: Some(self.txout.clone()),
@@ -192,7 +189,7 @@ impl Coin {
             inputs: vec![inp],
             outputs: vec![],
         };
-        PsbtExt::update_input_with_descriptor(&mut dummy_psbt, 0, &descr)
+        bwk_descriptor::updater::update_input(&mut dummy_psbt, 0, &descr)
             .map_err(|_| Error::Update)?;
 
         Ok(dummy_psbt.inputs[0].clone())
@@ -211,13 +208,12 @@ impl Coin {
 /// Derive the definite descriptor of a keychain at an index, out of a two-path
 /// multipath descriptor.
 pub fn derive_descriptor(
-    descriptor: &Descriptor<DescriptorPublicKey>,
+    descriptor: &WalletDescriptor,
     keychain: KeyChain,
     index: u32,
-) -> Result<Descriptor<DefiniteDescriptorKey>, Error> {
+) -> Result<WalletDefiniteDescriptor, Error> {
     let mut descriptors = descriptor
-        .clone()
-        .into_single_descriptors()
+        .single_paths()
         .map_err(|_| Error::MultiDescriptor)?
         .into_iter();
     let recv = descriptors.next().ok_or(Error::MultiDescriptor)?;
@@ -229,9 +225,7 @@ pub fn derive_descriptor(
         KeyChain::Custom(_) => return Err(Error::KeyChain),
     };
 
-    single
-        .at_derivation_index(index)
-        .map_err(|_| Error::Derivation)
+    single.derive_at(index).map_err(|_| Error::Derivation)
 }
 
 pub fn shuffle_coins(mut vec: Vec<Coin>) -> Vec<Coin> {
@@ -273,10 +267,9 @@ impl CoinSource for std::collections::BTreeMap<miniscript::bitcoin::OutPoint, Co
 /// Estimate the satisfaction size for an input, returning the result
 /// in weight units (WU).
 /// Note: The output of this function represent the worst case scenario.
-pub fn max_input_satisfaction_size(descriptor: &Descriptor<DescriptorPublicKey>) -> usize {
+pub fn max_input_satisfaction_size(descriptor: &WalletDescriptor) -> usize {
     descriptor
-        .clone()
-        .into_single_descriptors()
+        .single_paths()
         .expect("multikey")
         .first()
         .expect("multikey")
@@ -291,13 +284,17 @@ mod tests {
     use super::*;
     use bitcoin::bip32::Xpriv;
     use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use bwk_descriptor::wallet::to_wallet;
+    use miniscript::{Descriptor, DescriptorPublicKey};
     use std::str::FromStr;
 
-    fn bip32_descriptor() -> Descriptor<DescriptorPublicKey> {
+    fn bip32_descriptor() -> WalletDescriptor {
         let secp = Secp256k1::new();
         let xpriv = Xpriv::new_master(bitcoin::Network::Regtest, &[3u8; 32]).unwrap();
         let xpub = bitcoin::bip32::Xpub::from_priv(&secp, &xpriv);
-        Descriptor::<DescriptorPublicKey>::from_str(&format!("wpkh({xpub}/<0;1>/*)")).unwrap()
+        to_wallet(
+            Descriptor::<DescriptorPublicKey>::from_str(&format!("wpkh({xpub}/<0;1>/*)")).unwrap(),
+        )
     }
 
     fn bip32_coin(script_pubkey: ScriptBuf) -> Coin {

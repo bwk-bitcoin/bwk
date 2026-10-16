@@ -21,6 +21,7 @@ bitcoin = { workspace = true, features = ["rand-std"] }
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 bwk-psbt.workspace = true
+bwk-descriptor.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

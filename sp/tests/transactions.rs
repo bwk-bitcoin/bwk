@@ -13,7 +13,10 @@ use std::str::FromStr;
 use bitcoin::{bip32::ChildNumber, Network};
 use bwk::bwk_electrum::coin_store::PaymentType;
 use bwk_coin::Coin;
-use bwk_sign::hot_signer::HotSigner;
+use bwk_sign::{
+    bwk_descriptor::wallet::{to_wallet, WalletDescriptor},
+    hot_signer::HotSigner,
+};
 use bwk_sp::{
     account::{
         recipient::{SpRecipientAddress, TxBuilderSpExt},
@@ -65,8 +68,8 @@ fn test_transactions() {
     test_non_eligible_inputs_to_sp(&mut env);
 }
 
-fn descriptor(descriptor: &str) -> Descriptor<DescriptorPublicKey> {
-    Descriptor::from_str(descriptor).unwrap()
+fn descriptor(descriptor: &str) -> WalletDescriptor {
+    to_wallet(Descriptor::<DescriptorPublicKey>::from_str(descriptor).unwrap())
 }
 
 /// Create a drain recipient for a standard address (Amount::Max, no change).
@@ -798,11 +801,7 @@ fn test_mixed_sp_wsh_to_sp(env: &mut TestEnv) {
 
 /// Spend an SP coin and a coin of `descriptor` to our own SP address, then
 /// check the scanner finds the SP output and the SP change.
-fn assert_mixed_sp_to_sp(
-    env: &mut TestEnv,
-    name: &str,
-    descriptor: Descriptor<DescriptorPublicKey>,
-) {
+fn assert_mixed_sp_to_sp(env: &mut TestEnv, name: &str, descriptor: WalletDescriptor) {
     let start_height = env.next_scan_height();
     let mut account = env.sp_account(name);
     env.fund_sp(&mut account, 0.1);

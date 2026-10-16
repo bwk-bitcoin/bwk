@@ -6,10 +6,12 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use miniscript::DescriptorPublicKey;
 use serde::{Deserialize, Serialize};
 
-use bwk_descriptor::descriptor::{Descriptor, DescriptorDerivator};
+use bwk_descriptor::{
+    descriptor::{Descriptor, DescriptorDerivator},
+    wallet::WalletDescriptor,
+};
 use bwk_persist::{backend::PersistenceBackend, PersistError, PersistenceKind};
 
 use crate::{checkpoint::Checkpoint, open, raw_client::CertificateCheck};
@@ -178,7 +180,7 @@ impl ScannerConfig {
     }
 
     /// The miniscript descriptor, `None` when `descriptor` is `sp()`.
-    pub fn miniscript_descriptor(&self) -> Option<&miniscript::Descriptor<DescriptorPublicKey>> {
+    pub fn miniscript_descriptor(&self) -> Option<&WalletDescriptor> {
         self.descriptor.as_miniscript()
     }
 

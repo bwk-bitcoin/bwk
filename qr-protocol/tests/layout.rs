@@ -10,9 +10,9 @@ use core::{
 
 use bwk_qr_protocol::ffi::types::{
     AddressUri, Bip388, Buf, Bytes, Descriptor, DescriptorBody, DescriptorValue, Ecdsa, ErrorBody,
-    FirmwareVersion, GetKeys, KeyRequest, Keys, List, Path, RegisterDescriptor, Registration,
-    Request, RequestBody, Response, ResponseBody, Sign, Signature, SignatureValue, Signed,
-    SignedValue, TapKey, TapScript, VerifyAddress,
+    FirmwareVersion, GetKeys, KeyRequest, Keys, List, MusigPartialSig, MusigPubNonce, Path,
+    RegisterDescriptor, Registration, Request, RequestBody, Response, ResponseBody, Sign,
+    Signature, SignatureValue, Signed, SignedValue, TapKey, TapScript, VerifyAddress,
 };
 
 macro_rules! check {
@@ -51,8 +51,10 @@ fn the_c_mirror_matches_the_header() {
         Ecdsa => 56, 8;
         TapKey => 16, 8;
         TapScript => 80, 8;
-        SignatureValue => 80, 8;
-        Signature => 88, 8;
+        MusigPubNonce => 165, 1;
+        MusigPartialSig => 131, 1;
+        SignatureValue => 168, 8;
+        Signature => 176, 8;
         List<Signature> => 16, 8;
         SignedValue => 16, 8;
         Signed => 24, 8;

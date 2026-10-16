@@ -138,6 +138,21 @@ impl Config {
         })
     }
 
+    /// A watch-only or hot config from descriptor text (BIP-380, or BIP-390 with
+    /// `musig`).
+    #[allow(unused_variables)]
+    pub fn new_from_descriptor(
+        mnemonic: Option<String>,
+        account: String,
+        network: bitcoin::Network,
+        descriptor: &str,
+        data_dir: PathBuf,
+        dir_name: String,
+        persistence: Option<PersistenceKind>,
+    ) -> Result<Config, bwk_descriptor::descriptor::Error> {
+        todo!()
+    }
+
     /// View of this config that's safe to persist to disk.
     ///
     /// Under [`PersistenceKind::Sqlite`] the mnemonic is stripped so it
