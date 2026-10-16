@@ -43,6 +43,8 @@ pub trait MusigBackend {
         extra_in: Option<&[u8; 32]>,
     ) -> Result<(Self::SecNonce, [u8; 66]), Error>;
     fn nonce_agg(&self, pubnonces: &[[u8; 66]]) -> Result<[u8; 66], Error>;
+    /// Wipes an unused `secnonce` in place, when its `SecNonce` drops.
+    fn erase_secnonce(secnonce: &mut Self::SecNonce);
     /// Consumes `secnonce`: a nonce signs once.
     fn partial_sign(
         &self,

@@ -289,6 +289,10 @@ NUMS point:
     BIP341_NUMS =
         0x0250929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0
 
+Taproot keys are x-only, so `0x03 || x(BIP341_NUMS)` is equally unspendable. Emitters
+MUST write the even-y form above; readers MUST accept either parity when recognising a
+NUMS slot or a padding leaf.
+
 Every unspendable key of a policy is the same **NUMS xpub**: public key `BIP341_NUMS`
 and chain code `sha256(BIP341_NUMS || concat(serialized public keys of every tap-tree
 leaf key, DFS order))`, where a padding leaf contributes `BIP341_NUMS` and a `musig()`
@@ -306,8 +310,8 @@ public key of the BIP-328 synthetic xpub). The block holds 128 **NUMS slots**: s
    MUST refuse a policy that needs more than 127 padding leaves. Readers MUST discard
    such leaves before role recovery (Section 7).
 
-A reader recognises a NUMS slot in O(1): public key `BIP341_NUMS` and two single-step
-unhardened derivation indices, both at or above `0x7FFF_FF00`.
+A reader recognises a NUMS slot in O(1): public key `BIP341_NUMS` (either parity) and
+two single-step unhardened derivation indices, both at or above `0x7FFF_FF00`.
 
 The emitter MUST NOT put two unspendable keys with the same public key and different
 chain codes in one descriptor. Hardware signers compare keys on their compressed public

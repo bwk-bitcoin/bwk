@@ -94,6 +94,8 @@ pub enum AccountError {
     MissingBlindbitUrl,
     #[error("invalid sub-account mnemonic: {0}")]
     SubAccountMnemonic(bwk_sign::error::Error),
+    #[error("sub-account descriptor refused: {0}")]
+    SubAccountDescriptor(bwk_sign::error::Error),
     #[error("config error: {0}")]
     Config(#[from] config::ConfigError),
     #[error("descriptor error: {0}")]
@@ -1964,8 +1966,9 @@ fn register_sub_signer(
     if !signing_manager.has_bip32_signer(&signer.fingerprint()) {
         signing_manager.add_bip32_signer(signer);
     }
-    signing_manager.register_bip32_descriptor(descriptor);
-    Ok(())
+    signing_manager
+        .register_bip32_descriptor(descriptor)
+        .map_err(AccountError::SubAccountDescriptor)
 }
 
 #[cfg(feature = "mnemonic")]

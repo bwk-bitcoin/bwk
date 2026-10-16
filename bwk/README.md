@@ -177,10 +177,37 @@ Those answers arrive as `Notification::Signer(SignerNotification)`: a manager
 attached or detached, the account-wide signer list, the result of each request
 tagged with its `RequestId` and `SignerId`, and errors no request asked for.
 
+## MuSig2
+
+Under the `musig` feature an account can watch a MuSig2 descriptor (BIP-390).
+`Config::new_from_descriptor(None, ...)` builds a watch-only config from the
+descriptor text, `musig()` keys included; `is_descriptor_valid` accepts the same
+texts. `Account::descriptor()` returns it, its `Display` is the standard text.
+
+A spend runs as follows:
+
+1. Build the PSBT with `tx_builder()` as for any account.
+2. `spend_leaves(&outpoints)` lists the spend paths: the key path first, then
+   each leaf in depth-first order, with its signers' fingerprints, its
+   `older()` / `after()` timelocks, whether those are met at the current tip for
+   the given coins, and its witness weight. A leaf hash depends on the derivation
+   index, so it is computed at the first coin's derivation.
+3. `restrict_spend_path(&mut psbt, path)` keeps only that path in every input of
+   the account, before round 1: an m-of-n path is one leaf (one subset of m
+   cosigners), and each cosigner then answers for that leaf only. The leaf is
+   matched by its position in the tree, so it is the same leaf in every input.
+4. Each cosigner signs once per round: the first call adds its nonces, the
+   second its partial signatures. `musig_status(&psbt)` tells the round reached
+   and what each cosigner contributed.
+5. `finalize(&mut psbt)` aggregates the partial signatures
+   (`aggregate_musig`), runs the miniscript finalizer and extracts the
+   transaction. Without `musig` it only finalizes and extracts.
+
 ## Features
 
 All off by default. `logger` installs `env_logger` as the global logger; leave
 it off if the consumer installs its own. `sp` adds the silent-payments
 notification variants `bwk-sp` needs, `hwi` adds hardware wallet signers,
-`sqlite` selects the SQLite persistence backend, and `test` exposes the
-test-only constructors the integration tests reach for.
+`sqlite` selects the SQLite persistence backend, `musig` the MuSig2 wallets
+above, and `test` exposes the test-only constructors the integration tests reach
+for.

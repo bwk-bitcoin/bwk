@@ -9,7 +9,7 @@ description = "Bitcoin user policy: role-tagged Taproot multipath descriptors"
 miniscript = { workspace = true, features = ["serde", "compiler"] }
 serde.workspace = true
 bwk-descriptor.workspace = true
-bwk-keys = { workspace = true, optional = true }
+bwk-keys.workspace = true
 
 [features]
-musig = ["dep:bwk-keys", "bwk-keys/musig", "bwk-descriptor/musig"]
+musig = ["bwk-keys/musig", "bwk-descriptor/musig"]

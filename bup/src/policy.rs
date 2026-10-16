@@ -9,6 +9,7 @@ use std::{
 use bwk_descriptor::wallet::{WalletDescriptor, WalletKey};
 #[cfg(feature = "musig")]
 use bwk_keys::musig::MusigKey;
+use bwk_keys::nums::is_nums;
 use miniscript::{
     bitcoin::{absolute::LOCK_TIME_THRESHOLD, bip32::ChildNumber},
     descriptor::{TapTree, Tr},
@@ -24,7 +25,7 @@ use crate::{
         assign_start_indices, get_multipath_index, group_taptree_leaves, plain_key, LeafEntry,
         NUMS_BLOCK_START,
     },
-    nums::{bip341_nums, unspendable_internal_key},
+    nums::unspendable_internal_key,
     parse::{compute_satisfaction_wu, infer_policy_type, is_primary_only, oxpub, TR_KEY_PATH_WU},
     path::{
         Locktime, LocktimeError, NestedSide, OXpub, Path, Semantic, SemanticError, TapPosition,
@@ -35,18 +36,18 @@ use crate::{
 #[cfg(feature = "musig")]
 pub const MAX_LEAVES: usize = 32;
 
-/// Recognise a NUMS slot: the BIP-341 NUMS pubkey on two single-step unhardened paths
-/// inside the NUMS block (`NUMS_BLOCK_START` and up). The block is a structural contract by
-/// design: short-circuits before the legacy chain-code recompute, so a foreign descriptor
-/// that puts a NUMS-keyed internal key in the block is treated as unspendable whatever its
-/// chain code. Legacy detection (chain-code recompute) still runs as a fallback for older
-/// descriptors.
+/// Recognise a NUMS slot: the BIP-341 NUMS pubkey (either parity) on two single-step
+/// unhardened paths inside the NUMS block (`NUMS_BLOCK_START` and up). The block is a
+/// structural contract by design: short-circuits before the legacy chain-code recompute, so a
+/// foreign descriptor that puts a NUMS-keyed internal key in the block is treated as
+/// unspendable whatever its chain code. Legacy detection (chain-code recompute) still runs
+/// as a fallback for older descriptors.
 fn is_nums_slot(key: &WalletKey) -> bool {
     let Some(DescriptorPublicKey::MultiXPub(m)) = plain_key(key) else {
         return false;
     };
     let paths = m.derivation_paths.paths();
-    m.xkey.public_key == bip341_nums()
+    is_nums(&m.xkey.public_key)
         && paths.len() == 2
         && paths
             .iter()
@@ -82,7 +83,8 @@ fn extract_leaves<'a>(tap_tree: &'a TapTree<WalletKey>) -> Result<Vec<LeafEntry<
 }
 
 /// Structural match for a compiler-emitted NUMS padding leaf: a single `pk` over
-/// a NUMS-pubkey'd `MultiXPub`, on a NUMS slot or in the legacy chain-code-only form.
+/// a NUMS-pubkey'd (either parity) `MultiXPub`, on a NUMS slot or in the legacy
+/// chain-code-only form.
 /// Parsing accepts any valid miniscript, so this drops the leaf without checking its
 /// derivation or chain code, so a foreign descriptor
 /// with an intentional `pk(NUMS)` leaf is silently dropped here. `compile`
@@ -99,7 +101,7 @@ fn is_nums_padding_leaf(ms: &miniscript::Miniscript<WalletKey, miniscript::Tap>)
     let Some(DescriptorPublicKey::MultiXPub(m)) = plain_key(&first) else {
         return false;
     };
-    m.xkey.public_key == bip341_nums()
+    is_nums(&m.xkey.public_key)
 }
 
 /// Tag identifying the on-chain shape of a [`Policy`]. Inferred from the path set's semantic
@@ -1908,6 +1910,91 @@ mod tests {
             "{}/<2147483646;2147483647>/*",
             k1().xkey
         ))));
+    }
+
+    #[test]
+    fn odd_y_nums_internal_key_and_padding_parse_as_nums() {
+        // A foreign emitter may write H as `03||H.x`: the x-only key is the same, so the
+        // internal key on slot 0 stays unspendable and the padding leaf stays padding. The
+        // 2-of-3 primary keeps the internal key NUMS with and without `musig`.
+        let c1 = oxpub_from_str(
+            "[abcdef03]xpub6Bw79HbNSeS2xXw1sngPE3ehnk1U3iSPCgLYzC9LpN8m9nDuaKLZvkg8QXxL5pDmEmQtYscmUD8B9MkAAZbh6vxPzNXMaLfGQ9Sb3z85qhR/<0;1>/*",
+        );
+        let c2 = oxpub_from_str(
+            "[abcdef04]xpub661MyMwAqRbcEbs6ohRoUqTckEfLeT3vB2EsuWuckrEuDSKqdFXV6so8xJb4kvA4ZxT6hCydyFKsKwJrDm2LgSfTCphVqZgQbLzF49KwaXc/<0;1>/*",
+        );
+        let primary = Path::new(
+            Semantic::Multi {
+                keys: vec![k1(), k2(), c1.clone()],
+                threshold: 2,
+            },
+            Locktime::None,
+            TapPosition::TapTree(vec![]),
+        );
+        let recovery = Path::new(
+            Semantic::MultiMandatory {
+                keys: vec![c1, c2, k2()],
+                mandatory_keys: vec![k1()],
+                threshold: 2,
+            },
+            Locktime::Relative(relative::LockTime::from_height(144)),
+            TapPosition::TapTree(vec![]),
+        );
+        let mut policy =
+            Policy::new(vec![primary, recovery], PolicyType::CsvWithMandatoryKey).unwrap();
+        let desc = policy.compile().unwrap().clone();
+        let tr = match &desc {
+            miniscript::Descriptor::Tr(tr) => tr,
+            _ => panic!("expected Tr"),
+        };
+        let DescriptorPublicKey::MultiXPub(internal) = plain_key(tr.internal_key()).unwrap() else {
+            panic!("internal key is not a MultiXPub")
+        };
+        let even = internal.xkey;
+        assert!(is_nums_slot(tr.internal_key()));
+        assert!(tr
+            .tap_tree()
+            .as_ref()
+            .expect("tap tree present")
+            .iter()
+            .any(|(_, ms)| is_nums_padding_leaf(ms)));
+
+        let secp = miniscript::bitcoin::secp256k1::Secp256k1::verification_only();
+        let odd = bip32::Xpub {
+            public_key: even.public_key.negate(&secp),
+            ..even
+        };
+        assert_ne!(odd.public_key, even.public_key);
+        let text = desc.to_string();
+        let text = text.split('#').next().unwrap();
+        assert!(text.matches(&even.to_string()).count() >= 2);
+        let odd_desc =
+            WalletDescriptor::from_str(&text.replace(&even.to_string(), &odd.to_string())).unwrap();
+        let odd_tr = match &odd_desc {
+            miniscript::Descriptor::Tr(tr) => tr,
+            _ => panic!("expected Tr"),
+        };
+        assert!(is_nums_slot(odd_tr.internal_key()));
+        let padding: Vec<_> = odd_tr
+            .tap_tree()
+            .as_ref()
+            .expect("tap tree present")
+            .iter()
+            .filter(|(_, ms)| is_nums_padding_leaf(ms))
+            .collect();
+        assert!(!padding.is_empty());
+        for (_, ms) in padding {
+            let key = ms.iter_pk().next().expect("padding leaf has a key");
+            let DescriptorPublicKey::MultiXPub(m) = plain_key(&key).unwrap() else {
+                panic!("padding key is not a MultiXPub")
+            };
+            assert_eq!(m.xkey.public_key, odd.public_key);
+        }
+
+        let parsed = Policy::from_descriptor(&desc).unwrap();
+        let odd_parsed = Policy::from_descriptor(&odd_desc).unwrap();
+        assert_eq!(odd_parsed.policy_type(), parsed.policy_type());
+        assert_eq!(odd_parsed.paths(), parsed.paths());
     }
 
     #[test]

@@ -34,6 +34,7 @@ bwk-hwi = { workspace = true, features = ["service"], optional = true }
 
 [dev-dependencies]
 bwk-utils = { workspace = true, features = ["test"] }
+bwk-bup.workspace = true
 
 [features]
 default = ["hwi", "sp"]
@@ -45,4 +46,4 @@ sp = []
 # dependency does not exist) resolves cleanly. Code paths that touch `bwk_hwi`
 # are additionally gated with `not(target_os = "android")`.
 hwi = ["dep:bwk-hwi"]
-musig = ["bwk-descriptor/musig", "bwk-psbt/musig", "bwk-keys/musig", "dep:bwk-musig", "dep:getrandom"]
+musig = ["bwk-descriptor/musig", "bwk-psbt/musig", "bwk-keys/musig", "dep:bwk-musig", "dep:getrandom", "bwk-bup/musig"]

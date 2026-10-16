@@ -174,10 +174,19 @@ impl HotManager {
         self.add_bip32_signer(signer)
     }
 
-    pub fn register_bip32_descriptor(&mut self, descriptor: Descriptor) {
+    /// Registers `descriptor` with every loaded hot signer, or with none when one
+    /// of them refuses it ([`HotSigner::check_participant_reuse`]).
+    pub fn register_bip32_descriptor(
+        &mut self,
+        descriptor: Descriptor,
+    ) -> Result<(), error::Error> {
+        for signer in self.bip32_signers.values() {
+            signer.check_participant_reuse(&descriptor)?;
+        }
         for signer in self.bip32_signers.values_mut() {
             signer.inner_register_descriptor(descriptor.clone());
         }
+        Ok(())
     }
 
     /// Signs `psbt` with every loaded hot signer, in place.
@@ -310,12 +319,15 @@ impl manager::SigningManager for HotManager {
         let sender = self.require_subscriber()?;
         let request = self.requests.next();
         let hot = self.bip32_signers.get_mut(signer).expect("checked above");
-        hot.inner_register_descriptor(descriptor);
-        let _ = sender.send(Response::DescriptorRegistered {
-            request,
-            signer: signer.clone(),
-            registered: true,
-        });
+        let response = match hot.checked_register_descriptor(descriptor) {
+            Ok(()) => Response::DescriptorRegistered {
+                request,
+                signer: signer.clone(),
+                registered: true,
+            },
+            Err(e) => Response::error(request, signer.clone(), e.to_string()),
+        };
+        let _ = sender.send(response);
         Ok(request)
     }
 
@@ -664,6 +676,84 @@ mod tests {
                 assert_eq!(xpub, expected_b);
             }
             other => panic!("expected Xpub, got {other:?}"),
+        }
+    }
+
+    /// `tr(musig(A/<0;1>/*,B/<0;1>/*))` and `tr(A/<0;1>/*)`: A the key of `hot` at the
+    /// cosigner path, B the key of another signer.
+    #[cfg(feature = "musig")]
+    fn musig_and_plain_reuse(hot: &HotSigner) -> (Descriptor, Descriptor) {
+        let path = DerivationPath::from_str("m/87'/1'/0'/2").unwrap();
+        let other = HotSigner::new(bitcoin::Network::Regtest).unwrap();
+        let (a, b) = (hot.xpub(&path), other.xpub(&path));
+        (
+            Descriptor::from_str(&format!("tr(musig({a}/<0;1>/*,{b}/<0;1>/*))")).unwrap(),
+            Descriptor::from_str(&format!("tr({a}/<0;1>/*)")).unwrap(),
+        )
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn register_descriptor_refuses_participant_reuse() {
+        let mut manager = HotManager::new();
+        let id =
+            manager.new_bip32_signer_from_mnemonic(bitcoin::Network::Regtest, MNEMONIC.to_string());
+        let (tx, rx) = channel::unbounded();
+        manager.subscribe(tx);
+        let _ = rx.recv().unwrap(); // SignersChanged
+        let (musig, plain) = musig_and_plain_reuse(&manager.bip32_signers[&id]);
+
+        let request = manager.register_descriptor(&id, musig.clone()).unwrap();
+        match rx.recv().unwrap() {
+            Response::DescriptorRegistered {
+                request: req,
+                registered,
+                ..
+            } => {
+                assert_eq!(req, request);
+                assert!(registered);
+            }
+            other => panic!("expected DescriptorRegistered, got {other:?}"),
+        }
+
+        let request = manager.register_descriptor(&id, plain).unwrap();
+        match rx.recv().unwrap() {
+            Response::Error {
+                request: req,
+                signer,
+                message,
+            } => {
+                assert_eq!(req, Some(request));
+                assert_eq!(signer, Some(id.clone()));
+                assert_eq!(
+                    message,
+                    "a MuSig2 participant key is also used as a plain key"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert_eq!(manager.bip32_signers[&id].descriptors(), vec![musig]);
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn register_bip32_descriptor_refuses_participant_reuse_for_every_signer() {
+        let mut manager = HotManager::new();
+        let id =
+            manager.new_bip32_signer_from_mnemonic(bitcoin::Network::Regtest, MNEMONIC.to_string());
+        let other = manager.new_bip32_signer(bitcoin::Network::Regtest);
+        let (musig, plain) = musig_and_plain_reuse(&manager.bip32_signers[&id]);
+
+        manager.register_bip32_descriptor(musig.clone()).unwrap();
+        assert_eq!(
+            manager.register_bip32_descriptor(plain),
+            Err(crate::error::Error::MusigParticipantReuse)
+        );
+        for signer in [&id, &other] {
+            assert_eq!(
+                manager.bip32_signers[signer].descriptors(),
+                vec![musig.clone()]
+            );
         }
     }
 

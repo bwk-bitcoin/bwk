@@ -1092,8 +1092,9 @@ mod tests {
 
     #[test]
     fn padding_leaves_must_fit_the_nums_slots() {
-        // A path of 129 leaves fills 256 slots, leaving 7 free chunks; each later one
-        // takes a chunk and leaves 7 of its own: 7 + 6 * (paths - 1) free slots.
+        // A path of 129 leaves fills 256 slots and leaves seven free chunks. Each later
+        // path takes one of them and leaves seven of its own, six more free slots per
+        // path: 21 paths leave 127, the most the NUMS slots hold, and 22 leave 133.
         let leaves: Vec<u32> = (0..129).collect();
         let builder = |paths: usize| {
             let mut b: TreeBuilder<u32> = TreeBuilder::new();

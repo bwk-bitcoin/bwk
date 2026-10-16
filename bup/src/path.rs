@@ -95,7 +95,7 @@ impl OXpub {
     /// - public key x-coordinate is all zeros (sentinel / placeholder),
     /// - chain code is all zeros (sentinel / placeholder).
     pub fn validate(&self) -> Result<(), OXpubError> {
-        if self.xkey.public_key == crate::nums::bip341_nums() {
+        if bwk_keys::nums::is_nums(&self.xkey.public_key) {
             return Err(OXpubError::NumsKey);
         }
         // The compressed serialization is [parity, x_coord(32B)]. A real key on the curve
@@ -356,10 +356,11 @@ impl Semantic {
     }
 
     /// Structural sanity check: `Multi` / `MultiMandatory` thresholds must be in range,
-    /// no signer may appear twice in a key set, and every signer key (`OXpub`) must pass [`OXpub::validate`] (no NUMS, no zeroed
-    /// chain code). `Or`, `Unknown`, and `Custom` carry no thresholds or `OXpub` keys to
-    /// check; they pass unconditionally. `Or` and `Unknown` are uncompilable; `Custom`
-    /// compiles by reissuing multipath indices on its embedded miniscript.
+    /// no signer may appear twice in a key set, and every signer key (`OXpub`) must pass
+    /// [`OXpub::validate`] (no NUMS, no zeroed chain code). `Or`, `Unknown`, and `Custom`
+    /// carry no thresholds or `OXpub` keys to check; they pass unconditionally. `Or` and
+    /// `Unknown` are uncompilable; `Custom` compiles by reissuing multipath indices on its
+    /// embedded miniscript.
     pub fn validate(&self) -> Result<(), SemanticError> {
         for k in self.keys() {
             k.validate().map_err(SemanticError::InvalidKey)?;

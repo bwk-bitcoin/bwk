@@ -2,6 +2,7 @@ pub mod derivator;
 pub mod keys;
 #[cfg(feature = "musig")]
 pub mod musig;
+pub mod nums;
 
 use thiserror::Error;
 

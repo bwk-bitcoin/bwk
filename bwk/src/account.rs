@@ -38,7 +38,35 @@ use bwk_sign::{
 use bwk_tx::{recipient::ChangeRecipientProvider, tx_builder::TxBuilder};
 use crossbeam::channel;
 
-use miniscript::bitcoin::{self, Txid};
+#[cfg(feature = "musig")]
+use bwk_coin::{
+    derive_descriptor, max_input_satisfaction_size, Coin, CoinSpendInfo, KeyChain,
+    TAPROOT_KEYSPEND_SATISFACTION_WU,
+};
+#[cfg(feature = "musig")]
+use bwk_descriptor::wallet::{WalletDefiniteKey, WalletDescriptorExt, WalletKey};
+#[cfg(feature = "musig")]
+use bwk_keys::{musig::MusigKey, nums};
+#[cfg(feature = "musig")]
+use bwk_tx::bwk_psbt::musig::PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS;
+use miniscript::{
+    bitcoin::{self, secp256k1::Secp256k1, Txid},
+    psbt::PsbtExt,
+};
+#[cfg(feature = "musig")]
+use miniscript::{
+    bitcoin::{
+        absolute,
+        bip32::Fingerprint,
+        psbt::Input,
+        relative,
+        secp256k1::PublicKey,
+        taproot::{LeafVersion, TapLeafHash, TAPROOT_CONTROL_BASE_SIZE, TAPROOT_CONTROL_NODE_SIZE},
+        OutPoint, Sequence, VarInt, XOnlyPublicKey,
+    },
+    descriptor::{SinglePubKey, Tr},
+    DescriptorPublicKey, Miniscript, MiniscriptKey, Tap, Terminal, ToPublicKey,
+};
 
 use crate::config::Config;
 
@@ -60,6 +88,12 @@ pub enum Error {
     #[cfg(feature = "musig")]
     #[error("no such spend path")]
     UnknownSpendPath,
+    #[cfg(feature = "musig")]
+    #[error("the key path is unspendable: the internal key is the BIP-341 NUMS point")]
+    UnspendableKeyPath,
+    #[cfg(feature = "musig")]
+    #[error("the leaf is unspendable: every key in it is the BIP-341 NUMS point")]
+    UnspendableLeaf,
 }
 
 /// How an input is spent: the key path or one tap leaf.
@@ -81,7 +115,8 @@ pub struct SpendLeaf {
     pub relative: Option<u16>,
     /// `after()` height on the leaf.
     pub absolute: Option<u32>,
-    /// Every given coin's timelock on this path is met at the current tip.
+    /// Every given coin's timelock on this path is met at the current tip; an
+    /// `older()` path with no given coin is not spendable.
     pub spendable: bool,
     /// Witness weight of one input spent this way, control block included.
     pub satisfaction_wu: u64,
@@ -1127,30 +1162,182 @@ impl<P: ScanProfile> Account<P> {
 }
 
 // Spend paths, MuSig2 status and finalize
-#[allow(unused_variables)]
 impl<P: ScanProfile> Account<P> {
     /// Every spend path of the descriptor, key path first then leaves in DFS order,
     /// `spendable` evaluated for `outpoints` against the current tip.
+    ///
+    /// A tr() whose internal key is the BIP-341 NUMS point has no key path: it is
+    /// left out rather than listed as not spendable, as no signer can ever spend it.
+    /// So is a leaf whose keys are all that point, like bwk-bup's padding leaf.
+    ///
+    /// A leaf hash depends on the derivation index, so each leaf's hash is computed
+    /// at the derivation of the first outpoint (receive index 0 when `outpoints` is
+    /// empty); [`Account::restrict_spend_path`] resolves it by its position.
     #[cfg(feature = "musig")]
-    pub fn spend_leaves(&self, outpoints: &[bitcoin::OutPoint]) -> Result<Vec<SpendLeaf>, Error> {
-        todo!()
+    pub fn spend_leaves(&self, outpoints: &[OutPoint]) -> Result<Vec<SpendLeaf>, Error> {
+        let descriptor = self.scanner.descriptor();
+        let coins = outpoints
+            .iter()
+            .map(|outpoint| {
+                self.bip32_coin(outpoint)
+                    .ok_or_else(|| Error::Musig(format!("unknown coin {outpoint}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let miniscript::Descriptor::Tr(template) = &descriptor else {
+            return Ok(vec![SpendLeaf {
+                path: SpendPath::KeyPath,
+                signers: descriptor
+                    .plain_keys()
+                    .iter()
+                    .map(DescriptorPublicKey::master_fingerprint)
+                    .collect(),
+                relative: None,
+                absolute: None,
+                spendable: true,
+                satisfaction_wu: max_input_satisfaction_size(&descriptor) as u64,
+            }]);
+        };
+        let (keychain, index) = coins
+            .first()
+            .map_or((KeyChain::Receive, 0), |(_, coin_path)| *coin_path);
+        let miniscript::Descriptor::Tr(definite) =
+            derive_descriptor(&descriptor, keychain, index).map_err(to_musig)?
+        else {
+            return Err(Error::Musig("derived descriptor is not tr()".into()));
+        };
+        let heights: Vec<Option<u64>> = coins.iter().map(|(coin, _)| coin.height).collect();
+        // Without a header scanner there is no validated tip: a timelocked leaf is
+        // then reported unspendable.
+        let tip = self
+            .header_scanner
+            .as_ref()
+            .and_then(|header_scanner| header_scanner.headers.store().tip());
+        let mut leaves = Vec::new();
+        if !is_nums(template.internal_key()) {
+            leaves.push(SpendLeaf {
+                path: SpendPath::KeyPath,
+                signers: template.internal_key().master_fingerprints(),
+                relative: None,
+                absolute: None,
+                spendable: true,
+                satisfaction_wu: TAPROOT_KEYSPEND_SATISFACTION_WU,
+            });
+        }
+        for ((_, template_ms), (depth, definite_ms)) in
+            template.iter_scripts().zip(definite.iter_scripts())
+        {
+            if is_unspendable_leaf(template_ms) {
+                continue;
+            }
+            let locks = LeafLocks::of(template_ms);
+            leaves.push(SpendLeaf {
+                path: SpendPath::Leaf(leaf_hash(definite_ms)),
+                signers: leaf_signers(template_ms),
+                relative: locks.relative,
+                absolute: locks.absolute,
+                spendable: locks.met(tip, &heights),
+                satisfaction_wu: leaf_satisfaction_wu(definite_ms, depth)?,
+            });
+        }
+        Ok(leaves)
     }
 
     /// Keeps only `path` in every input: drops the other leaves' `tap_scripts`, their
     /// leaf hashes in `tap_key_origins`, and the 0x1a entries of aggregates `path`
     /// does not use. Called on the prepared PSBT before round 1.
+    ///
+    /// Only inputs spending a coin of this account are touched. A `Leaf` hash is
+    /// resolved to its depth-first position through any owned input holding it,
+    /// then every owned input keeps its own leaf at that position: inputs at
+    /// different indexes share one tree shape but not the leaf hashes.
+    /// `Error::UnknownSpendPath` when no owned input holds it, the PSBT unchanged.
+    /// `KeyPath` on a tr() whose internal key is the BIP-341 NUMS point is
+    /// `Error::UnspendableKeyPath`, the PSBT unchanged. A `Leaf` whose keys are all
+    /// that point is `Error::UnspendableLeaf`, the PSBT unchanged.
+    ///
+    /// A `Leaf` also writes its timelocks, which the signature covers: the leaf's
+    /// `older()` as each owned input's sequence, its `after()` as the locktime.
     #[cfg(feature = "musig")]
     pub fn restrict_spend_path(
         &self,
         psbt: &mut bitcoin::Psbt,
         path: SpendPath,
     ) -> Result<(), Error> {
-        todo!()
+        let descriptor = self.scanner.descriptor();
+        if let miniscript::Descriptor::Tr(tr) = &descriptor {
+            if path == SpendPath::KeyPath && is_nums(tr.internal_key()) {
+                return Err(Error::UnspendableKeyPath);
+            }
+        }
+        let mut owned: BTreeMap<usize, Tr<WalletDefiniteKey>> = BTreeMap::new();
+        for (input_index, txin) in psbt.unsigned_tx.input.iter().enumerate() {
+            let Some((_, (keychain, index))) = self.bip32_coin(&txin.previous_output) else {
+                continue;
+            };
+            match derive_descriptor(&descriptor, keychain, index).map_err(to_musig)? {
+                miniscript::Descriptor::Tr(tr) => {
+                    owned.insert(input_index, tr);
+                }
+                _ if path == SpendPath::KeyPath => {}
+                _ => return Err(Error::UnknownSpendPath),
+            }
+        }
+        match path {
+            SpendPath::KeyPath => {
+                for (input_index, input) in psbt.inputs.iter_mut().enumerate() {
+                    if let Some(tr) = owned.get(&input_index) {
+                        keep_key_path(input, tr);
+                    }
+                }
+            }
+            SpendPath::Leaf(hash) => {
+                let position = owned
+                    .values()
+                    .find_map(|tr| tr.iter_scripts().position(|(_, ms)| leaf_hash(ms) == hash))
+                    .ok_or(Error::UnknownSpendPath)?;
+                if let miniscript::Descriptor::Tr(template) = &descriptor {
+                    if template
+                        .iter_scripts()
+                        .nth(position)
+                        .is_some_and(|(_, ms)| is_unspendable_leaf(ms))
+                    {
+                        return Err(Error::UnspendableLeaf);
+                    }
+                }
+                let leaves = owned
+                    .iter()
+                    .map(|(input_index, tr)| {
+                        tr.iter_scripts()
+                            .nth(position)
+                            .map(|(_, ms)| (*input_index, ms))
+                            .ok_or(Error::UnknownSpendPath)
+                    })
+                    .collect::<Result<BTreeMap<_, _>, _>>()?;
+                for (input_index, input) in psbt.inputs.iter_mut().enumerate() {
+                    if let Some(ms) = leaves.get(&input_index) {
+                        keep_leaf(input, ms);
+                    }
+                }
+                set_leaf_locks(&mut psbt.unsigned_tx, &leaves);
+            }
+        }
+        Ok(())
+    }
+
+    /// The coin at `outpoint` and its (keychain, index), when it is a descriptor
+    /// coin of this account.
+    #[cfg(feature = "musig")]
+    fn bip32_coin(&self, outpoint: &OutPoint) -> Option<(Coin, (KeyChain, u32))> {
+        let coin = self.scanner.get_coin(outpoint)?;
+        match coin.spend_info {
+            CoinSpendInfo::Bip32 { coin_path, .. } => Some((coin, coin_path)),
+            CoinSpendInfo::Sp { .. } => None,
+        }
     }
 
     /// The account's descriptor (standard text through Display).
     pub fn descriptor(&self) -> Descriptor {
-        todo!()
+        self.scanner.wallet_descriptor()
     }
 
     /// Signing progress of `psbt` per cosigner, cosigners from the account descriptor.
@@ -1159,20 +1346,247 @@ impl<P: ScanProfile> Account<P> {
         &self,
         psbt: &bitcoin::Psbt,
     ) -> Result<bwk_sign::musig::MusigStatus, Error> {
-        todo!()
+        bwk_sign::musig::musig_status(psbt, &self.scanner.descriptor()).map_err(to_musig)
     }
 
     /// Aggregates complete partial signatures; the count aggregated.
     #[cfg(feature = "musig")]
     pub fn aggregate_musig(&self, psbt: &mut bitcoin::Psbt) -> Result<usize, Error> {
-        todo!()
+        bwk_sign::musig::aggregate_partial_sigs(psbt, &self.scanner.descriptor()).map_err(to_musig)
     }
 
     /// Aggregates musig partial signatures (under `musig`), then miniscript finalize,
     /// then extracts.
     pub fn finalize(&self, psbt: &mut bitcoin::Psbt) -> Result<bitcoin::Transaction, Error> {
-        todo!()
+        #[cfg(feature = "musig")]
+        self.aggregate_musig(psbt)?;
+        PsbtExt::finalize_mut(psbt, &Secp256k1::verification_only()).map_err(|errors| {
+            let errors: Vec<String> = errors.iter().map(ToString::to_string).collect();
+            Error::Finalize(errors.join("; "))
+        })?;
+        Ok(psbt.clone().extract_tx_unchecked_fee_rate())
     }
+}
+
+#[cfg(feature = "musig")]
+fn to_musig<E: std::fmt::Display>(error: E) -> Error {
+    Error::Musig(error.to_string())
+}
+
+/// `key` is the BIP-341 NUMS point before any derivation: a plain key or an xpub
+/// whose own public key has H's x coordinate, either y parity, since taproot keys
+/// are x-only. Its derived children are not H, so this is checked on the descriptor
+/// template, not on a derived descriptor.
+#[cfg(feature = "musig")]
+fn is_nums(key: &WalletKey) -> bool {
+    let MusigKey::Plain(key) = key else {
+        return false;
+    };
+    match key {
+        DescriptorPublicKey::Single(single) => match single.key {
+            SinglePubKey::FullKey(key) => nums::is_nums(&key.inner),
+            SinglePubKey::XOnly(key) => nums::is_nums_x_only(&key),
+        },
+        DescriptorPublicKey::XPub(xpub) => nums::is_nums(&xpub.xkey.public_key),
+        DescriptorPublicKey::MultiXPub(xpub) => nums::is_nums(&xpub.xkey.public_key),
+    }
+}
+
+/// No signer can ever spend the leaf: every key of `ms` is the BIP-341 NUMS point
+/// and every satisfaction needs a signature (miniscript's `s` property), so a
+/// branch without a signature like `or_d(pk(NUMS),older(N))` stays spendable.
+#[cfg(feature = "musig")]
+fn is_unspendable_leaf(ms: &Miniscript<WalletKey, Tap>) -> bool {
+    let mut keys = ms.iter_pk().peekable();
+    keys.peek().is_some() && keys.all(|key| is_nums(&key)) && ms.requires_sig()
+}
+
+#[cfg(feature = "musig")]
+fn leaf_hash(ms: &Miniscript<WalletDefiniteKey, Tap>) -> TapLeafHash {
+    TapLeafHash::from_script(&ms.encode(), LeafVersion::TapScript)
+}
+
+/// Fingerprints of every key of the leaf, cosigners included, in first-seen order.
+#[cfg(feature = "musig")]
+fn leaf_signers(ms: &Miniscript<WalletKey, Tap>) -> Vec<Fingerprint> {
+    let mut signers = Vec::new();
+    for fingerprint in ms.iter_pk().flat_map(|key| key.master_fingerprints()) {
+        if !signers.contains(&fingerprint) {
+            signers.push(fingerprint);
+        }
+    }
+    signers
+}
+
+#[cfg(feature = "musig")]
+fn compact_size_len(n: usize) -> usize {
+    VarInt(n as u64).size()
+}
+
+/// Witness weight of spending through one leaf at `depth`, the per-leaf term of
+/// miniscript's `Tr::max_weight_to_satisfy`.
+#[cfg(feature = "musig")]
+fn leaf_satisfaction_wu(ms: &Miniscript<WalletDefiniteKey, Tap>, depth: u8) -> Result<u64, Error> {
+    let script_size = ms.script_size();
+    let elems = ms.max_satisfaction_witness_elements().map_err(to_musig)?;
+    let sat = ms.max_satisfaction_size().map_err(to_musig)?;
+    let control_block = TAPROOT_CONTROL_BASE_SIZE + TAPROOT_CONTROL_NODE_SIZE * depth as usize;
+    // +1 stack element for the control block, the script is counted in `elems`.
+    let wu = compact_size_len(elems + 1) - compact_size_len(0)
+        + sat
+        + compact_size_len(script_size)
+        + script_size
+        + compact_size_len(control_block)
+        + control_block;
+    Ok(wu as u64)
+}
+
+/// The height-based timelocks of one leaf.
+#[cfg(feature = "musig")]
+#[derive(Default)]
+struct LeafLocks {
+    /// Largest `older()` in blocks.
+    relative: Option<u16>,
+    /// Largest `after()` height.
+    absolute: Option<u32>,
+    /// The leaf holds a time-based lock, never reported as spendable.
+    time_based: bool,
+    /// Largest `older()` (heights and times), the input sequence it requires.
+    sequence: Option<Sequence>,
+    /// Largest `after()` (heights and times), the transaction locktime it requires.
+    lock_time: Option<u32>,
+}
+
+#[cfg(feature = "musig")]
+impl LeafLocks {
+    fn of<Pk: MiniscriptKey>(ms: &Miniscript<Pk, Tap>) -> Self {
+        let mut locks = LeafLocks::default();
+        for node in ms.iter() {
+            match &node.node {
+                Terminal::Older(lock) => {
+                    locks.sequence = locks.sequence.max(Some(Sequence::from(*lock)));
+                    match relative::LockTime::from(*lock) {
+                        relative::LockTime::Blocks(height) => {
+                            locks.relative = locks.relative.max(Some(height.value()));
+                        }
+                        relative::LockTime::Time(_) => locks.time_based = true,
+                    }
+                }
+                Terminal::After(lock) => {
+                    locks.lock_time = locks.lock_time.max(Some(lock.to_consensus_u32()));
+                    match absolute::LockTime::from(*lock) {
+                        absolute::LockTime::Blocks(height) => {
+                            locks.absolute = locks.absolute.max(Some(height.to_consensus_u32()));
+                        }
+                        absolute::LockTime::Seconds(_) => locks.time_based = true,
+                    }
+                }
+                _ => {}
+            }
+        }
+        locks
+    }
+
+    /// A transaction mined in the block after `tip` meets every lock, spending
+    /// coins confirmed at `heights`: a locktime `a` tx is final at `tip + 1` when
+    /// `tip >= a`, and an `older(r)` input when `tip + 1 >= height + r`.
+    fn met(&self, tip: Option<u32>, heights: &[Option<u64>]) -> bool {
+        if self.time_based {
+            return false;
+        }
+        if self.relative.is_none() && self.absolute.is_none() {
+            return true;
+        }
+        let Some(tip) = tip else {
+            return false;
+        };
+        let next = u64::from(tip) + 1;
+        let absolute = self.absolute.is_none_or(|absolute| tip >= absolute);
+        // No coin to measure the delay from: an `older()` leaf is not spendable.
+        let relative = self.relative.is_none_or(|relative| {
+            !heights.is_empty()
+                && heights
+                    .iter()
+                    .all(|height| height.is_some_and(|height| next >= height + u64::from(relative)))
+        });
+        absolute && relative
+    }
+}
+
+/// Writes the timelocks of each owned input's leaf, covered by the signature, so the
+/// spend can be finalized: `older()` as that input's sequence, `after()` as the
+/// transaction locktime with the input's sequence kept non-final.
+#[cfg(feature = "musig")]
+fn set_leaf_locks(
+    tx: &mut bitcoin::Transaction,
+    leaves: &BTreeMap<usize, &Miniscript<WalletDefiniteKey, Tap>>,
+) {
+    for (input_index, ms) in leaves {
+        let locks = LeafLocks::of(*ms);
+        let txin = &mut tx.input[*input_index];
+        if let Some(sequence) = locks.sequence {
+            txin.sequence = sequence;
+        }
+        if let Some(lock_time) = locks.lock_time {
+            if txin.sequence.is_final() {
+                txin.sequence = Sequence::ENABLE_RBF_NO_LOCKTIME;
+            }
+            tx.lock_time = absolute::LockTime::from_consensus(lock_time);
+        }
+    }
+}
+
+/// Key path only: no leaf, the internal key and its cosigners' origins with no
+/// leaf hash, and the internal aggregate's 0x1a only.
+#[cfg(feature = "musig")]
+fn keep_key_path(input: &mut Input, tr: &Tr<WalletDefiniteKey>) {
+    let internal = tr.internal_key();
+    let mut keys: Vec<XOnlyPublicKey> = internal
+        .plain_keys()
+        .into_iter()
+        .map(|key| key.to_x_only_pubkey())
+        .collect();
+    keys.push(internal.to_x_only_pubkey());
+    input.tap_scripts.clear();
+    input.tap_key_origins.retain(|key, _| keys.contains(key));
+    for (leaf_hashes, _) in input.tap_key_origins.values_mut() {
+        leaf_hashes.clear();
+    }
+    keep_participants(input, internal.as_musig().map(|agg| agg.aggregate()));
+}
+
+/// Only the leaf `ms`: its script, the origins of its keys with its hash only,
+/// and the 0x1a of its aggregates.
+#[cfg(feature = "musig")]
+fn keep_leaf(input: &mut Input, ms: &Miniscript<WalletDefiniteKey, Tap>) {
+    let hash = leaf_hash(ms);
+    input
+        .tap_scripts
+        .retain(|_, (script, version)| TapLeafHash::from_script(script, *version) == hash);
+    input
+        .tap_key_origins
+        .retain(|_, (leaf_hashes, _)| leaf_hashes.contains(&hash));
+    for (leaf_hashes, _) in input.tap_key_origins.values_mut() {
+        *leaf_hashes = vec![hash];
+    }
+    keep_participants(
+        input,
+        ms.iter_pk()
+            .filter_map(|key| key.as_musig().map(|agg| agg.aggregate())),
+    );
+}
+
+/// Drops every 0x1a entry whose aggregate is not one of `aggregates`.
+#[cfg(feature = "musig")]
+fn keep_participants(input: &mut Input, aggregates: impl IntoIterator<Item = PublicKey>) {
+    let kept: Vec<[u8; 33]> = aggregates
+        .into_iter()
+        .map(|aggregate| aggregate.serialize())
+        .collect();
+    input.unknown.retain(|key, _| {
+        key.type_value != PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS
+            || kept.iter().any(|aggregate| key.key == aggregate[..])
+    });
 }
 
 impl<P: ScanProfile> AccountHistory for Account<P> {
@@ -2276,7 +2690,32 @@ mod integration_tests {
     use miniscript::bitcoin::{
         self, bip32::ChildNumber, Address, Amount, Network, Transaction, Txid,
     };
-    use miniscript::psbt::PsbtExt;
+    #[cfg(feature = "musig")]
+    use std::str::FromStr;
+
+    #[cfg(feature = "musig")]
+    use crate::account::{is_unspendable_leaf, Error, SpendPath};
+    #[cfg(feature = "musig")]
+    use bwk_bup::{Locktime, OXpub, Path, Policy, PolicyType, Semantic, TapPosition};
+    #[cfg(feature = "musig")]
+    use bwk_descriptor::{musig::musig_descriptor_to_string, wallet::WalletKey};
+    #[cfg(feature = "musig")]
+    use bwk_keys::nums::bip341_nums;
+    #[cfg(feature = "musig")]
+    use bwk_sign::musig::MusigRound;
+    #[cfg(feature = "musig")]
+    use bwk_tx::bwk_psbt::musig::musig_input_participants_all;
+    #[cfg(feature = "musig")]
+    use miniscript::{
+        bitcoin::{
+            absolute,
+            bip32::{ChainCode, DerivationPath, Xpub},
+            hashes::Hash,
+            taproot::TapLeafHash,
+            NetworkKind, OutPoint, Psbt, Sequence,
+        },
+        Miniscript, Tap,
+    };
 
     use electrsd::{
         bitcoind::{bitcoincore_rpc::RpcApi, BitcoinD},
@@ -2746,8 +3185,7 @@ mod integration_tests {
             mnemonic,
             account.scanner().wallet_descriptor(),
         );
-        PsbtExt::finalize_mut(&mut psbt, &bitcoin::secp256k1::Secp256k1::new()).unwrap();
-        let tx = psbt.extract_tx_unchecked_fee_rate();
+        let tx = account.finalize(&mut psbt).unwrap();
         let txid = bitcoind.client.send_raw_transaction(&tx).unwrap();
         let blocks: u32 = random_range(2..15);
         generate(bitcoind, blocks);
@@ -3070,9 +3508,7 @@ mod integration_tests {
                             &mnemonic.to_string(),
                             account.scanner().wallet_descriptor(),
                         );
-                        PsbtExt::finalize_mut(&mut psbt, &bitcoin::secp256k1::Secp256k1::new())
-                            .unwrap();
-                        let tx = psbt.extract_tx_unchecked_fee_rate();
+                        let tx = account.finalize(&mut psbt).unwrap();
                         match bitcoind.client.send_raw_transaction(&tx) {
                             Ok(_) => break,
                             Err(_) if attempt < 30 => {
@@ -3105,6 +3541,634 @@ mod integration_tests {
         sleep(Duration::from_millis(300));
         let payments = account.scanner().payment_history();
         assert_eq!(payments.len(), 16);
+    }
+
+    #[cfg(feature = "musig")]
+    const COSIGNER_PATH: &str = "m/87'/1'/0'/2";
+    #[cfg(feature = "musig")]
+    const MUSIG_TIMEOUT: u64 = 120;
+
+    /// A hot signer and its `[fp/87'/1'/0'/2]tpub` cosigner text.
+    #[cfg(feature = "musig")]
+    struct Cosigner {
+        signer: HotSigner,
+        text: String,
+    }
+
+    #[cfg(feature = "musig")]
+    fn musig_cosigners(n: usize) -> Vec<Cosigner> {
+        (0..n)
+            .map(|_| {
+                let mnemonic = Mnemonic::generate(12).unwrap().to_string();
+                let signer = HotSigner::new_from_mnemonics(Network::Regtest, &mnemonic).unwrap();
+                let text = signer
+                    .xpub(&DerivationPath::from_str(COSIGNER_PATH).unwrap())
+                    .to_string();
+                Cosigner { signer, text }
+            })
+            .collect()
+    }
+
+    /// A watch-only account of the descriptor `text`, under `dir`.
+    #[cfg(feature = "musig")]
+    fn musig_account(text: &str, url: &str, port: u16, dir: &TempDir) -> Account {
+        maybe_create_dir(&dir.path().join(".bwk"));
+        let mut config = Config::new_from_descriptor(
+            None,
+            "musig".to_string(),
+            Network::Regtest,
+            text,
+            dir.path().to_path_buf(),
+            ".bwk".to_string(),
+            Some(PersistenceKind::Json),
+        )
+        .unwrap();
+        config.scanner.look_ahead = 20;
+        config.set_electrum_url(url.to_string());
+        config.set_electrum_port(port.to_string());
+        Account::new(config)
+    }
+
+    /// Pays `sats` to a new receive address, mines it and waits for the coin.
+    #[cfg(feature = "musig")]
+    fn fund(account: &mut Account, bitcoind: &BitcoinD, sats: u64) -> OutPoint {
+        let address = account.scanner_mut().new_recv_addr();
+        let txid = send_to_address(bitcoind, &address, Amount::from_sat(sats));
+        generate(bitcoind, 1);
+        let confirmed = || {
+            account
+                .scanner()
+                .coins()
+                .values()
+                .find(|entry| entry.coin.outpoint.txid == txid && entry.coin.height.is_some())
+                .map(|entry| entry.coin.outpoint)
+        };
+        wait_until_timeout(|| confirmed().is_some(), MUSIG_TIMEOUT);
+        confirmed().unwrap()
+    }
+
+    /// Waits until the account's header chain reaches bitcoind's tip.
+    #[cfg(feature = "musig")]
+    fn wait_tip(account: &Account, bitcoind: &BitcoinD) {
+        let height = get_block_height(bitcoind);
+        wait_until_timeout(
+            || {
+                account
+                    .header_store()
+                    .is_some_and(|store| store.tip() == Some(height))
+            },
+            MUSIG_TIMEOUT,
+        );
+    }
+
+    /// A regtest musig account, its cosigners (each registered on the account
+    /// descriptor) and its funded coins. The account drops before its directory and
+    /// the daemons.
+    #[cfg(feature = "musig")]
+    struct MusigWallet {
+        account: Account,
+        cosigners: Vec<Cosigner>,
+        coins: Vec<OutPoint>,
+        _dir: TempDir,
+        _electrsd: ElectrsD,
+        bitcoind: TestBitcoinD,
+    }
+
+    #[cfg(feature = "musig")]
+    impl MusigWallet {
+        /// `n` cosigners, the account of `policy` over their texts, and one coin of
+        /// 100_000 sats per entry of `coins`, each at its own receive index.
+        fn new(n: usize, policy: fn(&[Cosigner]) -> String, coins: usize) -> Self {
+            let (url, port, electrsd, bitcoind) = bootstrap_electrs();
+            generate(&bitcoind, 100);
+            let mut cosigners = musig_cosigners(n);
+            let dir = TempDir::new().unwrap();
+            let mut account = musig_account(&policy(&cosigners), &url, port, &dir);
+            for cosigner in &mut cosigners {
+                cosigner
+                    .signer
+                    .inner_register_descriptor(account.descriptor());
+            }
+            let coins = (0..coins)
+                .map(|_| fund(&mut account, &bitcoind, 100_000))
+                .collect();
+            MusigWallet {
+                account,
+                cosigners,
+                coins,
+                _dir: dir,
+                _electrsd: electrsd,
+                bitcoind,
+            }
+        }
+
+        /// Spends every coin to an external address, change back to the account.
+        fn psbt(&self) -> Psbt {
+            let mut builder = self.account.tx_builder();
+            builder.new_template();
+            builder.tx_template.inputs = self
+                .coins
+                .iter()
+                .map(|outpoint| self.account.scanner().get_coin(outpoint).unwrap())
+                .collect();
+            builder.dummy_external_output(50_000);
+            builder.generate().unwrap()
+        }
+
+        /// One signing call by each of `signers`, in order.
+        fn round(&self, psbt: &mut Psbt, signers: &[usize]) {
+            let descriptor = self.account.descriptor();
+            for signer in signers {
+                self.cosigners[*signer]
+                    .signer
+                    .inner_sign(psbt, descriptor.as_miniscript().unwrap())
+                    .unwrap();
+            }
+        }
+
+        fn status(&self, psbt: &Psbt) -> MusigRound {
+            self.account.musig_status(psbt).unwrap().round
+        }
+
+        fn fingerprint(&self, cosigner: usize) -> bitcoin::bip32::Fingerprint {
+            self.cosigners[cosigner].signer.fingerprint()
+        }
+
+        /// Broadcasts `tx`, mines a block and checks the block holds it.
+        fn mine(&self, tx: &Transaction) {
+            let txid = self.bitcoind.client.send_raw_transaction(tx).unwrap();
+            generate(&self.bitcoind, 1);
+            let tip = self.bitcoind.client.get_best_block_hash().unwrap();
+            let block = self.bitcoind.client.get_block(&tip).unwrap();
+            assert!(block.txdata.iter().any(|tx| tx.compute_txid() == txid));
+        }
+    }
+
+    /// `tr(musig(A,B)/<0;1>/*)`.
+    #[cfg(feature = "musig")]
+    fn two_of_two(c: &[Cosigner]) -> String {
+        format!("tr(musig({},{})/<0;1>/*)", c[0].text, c[1].text)
+    }
+
+    /// `tr(D/<0;1>/*,{pk(musig(A,B)/<0;1>/*),{pk(musig(A,C)/<0;1>/*),pk(musig(B,C)/<0;1>/*)}})`.
+    #[cfg(feature = "musig")]
+    fn two_of_three(c: &[Cosigner]) -> String {
+        format!(
+            "tr({}/<0;1>/*,{{pk(musig({},{})/<0;1>/*),{{pk(musig({},{})/<0;1>/*),pk(musig({},{})/<0;1>/*)}}}})",
+            c[3].text, c[0].text, c[1].text, c[0].text, c[2].text, c[1].text, c[2].text
+        )
+    }
+
+    /// `tr(D/<0;1>/*,{pk(musig(A,B)/<0;1>/*),and_v(v:pk(C/<0;1>/*),older(10))})`.
+    #[cfg(feature = "musig")]
+    fn musig_or_timelocked(c: &[Cosigner]) -> String {
+        format!(
+            "tr({}/<0;1>/*,{{pk(musig({},{})/<0;1>/*),and_v(v:pk({}/<0;1>/*),older(10))}})",
+            c[3].text, c[0].text, c[1].text, c[2].text
+        )
+    }
+
+    /// An xpub whose public key is the BIP-341 NUMS point.
+    #[cfg(feature = "musig")]
+    fn nums_xpub() -> Xpub {
+        Xpub {
+            network: NetworkKind::Test,
+            depth: 0,
+            parent_fingerprint: Default::default(),
+            child_number: ChildNumber::from_normal_idx(0).unwrap(),
+            public_key: bip341_nums(),
+            chain_code: ChainCode::from([7; 32]),
+        }
+    }
+
+    /// bwk-bup's shape: `tr(NUMS/<2147483646;2147483647>/*,pk(A/<512;513>/*))`, the
+    /// internal key an xpub whose public key is the BIP-341 NUMS point.
+    #[cfg(feature = "musig")]
+    fn nums_internal_key(c: &[Cosigner]) -> String {
+        format!(
+            "tr({}/<2147483646;2147483647>/*,pk({}/<512;513>/*))",
+            nums_xpub(),
+            c[0].text
+        )
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn nums_leaf_with_a_branch_without_signature_is_spendable() {
+        let nums = nums_xpub();
+        let leaf = |text: String| Miniscript::<WalletKey, Tap>::from_str_insane(&text).unwrap();
+        assert!(is_unspendable_leaf(&leaf(format!("pk({nums}/<0;1>/*)"))));
+        assert!(!is_unspendable_leaf(&leaf(format!(
+            "or_d(pk({nums}/<0;1>/*),older(10))"
+        ))));
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn odd_y_nums_is_nums() {
+        let (x_only, _) = bip341_nums().x_only_public_key();
+        let odd = bitcoin::PublicKey::new(bitcoin::secp256k1::PublicKey::from_x_only_public_key(
+            x_only,
+            bitcoin::key::Parity::Odd,
+        ));
+        assert_eq!(odd.to_bytes()[0], 0x03);
+        let odd_xpub = Xpub {
+            public_key: odd.inner,
+            ..nums_xpub()
+        };
+        let leaf = |text: String| Miniscript::<WalletKey, Tap>::from_str_insane(&text).unwrap();
+        assert!(is_unspendable_leaf(&leaf(format!("pk({odd})"))));
+        assert!(is_unspendable_leaf(&leaf(format!(
+            "pk({odd_xpub}/<0;1>/*)"
+        ))));
+        assert!(is_unspendable_leaf(&leaf(format!("pk({odd_xpub}/0/*)"))));
+    }
+
+    /// bwk-bup's PrimaryOnly 2-of-3 over A, B, C: a NUMS internal key, the three
+    /// musig pair leaves and one `pk(NUMS)` padding leaf.
+    #[cfg(feature = "musig")]
+    fn bup_primary_only_two_of_three(c: &[Cosigner]) -> String {
+        let path = DerivationPath::from_str(COSIGNER_PATH).unwrap();
+        let keys = c
+            .iter()
+            .map(|cosigner| {
+                let xpub = cosigner.signer.xpub(&path);
+                OXpub::new(Some(xpub.origin), xpub.xkey)
+            })
+            .collect();
+        let mut policy = Policy::new(
+            vec![Path::new(
+                Semantic::Multi { keys, threshold: 2 },
+                Locktime::None,
+                TapPosition::TapTree(vec![]),
+            )],
+            PolicyType::PrimaryOnly,
+        )
+        .unwrap();
+        musig_descriptor_to_string(policy.compile().unwrap(), false)
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn spend_leaves_lists_musig_key_path() {
+        let wallet = MusigWallet::new(2, two_of_two, 1);
+        let leaves = wallet.account.spend_leaves(&wallet.coins).unwrap();
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(leaves[0].path, SpendPath::KeyPath);
+        assert!(leaves[0].spendable);
+        assert_eq!(
+            leaves[0].signers,
+            vec![wallet.fingerprint(0), wallet.fingerprint(1)]
+        );
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn nums_internal_key_has_no_key_path() {
+        let wallet = MusigWallet::new(1, nums_internal_key, 1);
+        let leaves = wallet.account.spend_leaves(&wallet.coins).unwrap();
+        assert_eq!(leaves.len(), 1);
+        assert!(matches!(leaves[0].path, SpendPath::Leaf(_)));
+        assert_eq!(leaves[0].signers, vec![wallet.fingerprint(0)]);
+        assert!(leaves[0].spendable);
+
+        let mut psbt = wallet.psbt();
+        let before = psbt.clone();
+        assert!(matches!(
+            wallet
+                .account
+                .restrict_spend_path(&mut psbt, SpendPath::KeyPath),
+            Err(Error::UnspendableKeyPath)
+        ));
+        assert_eq!(psbt, before);
+
+        wallet
+            .account
+            .restrict_spend_path(&mut psbt, leaves[0].path)
+            .unwrap();
+        wallet.round(&mut psbt, &[0]);
+        let tx = wallet.account.finalize(&mut psbt).unwrap();
+        wallet.mine(&tx);
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn padding_leaf_is_not_a_spend_path() {
+        let wallet = MusigWallet::new(3, bup_primary_only_two_of_three, 1);
+        let leaves = wallet.account.spend_leaves(&wallet.coins).unwrap();
+        let signers: Vec<_> = leaves.iter().map(|leaf| leaf.signers.clone()).collect();
+        let (a, b, c) = (
+            wallet.fingerprint(0),
+            wallet.fingerprint(1),
+            wallet.fingerprint(2),
+        );
+        assert_eq!(signers, vec![vec![a, b], vec![a, c], vec![b, c]]);
+        assert!(leaves
+            .iter()
+            .all(|leaf| matches!(leaf.path, SpendPath::Leaf(_)) && leaf.spendable));
+
+        let mut psbt = wallet.psbt();
+        let hashes: BTreeSet<TapLeafHash> = psbt.inputs[0]
+            .tap_scripts
+            .values()
+            .map(|(script, version)| TapLeafHash::from_script(script, *version))
+            .collect();
+        assert_eq!(hashes.len(), 4);
+        let listed: BTreeSet<TapLeafHash> = leaves
+            .iter()
+            .map(|leaf| match leaf.path {
+                SpendPath::Leaf(hash) => hash,
+                SpendPath::KeyPath => unreachable!(),
+            })
+            .collect();
+        let padding: Vec<_> = hashes.difference(&listed).collect();
+        assert_eq!(padding.len(), 1);
+
+        let before = psbt.clone();
+        assert!(matches!(
+            wallet
+                .account
+                .restrict_spend_path(&mut psbt, SpendPath::Leaf(*padding[0])),
+            Err(Error::UnspendableLeaf)
+        ));
+        assert_eq!(psbt, before);
+
+        // Each listed leaf still resolves to itself.
+        for leaf in &leaves {
+            let mut restricted = before.clone();
+            wallet
+                .account
+                .restrict_spend_path(&mut restricted, leaf.path)
+                .unwrap();
+            let kept: Vec<_> = restricted.inputs[0]
+                .tap_scripts
+                .values()
+                .map(|(script, version)| {
+                    SpendPath::Leaf(TapLeafHash::from_script(script, *version))
+                })
+                .collect();
+            assert_eq!(kept, vec![leaf.path]);
+        }
+
+        wallet
+            .account
+            .restrict_spend_path(&mut psbt, leaves[2].path)
+            .unwrap();
+        wallet.round(&mut psbt, &[1, 2]);
+        wallet.round(&mut psbt, &[1, 2]);
+        assert_eq!(wallet.status(&psbt), MusigRound::Ready);
+        let tx = wallet.account.finalize(&mut psbt).unwrap();
+        wallet.mine(&tx);
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_key_path_spend_two_of_two() {
+        let wallet = MusigWallet::new(2, two_of_two, 1);
+        let mut psbt = wallet.psbt();
+        wallet
+            .account
+            .restrict_spend_path(&mut psbt, SpendPath::KeyPath)
+            .unwrap();
+        for input in &psbt.inputs {
+            let cosigners = input
+                .tap_key_origins
+                .values()
+                .filter(|(_, (fingerprint, _))| {
+                    [wallet.fingerprint(0), wallet.fingerprint(1)].contains(fingerprint)
+                })
+                .count();
+            assert_eq!(cosigners, 2);
+            assert_eq!(musig_input_participants_all(input).unwrap().len(), 1);
+        }
+        assert_eq!(wallet.status(&psbt), MusigRound::Nonces);
+
+        wallet.round(&mut psbt, &[0, 1]);
+        assert_eq!(wallet.status(&psbt), MusigRound::PartialSigs);
+        wallet.round(&mut psbt, &[0, 1]);
+        assert_eq!(wallet.status(&psbt), MusigRound::Ready);
+
+        let tx = wallet.account.finalize(&mut psbt).unwrap();
+        wallet.mine(&tx);
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_two_of_three_leaf_spend() {
+        let wallet = MusigWallet::new(4, two_of_three, 2);
+        let leaves = wallet.account.spend_leaves(&wallet.coins).unwrap();
+        assert_eq!(leaves.len(), 4);
+        assert_eq!(leaves[0].path, SpendPath::KeyPath);
+        assert_eq!(leaves[0].signers, vec![wallet.fingerprint(3)]);
+        let ab = vec![wallet.fingerprint(0), wallet.fingerprint(1)];
+        let ab_leaves: Vec<_> = leaves.iter().filter(|leaf| leaf.signers == ab).collect();
+        assert_eq!(ab_leaves.len(), 1);
+        assert!(ab_leaves[0].spendable);
+        assert!(matches!(ab_leaves[0].path, SpendPath::Leaf(_)));
+
+        let mut psbt = wallet.psbt();
+        wallet
+            .account
+            .restrict_spend_path(&mut psbt, ab_leaves[0].path)
+            .unwrap();
+        for input in &psbt.inputs {
+            assert_eq!(input.tap_scripts.len(), 1);
+            assert_eq!(musig_input_participants_all(input).unwrap().len(), 1);
+        }
+        // The two inputs sit at different indexes: same leaf, different hashes.
+        let hashes: BTreeSet<TapLeafHash> = psbt
+            .inputs
+            .iter()
+            .flat_map(|input| input.tap_scripts.values())
+            .map(|(script, version)| TapLeafHash::from_script(script, *version))
+            .collect();
+        assert_eq!(hashes.len(), 2);
+
+        assert_eq!(wallet.status(&psbt), MusigRound::Nonces);
+        wallet.round(&mut psbt, &[0, 1]);
+        assert_eq!(wallet.status(&psbt), MusigRound::PartialSigs);
+        wallet.round(&mut psbt, &[0, 1]);
+        assert_eq!(wallet.status(&psbt), MusigRound::Ready);
+
+        let tx = wallet.account.finalize(&mut psbt).unwrap();
+        wallet.mine(&tx);
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn spend_relative_timelocked_leaf_after_delay() {
+        let wallet = MusigWallet::new(4, musig_or_timelocked, 1);
+        let leaves = || {
+            wait_tip(&wallet.account, &wallet.bitcoind);
+            wallet.account.spend_leaves(&wallet.coins).unwrap()
+        };
+        let ab = vec![wallet.fingerprint(0), wallet.fingerprint(1)];
+        let check = |timelocked_spendable: bool| {
+            let leaves = leaves();
+            assert_eq!(leaves.len(), 3);
+            assert_eq!(leaves[0].path, SpendPath::KeyPath);
+            assert!(leaves[0].spendable);
+            assert_eq!(leaves[1].signers, ab);
+            assert_eq!(leaves[1].relative, None);
+            assert!(leaves[1].spendable);
+            assert_eq!(leaves[2].signers, vec![wallet.fingerprint(2)]);
+            assert_eq!(leaves[2].relative, Some(10));
+            assert_eq!(leaves[2].absolute, None);
+            assert_eq!(leaves[2].spendable, timelocked_spendable);
+        };
+
+        // Confirmed at height h: an older(10) spend can be mined at h + 10.
+        check(false);
+        generate(&wallet.bitcoind, 8);
+        check(false);
+
+        let timelocked = leaves()[2].path;
+        let mut psbt = wallet.psbt();
+        wallet
+            .account
+            .restrict_spend_path(&mut psbt, timelocked)
+            .unwrap();
+        assert_eq!(
+            psbt.unsigned_tx.input[0].sequence,
+            Sequence::from_height(10)
+        );
+        wallet.round(&mut psbt, &[2]);
+        let tx = wallet.account.finalize(&mut psbt).unwrap();
+        // One block early: not BIP-68 final yet.
+        let early = wallet
+            .bitcoind
+            .client
+            .send_raw_transaction(&tx)
+            .unwrap_err();
+        assert!(format!("{early:?}").contains("non-BIP68-final"));
+
+        generate(&wallet.bitcoind, 1);
+        check(true);
+        // No coin to measure the delay from: never spendable.
+        let without_coins = wallet.account.spend_leaves(&[]).unwrap();
+        assert_eq!(without_coins[2].relative, Some(10));
+        assert!(!without_coins[2].spendable);
+        assert!(without_coins[1].spendable);
+        wallet.mine(&tx);
+    }
+
+    /// The `after()` height of [`musig_or_after`], above the funded coin's.
+    #[cfg(feature = "musig")]
+    const AFTER_HEIGHT: u32 = 250;
+
+    /// `tr(D/<0;1>/*,{pk(musig(A,B)/<0;1>/*),and_v(v:pk(C/<0;1>/*),after(250))})`.
+    #[cfg(feature = "musig")]
+    fn musig_or_after(c: &[Cosigner]) -> String {
+        format!(
+            "tr({}/<0;1>/*,{{pk(musig({},{})/<0;1>/*),and_v(v:pk({}/<0;1>/*),after({AFTER_HEIGHT}))}})",
+            c[3].text, c[0].text, c[1].text, c[2].text
+        )
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn spend_absolute_timelocked_leaf_at_height() {
+        let wallet = MusigWallet::new(4, musig_or_after, 1);
+        let leaves = |outpoints: &[OutPoint]| {
+            wait_tip(&wallet.account, &wallet.bitcoind);
+            wallet.account.spend_leaves(outpoints).unwrap()
+        };
+        let check = |spendable: bool| {
+            for outpoints in [&wallet.coins[..], &[]] {
+                let leaves = leaves(outpoints);
+                assert_eq!(leaves.len(), 3);
+                assert_eq!(leaves[2].signers, vec![wallet.fingerprint(2)]);
+                assert_eq!(leaves[2].relative, None);
+                assert_eq!(leaves[2].absolute, Some(AFTER_HEIGHT));
+                assert_eq!(leaves[2].spendable, spendable);
+            }
+        };
+
+        let height = get_block_height(&wallet.bitcoind);
+        assert!(height < AFTER_HEIGHT - 1);
+        generate(&wallet.bitcoind, AFTER_HEIGHT - 1 - height);
+        check(false);
+
+        let timelocked = leaves(&wallet.coins)[2].path;
+        let mut psbt = wallet.psbt();
+        wallet
+            .account
+            .restrict_spend_path(&mut psbt, timelocked)
+            .unwrap();
+        assert_eq!(
+            psbt.unsigned_tx.lock_time,
+            absolute::LockTime::from_height(AFTER_HEIGHT).unwrap()
+        );
+        assert!(psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .all(|txin| !txin.sequence.is_final()));
+        wallet.round(&mut psbt, &[2]);
+        let tx = wallet.account.finalize(&mut psbt).unwrap();
+        // Tip at AFTER_HEIGHT - 1: the next block cannot hold it yet.
+        let early = wallet
+            .bitcoind
+            .client
+            .send_raw_transaction(&tx)
+            .unwrap_err();
+        assert!(format!("{early:?}").contains("non-final"));
+
+        generate(&wallet.bitcoind, 1);
+        check(true);
+        wallet.mine(&tx);
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn restrict_spend_path_refuses_unknown_leaf() {
+        let wallet = MusigWallet::new(4, two_of_three, 2);
+        let mut psbt = wallet.psbt();
+        let before = psbt.clone();
+        assert!(matches!(
+            wallet
+                .account
+                .restrict_spend_path(&mut psbt, SpendPath::Leaf(TapLeafHash::all_zeros())),
+            Err(Error::UnknownSpendPath)
+        ));
+        assert_eq!(psbt, before);
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn restrict_spend_path_key_path_drops_leaves() {
+        let wallet = MusigWallet::new(4, two_of_three, 2);
+        let mut psbt = wallet.psbt();
+        for input in &psbt.inputs {
+            assert_eq!(input.tap_scripts.len(), 3);
+            assert_eq!(musig_input_participants_all(input).unwrap().len(), 3);
+        }
+        wallet
+            .account
+            .restrict_spend_path(&mut psbt, SpendPath::KeyPath)
+            .unwrap();
+        for input in &psbt.inputs {
+            assert!(input.tap_scripts.is_empty());
+            // The internal key D is plain: no aggregate is left.
+            assert!(musig_input_participants_all(input).unwrap().is_empty());
+            assert_eq!(input.tap_key_origins.len(), 1);
+            let (leaf_hashes, (fingerprint, _)) = input.tap_key_origins.values().next().unwrap();
+            assert!(leaf_hashes.is_empty());
+            assert_eq!(*fingerprint, wallet.fingerprint(3));
+        }
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn finalize_without_musig_signatures_fails_cleanly() {
+        let wallet = MusigWallet::new(2, two_of_two, 1);
+        let mut psbt = wallet.psbt();
+        wallet.round(&mut psbt, &[0, 1]);
+        assert_eq!(wallet.status(&psbt), MusigRound::PartialSigs);
+        assert!(matches!(
+            wallet.account.finalize(&mut psbt),
+            Err(Error::Finalize(_))
+        ));
     }
 }
 

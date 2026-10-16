@@ -41,6 +41,7 @@ bwk-persist = { workspace = true, features = ["test"] }
 electrsd.workspace = true
 rand = "0.9.0"
 temp-dir.workspace = true
+bwk-bup.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true
@@ -56,4 +57,4 @@ test = ["bwk-electrum/test", "bwk-utils/test", "bwk-sign/test", "bwk-tx/test", "
 # own logger would otherwise pull env_logger and its timestamp/colour stack.
 logger = ["dep:env_logger"]
 # MuSig2 wallets: `WalletKey` becomes `MusigKey` across the graph.
-musig = ["bwk-sign/musig", "bwk-descriptor/musig"]
+musig = ["bwk-sign/musig", "bwk-descriptor/musig", "bwk-keys/musig", "bwk-bup/musig"]

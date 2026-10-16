@@ -14,7 +14,7 @@ use crate::{
 use bwk_descriptor::{
     derivator::SpkDerivator,
     descriptor::{tr, tr_path, wpkh, wpkh_path, Descriptor},
-    wallet::{WalletDescriptor, WalletDescriptorExt},
+    wallet::{WalletDescriptor, WalletDescriptorExt, WalletKeyExt},
 };
 #[cfg(feature = "musig")]
 use bwk_keys::musig::MusigKey;
@@ -29,11 +29,10 @@ use bwk_psbt::musig::{
     set_musig_input_partial_sig, set_musig_input_pub_nonce, MusigPartialSig, MusigPubNonce,
 };
 use bwk_psbt::PsbtV2;
-#[cfg(feature = "musig")]
-use miniscript::ForEachKey;
 use miniscript::{
-    bitcoin::{bip32::ChildNumber, hashes::Hash, key::TapTweak},
+    bitcoin::{bip32::ChildNumber, hashes::Hash, key::TapTweak, ScriptBuf},
     psbt::PsbtExt,
+    ForEachKey,
 };
 use serde::{Deserialize, Serialize};
 use {
@@ -95,12 +94,10 @@ impl Signer for HotSigner {
             send!(self, Error(Error::DescriptorNetwork));
             return;
         }
-        #[cfg(feature = "musig")]
-        if self.reuses_participant_key(inner) {
-            send!(self, Error(Error::MusigParticipantReuse));
+        if let Err(e) = self.checked_register_descriptor(descriptor.clone()) {
+            send!(self, Error(e));
             return;
         }
-        self.descriptors.insert(descriptor.clone());
         send!(self, DescriptorRegistered(descriptor, true));
     }
 
@@ -152,6 +149,10 @@ impl HotSigner {
             network: self.network,
         })
     }
+    /// Loads the descriptors without the participant-reuse check of
+    /// [`HotSigner::checked_register_descriptor`]: they passed it when registered,
+    /// and refusing one here would drop a stored descriptor. The ordinary signing
+    /// pass still never signs with a participant key.
     pub fn from_json(json: JsonSigner) -> Self {
         let mut signer = HotSigner::new_from_mnemonics(json.network, &json.mnemonic.to_string())
             .expect("valid signer");
@@ -297,7 +298,9 @@ impl HotSigner {
     /// Registers a descriptor for the signer.
     ///
     /// This function adds the given descriptor to the signer's internal set of
-    /// descriptors if it is not already registered.
+    /// descriptors if it is not already registered. It does not run the
+    /// participant-reuse check: new descriptors go through
+    /// [`HotSigner::checked_register_descriptor`].
     ///
     /// # Arguments
     /// * `descriptor` - The descriptor to be registered.
@@ -305,6 +308,30 @@ impl HotSigner {
         if !self.descriptors.contains(&descriptor) {
             self.descriptors.insert(descriptor);
         }
+    }
+
+    /// Registers `descriptor` unless [`HotSigner::check_participant_reuse`] refuses it.
+    pub fn checked_register_descriptor(&mut self, descriptor: Descriptor) -> Result<(), Error> {
+        self.check_participant_reuse(&descriptor)?;
+        self.inner_register_descriptor(descriptor);
+        Ok(())
+    }
+
+    /// `Error::MusigParticipantReuse` when `descriptor` uses one of this signer's
+    /// musig() participant keys as a plain key, or makes a participant of one of its
+    /// plain keys, among the registered descriptors and itself.
+    #[cfg(feature = "musig")]
+    pub fn check_participant_reuse(&self, descriptor: &Descriptor) -> Result<(), Error> {
+        match descriptor.as_miniscript() {
+            Some(inner) if self.reuses_participant_key(inner) => Err(Error::MusigParticipantReuse),
+            _ => Ok(()),
+        }
+    }
+
+    /// No musig() key without `musig`: nothing to refuse.
+    #[cfg(not(feature = "musig"))]
+    pub fn check_participant_reuse(&self, _descriptor: &Descriptor) -> Result<(), Error> {
+        Ok(())
     }
 
     /// Retrieves the extended private key at the specified derivation path.
@@ -631,7 +658,13 @@ impl HotSigner {
                 !psbt.inputs[index].tap_key_origins.is_empty(),
             ) {
                 (true, false, false) => {
-                    match self.sign_input_segwit(psbt, index, &derivator, &mut cache) {
+                    match self.sign_input_segwit(
+                        psbt,
+                        index,
+                        &derivator,
+                        &mut cache,
+                        participant_paths,
+                    ) {
                         Ok(()) => signed_any = true,
                         Err(Error::SpkNotMatch) => continue,
                         Err(e) => return Err(e),
@@ -710,6 +743,7 @@ impl HotSigner {
         index: usize,
         derivator: &SpkDerivator,
         cache: &mut sighash::SighashCache<bitcoin::Transaction>,
+        participant_paths: &KeyPaths,
     ) -> Result<(), Error> {
         Self::has_witness_utxo(psbt, index)?;
         let sighash = self.segwit_hash(psbt, index, cache)?;
@@ -719,7 +753,7 @@ impl HotSigner {
         }
         let mut derivation_paths = vec![];
         input.bip32_derivation.iter().for_each(|(_, (fg, deriv))| {
-            if *fg == self.fingerprint() {
+            if *fg == self.fingerprint() && !participant_paths.contains(deriv) {
                 derivation_paths.push(deriv.clone());
             }
         });
@@ -751,7 +785,7 @@ impl HotSigner {
         Ok(hash)
     }
 
-    pub fn inner_sign_input_segwit(
+    pub(crate) fn inner_sign_input_segwit(
         &self,
         hash: Message,
         input: &mut Input,
@@ -767,21 +801,11 @@ impl HotSigner {
                 continue;
             }
 
-            if let Some(wit) = &input.witness_utxo {
-                let ap = account_path(d)?;
-                let expected_spk = match ap.0 {
-                    false => derivator.receive_at(ap.1),
-                    true => derivator.change_at(ap.1),
-                }
-                .script_pubkey();
-                if wit.script_pubkey != expected_spk {
-                    Err(Error::SpkNotMatch)
-                } else {
-                    Ok(())
-                }
-            } else {
-                Err(Error::MissingWitnessUtxo)
-            }?;
+            let wit = input
+                .witness_utxo
+                .as_ref()
+                .ok_or(Error::MissingWitnessUtxo)?;
+            check_spk(derivator, d, &wit.script_pubkey)?;
 
             // Grind the nonce until the signature serializes to its full
             // fixed-size low-R, low-S form (32-byte R with the high bit clear,
@@ -847,22 +871,11 @@ impl HotSigner {
                     return Err(Error::SpkNotMatch);
                 }
 
-                // Check the spk matches
-                if let Some(wit) = &input.witness_utxo {
-                    let ap = account_path(der_path)?;
-                    let expected_spk = match ap.0 {
-                        false => derivator.receive_at(ap.1),
-                        true => derivator.change_at(ap.1),
-                    }
-                    .script_pubkey();
-                    if wit.script_pubkey != expected_spk {
-                        Err(Error::SpkNotMatch)
-                    } else {
-                        Ok(())
-                    }
-                } else {
-                    Err(Error::MissingWitnessUtxo)
-                }?;
+                let wit = input
+                    .witness_utxo
+                    .as_ref()
+                    .ok_or(Error::MissingWitnessUtxo)?;
+                check_spk(derivator, der_path, &wit.script_pubkey)?;
 
                 // Then sign
                 let sighash = cache
@@ -1283,6 +1296,42 @@ fn derives(key: &DerivationPath, ranged: bool, path: &DerivationPath) -> bool {
     }
 }
 
+/// `Error::SpkNotMatch` unless `spk` is the receive or change script at the last
+/// step of `path`, and the step before it, the keychain, is the multipath element
+/// of that script (the first for receive, the second for change) on a key of the
+/// descriptor: a receive origin cannot sign a change script at the same index. A
+/// bwk-bup zone puts the elements anywhere (`<512;513>`), not only at 0 and 1.
+fn check_spk(
+    derivator: &SpkDerivator,
+    path: &DerivationPath,
+    spk: &ScriptBuf,
+) -> Result<(), Error> {
+    let [.., keychain, ChildNumber::Normal { index }] = path.as_ref() else {
+        return Err(Error::SpkNotMatch);
+    };
+    let receive = derivator.receive_spk_at(*index) == *spk;
+    let change = derivator.change_spk_at(*index) == *spk;
+    // `Descriptor` has no `iter_pk`: `for_each_key` stops at the first key whose
+    // closure returns false, so it returns false exactly when some key matches.
+    let matches = !derivator.descriptor().for_each_key(|key| {
+        !WalletKeyExt::plain_keys(key).into_iter().any(|key| {
+            let DescriptorPublicKey::MultiXPub(xkey) = key else {
+                return false;
+            };
+            let [receive_path, change_path] = xkey.derivation_paths.paths().as_slice() else {
+                return false;
+            };
+            (receive && receive_path.as_ref().last() == Some(keychain))
+                || (change && change_path.as_ref().last() == Some(keychain))
+        })
+    });
+    if matches {
+        Ok(())
+    } else {
+        Err(Error::SpkNotMatch)
+    }
+}
+
 /// A 0x1c to write on input `input_index`.
 #[cfg(feature = "musig")]
 struct InputPartialSig {
@@ -1349,35 +1398,6 @@ pub fn deriv_path(path: &(bool /* is_change */, u32)) -> Result<DerivationPath, 
     let account_u32: u32 = path.0.into();
     DerivationPath::from_str(&format!("m/{}/{}", account_u32, path.1))
         .map_err(|_| Error::DerivationPath)
-}
-
-/// Converts a derivation path into a tuple containing an account type and an index.
-///
-/// # Arguments
-/// * `path` - A reference to a [`DerivationPath`] that contains the account type and index.
-///
-/// # Returns
-/// A result containing a tuple of the change flag as `bool` and the index as `u32`.
-/// Returns an error if the derivation path does not have the expected length.
-pub fn account_path(path: &DerivationPath) -> Result<(bool /* is_change */, u32), Error> {
-    let mut path = path.to_u32_vec();
-    #[allow(clippy::comparison_chain)]
-    if path.len() < 2 {
-        return Err(Error::DerivationPath);
-    } else if path.len() > 2 {
-        path = path[path.len() - 2..path.len()].to_vec();
-    }
-    if path.is_empty() {
-        return Err(Error::DerivationPath);
-    }
-    let is_change = match path[0] {
-        0 => false,
-        1 => true,
-        _ => {
-            return Err(Error::DerivationPath);
-        }
-    };
-    Ok((is_change, path[1]))
 }
 
 #[cfg(all(test, feature = "test"))]
@@ -1701,6 +1721,49 @@ mod tests {
         assert_eq!(
             signer.sign_v2(&mut psbt, &descriptor),
             Err(Error::MixedSigningInfo)
+        );
+    }
+
+    #[test]
+    fn check_spk_matches_the_keychain_step() {
+        let network = Network::Regtest;
+        let signer = new_signer(network);
+        let account_path = DerivationPath::from_str("m/84'/0'/0'").unwrap();
+        let xpub = signer.xpub(&account_path);
+        let origin = |keychain: u32, index: u32| {
+            account_path
+                .child(ChildNumber::from_normal_idx(keychain).unwrap())
+                .child(ChildNumber::from_normal_idx(index).unwrap())
+        };
+
+        let derivator = SpkDerivator::new(to_wallet(wpkh(xpub.clone())), network).unwrap();
+        let (receive, change) = (derivator.receive_spk_at(3), derivator.change_spk_at(3));
+        assert_eq!(check_spk(&derivator, &origin(0, 3), &receive), Ok(()));
+        assert_eq!(check_spk(&derivator, &origin(1, 3), &change), Ok(()));
+        assert_eq!(
+            check_spk(&derivator, &origin(0, 3), &change),
+            Err(Error::SpkNotMatch)
+        );
+        assert_eq!(
+            check_spk(&derivator, &origin(1, 3), &receive),
+            Err(Error::SpkNotMatch)
+        );
+
+        let zone = miniscript::Descriptor::<DescriptorPublicKey>::from_str(&format!(
+            "wpkh({xpub}/<512;513>/*)"
+        ))
+        .unwrap();
+        let derivator = SpkDerivator::new(to_wallet(zone), network).unwrap();
+        let (receive, change) = (derivator.receive_spk_at(3), derivator.change_spk_at(3));
+        assert_eq!(check_spk(&derivator, &origin(512, 3), &receive), Ok(()));
+        assert_eq!(check_spk(&derivator, &origin(513, 3), &change), Ok(()));
+        assert_eq!(
+            check_spk(&derivator, &origin(512, 3), &change),
+            Err(Error::SpkNotMatch)
+        );
+        assert_eq!(
+            check_spk(&derivator, &origin(0, 3), &receive),
+            Err(Error::SpkNotMatch)
         );
     }
 
@@ -2279,7 +2342,12 @@ mod musig_tests {
     }
 
     fn musig_psbt(descriptor: &WalletDescriptor, indexes: &[u32]) -> Psbt {
-        let receive = descriptor.single_paths().unwrap()[0].clone();
+        keychain_psbt(descriptor, 0, indexes)
+    }
+
+    /// Spends the coins of `keychain` (0 receive, 1 change) at `indexes`.
+    fn keychain_psbt(descriptor: &WalletDescriptor, keychain: usize, indexes: &[u32]) -> Psbt {
+        let single = descriptor.single_paths().unwrap()[keychain].clone();
         let input = indexes
             .iter()
             .enumerate()
@@ -2301,7 +2369,7 @@ mod musig_tests {
         };
         let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
         for (position, index) in indexes.iter().enumerate() {
-            let definite = receive.derive_at(*index).unwrap();
+            let definite = single.derive_at(*index).unwrap();
             psbt.inputs[position].witness_utxo = Some(TxOut {
                 value: Amount::from_sat(100_000),
                 script_pubkey: definite.script_pubkey(),
@@ -2396,6 +2464,96 @@ mod musig_tests {
 
         assert_eq!(finalize(&mut psbt, &d), 2);
         assert!(psbt.inputs.iter().all(|i| i.final_script_witness.is_some()));
+    }
+
+    /// `tr(musig(A,B)/<zone>/*)` spends its coin at index 3 of `keychain` by the
+    /// key path.
+    fn musig_key_path_signs_at(zone: &str, keychain: usize) {
+        let [mut a, mut b]: [HotSigner; 2] = musig_signers(2).try_into().unwrap();
+        let text = format!("tr(musig({},{})/<{zone}>/*)", cosigner(&a), cosigner(&b));
+        let d = register(&mut [&mut a, &mut b], &text);
+        let mut psbt = keychain_psbt(&d, keychain, &[3]);
+
+        both_round_one(&mut psbt, &d, &a, &b);
+        assert_eq!(round(&psbt, &d), MusigRound::PartialSigs);
+        a.inner_sign(&mut psbt, &d).unwrap();
+        b.inner_sign(&mut psbt, &d).unwrap();
+        assert_eq!(round(&psbt, &d), MusigRound::Ready);
+        assert_eq!(finalize(&mut psbt, &d), 1);
+        assert!(psbt.inputs[0].final_script_witness.is_some());
+    }
+
+    #[test]
+    fn musig_key_path_signs_a_change_coin() {
+        musig_key_path_signs_at("0;1", 1);
+    }
+
+    #[test]
+    fn musig_key_path_signs_in_a_bwk_bup_zone() {
+        musig_key_path_signs_at("512;513", 0);
+    }
+
+    #[test]
+    fn musig_key_path_signs_in_the_second_step_of_a_bwk_bup_zone() {
+        musig_key_path_signs_at("512;513", 1);
+    }
+
+    #[test]
+    fn plain_key_path_signs_in_a_bwk_bup_zone() {
+        let [mut a]: [HotSigner; 1] = musig_signers(1).try_into().unwrap();
+        let text = format!("tr({}/<512;513>/*)", plain(&a));
+        let d = register(&mut [&mut a], &text);
+        for keychain in [0, 1] {
+            let mut psbt = keychain_psbt(&d, keychain, &[3]);
+            a.inner_sign(&mut psbt, &d).unwrap();
+            assert!(psbt.inputs[0].tap_key_sig.is_some());
+            psbt.finalize_mut(&Secp256k1::verification_only()).unwrap();
+        }
+    }
+
+    #[test]
+    fn plain_key_path_in_a_bwk_bup_zone_signs_in_round_two() {
+        let [mut a, mut b]: [HotSigner; 2] = musig_signers(2).try_into().unwrap();
+        let text = format!(
+            "tr({}/<512;513>/*,pk(musig({},{})/<512;513>/*))",
+            plain(&a),
+            cosigner(&a),
+            cosigner(&b)
+        );
+        let d = register(&mut [&mut a, &mut b], &text);
+        let mut psbt = keychain_psbt(&d, 1, &[3]);
+
+        both_round_one(&mut psbt, &d, &a, &b);
+        assert!(psbt.inputs[0].tap_key_sig.is_none());
+        a.inner_sign(&mut psbt, &d).unwrap();
+        assert!(psbt.inputs[0].tap_key_sig.is_some());
+        assert_eq!(partial_sig_count(&psbt), 1);
+        b.inner_sign(&mut psbt, &d).unwrap();
+        assert_eq!(round(&psbt, &d), MusigRound::Ready);
+    }
+
+    #[test]
+    fn segwit_participant_origin_gets_no_signature() {
+        let [mut a, mut b]: [HotSigner; 2] = musig_signers(2).try_into().unwrap();
+        let musig_text = format!(
+            "tr(musig({}/<0;1>/*,{}/<0;1>/*))",
+            cosigner(&a),
+            cosigner(&b)
+        );
+        register(&mut [&mut a, &mut b], &musig_text);
+        // Registered unchecked, as from_json loads it: its key is a participant.
+        let wpkh_text = format!("wpkh({}/<0;1>/*)", cosigner(&a));
+        let wpkh = register(&mut [&mut a], &wpkh_text);
+        let mut psbt = musig_psbt(&wpkh, &[0]);
+        let path = DerivationPath::from_str(&format!("{COSIGNER_PATH}/0/0")).unwrap();
+        assert_eq!(
+            psbt.inputs[0].bip32_derivation.values().collect::<Vec<_>>(),
+            vec![&(a.fingerprint(), path)]
+        );
+
+        assert_eq!(a.inner_sign(&mut psbt, &wpkh), Err(Error::SigningInfo));
+        a.sign(&mut psbt);
+        assert!(psbt.inputs[0].partial_sigs.is_empty());
     }
 
     #[test]
@@ -2631,7 +2789,7 @@ mod musig_tests {
 
         assert_eq!(
             aggregate_partial_sigs(&mut psbt, &d),
-            Err(Error::MusigPartialSig(0))
+            Err(Error::MusigPartialSig(0, Some(slot.participant)))
         );
         assert!(psbt.inputs[0].tap_key_sig.is_none());
     }

@@ -1,10 +1,10 @@
 use std::{path::PathBuf, str::FromStr};
 
-use bwk_descriptor::descriptor::ScriptType;
+use bwk_descriptor::descriptor::{Descriptor, ScriptType};
 use bwk_electrum::config::ScannerConfig;
 use bwk_persist::PersistenceKind;
 use bwk_sign::hot_signer::HotSigner;
-use miniscript::{bitcoin, Descriptor, DescriptorPublicKey};
+use miniscript::bitcoin;
 use serde::{Deserialize, Serialize};
 
 /// The directory `datadir` hangs its subdirectory off: the home directory on
@@ -139,8 +139,7 @@ impl Config {
     }
 
     /// A watch-only or hot config from descriptor text (BIP-380, or BIP-390 with
-    /// `musig`).
-    #[allow(unused_variables)]
+    /// `musig`). An `sp()` text is `Error::NotMiniscript`.
     pub fn new_from_descriptor(
         mnemonic: Option<String>,
         account: String,
@@ -150,7 +149,21 @@ impl Config {
         dir_name: String,
         persistence: Option<PersistenceKind>,
     ) -> Result<Config, bwk_descriptor::descriptor::Error> {
-        todo!()
+        let descriptor = Descriptor::from_str(descriptor)?;
+        if descriptor.is_sp() {
+            return Err(bwk_descriptor::descriptor::Error::NotMiniscript);
+        }
+        Ok(Config {
+            scanner: ScannerConfig::new(
+                descriptor,
+                data_dir,
+                dir_name,
+                account,
+                network,
+                persistence,
+            ),
+            mnemonic,
+        })
     }
 
     /// View of this config that's safe to persist to disk.
@@ -211,21 +224,93 @@ impl Config {
     }
 }
 
-/// Checks if the provided descriptor string is valid.
+/// Checks if the provided descriptor string is a valid miniscript descriptor:
+/// BIP-380 text, or BIP-390 text under `musig`. An `sp()` text is not.
 ///
 /// # Arguments
 ///
 /// * `descriptor` - A string representing the descriptor to validate.
 pub fn is_descriptor_valid(descriptor: String) -> bool {
-    Descriptor::<DescriptorPublicKey>::from_str(&descriptor).is_ok()
+    Descriptor::from_str(&descriptor).is_ok_and(|d| d.as_miniscript().is_some())
 }
 
 #[cfg(test)]
 pub mod tests {
     use bwk_persist::config_store::{ConfigStore, FileConfigStore};
-    use miniscript::bitcoin::bip32::ChildNumber;
+    use miniscript::bitcoin::{
+        bip32::{ChildNumber, DerivationPath, Xpriv, Xpub},
+        secp256k1::Secp256k1,
+    };
 
     use super::*;
+
+    /// `[fp/87'/1'/0'/2]tpub` of a fresh regtest signer.
+    fn cosigner_text() -> String {
+        HotSigner::new(bitcoin::Network::Regtest)
+            .unwrap()
+            .xpub(&DerivationPath::from_str("m/87'/1'/0'/2").unwrap())
+            .to_string()
+    }
+
+    fn sp_text() -> String {
+        let secp = Secp256k1::new();
+        let scan = Xpriv::new_master(bitcoin::Network::Testnet, &[0x02; 64]).unwrap();
+        let spend = Xpriv::new_master(bitcoin::Network::Testnet, &[0x03; 64]).unwrap();
+        let spend = Xpub::from_priv(&secp, &spend);
+        format!("sp([deadbeef/352h/0h/0h]{scan}/0h,{spend}/0h)")
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn new_from_descriptor_round_trips_musig_text() {
+        let temp = temp_dir::TempDir::new().unwrap();
+        let written = format!("tr(musig({},{})/<0;1>/*)", cosigner_text(), cosigner_text());
+        let text = Descriptor::from_str(&written).unwrap().to_string();
+        assert!(text.starts_with("tr(musig(["));
+        let cfg = Config::new_from_descriptor(
+            None,
+            "musig".to_string(),
+            bitcoin::Network::Regtest,
+            &text,
+            temp.child("storage"),
+            "wallet".to_string(),
+            Some(PersistenceKind::Json),
+        )
+        .unwrap();
+        assert_eq!(cfg.scanner.descriptor.to_string(), text);
+        assert_eq!(cfg.scanner.account, "musig");
+        assert!(cfg.mnemonic.is_none());
+    }
+
+    #[test]
+    fn is_descriptor_valid_reads_both_forms() {
+        let wpkh = format!("wpkh({}/<0;1>/*)", cosigner_text());
+        assert!(is_descriptor_valid(wpkh));
+        #[cfg(feature = "musig")]
+        assert!(is_descriptor_valid(format!(
+            "tr(musig({},{})/<0;1>/*)",
+            cosigner_text(),
+            cosigner_text()
+        )));
+        assert!(!is_descriptor_valid("garbage".to_string()));
+        assert!(Descriptor::from_str(&sp_text()).unwrap().is_sp());
+        assert!(!is_descriptor_valid(sp_text()));
+
+        let temp = temp_dir::TempDir::new().unwrap();
+        let sp = Config::new_from_descriptor(
+            None,
+            "sp".to_string(),
+            bitcoin::Network::Regtest,
+            &sp_text(),
+            temp.child("storage"),
+            "wallet".to_string(),
+            None,
+        );
+        assert!(matches!(
+            sp,
+            Err(bwk_descriptor::descriptor::Error::NotMiniscript)
+        ));
+    }
 
     #[test]
     fn config_round_trips_through_file_store() {

@@ -114,6 +114,10 @@ impl MusigBackend for RustBitcoin {
         Ok(AggregatedNonce::new(&refs).serialize())
     }
 
+    fn erase_secnonce(secnonce: &mut Self::SecNonce) {
+        secnonce.non_secure_erase();
+    }
+
     /// `Session::partial_sign` asserts on a used nonce or one of another key: the
     /// nonce goes through its bytes to be checked first. The bytes stay local to this
     /// call and are zeroed, never stored.

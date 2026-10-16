@@ -7,7 +7,8 @@ use crate::{
 };
 
 /// A secret nonce bound to its signer key. Not Clone, not serializable: it is moved
-/// into `partial_sign` and signs once.
+/// into `partial_sign` and signs once. Dropped unused (a session replaced, erased or
+/// failed), it is erased through [`MusigBackend::erase_secnonce`].
 ///
 /// ```compile_fail
 /// fn reuse<B: bwk_musig::MusigBackend>(n: bwk_musig::SecNonce<B>) {
@@ -15,7 +16,8 @@ use crate::{
 /// }
 /// ```
 pub struct SecNonce<B: MusigBackend> {
-    inner: B::SecNonce,
+    /// None once moved into `partial_sign`.
+    inner: Option<B::SecNonce>,
     public_key: [u8; 33],
 }
 
@@ -25,8 +27,18 @@ impl<B: MusigBackend> SecNonce<B> {
         self.public_key
     }
 
-    pub(crate) fn into_inner(self) -> B::SecNonce {
+    pub(crate) fn into_inner(mut self) -> B::SecNonce {
         self.inner
+            .take()
+            .expect("a SecNonce holds its nonce until consumed")
+    }
+}
+
+impl<B: MusigBackend> Drop for SecNonce<B> {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.as_mut() {
+            B::erase_secnonce(inner);
+        }
     }
 }
 
@@ -81,7 +93,7 @@ pub fn nonce_gen_with_rand<B: MusigBackend>(
         extra_in,
     )?;
     let secnonce = SecNonce {
-        inner,
+        inner: Some(inner),
         public_key: *public_key,
     };
     Ok((secnonce, pubnonce))

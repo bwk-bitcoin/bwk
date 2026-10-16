@@ -32,7 +32,7 @@ use miniscript::{
     Descriptor,
 };
 
-use crate::{error::Error, hot_signer::account_path};
+use crate::error::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MusigSessionId(pub [u8; 32]);
@@ -255,26 +255,29 @@ pub(crate) fn slot_infos(
     Ok(slots)
 }
 
-/// The descriptor derived at the input's (change, index), found from its
-/// `tap_key_origins` and checked against the spent script; None when not ours.
+/// The descriptor derived at the input's index, found from the last step of its
+/// `tap_key_origins` paths and checked against the spent script on each single
+/// path; None when not ours. The multipath step is not read: a bwk-bup zone puts
+/// it anywhere (`<512;513>`), not only at 0 and 1.
 fn input_descriptor(
     input: &Input,
     spent: &TxOut,
     single_paths: &[WalletDescriptor],
 ) -> Result<Option<WalletDefiniteDescriptor>, Error> {
-    let candidates: BTreeSet<(bool, u32)> = input
+    let candidates: BTreeSet<u32> = input
         .tap_key_origins
         .values()
-        .filter_map(|(_, (_, path))| account_path(path).ok())
-        .filter(|(_, index)| ChildNumber::from_normal_idx(*index).is_ok())
+        .filter_map(|(_, (_, path))| match path.as_ref().last() {
+            Some(ChildNumber::Normal { index }) => Some(*index),
+            _ => None,
+        })
         .collect();
-    for (change, index) in candidates {
-        let Some(single) = single_paths.get(usize::from(change)) else {
-            continue;
-        };
-        let definite = single.derive_at(index).map_err(|_| Error::DerivationPath)?;
-        if definite.script_pubkey() == spent.script_pubkey {
-            return Ok(Some(definite));
+    for index in candidates {
+        for single in single_paths {
+            let definite = single.derive_at(index).map_err(|_| Error::DerivationPath)?;
+            if definite.script_pubkey() == spent.script_pubkey {
+                return Ok(Some(definite));
+            }
         }
     }
     Ok(None)
@@ -454,7 +457,7 @@ pub fn aggregate_partial_sigs(
         let message = Message::from_digest(slot_sighash(psbt, first)?);
         let aggregate = first.aggregate.x_only_public_key().0;
         secp.verify_schnorr(&signature, &message, &aggregate)
-            .map_err(|_| Error::MusigPartialSig(first.input_index))?;
+            .map_err(|_| Error::MusigPartialSig(first.input_index, None))?;
         let signature = taproot::Signature {
             signature,
             sighash_type: TapSighashType::Default,
@@ -499,12 +502,16 @@ fn aggregate_group(
             &sighash,
         );
         if !valid {
-            return Err(Error::MusigPartialSig(input_index));
+            return Err(Error::MusigPartialSig(
+                input_index,
+                Some(info.slot.participant),
+            ));
         }
     }
     let signature = partial_agg(&RustBitcoin, &key_agg, &aggnonce, &sighash, partial_sigs)
-        .map_err(|_| Error::MusigPartialSig(input_index))?;
-    schnorr::Signature::from_slice(&signature).map_err(|_| Error::MusigPartialSig(input_index))
+        .map_err(|_| Error::MusigPartialSig(input_index, None))?;
+    schnorr::Signature::from_slice(&signature)
+        .map_err(|_| Error::MusigPartialSig(input_index, None))
 }
 
 /// The BIP-341 sighash a slot signs (default sighash type).

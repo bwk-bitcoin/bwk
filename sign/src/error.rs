@@ -1,4 +1,6 @@
 use bip39;
+#[cfg(feature = "musig")]
+use miniscript::bitcoin::secp256k1::PublicKey;
 use std::fmt::Display;
 
 #[derive(Debug, PartialEq)]
@@ -32,7 +34,9 @@ pub enum Error {
     #[cfg(feature = "musig")]
     MusigNonces,
     #[cfg(feature = "musig")]
-    MusigPartialSig(usize),
+    /// Input index, and the participant whose partial signature fails to verify
+    /// (`None` when the shares verify but their aggregate does not).
+    MusigPartialSig(usize, Option<PublicKey>),
     #[cfg(feature = "musig")]
     Musig(bwk_musig::Error),
     #[cfg(feature = "musig")]
@@ -78,9 +82,14 @@ impl Display for Error {
             #[cfg(feature = "musig")]
             Error::MusigNonces => write!(f, "MuSig2 nonces missing from cosigners"),
             #[cfg(feature = "musig")]
-            Error::MusigPartialSig(index) => {
+            Error::MusigPartialSig(index, None) => {
                 write!(f, "invalid MuSig2 partial signature on input {index}")
             }
+            #[cfg(feature = "musig")]
+            Error::MusigPartialSig(index, Some(participant)) => write!(
+                f,
+                "invalid MuSig2 partial signature on input {index} from participant {participant}"
+            ),
             #[cfg(feature = "musig")]
             Error::Musig(e) => write!(f, "MuSig2 error: {e}"),
             #[cfg(feature = "musig")]

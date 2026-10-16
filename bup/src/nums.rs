@@ -3,8 +3,6 @@
 //!
 //! Pulled out of liana's `descriptors::analysis` so this crate stays independent.
 
-use std::str::FromStr;
-
 use bwk_descriptor::wallet::WalletKey;
 #[cfg(feature = "musig")]
 use bwk_keys::musig::MusigKey;
@@ -12,26 +10,13 @@ use miniscript::{
     bitcoin::{
         bip32,
         hashes::{sha256, Hash},
-        secp256k1,
     },
     descriptor,
 };
 
 use crate::multipath::{plain_key, wallet_key};
 
-/// The BIP-341 NUMS ("Nothing Up My Sleeve") point.
-///
-/// See BIP-341:
-/// > One example of such a point is H =
-/// > lift_x(0x50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0) which is
-/// > constructed by taking the hash of the standard uncompressed encoding of the secp256k1
-/// > base point G as X coordinate.
-pub fn bip341_nums() -> secp256k1::PublicKey {
-    secp256k1::PublicKey::from_str(
-        "0250929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0",
-    )
-    .expect("Valid pubkey: NUMS from BIP341")
-}
+pub use bwk_keys::nums::bip341_nums;
 
 /// The xpub whose public key a leaf key adds to the NUMS chain code: a plain
 /// `MultiXPub`'s own, or with `musig` an aggregate-then-derive musig()'s BIP-328 synthetic
