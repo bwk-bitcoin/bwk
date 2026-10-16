@@ -6,20 +6,26 @@ pub trait Rng {
 }
 
 /// The secp256k1 library the protocol runs on.
+///
+/// Points are 33-byte compressed encodings, scalars 32-byte big-endian.
 pub trait MusigBackend {
     /// KeyAgg context with its tweaks applied in order.
     type KeyAggCache: Clone;
     /// A secret nonce: never cloned, serialized or reused.
     type SecNonce;
 
+    /// Whether `p` is a compressed encoding (0x02 or 0x03) of a point on the curve.
     fn point_is_valid(&self, p: &[u8; 33]) -> bool;
-    /// BIP-327 KeySort, in place.
+    /// BIP-327 KeySort, in place: a lexicographic sort of the encodings, valid or not.
     fn key_sort(&self, keys: &mut [[u8; 33]]);
-    /// BIP-327 KeyAgg over `keys` in the given order.
+    /// BIP-327 KeyAgg over `keys` in the given order. `Error::NoKeys` for an empty
+    /// slice, `Error::InvalidPoint` for any invalid encoding.
     fn key_agg(&self, keys: &[[u8; 33]]) -> Result<Self::KeyAggCache, Error>;
     /// The cache's aggregate key, tweaks included.
     fn agg_pk(&self, cache: &Self::KeyAggCache) -> [u8; 33];
     /// Applies a plain or x-only tweak and returns the new aggregate key.
+    /// `Error::InvalidTweak` for a tweak >= n or an infinite result, the cache is then
+    /// left in an unspecified state: callers tweak a copy.
     fn tweak_add(
         &self,
         cache: &mut Self::KeyAggCache,

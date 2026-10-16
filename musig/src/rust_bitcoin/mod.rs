@@ -4,6 +4,8 @@
 
 pub use secp256k1_musig;
 
+use secp256k1_musig::{musig::KeyAggCache, PublicKey, Scalar};
+
 use crate::{backend::MusigBackend, Error};
 
 /// The backend on rust-secp256k1 0.33 (global context).
@@ -21,19 +23,26 @@ impl MusigBackend for RustBitcoin {
     type SecNonce = secp256k1_musig::musig::SecretNonce;
 
     fn point_is_valid(&self, p: &[u8; 33]) -> bool {
-        todo!()
+        public_key(p).is_ok()
     }
 
     fn key_sort(&self, keys: &mut [[u8; 33]]) {
-        todo!()
+        // `secp256k1::sort_pubkeys` parses the keys: a byte sort also orders invalid ones.
+        keys.sort_unstable();
     }
 
     fn key_agg(&self, keys: &[[u8; 33]]) -> Result<Self::KeyAggCache, Error> {
-        todo!()
+        // `KeyAggCache::new` panics on an empty slice.
+        if keys.is_empty() {
+            return Err(Error::NoKeys);
+        }
+        let keys = keys.iter().map(public_key).collect::<Result<Vec<_>, _>>()?;
+        let refs = keys.iter().collect::<Vec<_>>();
+        Ok(KeyAggCache::new(&refs))
     }
 
     fn agg_pk(&self, cache: &Self::KeyAggCache) -> [u8; 33] {
-        todo!()
+        cache.agg_pk_full().serialize()
     }
 
     fn tweak_add(
@@ -42,7 +51,14 @@ impl MusigBackend for RustBitcoin {
         tweak: &[u8; 32],
         x_only: bool,
     ) -> Result<[u8; 33], Error> {
-        todo!()
+        let tweak = scalar(tweak)?;
+        let key = if x_only {
+            cache.pubkey_xonly_tweak_add(&tweak)
+        } else {
+            cache.pubkey_ec_tweak_add(&tweak)
+        };
+        key.map(|key| key.serialize())
+            .map_err(|_| Error::InvalidTweak)
     }
 
     fn nonce_gen(
@@ -93,4 +109,12 @@ impl MusigBackend for RustBitcoin {
     ) -> Result<[u8; 64], Error> {
         todo!()
     }
+}
+
+fn public_key(p: &[u8; 33]) -> Result<PublicKey, Error> {
+    PublicKey::from_byte_array_compressed(*p).map_err(|_| Error::InvalidPoint)
+}
+
+fn scalar(t: &[u8; 32]) -> Result<Scalar, Error> {
+    Scalar::from_be_bytes(*t).map_err(|_| Error::InvalidTweak)
 }

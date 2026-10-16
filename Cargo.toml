@@ -73,9 +73,9 @@ bitcoin_hashes = "0.13.0"
 bech32 = "0.9"
 ureq = { version = "3.3", default-features = false }
 # rust-secp256k1 with the musig module, as bark/ark-lib uses it; bitcoin 0.32 stays on
-# secp256k1 0.29, conversions go through bytes. Phase 1 adjusts the feature names to
-# what 0.33 publishes.
-secp256k1-musig = { package = "secp256k1", version = "0.33", default-features = false, features = ["std", "global-context"] }
+# secp256k1 0.29, conversions go through bytes. 0.33's musig API runs on its internal
+# context, so only `std` is enabled.
+secp256k1-musig = { package = "secp256k1", version = "0.33", default-features = false, features = ["std"] }
 
 # bwk crates
 bwk-electrum = { path = "electrum" }

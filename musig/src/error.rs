@@ -1,3 +1,5 @@
+//! The error type shared by the protocol code and every backend.
+
 /// Errors from the MuSig2 protocol and its backends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "rust-bitcoin", derive(thiserror::Error))]

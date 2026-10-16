@@ -48,6 +48,8 @@ Blindbit).
 | bwk-sp          | Silent Payments account (BIP352, Blindbit backend)    |
 | bwk-tx          | Transaction building, coin selection, PSBT            |
 | bwk-psbt        | PSBTv2 (BIP370), silent-payment fields (BIP375/376)   |
+| bwk-musig       | MuSig2 (BIP-327) key aggregation, nonces, partial     |
+|                 | signatures (no_std)                                   |
 | bwk-electrum    | Electrum client, scanner, scan stores, header chain   |
 | bwk-sign        | Signers and signing managers (hot, hardware, remote)  |
 | bwk-descriptor  | Miniscript and sp() descriptors, SpkDerivator         |
@@ -69,6 +71,7 @@ See crate READMEs:
 [bwk-sp](sp/README.md),
 [bwk-tx](tx/README.md),
 [bwk-psbt](psbt/README.md),
+[bwk-musig](musig/README.md),
 [bwk-electrum](electrum/README.md),
 [bwk-sign](sign/README.md),
 [bwk-descriptor](descriptor/README.md),
