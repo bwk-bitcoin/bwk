@@ -53,6 +53,8 @@ tests locally. Commit messages must be single-line and follow existing style
 |                 | the scan stores, the header chain and the reconcile pass    |
 | bwk-sign        | Signers and signing managers: hot, hardware, remote         |
 | bwk-descriptor  | Miniscript and sp() descriptor handling, SpkDerivator       |
+| bwk-bup         | Bitcoin user policy: role-tagged Taproot multipath          |
+|                 | descriptors, compile and read back (BIP draft)              |
 | bwk-keys        | Key derivation utilities (OXpriv, OXpub, KeyDerivator)      |
 | bwk-p2p         | Bitcoin P2P network client, DNS seed resolution             |
 | bwk-coin        | Coin domain types shared by bwk-tx and bwk-electrum         |
