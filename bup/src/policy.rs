@@ -858,7 +858,7 @@ impl Policy {
 
     /// Every signer key with the role its origin carries (None when it has none).
     pub fn key_types(&self) -> BTreeMap<OXpub, Option<KeyType>> {
-        todo!()
+        self.paths.iter().flat_map(Path::key_types).collect()
     }
 }
 
@@ -1151,29 +1151,31 @@ fn validate_csv_with_nested_mandatory_paths(paths: &[Path]) -> Result<(), Policy
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::path::{Leaf, OXpub, Path, Semantic, TapPosition};
+    use crate::{
+        key_role::{key_type_of, KeyType},
+        path::{Leaf, OXpub, Path, Semantic, TapPosition},
+        test_keys::test_account,
+    };
     #[cfg(feature = "musig")]
     use crate::{
         musig::{musig_aggregate, musig_key, musig_leaf, musig_participants, participant_key},
         test_keys::{test_key, test_keys},
     };
+    use bwk_descriptor::wallet::WalletKeyExt;
     #[cfg(feature = "musig")]
     use bwk_descriptor::{musig::musig_descriptor_to_string, wallet::WalletDescriptorExt};
     #[cfg(feature = "musig")]
     use bwk_keys::{derivator::KeyDerivator, musig::MusigKey};
+    #[cfg(feature = "musig")]
+    use miniscript::bitcoin::{
+        bip32::DerivationPath,
+        hashes::{sha256, Hash},
+        Network,
+    };
     use miniscript::{
         bitcoin::{absolute, relative},
         policy::Liftable,
-        DescriptorPublicKey, Miniscript, Tap,
-    };
-    #[cfg(feature = "musig")]
-    use miniscript::{
-        bitcoin::{
-            bip32::DerivationPath,
-            hashes::{sha256, Hash},
-            Network,
-        },
-        ForEachKey,
+        DescriptorPublicKey, ForEachKey, Miniscript, Tap,
     };
     use std::str::FromStr;
 
@@ -3979,6 +3981,109 @@ mod tests {
         let desc = policy.compile().unwrap().clone();
         let parsed = Policy::from_descriptor(&desc).unwrap();
         assert_eq!(parsed.policy_type(), PolicyType::Unknown);
+    }
+
+    // Key roles
+
+    #[test]
+    fn key_types_survive_round_trip() {
+        let a = test_account(1, 0).role_key(KeyType::Internal, 0).unwrap();
+        let b = test_account(2, 0).role_key(KeyType::SafetyNet, 0).unwrap();
+        let primary = Path::new(
+            Semantic::Single(a.clone()),
+            Locktime::None,
+            TapPosition::InternalKey,
+        );
+        let recov = Path::new(
+            Semantic::Single(b.clone()),
+            rel(144),
+            TapPosition::TapTree(vec![]),
+        );
+        let mut policy = Policy::new(vec![primary, recov], PolicyType::Csv).unwrap();
+        let expected = BTreeMap::from([
+            (a, Some(KeyType::Internal)),
+            (b.clone(), Some(KeyType::SafetyNet)),
+        ]);
+        assert_eq!(policy.key_types(), expected);
+
+        let desc = policy.compile().unwrap().clone();
+        let parsed = Policy::from_descriptor(&desc).unwrap();
+        assert_eq!(parsed.key_types(), expected);
+        let parsed_recov = parsed
+            .paths()
+            .iter()
+            .find(|p| matches!(p.locktime(), Locktime::Relative(_)))
+            .expect("Relative recovery missing");
+        assert_eq!(
+            parsed_recov.key_types(),
+            vec![(b, Some(KeyType::SafetyNet))]
+        );
+    }
+
+    #[test]
+    fn key_types_none_without_role_origin() {
+        let b = test_account(2, 0).role_key(KeyType::SafetyNet, 0).unwrap();
+        let primary = Path::new(
+            Semantic::Single(k1()),
+            Locktime::None,
+            TapPosition::InternalKey,
+        );
+        let recov = Path::new(
+            Semantic::Single(b.clone()),
+            rel(144),
+            TapPosition::TapTree(vec![]),
+        );
+        let policy = Policy::new(vec![primary, recov], PolicyType::Csv).unwrap();
+        assert_eq!(
+            policy.key_types(),
+            BTreeMap::from([(k1(), None), (b, Some(KeyType::SafetyNet))])
+        );
+    }
+
+    #[test]
+    fn compile_keeps_role_origins() {
+        let cosigners = [1, 2, 3]
+            .map(|seed| {
+                test_account(seed, 0)
+                    .role_key(KeyType::Cosigner, 0)
+                    .unwrap()
+            })
+            .to_vec();
+        let safety_net = test_account(4, 0).role_key(KeyType::SafetyNet, 0).unwrap();
+        let primary = Path::new(
+            Semantic::Multi {
+                keys: cosigners,
+                threshold: 2,
+            },
+            Locktime::None,
+            TapPosition::TapTree(vec![]),
+        );
+        let recov = Path::new(
+            Semantic::Single(safety_net),
+            rel(144),
+            TapPosition::TapTree(vec![]),
+        );
+        let mut policy = Policy::new(vec![primary, recov], PolicyType::Csv).unwrap();
+        let desc = policy.compile().unwrap();
+        let mut roles = BTreeSet::new();
+        let mut keys_without_role = 0;
+        desc.for_each_key(|k| {
+            for plain in WalletKeyExt::plain_keys(k) {
+                match key_type_of(plain) {
+                    Some(role) => {
+                        roles.insert(role);
+                    }
+                    None => keys_without_role += 1,
+                }
+            }
+            true
+        });
+        assert_eq!(
+            roles,
+            BTreeSet::from([(KeyType::Cosigner, 0), (KeyType::SafetyNet, 0)])
+        );
+        // The NUMS internal key is the only key without a role.
+        assert_eq!(keys_without_role, 1);
     }
 
     // MuSig2 compile

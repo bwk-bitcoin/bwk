@@ -90,7 +90,11 @@ descriptor (`Policy::from_descriptor`). Round-tripping is a load-bearing invaria
   internal key when no path qualifies for key-path spending). Pulled out of liana's
   `descriptors::analysis` so this crate stays independent.
 - **`key_role.rs`** - `KeyType` key role carried in R, the last origin step of a
-  BIP-87 key `[fp/87'/coin'/account'/R]xpub`, and `Bip87Account`.
+  BIP-87 key `[fp/87'/coin'/account'/R]xpub`, `R = (index << 4) | role` (low 4 bits
+  the role, 4 to 15 reserved). `Bip87Account` holds an account xpub fetched once and
+  derives the role keys (`role_key`); `key_type` / `key_type_of` read the role back
+  from an origin. `Path::key_types` and `Policy::key_types` list every signer key with
+  its role. A role is descriptive, it never constrains which path a key sits on.
 - **`musig.rs`** (`musig` only) - MuSig2 helpers the compiler and the reader call:
   `musig_key` / `musig_leaf` build `musig(keys)/<a;a+1>/*`, `musig_participants`
   reads the keys and zone index back.

@@ -7,7 +7,7 @@ use miniscript::{
     Miniscript, Tap,
 };
 
-use crate::key_role::KeyType;
+use crate::key_role::{key_type, KeyType};
 
 /// CLTV alignment grid (~ 1 week of blocks). `Locktime::AbsoluteRenewable` heights are
 /// constrained to non-zero multiples of this - the small candidate set keeps a future
@@ -618,8 +618,11 @@ impl Path {
         self.start_index
     }
 
+    /// Every signer key in [`Semantic::keys`] order with the role its origin carries.
     pub fn key_types(&self) -> Vec<(OXpub, Option<KeyType>)> {
-        todo!()
+        self.keys()
+            .map(|k| (k.clone(), key_type(k).map(|(role, _)| role)))
+            .collect()
     }
 
     /// Lay out this path at multipath base `start`: assign `start_index`, populate

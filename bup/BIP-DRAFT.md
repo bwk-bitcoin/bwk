@@ -102,6 +102,11 @@ in BIP-389.
   particular `(role, locktime-kind)` pair (Section 2).
 - **Multipath group.** The two indices `<a; a+1>` carried by a single multipath key
   (BIP-389). All keys on one tap-leaf share one multipath group.
+- **MuSig2 form.** The emission of multisig shapes as `pk(musig(...))` leaves
+  (BIP-390), aggregate then derive: the participant keys are aggregated first, the
+  multipath group is then applied to the aggregate (Section 3).
+- **Key role.** The role of one key in the wallet setup (Internal, External,
+  Cosigner, Safety Net), carried in the key's origin (Section 10).
 
 ### 2. Zone layout
 
@@ -154,6 +159,23 @@ Leaf count: 1. Multipath group: `<s; s+1>` where `s` is the path's allocated bas
 (compiles via miniscript to `multi_a(t, …)` under Taproot). Leaf count: 1. All `n`
 keys share one multipath group `<s; s+1>`.
 
+MuSig2 form:
+
+- `1 < t < n`: one leaf per `t`-subset `S` of the keys,
+
+      pk(musig(S_1, …, S_t)/<s;s+1>/*)
+
+  subsets in lexicographic order of key positions. Leaf count: `C(n, t)`. Each leaf
+  gets a fresh multipath group.
+- `t = n`: one leaf
+
+      pk(musig(K_1, …, K_n)/<s;s+1>/*)
+
+  or, when the path has no locktime and is the primary path, the Tr internal key
+  `musig(K_1, …, K_n)/<s;s+1>/*` and no leaf.
+- `t = 1`: one `pk(K_i/<s;s+1>/*)` leaf per key, in key order. A `musig()` of one
+  participant is never emitted.
+
 #### 3.3 `MultiMandatory`
 
 "Every key in a mandatory set `M` must sign, plus a `(t − |M|)`-subset of a cosigner
@@ -165,6 +187,12 @@ for each cosigner subset `S ⊆ K` with `|S| = t − |M|`:
 Leaf count: `C(|K|, t − |M|)`. Each leaf gets a fresh multipath group; the mandatory
 keys appear on every leaf, the cosigner keys each appear on a strict subset of
 leaves.
+
+MuSig2 form: one leaf per cosigner subset `S`,
+
+    pk(musig(M_1, …, M_m, S_1, …, S_{t-m})/<s;s+1>/*)
+
+Leaf count unchanged.
 
 #### 3.4 `MultiMandatoryNested`
 
@@ -179,6 +207,21 @@ necessary. Per-leaf miniscript, for each `(Ms ⊆ M, Ks ⊆ K)` with
     thresh(mt + t, pk(Ms_1), …, pk(Ms_mt), pk(Ks_1), …, pk(Ks_t))
 
 Leaf count: `C(|M|, mt) · C(|K|, t)`.
+
+MuSig2 form: one leaf per `(Ms, Ks)` pair,
+
+    pk(musig(Ms_1, …, Ms_mt, Ks_1, …, Ks_t)/<s;s+1>/*)
+
+Leaf count unchanged.
+
+In the MuSig2 form of Sections 3.2 to 3.4:
+
+- every participant of a `musig()` is a key with its origin and no derivation after
+  it;
+- the multipath group sits on the `musig()` expression, not on the participants;
+- participants keep the path's key order;
+- a locktime wraps each leaf as in the script form, e.g.
+  `and_v(v:pk(musig(S_1, …, S_t)/<s;s+1>/*),older(n))`.
 
 #### 3.5 `Custom`
 
@@ -231,6 +274,10 @@ contiguous groups.
 **Collision rule.** No `(xpub, multipath-index)` pair MAY be claimed by two distinct
 paths. Emitters MUST reject any policy that would produce such a collision.
 
+**MuSig2 form.** The cursor rule is unchanged. The multipath group of a `musig()`
+leaf is the one on the `musig()` expression. For the collision rule, a `musig()`
+expression counts as one key: its aggregate, the synthetic xpub of BIP-328.
+
 ### 6. NUMS marker
 
 The two largest unhardened indices, `[0x7FFF_FFFE; 0x7FFF_FFFF]`, are reserved as the
@@ -245,7 +292,8 @@ The marker has two uses:
 1. **Unspendable internal key.** When no path qualifies for key-path spending, the Tr
    internal key SHOULD be a NUMS-marker key whose chain code is
    `sha256(BIP341_NUMS || concat(serialized public keys of every tap-tree leaf key,
-   DFS order))`.
+   DFS order))`. A `musig()` key contributes its aggregate public key: the untweaked
+   KeyAgg output of BIP-327, the public key of the BIP-328 synthetic xpub.
    Readers MUST recognise such an internal key as unspendable.
 2. **Padding leaves.** Tap-tree slots that exist for shape reasons but carry no
    policy meaning SHOULD be filled with `pk(NUMS-marker-key)`. Readers MUST discard
@@ -320,6 +368,9 @@ A compliant emitter MUST:
    compatibility.
 6. Use only block-height locktimes (no timestamp-side absolute values).
 
+When emitting the MuSig2 form, an emitter MUST NOT produce more than 32 tap leaves,
+padding leaves excluded.
+
 A compliant emitter SHOULD:
 
 - Prefer the NUMS marker form over the chain-code-only form for new descriptors.
@@ -349,6 +400,39 @@ A compliant reader SHOULD:
   paths.
 - Treat unrecognised zones (e.g. `[5120, …)`) as opaque, forward-compatible role
   tags.
+
+### 10. Key role
+
+The zone of Section 2 tags the role of a path. The role of one key in the wallet
+setup is carried separately, in the last step `R` of the key's origin:
+
+    [fp/87'/coin'/account'/R]xpub
+
+`coin'` is `0'` on mainnet and `1'` on every test network. `account'` is any hardened
+BIP-87 account. `R` is unhardened; `xpub` is the key derived at `R`.
+
+The low 4 bits of `R` are the role:
+
+| Role       | `R & 0xF`   |
+| ---------- | ----------- |
+| Internal   | `0`         |
+| External   | `1`         |
+| Cosigner   | `2`         |
+| Safety Net | `3`         |
+| reserved   | `4` to `15` |
+
+The bits above are an occurrence index: `R = (index << 4) | role`. The index is `0`
+by default. It is raised only when one key must appear under distinct xpubs in a
+single policy.
+
+An emitter asks a signing device for the account xpub at `m/87'/coin'/account'` once
+and derives the child `R` itself, for every role the key takes.
+
+A reader reads the role from an origin of exactly four steps whose first three are
+hardened (`87'`, then `0'` or `1'`, then any account) and whose last is unhardened.
+It reports no role for any other origin, and for a reserved role value.
+
+A key role is descriptive: it does not constrain which path a key sits on.
 
 ## Rationale
 
@@ -428,6 +512,12 @@ policies from both. Mandating one tap-tree algorithm would be additional surface
 no interop benefit at this layer; individual implementations can still commit to
 byte-stable layouts if they want PSBT-level descriptor equality.
 
+### Why the key role in the origin?
+
+The descriptor already carries every key's origin, so the role travels with it and
+needs no new syntax. Devices register the key as a plain BIP-32 origin, and the
+account xpub is fetched once per key, whatever roles it takes.
+
 ## Use cases
 
 ### 9.1 A watch-only wallet rendering an imported descriptor
@@ -470,7 +560,9 @@ otherwise both are viable and the service picks the cheaper witness weight.
 ## Backwards compatibility
 
 This BIP introduces no new descriptor syntax. A compliant descriptor is a plain
-`tr(...)` multipath descriptor as defined by BIP-386 + BIP-389:
+`tr(...)` multipath descriptor as defined by BIP-386 + BIP-389. The MuSig2 form uses
+the `musig()` syntax of BIP-390, with the aggregation of BIP-327 (MuSig2) and the
+derivation of BIP-328 (MuSig2 derivation, synthetic xpub):
 
 - Any BIP-386 + BIP-389 wallet can derive addresses from a compliant descriptor.
 - Any miniscript-aware wallet can spend from a compliant descriptor via the script
@@ -543,5 +635,5 @@ reference implementation.
 The role catalog of Section 3 and the zone layout of Section 2 were extracted from
 descriptor-analysis code shipped in the Liana wallet, where the multipath-tagging
 convention was developed in practice over several releases. Thanks to the Liana
-developers and to the authors of BIP-341, BIP-379, BIP-386, and BIP-389, whose
-primitives this BIP composes.
+developers and to the authors of BIP-327, BIP-328, BIP-341, BIP-379, BIP-386,
+BIP-389, and BIP-390, whose primitives this BIP composes.

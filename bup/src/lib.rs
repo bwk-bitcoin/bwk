@@ -13,7 +13,7 @@ pub mod nums;
 pub mod parse;
 pub mod path;
 pub mod policy;
-#[cfg(all(test, feature = "musig"))]
+#[cfg(test)]
 mod test_keys;
 pub mod tree_builder;
 
