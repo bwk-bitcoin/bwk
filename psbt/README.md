@@ -82,3 +82,46 @@ that is itself a silent payment: its own ECDH shares and DLEQ proofs, the
 derivation of the spend key it needs, and the tweak `t` such that the input's
 output key is `b_spend + t`, which is how a signer holding `b_spend`
 recognises a silent payment it can spend.
+
+## MuSig2 fields (BIP-373)
+
+The `musig` module, behind the `musig` feature, holds the four BIP-373 keytypes
+rust-bitcoin does not model. They live in the `unknown` map of a
+`bitcoin::psbt::Input` / `Output` under their real keytype numbers, so the same
+functions serve a `bitcoin::Psbt` (`psbt.inputs[i]`) and a `PsbtV2`
+(`psbt.inputs[i].psbt`), and both serializations keep them.
+
+```
++------+------------------+---------------------------------------------+---------------------+
+| type | field            | keydata                                     | value               |
++------+------------------+---------------------------------------------+---------------------+
+| 0x1a | in participants  | aggregate (33)                              | participant (33) *n |
+| 0x1b | in pub nonce     | participant (33) aggregate (33) [leaf (32)] | public nonce (66)   |
+| 0x1c | in partial sig   | participant (33) aggregate (33) [leaf (32)] | partial sig (32)    |
+| 0x08 | out participants | aggregate (33)                              | participant (33) *n |
++------+------------------+---------------------------------------------+---------------------+
+```
+
+Every key is a 33-byte compressed key: an x-only key is refused. Participants
+are listed in aggregation order (sorted when KeySort was used), at least one.
+
+Which key goes in the aggregate slot:
+
+- 0x1a and 0x08: the plain KeyAgg output, with no tweak. The path from it to the
+  internal or script key is a `tap_key_origins` entry under the BIP-328 synthetic
+  xpub fingerprint.
+- 0x1b and 0x1c on the key path: the taproot output key (BIP-32 tweaks then the
+  BIP-341 taptweak), with no leaf hash.
+- 0x1b and 0x1c on a script path: the key as it appears in the leaf (BIP-32
+  tweaks only), with the hash of that leaf.
+
+The module stores what the caller passes and checks lengths and key encodings
+only: applying the slot rule is the caller's job, and the nonce points and the
+partial signature scalars are checked by bwk-musig.
+
+```rust
+use bwk_psbt::musig::{musig_input_pub_nonces, set_musig_input_participants};
+
+set_musig_input_participants(&mut psbt.inputs[0], aggregate, &participants);
+let nonces = musig_input_pub_nonces(&psbt_v2.inputs[0].psbt)?;
+```

@@ -47,7 +47,8 @@ Blindbit).
 | bwk             | Account for descriptor wallets (Electrum backend)     |
 | bwk-sp          | Silent Payments account (BIP352, Blindbit backend)    |
 | bwk-tx          | Transaction building, coin selection, PSBT            |
-| bwk-psbt        | PSBTv2 (BIP370), silent-payment fields (BIP375/376)   |
+| bwk-psbt        | PSBTv2 (BIP370), silent-payment fields (BIP375/376),  |
+|                 | MuSig2 fields (BIP373)                                |
 | bwk-musig       | MuSig2 (BIP-327) key aggregation, nonces, partial     |
 |                 | signatures (no_std)                                   |
 | bwk-electrum    | Electrum client, scanner, scan stores, header chain   |

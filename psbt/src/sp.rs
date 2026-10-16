@@ -328,38 +328,22 @@ mod tests {
     use bitcoin::{
         bip32::{ChildNumber, DerivationPath, Fingerprint},
         psbt::{Input, Output},
-        secp256k1::{PublicKey, Secp256k1, SecretKey},
         Psbt,
     };
 
-    use crate::sp::{
-        key, scan_key, set_sp_global_dleq, set_sp_global_ecdh_share, set_sp_input_dleq,
-        set_sp_input_ecdh_share, set_sp_input_spend_bip32_derivation, set_sp_input_tweak,
-        set_sp_v0_output, sp_global_dleq, sp_global_ecdh_share, sp_input_dleq, sp_input_dleqs,
-        sp_input_ecdh_share, sp_input_ecdh_shares, sp_input_spend_bip32_derivation, sp_input_tweak,
-        sp_v0_output, Error, SpProof, SpShare, DLEQ_PROOF_LEN, PSBT_GLOBAL_SP_DLEQ,
-        PSBT_GLOBAL_SP_ECDH_SHARE, PSBT_IN_SP_DLEQ, PSBT_IN_SP_ECDH_SHARE,
-        PSBT_IN_SP_SPEND_BIP32_DERIVATION, PSBT_IN_SP_TWEAK, PSBT_OUT_SP_V0_INFO, SP_V0_INFO_LEN,
-        TWEAK_LEN,
+    use crate::{
+        sp::{
+            key, scan_key, set_sp_global_dleq, set_sp_global_ecdh_share, set_sp_input_dleq,
+            set_sp_input_ecdh_share, set_sp_input_spend_bip32_derivation, set_sp_input_tweak,
+            set_sp_v0_output, sp_global_dleq, sp_global_ecdh_share, sp_input_dleq, sp_input_dleqs,
+            sp_input_ecdh_share, sp_input_ecdh_shares, sp_input_spend_bip32_derivation,
+            sp_input_tweak, sp_v0_output, Error, SpProof, SpShare, DLEQ_PROOF_LEN,
+            PSBT_GLOBAL_SP_DLEQ, PSBT_GLOBAL_SP_ECDH_SHARE, PSBT_IN_SP_DLEQ, PSBT_IN_SP_ECDH_SHARE,
+            PSBT_IN_SP_SPEND_BIP32_DERIVATION, PSBT_IN_SP_TWEAK, PSBT_OUT_SP_V0_INFO,
+            SP_V0_INFO_LEN, TWEAK_LEN,
+        },
+        test_utils::{one_input_psbt, psbt_spending, public_key},
     };
-
-    fn public_key(b: u8) -> PublicKey {
-        let secp = Secp256k1::new();
-        PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[b; 32]).unwrap())
-    }
-
-    fn psbt_spending(input: Vec<bitcoin::TxIn>) -> Psbt {
-        let tx = bitcoin::Transaction {
-            version: bitcoin::transaction::Version::TWO,
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input,
-            output: vec![bitcoin::TxOut {
-                value: bitcoin::Amount::from_sat(1000),
-                script_pubkey: bitcoin::ScriptBuf::new(),
-            }],
-        };
-        Psbt::from_unsigned_tx(tx).unwrap()
-    }
 
     #[test]
     fn global_fields_round_trip() {
@@ -408,15 +392,6 @@ mod tests {
 
         assert_eq!(sp_global_ecdh_share(&psbt, scan), Err(Error::InvalidValue));
         assert_eq!(sp_global_dleq(&psbt, scan), Err(Error::InvalidValue));
-    }
-
-    fn one_input_psbt() -> Psbt {
-        psbt_spending(vec![bitcoin::TxIn {
-            previous_output: bitcoin::OutPoint::null(),
-            script_sig: bitcoin::ScriptBuf::new(),
-            sequence: bitcoin::Sequence::MAX,
-            witness: bitcoin::Witness::new(),
-        }])
     }
 
     #[test]

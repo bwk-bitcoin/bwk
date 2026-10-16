@@ -12,5 +12,9 @@ readme.workspace = true
 bitcoin.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+hex.workspace = true
+serde_json.workspace = true
+
 [features]
 musig = []

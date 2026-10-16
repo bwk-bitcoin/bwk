@@ -917,6 +917,43 @@ fn take<'a>(bytes: &mut &'a [u8], length: usize) -> Result<&'a [u8], Error> {
 }
 
 #[cfg(test)]
+mod test_utils {
+    use bitcoin::{
+        absolute,
+        secp256k1::{PublicKey, Secp256k1, SecretKey},
+        transaction, Amount, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+        Witness,
+    };
+
+    pub fn public_key(b: u8) -> PublicKey {
+        let secp = Secp256k1::new();
+        PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[b; 32]).unwrap())
+    }
+
+    pub fn psbt_spending(input: Vec<TxIn>) -> Psbt {
+        let tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input,
+            output: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        Psbt::from_unsigned_tx(tx).unwrap()
+    }
+
+    pub fn one_input_psbt() -> Psbt {
+        psbt_spending(vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }])
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
@@ -924,14 +961,13 @@ mod tests {
         absolute,
         hashes::Hash,
         psbt::{self, raw::Key},
-        secp256k1::{PublicKey, Secp256k1, SecretKey},
         transaction, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
     };
 
     use crate::{
-        read_map, sp, spec_key_type, Error, Input, Output, PsbtV2, TxModifiable,
-        PSBT_GLOBAL_TX_VERSION, PSBT_GLOBAL_UNSIGNED_TX, PSBT_GLOBAL_VERSION, PSBT_IN_SEQUENCE,
-        PSBT_OUT_AMOUNT,
+        read_map, sp, spec_key_type, test_utils::public_key, Error, Input, Output, PsbtV2,
+        TxModifiable, PSBT_GLOBAL_TX_VERSION, PSBT_GLOBAL_UNSIGNED_TX, PSBT_GLOBAL_VERSION,
+        PSBT_IN_SEQUENCE, PSBT_OUT_AMOUNT,
     };
 
     #[test]
@@ -985,11 +1021,6 @@ mod tests {
             type_value,
             key: Vec::new(),
         }
-    }
-
-    fn public_key(b: u8) -> PublicKey {
-        let secp = Secp256k1::new();
-        PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[b; 32]).unwrap())
     }
 
     fn v0_tx(lock_time: absolute::LockTime) -> Transaction {
