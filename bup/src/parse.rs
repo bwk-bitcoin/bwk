@@ -6,6 +6,7 @@ use std::{
     sync,
 };
 
+use bwk_descriptor::wallet::WalletKey;
 use miniscript::{
     bitcoin::{absolute, relative},
     descriptor::Wildcard,
@@ -14,7 +15,7 @@ use miniscript::{
 };
 
 use crate::{
-    multipath::LeafEntry,
+    multipath::{plain_key, LeafEntry},
     path::{
         count_combinations, is_cltv_aligned, Leaf, Locktime, OXpub, Path, Semantic, TapPosition,
     },
@@ -27,8 +28,8 @@ use crate::{
 /// `pub(crate)` upstream); a BIP-341 consensus invariant, not expected to drift.
 pub(super) const TR_KEY_PATH_WU: u64 = 1 + 65;
 
-pub(super) fn oxpub(k: &DescriptorPublicKey) -> Option<OXpub> {
-    if let DescriptorPublicKey::MultiXPub(xpub) = k {
+pub(super) fn oxpub(k: &WalletKey) -> Option<OXpub> {
+    if let Some(DescriptorPublicKey::MultiXPub(xpub)) = plain_key(k) {
         // Require an origin (fingerprint): classification is keyed on signer
         // identity. Origin-less keys fall through to `Semantic::Unknown`.
         xpub.origin.as_ref()?;
@@ -56,7 +57,7 @@ pub(super) fn oxpub_to_key(
 
 /// If `sub` is `older(...)` / `after(...)`, build the matching [`Locktime`]; `None` otherwise.
 /// Absolute heights are tagged renewable iff aligned to the CLTV grid.
-fn try_into_locktime(sub: &SemanticPolicy<DescriptorPublicKey>) -> Option<Locktime> {
+fn try_into_locktime(sub: &SemanticPolicy<WalletKey>) -> Option<Locktime> {
     match sub {
         SemanticPolicy::Older(v) => {
             let raw = v.to_consensus_u32();
@@ -77,7 +78,7 @@ fn try_into_locktime(sub: &SemanticPolicy<DescriptorPublicKey>) -> Option<Lockti
     }
 }
 
-type ThreshOfPolicy = miniscript::Threshold<sync::Arc<SemanticPolicy<DescriptorPublicKey>>, 0>;
+type ThreshOfPolicy = miniscript::Threshold<sync::Arc<SemanticPolicy<WalletKey>>, 0>;
 
 /// `thresh(2, locktime, body)`: must be exactly `k == n == 2` with one sub a locktime and the
 /// other a non-locktime body. Recurses on the body. `None` if the shape doesn't match.
@@ -88,7 +89,7 @@ fn classify_thresh2_locktime_body(
         return Ok(None);
     }
     let mut timelock: Option<Locktime> = None;
-    let mut body: Option<&SemanticPolicy<DescriptorPublicKey>> = None;
+    let mut body: Option<&SemanticPolicy<WalletKey>> = None;
     for sub in t.data() {
         if let Some(lt) = try_into_locktime(sub.as_ref()) {
             if timelock.is_some() {
@@ -187,10 +188,10 @@ fn classify_pure_thresh(t: &ThreshOfPolicy) -> Result<Option<Semantic>, PolicyEr
 
 /// Returns `true` if every key in `keys` is a `MultiXPub` with an origin and all origin
 /// fingerprints are distinct.
-fn has_unique_origins(keys: &[&DescriptorPublicKey]) -> bool {
+fn has_unique_origins(keys: &[&WalletKey]) -> bool {
     let mut seen = HashSet::new();
     for k in keys {
-        let DescriptorPublicKey::MultiXPub(x) = k else {
+        let Some(DescriptorPublicKey::MultiXPub(x)) = plain_key(k) else {
             return false;
         };
         let Some((fp, _)) = &x.origin else {
@@ -269,7 +270,7 @@ fn classify_thresh(t: &ThreshOfPolicy) -> Result<Option<(Semantic, Locktime)>, P
 /// Recognise a normalised semantic policy as a known shape. `Ok(None)` if unrecognised - the
 /// caller decides whether to fall back to `Semantic::Unknown`.
 fn policy_to_known_semantic(
-    policy: &SemanticPolicy<DescriptorPublicKey>,
+    policy: &SemanticPolicy<WalletKey>,
 ) -> Result<Option<(Semantic, Locktime)>, PolicyError> {
     match policy {
         SemanticPolicy::Key(k) => {
@@ -284,7 +285,7 @@ fn policy_to_known_semantic(
 }
 
 /// Classify a normalised semantic policy, falling back to `Semantic::Unknown` if unrecognised.
-fn policy_to_semantic(policy: &SemanticPolicy<DescriptorPublicKey>) -> (Semantic, Locktime) {
+fn policy_to_semantic(policy: &SemanticPolicy<WalletKey>) -> (Semantic, Locktime) {
     policy_to_known_semantic(policy).ok().flatten().unwrap_or((
         Semantic::Unknown {
             policy: policy.clone(),
@@ -296,7 +297,7 @@ fn policy_to_semantic(policy: &SemanticPolicy<DescriptorPublicKey>) -> (Semantic
 /// Lift a tap-leaf miniscript to a semantic policy and classify it, falling back to
 /// `Semantic::Unknown` if unrecognised.
 fn miniscript_to_semantic(
-    ms: &Miniscript<DescriptorPublicKey, Tap>,
+    ms: &Miniscript<WalletKey, Tap>,
 ) -> Result<(Semantic, Locktime), PolicyError> {
     let lifted = ms.lift().map_err(PolicyError::Miniscript)?.normalized();
     Ok(policy_to_semantic(&lifted))
@@ -305,7 +306,7 @@ fn miniscript_to_semantic(
 /// Parsed shape of a single tap-tree leaf: N-of-N keys, optionally gated by one locktime.
 struct LeafShape {
     threshold: usize,
-    keys: Vec<DescriptorPublicKey>,
+    keys: Vec<WalletKey>,
     locktime: Locktime,
 }
 
@@ -316,7 +317,7 @@ impl LeafShape {
         if self.threshold == 0 || self.threshold > self.keys.len() {
             return false;
         }
-        let key_refs: Vec<&DescriptorPublicKey> = self.keys.iter().collect();
+        let key_refs: Vec<&WalletKey> = self.keys.iter().collect();
         self.keys.iter().all(|k| oxpub(k).is_some()) && has_unique_origins(&key_refs)
     }
 }
@@ -345,7 +346,7 @@ fn shapes_consistent(shapes: &[LeafShape]) -> Option<(usize, Locktime)> {
 
 /// Parse a miniscript into a [`LeafShape`] if it's an N-of-N AND optionally gated by a single
 /// `older()` / `after()` - the shape every `MultiMandatory` leaf takes.
-fn miniscript_to_leaf_shape(ms: &Miniscript<DescriptorPublicKey, Tap>) -> Option<LeafShape> {
+fn miniscript_to_leaf_shape(ms: &Miniscript<WalletKey, Tap>) -> Option<LeafShape> {
     let lifted = ms.lift().ok()?.normalized();
     let SemanticPolicy::Thresh(t) = lifted else {
         return None;
@@ -573,10 +574,7 @@ impl Path {
 /// Path satisfaction WU at tap-tree `depth`. Sums miniscript's `max_satisfaction_size`,
 /// `script_size`, the script length-prefix, and the control block (`1 + 33 + 32 * depth`).
 /// `None` if miniscript can't size the satisfaction.
-pub fn compute_satisfaction_wu(
-    leaf_ms: &Miniscript<DescriptorPublicKey, Tap>,
-    depth: u8,
-) -> Option<u64> {
+pub fn compute_satisfaction_wu(leaf_ms: &Miniscript<WalletKey, Tap>, depth: u8) -> Option<u64> {
     let sat_size = leaf_ms.max_satisfaction_size().ok()? as u64;
     let script_size = leaf_ms.script_size() as u64;
     let control_block_wu = 1 + 33 + 32 * (depth as u64);

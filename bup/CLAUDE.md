@@ -19,6 +19,13 @@ by "The Liana developers".
 The `musig` feature (off by default) enables the `musig` module and the MuSig2 shapes,
 through `bwk-keys/musig` and `bwk-descriptor/musig`.
 
+Descriptor keys are `bwk_descriptor::wallet::WalletKey` (descriptors are
+`WalletDescriptor`): `DescriptorPublicKey` without `musig`, `bwk_keys::musig::MusigKey`
+with it, every plain key then being `MusigKey::Plain`. Signer keys stay `OXpub`. A
+plain descriptor parses, compiles and prints identically in both builds.
+`multipath::plain_key` / `multipath::wallet_key` are the only conversions between the
+two key types.
+
 ## Build / test
 
 Run from the bwk workspace root.
@@ -76,6 +83,8 @@ descriptor (`Policy::from_descriptor`). Round-tripping is a load-bearing invaria
   consecutive `<a; a+1>`) and `key_indices` (returns every index a `MultiXPub` or
   `XPub` key claims, used by the compile-side collision check; enforces single-step,
   unhardened, and `<a; a+1>` consecutive shape but permits any starting parity).
+  Under `musig` both also read a musig() aggregate: its BIP-328 synthetic xpub and the
+  indices of the musig() derivation.
 - **`nums.rs`** - the BIP-341 NUMS ("Nothing Up My Sleeve") public key and
   `unspendable_internal_key` (the deterministic NUMS xpub derivation used as Tr
   internal key when no path qualifies for key-path spending). Pulled out of liana's
@@ -159,7 +168,7 @@ Inferred by `parse::infer_policy_type`; declared up-front for `Policy::new`:
   policy-level invariants (primary count, recovery presence, mixing). It does NOT
   accept `Semantic::Unknown` paths - those are parser-only. Consumers who need an
   arbitrary tap-leaf script use
-  `Semantic::Custom(Miniscript<DescriptorPublicKey, Tap>)`, which the compiler emits
+  `Semantic::Custom(Miniscript<WalletKey, Tap>)`, which the compiler emits
   verbatim - multipath indices on the consumer's keys are the consumer's
   responsibility. `Custom` paths require `Locktime::None`; encode any locktime gate
   inside the embedded miniscript.

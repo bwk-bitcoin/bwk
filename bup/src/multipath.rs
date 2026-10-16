@@ -3,6 +3,9 @@
 
 use std::collections::BTreeMap;
 
+use bwk_descriptor::wallet::WalletKey;
+#[cfg(feature = "musig")]
+use bwk_keys::musig::MusigKey;
 use miniscript::{
     bitcoin::bip32,
     descriptor::{self, DescriptorPublicKey},
@@ -10,6 +13,33 @@ use miniscript::{
 };
 
 use crate::{path::Path, policy::PolicyError};
+
+/// The plain key behind `key`, None for a musig() aggregate.
+#[cfg(not(feature = "musig"))]
+pub(crate) fn plain_key(key: &WalletKey) -> Option<&DescriptorPublicKey> {
+    Some(key)
+}
+
+/// The plain key behind `key`, None for a musig() aggregate.
+#[cfg(feature = "musig")]
+pub(crate) fn plain_key(key: &WalletKey) -> Option<&DescriptorPublicKey> {
+    match key {
+        MusigKey::Plain(k) => Some(k),
+        MusigKey::Musig(_) => None,
+    }
+}
+
+/// `key` as the wallet key type.
+#[cfg(not(feature = "musig"))]
+pub(crate) fn wallet_key(key: DescriptorPublicKey) -> WalletKey {
+    key
+}
+
+/// `key` as the wallet key type.
+#[cfg(feature = "musig")]
+pub(crate) fn wallet_key(key: DescriptorPublicKey) -> WalletKey {
+    MusigKey::Plain(key)
+}
 
 /// Marker multipath used on the NUMS internal key emitted by `Policy::compile`. The two
 /// largest unhardened indices (`2^31 - 2` and `2^31 - 1`) tag the internal key as
@@ -87,7 +117,7 @@ pub struct LeafEntry<'a> {
     /// multipath xpubs.
     pub indices: Vec<u32>,
     /// The lifted leaf miniscript.
-    pub ms: &'a Miniscript<DescriptorPublicKey, Tap>,
+    pub ms: &'a Miniscript<WalletKey, Tap>,
 }
 
 impl<'a> LeafEntry<'a> {
@@ -132,11 +162,23 @@ impl IntoIterator for LeafGroup {
 
 impl std::error::Error for MultipathError {}
 
-pub fn get_multipath_index(key: &DescriptorPublicKey) -> Result<u32, MultipathError> {
-    let DescriptorPublicKey::MultiXPub(xpub) = key else {
+pub fn get_multipath_index(key: &WalletKey) -> Result<u32, MultipathError> {
+    #[cfg(feature = "musig")]
+    if let MusigKey::Musig(agg) = key {
+        if agg.derives_cosigners() {
+            return Err(MultipathError::NotMultiXPub);
+        }
+        let derivation = agg.derivation().ok_or(MultipathError::NotMultiXPub)?;
+        return multipath_start(derivation.paths.paths());
+    }
+    let Some(DescriptorPublicKey::MultiXPub(xpub)) = plain_key(key) else {
         return Err(MultipathError::NotMultiXPub);
     };
-    let paths = xpub.derivation_paths.paths();
+    multipath_start(xpub.derivation_paths.paths())
+}
+
+/// The even start `a` of a strict `<a;a+1>` pair of single-step paths.
+fn multipath_start(paths: &[bip32::DerivationPath]) -> Result<u32, MultipathError> {
     if paths.len() != 2 {
         return Err(MultipathError::WrongPathCount(paths.len()));
     }
@@ -166,51 +208,79 @@ pub fn get_multipath_index(key: &DescriptorPublicKey) -> Result<u32, MultipathEr
 /// Shape constraints (mirroring `get_multipath_index`):
 /// - `MultiXPub`: exactly two single-step, unhardened paths; both indices returned.
 /// - `XPub`: exactly one single-step, unhardened derivation_path; the single index returned.
+/// - musig() aggregate: its BIP-328 synthetic xpub with the indices of the musig()
+///   derivation, under the same rules as `MultiXPub` (two paths) or `XPub` (one path);
+///   `Ok(None)` without a derivation (a fixed key, like `Single`). Derived cosigners
+///   (derive then aggregate) error with `NotMultiXPub`.
 ///
 /// Multi-step / hardened / wrong-count paths error with the same `MultipathError` variants
 /// the parser already uses, so the compile-side check and the parser stay aligned.
-pub fn key_indices(
-    key: &DescriptorPublicKey,
-) -> Result<Option<(bip32::Xpub, Vec<u32>)>, MultipathError> {
-    match key {
-        DescriptorPublicKey::MultiXPub(xpub) => {
-            let paths = xpub.derivation_paths.paths();
-            if paths.len() != 2 {
-                return Err(MultipathError::WrongPathCount(paths.len()));
-            }
-            for p in paths {
-                if p.len() != 1 {
-                    return Err(MultipathError::MultiStepPath);
-                }
-            }
-            let first = paths[0][0];
-            let second = paths[1][0];
-            if first.is_hardened() || second.is_hardened() {
-                return Err(MultipathError::HardenedStep);
-            }
-            let (first_u, second_u): (u32, u32) = (first.into(), second.into());
-            // Reject gaps like `<3;5>`. We deliberately *don't* fire here when the two
-            // legs are identical (e.g. `<3;3>`) so that the higher-level intra-key
-            // duplicate detector can surface that case as `DuplicateMultipathIndex`
-            // rather than `NonConsecutive`.
-            if first_u != second_u && first_u + 1 != second_u {
-                return Err(MultipathError::NonConsecutive);
-            }
-            Ok(Some((xpub.xkey, vec![first_u, second_u])))
+pub fn key_indices(key: &WalletKey) -> Result<Option<(bip32::Xpub, Vec<u32>)>, MultipathError> {
+    #[cfg(feature = "musig")]
+    if let MusigKey::Musig(agg) = key {
+        if agg.derives_cosigners() {
+            return Err(MultipathError::NotMultiXPub);
         }
-        DescriptorPublicKey::XPub(xpub) => {
-            let path = &xpub.derivation_path;
-            if path.len() != 1 {
-                return Err(MultipathError::MultiStepPath);
-            }
-            let step = path[0];
-            if step.is_hardened() {
-                return Err(MultipathError::HardenedStep);
-            }
-            Ok(Some((xpub.xkey, vec![step.into()])))
-        }
-        DescriptorPublicKey::Single(_) => Ok(None),
+        let Some(derivation) = agg.derivation() else {
+            return Ok(None);
+        };
+        let paths = derivation.paths.paths();
+        let indices = match paths.len() {
+            2 => pair_indices(paths)?,
+            1 => single_index(&paths[0])?,
+            n => return Err(MultipathError::WrongPathCount(n)),
+        };
+        let xpub = *agg.synthetic_xpub().ok_or(MultipathError::NotMultiXPub)?;
+        return Ok(Some((xpub, indices)));
     }
+    match plain_key(key) {
+        Some(DescriptorPublicKey::MultiXPub(xpub)) => Ok(Some((
+            xpub.xkey,
+            pair_indices(xpub.derivation_paths.paths())?,
+        ))),
+        Some(DescriptorPublicKey::XPub(xpub)) => {
+            Ok(Some((xpub.xkey, single_index(&xpub.derivation_path)?)))
+        }
+        Some(DescriptorPublicKey::Single(_)) | None => Ok(None),
+    }
+}
+
+/// Both indices of a `<a;a+1>` (or `<a;a>`) pair of single-step, unhardened paths.
+fn pair_indices(paths: &[bip32::DerivationPath]) -> Result<Vec<u32>, MultipathError> {
+    if paths.len() != 2 {
+        return Err(MultipathError::WrongPathCount(paths.len()));
+    }
+    for p in paths {
+        if p.len() != 1 {
+            return Err(MultipathError::MultiStepPath);
+        }
+    }
+    let first = paths[0][0];
+    let second = paths[1][0];
+    if first.is_hardened() || second.is_hardened() {
+        return Err(MultipathError::HardenedStep);
+    }
+    let (first_u, second_u): (u32, u32) = (first.into(), second.into());
+    // Reject gaps like `<3;5>`. We deliberately *don't* fire here when the two
+    // legs are identical (e.g. `<3;3>`) so that the higher-level intra-key
+    // duplicate detector can surface that case as `DuplicateMultipathIndex`
+    // rather than `NonConsecutive`.
+    if first_u != second_u && first_u + 1 != second_u {
+        return Err(MultipathError::NonConsecutive);
+    }
+    Ok(vec![first_u, second_u])
+}
+
+/// The index of a single-step, unhardened path.
+fn single_index(path: &bip32::DerivationPath) -> Result<Vec<u32>, MultipathError> {
+    if path.len() != 1 {
+        return Err(MultipathError::MultiStepPath);
+    }
+    let step = path[0];
+    if step.is_hardened() {
+        return Err(MultipathError::HardenedStep);
+    }
+    Ok(vec![step.into()])
 }
 
 /// Returns `Err(MixedLeafIndices)` if the entry's keys do not all share the same multipath index.
@@ -314,12 +384,85 @@ pub(super) fn assign_start_indices(paths: &mut [Path]) -> Result<(), PolicyError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
+
+    #[cfg(feature = "musig")]
+    use bwk_keys::musig::{MusigAggregate, MusigDerivation};
+    #[cfg(feature = "musig")]
+    use miniscript::{bitcoin::NetworkKind, descriptor::Wildcard};
+
+    #[cfg(feature = "musig")]
+    use crate::multipath::{deriv_paths_starting_at, key_indices, MultipathError};
+    use crate::multipath::{get_multipath_index, plain_key, wallet_key};
+
+    const KEY_4_5: &str = "[abcdef01]xpub6Eze7yAT3Y1wGrnzedCNVYDXUqa9NmHVWck5emBaTbXtURbe1NWZbK9bsz1TiVE7Cz341PMTfYgFw1KdLWdzcM1UMFTcdQfCYhhXZ2HJvTW/<4;5>/*";
+
+    /// `musig(K1, K2)` over the two policy test xpubs, aggregate then derive at
+    /// `<start;start+1>/*`, or with no derivation when `start` is None.
+    #[cfg(feature = "musig")]
+    fn musig_key_at(start: Option<u32>) -> MusigKey {
+        let cosigners = vec![
+            DescriptorPublicKey::from_str("[abcdef01]xpub6Eze7yAT3Y1wGrnzedCNVYDXUqa9NmHVWck5emBaTbXtURbe1NWZbK9bsz1TiVE7Cz341PMTfYgFw1KdLWdzcM1UMFTcdQfCYhhXZ2HJvTW").unwrap(),
+            DescriptorPublicKey::from_str("[abcdef02]xpub688Hn4wScQAAiYJLPg9yH27hUpfZAUnmJejRQBCiwfP5PEDzjWMNW1wChcninxr5gyavFqbbDjdV1aK5USJz8NDVjUy7FRQaaqqXHh5SbXe").unwrap(),
+        ];
+        let derivation = start.map(|start| MusigDerivation {
+            paths: deriv_paths_starting_at(start),
+            wildcard: Wildcard::Unhardened,
+        });
+        MusigKey::Musig(MusigAggregate::new(cosigners, derivation, NetworkKind::Main).unwrap())
+    }
 
     #[test]
     fn key_multipath_extraction() {
-        use std::str::FromStr;
-        let s = "[abcdef01]xpub6Eze7yAT3Y1wGrnzedCNVYDXUqa9NmHVWck5emBaTbXtURbe1NWZbK9bsz1TiVE7Cz341PMTfYgFw1KdLWdzcM1UMFTcdQfCYhhXZ2HJvTW/<4;5>/*";
-        let key = DescriptorPublicKey::from_str(s).unwrap();
+        let key = wallet_key(DescriptorPublicKey::from_str(KEY_4_5).unwrap());
         assert_eq!(get_multipath_index(&key), Ok(4));
+    }
+
+    #[test]
+    fn plain_key_round_trips_wallet_key() {
+        let k = DescriptorPublicKey::from_str(KEY_4_5).unwrap();
+        assert_eq!(plain_key(&wallet_key(k.clone())), Some(&k));
+        assert_eq!(get_multipath_index(&wallet_key(k)), Ok(4));
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn get_multipath_index_reads_musig_derivation() {
+        assert_eq!(get_multipath_index(&musig_key_at(Some(512))), Ok(512));
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn get_multipath_index_rejects_musig_without_derivation() {
+        assert_eq!(
+            get_multipath_index(&musig_key_at(None)),
+            Err(MultipathError::NotMultiXPub)
+        );
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn get_multipath_index_rejects_derive_then_aggregate() {
+        let cosigners = vec![
+            DescriptorPublicKey::from_str("[abcdef01]xpub6Eze7yAT3Y1wGrnzedCNVYDXUqa9NmHVWck5emBaTbXtURbe1NWZbK9bsz1TiVE7Cz341PMTfYgFw1KdLWdzcM1UMFTcdQfCYhhXZ2HJvTW/<0;1>/*").unwrap(),
+            DescriptorPublicKey::from_str("[abcdef02]xpub688Hn4wScQAAiYJLPg9yH27hUpfZAUnmJejRQBCiwfP5PEDzjWMNW1wChcninxr5gyavFqbbDjdV1aK5USJz8NDVjUy7FRQaaqqXHh5SbXe/<0;1>/*").unwrap(),
+        ];
+        let key = MusigKey::Musig(MusigAggregate::new(cosigners, None, NetworkKind::Main).unwrap());
+        assert_eq!(get_multipath_index(&key), Err(MultipathError::NotMultiXPub));
+        assert_eq!(key_indices(&key), Err(MultipathError::NotMultiXPub));
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn key_indices_musig_uses_synthetic_xpub() {
+        let key = musig_key_at(Some(512));
+        let MusigKey::Musig(agg) = &key else {
+            panic!("expected a musig() key");
+        };
+        assert_eq!(
+            key_indices(&key),
+            Ok(Some((*agg.synthetic_xpub().unwrap(), vec![512, 513])))
+        );
+        assert_eq!(key_indices(&musig_key_at(None)), Ok(None));
     }
 }

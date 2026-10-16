@@ -1,9 +1,10 @@
 //! `Path` and friends - the per-spending-path representation used by the new `Policy` model.
 
+use bwk_descriptor::wallet::WalletKey;
 use miniscript::{
     bitcoin::{absolute, bip32, relative},
     policy::Semantic as SemanticPolicy,
-    DescriptorPublicKey, Miniscript, Tap,
+    Miniscript, Tap,
 };
 
 use crate::key_role::KeyType;
@@ -281,14 +282,12 @@ pub enum Semantic {
     /// `Policy::from_descriptor`; not constructable via `Policy::new` (consumers use
     /// [`Semantic::Custom`] instead). Uncompilable: a policy containing `Unknown` paths
     /// cannot round-trip back through `Policy::compile`.
-    Unknown {
-        policy: SemanticPolicy<DescriptorPublicKey>,
-    },
+    Unknown { policy: SemanticPolicy<WalletKey> },
     /// Consumer-provided tap-context miniscript leaf. The compiler reissues the multipath
     /// derivation indices on every key but otherwise emits the miniscript as-is.
     /// `Custom` paths require `Locktime::None`; any locktime gate must be encoded inside
     /// the embedded miniscript by the consumer.
-    Custom(Miniscript<DescriptorPublicKey, Tap>),
+    Custom(Miniscript<WalletKey, Tap>),
 }
 
 impl Semantic {
@@ -488,7 +487,7 @@ pub struct Path {
     /// `Policy::compile` (one entry for `Single`/`Multi`, one entry per cosigner-subset
     /// for `MultiMandatory`); empty for `TapPosition::InternalKey` and for paths
     /// produced by `Policy::from_descriptor`.
-    leaves: Vec<Miniscript<DescriptorPublicKey, Tap>>,
+    leaves: Vec<Miniscript<WalletKey, Tap>>,
 }
 
 impl Path {
@@ -584,7 +583,7 @@ impl Path {
     /// Compiled tap-leaf miniscripts for this path. Empty for `TapPosition::InternalKey`
     /// paths and for paths produced by `Policy::from_descriptor` (which only stores leaf
     /// indices, not the lifted miniscripts).
-    pub fn leaves(&self) -> &[Miniscript<DescriptorPublicKey, Tap>] {
+    pub fn leaves(&self) -> &[Miniscript<WalletKey, Tap>] {
         &self.leaves
     }
 
@@ -684,7 +683,7 @@ mod tests {
         // sig_count returns the total signer count per leaf.
         assert_eq!(s.sig_count(), Some(2));
 
-        let policy = Miniscript::<DescriptorPublicKey, Tap>::from_str(
+        let policy = Miniscript::<WalletKey, Tap>::from_str(
             "pk([abcdef01]xpub6Eze7yAT3Y1wGrnzedCNVYDXUqa9NmHVWck5emBaTbXtURbe1NWZbK9bsz1TiVE7Cz341PMTfYgFw1KdLWdzcM1UMFTcdQfCYhhXZ2HJvTW/<0;1>/*)",
         )
         .unwrap()
@@ -713,7 +712,7 @@ mod tests {
 
     #[test]
     fn unknown_path_has_no_weight() {
-        let policy = Miniscript::<DescriptorPublicKey, Tap>::from_str(
+        let policy = Miniscript::<WalletKey, Tap>::from_str(
             "pk([abcdef01]xpub6Eze7yAT3Y1wGrnzedCNVYDXUqa9NmHVWck5emBaTbXtURbe1NWZbK9bsz1TiVE7Cz341PMTfYgFw1KdLWdzcM1UMFTcdQfCYhhXZ2HJvTW/<0;1>/*)",
         )
         .unwrap()

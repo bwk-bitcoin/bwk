@@ -8,6 +8,7 @@
 
 use std::sync;
 
+use bwk_descriptor::wallet::WalletKey;
 use miniscript::{
     bitcoin::{
         bip32,
@@ -20,7 +21,7 @@ use miniscript::{
 };
 
 use crate::{
-    multipath::{deriv_paths_starting_at, NUMS_MARKER_MULTIPATH},
+    multipath::{deriv_paths_starting_at, plain_key, wallet_key, NUMS_MARKER_MULTIPATH},
     nums::bip341_nums,
     parse::oxpub_to_key,
     path::{Path, Semantic, TapPosition},
@@ -427,7 +428,7 @@ impl<T: Clone + std::fmt::Display> TreeBuilder<T> {
 
 pub(super) fn build(
     paths: &[Path],
-) -> Result<(DescriptorPublicKey, Option<TapTree<DescriptorPublicKey>>), PolicyError> {
+) -> Result<(WalletKey, Option<TapTree<WalletKey>>), PolicyError> {
     let network = network_from_paths(paths).unwrap_or(NetworkKind::Main);
     let mut order: Vec<usize> = (0..paths.len())
         .filter(|&i| !paths[i].leaves().is_empty())
@@ -447,10 +448,10 @@ pub(super) fn build(
         }
     }
 
-    let mut builder: TreeBuilder<Miniscript<DescriptorPublicKey, Tap>> = TreeBuilder::new();
+    let mut builder: TreeBuilder<Miniscript<WalletKey, Tap>> = TreeBuilder::new();
     for (i, group) in groups.iter().enumerate() {
         let more_after = i + 1 < groups.len();
-        let combined: Vec<Miniscript<DescriptorPublicKey, Tap>> = group
+        let combined: Vec<Miniscript<WalletKey, Tap>> = group
             .iter()
             .flat_map(|&idx| paths[idx].leaves().iter().cloned())
             .collect();
@@ -468,14 +469,14 @@ pub(super) fn build(
                 unreachable!("validated by sanitize");
             };
             let cursor = p.start_index().expect("set by assign_start_indices");
-            oxpub_to_key(key, deriv_paths_starting_at(cursor))
+            wallet_key(oxpub_to_key(key, deriv_paths_starting_at(cursor)))
         }
-        None => nums_descriptor_key(network, seed),
+        None => wallet_key(nums_descriptor_key(network, seed)),
     };
 
     let internal_key_is_nums = matches!(
-        &internal_key,
-        DescriptorPublicKey::MultiXPub(m) if m.xkey.public_key == bip341_nums()
+        plain_key(&internal_key),
+        Some(DescriptorPublicKey::MultiXPub(m)) if m.xkey.public_key == bip341_nums()
     );
     let mut chain = if internal_key_is_nums {
         chain_advance(seed)
@@ -492,16 +493,14 @@ pub(super) fn build(
     Ok((internal_key, tap_tree))
 }
 
-fn nums_seed_chain_code(
-    builder: &TreeBuilder<Miniscript<DescriptorPublicKey, Tap>>,
-) -> bip32::ChainCode {
+fn nums_seed_chain_code(builder: &TreeBuilder<Miniscript<WalletKey, Tap>>) -> bip32::ChainCode {
     let nums = bip341_nums().serialize();
     let mut concat: Vec<u8> = Vec::new();
     builder.dfs_slots(|s| match s {
         DfsSlot::Free => concat.extend_from_slice(&nums),
         DfsSlot::Leaf(ms) => {
             for k in ms.iter_pk() {
-                if let DescriptorPublicKey::MultiXPub(m) = k {
+                if let Some(DescriptorPublicKey::MultiXPub(m)) = plain_key(&k) {
                     concat.extend_from_slice(&m.xkey.public_key.serialize());
                 }
             }
@@ -510,7 +509,7 @@ fn nums_seed_chain_code(
     bip32::ChainCode::from(sha256::Hash::hash(&concat).as_ref())
 }
 
-fn into_tap_tree(tree: Tree<Miniscript<DescriptorPublicKey, Tap>>) -> TapTree<DescriptorPublicKey> {
+fn into_tap_tree(tree: Tree<Miniscript<WalletKey, Tap>>) -> TapTree<WalletKey> {
     match tree {
         Tree::Leaf(ms) => TapTree::Leaf(sync::Arc::new(ms)),
         Tree::Branch(l, r) => TapTree::combine(into_tap_tree(*l), into_tap_tree(*r)),
@@ -549,12 +548,9 @@ fn nums_descriptor_key(network: NetworkKind, chain_code: bip32::ChainCode) -> De
     })
 }
 
-fn nums_pk_leaf(
-    network: NetworkKind,
-    chain_code: bip32::ChainCode,
-) -> Miniscript<DescriptorPublicKey, Tap> {
+fn nums_pk_leaf(network: NetworkKind, chain_code: bip32::ChainCode) -> Miniscript<WalletKey, Tap> {
     let key = nums_descriptor_key(network, chain_code);
-    ConcretePolicy::Key(key)
+    ConcretePolicy::Key(wallet_key(key))
         .compile::<Tap>()
         .expect("pk(NUMS) compiles trivially")
 }

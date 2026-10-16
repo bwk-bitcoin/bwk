@@ -6,6 +6,7 @@ use std::{
     error, fmt,
 };
 
+use bwk_descriptor::wallet::{WalletDescriptor, WalletKey};
 use miniscript::{
     bitcoin::absolute::LOCK_TIME_THRESHOLD,
     descriptor::{TapTree, Tr},
@@ -16,7 +17,7 @@ use miniscript::{
 use crate::{
     key_role::{KeyRoleError, KeyType},
     multipath::{
-        assign_start_indices, get_multipath_index, group_taptree_leaves, LeafEntry,
+        assign_start_indices, get_multipath_index, group_taptree_leaves, plain_key, LeafEntry,
         NUMS_MARKER_MULTIPATH,
     },
     nums::{bip341_nums, unspendable_internal_key},
@@ -35,8 +36,8 @@ pub const MAX_LEAVES: usize = 32;
 /// legacy chain-code recompute, so a foreign descriptor that reuses the marker on a
 /// NUMS-keyed internal key is treated as unspendable regardless of derivation. Legacy
 /// detection (chain-code recompute) still runs as a fallback for older descriptors.
-fn is_new_style_nums(key: &DescriptorPublicKey) -> bool {
-    let DescriptorPublicKey::MultiXPub(m) = key else {
+fn is_new_style_nums(key: &WalletKey) -> bool {
+    let Some(DescriptorPublicKey::MultiXPub(m)) = plain_key(key) else {
         return false;
     };
     if m.xkey.public_key != bip341_nums() {
@@ -51,7 +52,7 @@ fn is_new_style_nums(key: &DescriptorPublicKey) -> bool {
 }
 
 fn extract_leaves<'a>(
-    tap_tree: &'a TapTree<DescriptorPublicKey>,
+    tap_tree: &'a TapTree<WalletKey>,
 ) -> Result<Vec<LeafEntry<'a>>, crate::multipath::MultipathError> {
     let mut entries = Vec::new();
     for (idx, (depth, ms)) in tap_tree.iter().enumerate() {
@@ -78,7 +79,7 @@ fn extract_leaves<'a>(
 /// with an intentional `pk(NUMS)` leaf is silently dropped here. `compile`
 /// enforces stricter rules: `OXpub::validate` rejects NUMS at the signer-key
 /// boundary, so we never produce real `pk(NUMS)` signer leaves.
-fn is_nums_padding_leaf(ms: &miniscript::Miniscript<DescriptorPublicKey, miniscript::Tap>) -> bool {
+fn is_nums_padding_leaf(ms: &miniscript::Miniscript<WalletKey, miniscript::Tap>) -> bool {
     let mut keys = ms.iter_pk();
     let Some(first) = keys.next() else {
         return false;
@@ -86,7 +87,7 @@ fn is_nums_padding_leaf(ms: &miniscript::Miniscript<DescriptorPublicKey, miniscr
     if keys.next().is_some() {
         return false;
     }
-    let DescriptorPublicKey::MultiXPub(m) = first else {
+    let Some(DescriptorPublicKey::MultiXPub(m)) = plain_key(&first) else {
         return false;
     };
     m.xkey.public_key == bip341_nums()
@@ -500,11 +501,11 @@ impl From<KeyRoleError> for PolicyError {
 }
 
 /// A Tr-only Liana policy. Carries its [`Path`]s, an optional cached compiled
-/// [`Descriptor<DescriptorPublicKey>`], and the [`PolicyType`] tag.
+/// [`WalletDescriptor`], and the [`PolicyType`] tag.
 #[derive(Debug, Clone)]
 pub struct Policy {
     paths: Vec<Path>,
-    descriptor: Option<Descriptor<DescriptorPublicKey>>,
+    descriptor: Option<WalletDescriptor>,
     policy_type: PolicyType,
 }
 
@@ -555,7 +556,7 @@ impl Policy {
     /// rules. Notably, this does not check cross-path multipath uniqueness: two
     /// paths may share an individual index on the same xpub, which `compile` would
     /// refuse to produce (see `check_multipath_uniqueness`).
-    pub fn from_descriptor(desc: &Descriptor<DescriptorPublicKey>) -> Result<Self, PolicyError> {
+    pub fn from_descriptor(desc: &WalletDescriptor) -> Result<Self, PolicyError> {
         let tr = match desc {
             Descriptor::Tr(tr) => tr,
             _ => return Err(PolicyError::NotTaproot),
@@ -599,10 +600,7 @@ impl Policy {
         if let Some(tap_tree) = tr.tap_tree() {
             let by_leaf: BTreeMap<
                 usize,
-                (
-                    u8,
-                    &miniscript::Miniscript<DescriptorPublicKey, miniscript::Tap>,
-                ),
+                (u8, &miniscript::Miniscript<WalletKey, miniscript::Tap>),
             > = tap_tree.iter().enumerate().collect();
             for path in paths.iter_mut() {
                 if let TapPosition::TapTree(leaves) = path.position() {
@@ -642,7 +640,7 @@ impl Policy {
     ///
     /// Each call recompiles from scratch, populating `start_index`, `indices`, and `miniscript`
     /// on each path.
-    pub fn compile(&mut self) -> Result<&Descriptor<DescriptorPublicKey>, PolicyError> {
+    pub fn compile(&mut self) -> Result<&WalletDescriptor, PolicyError> {
         self.descriptor = None;
         let promoted = self.auto_promote_internal_key_maybe();
         if let Err(e) = self.sanitize() {
@@ -793,7 +791,7 @@ impl Policy {
         &self.paths
     }
 
-    pub fn descriptor(&self) -> Option<&Descriptor<DescriptorPublicKey>> {
+    pub fn descriptor(&self) -> Option<&WalletDescriptor> {
         self.descriptor.as_ref()
     }
 
@@ -1553,12 +1551,12 @@ mod tests {
             _ => panic!("expected Tr"),
         };
         let internal = tr.internal_key();
-        let DescriptorPublicKey::MultiXPub(m) = internal else {
+        let DescriptorPublicKey::MultiXPub(m) = plain_key(internal).unwrap() else {
             panic!("internal key is not a MultiXPub")
         };
         assert_eq!(m.xkey.public_key, crate::nums::bip341_nums());
         let legacy = crate::nums::unspendable_internal_key(tr).expect("legacy key");
-        let DescriptorPublicKey::MultiXPub(legacy_m) = legacy else {
+        let DescriptorPublicKey::MultiXPub(legacy_m) = plain_key(&legacy).unwrap() else {
             panic!("legacy key is not a MultiXPub")
         };
         assert_eq!(
@@ -1603,7 +1601,7 @@ mod tests {
             _ => panic!("expected Tr"),
         };
         let legacy = crate::nums::unspendable_internal_key(tr).expect("legacy key");
-        let DescriptorPublicKey::MultiXPub(legacy_m) = legacy else {
+        let DescriptorPublicKey::MultiXPub(legacy_m) = plain_key(&legacy).unwrap() else {
             panic!("legacy key is not a MultiXPub")
         };
         let seed = legacy_m.xkey.chain_code;
@@ -1624,7 +1622,7 @@ mod tests {
             .iter_pk()
             .next()
             .expect("padding leaf has a key");
-        let DescriptorPublicKey::MultiXPub(m) = key else {
+        let DescriptorPublicKey::MultiXPub(m) = plain_key(&key).unwrap() else {
             panic!("padding key is not MultiXPub")
         };
         assert_eq!(
@@ -1687,7 +1685,7 @@ mod tests {
                     return None;
                 }
                 let key = ms.iter_pk().next()?;
-                let DescriptorPublicKey::MultiXPub(m) = key else {
+                let DescriptorPublicKey::MultiXPub(m) = plain_key(&key)? else {
                     return None;
                 };
                 Some(m.xkey.chain_code)
@@ -1711,12 +1709,11 @@ mod tests {
 
     #[test]
     fn legacy_csv_layout_parses_as_csv() {
-        use miniscript::Descriptor;
         // Hand-rolled Csv-shape Tr descriptor using the legacy `<0;1>` (primary) / `<2;3>`
         // (recovery) adjacent-multipath layout. The compiler now emits the new 512+ layout,
         // but on-chain wallets created with the legacy layout must keep parsing as Csv.
         let s = "tr([abcdef01]xpub6Eze7yAT3Y1wGrnzedCNVYDXUqa9NmHVWck5emBaTbXtURbe1NWZbK9bsz1TiVE7Cz341PMTfYgFw1KdLWdzcM1UMFTcdQfCYhhXZ2HJvTW/<0;1>/*,and_v(v:pk([abcdef02]xpub688Hn4wScQAAiYJLPg9yH27hUpfZAUnmJejRQBCiwfP5PEDzjWMNW1wChcninxr5gyavFqbbDjdV1aK5USJz8NDVjUy7FRQaaqqXHh5SbXe/<2;3>/*),older(144)))";
-        let desc = Descriptor::<DescriptorPublicKey>::from_str(s).unwrap();
+        let desc = WalletDescriptor::from_str(s).unwrap();
         let parsed = Policy::from_descriptor(&desc).unwrap();
         assert_eq!(parsed.policy_type(), PolicyType::Csv);
     }
@@ -2130,16 +2127,16 @@ mod tests {
         ));
     }
 
-    fn unknown_policy_from(ms: &str) -> SemanticPolicy<DescriptorPublicKey> {
-        Miniscript::<DescriptorPublicKey, Tap>::from_str(ms)
+    fn unknown_policy_from(ms: &str) -> SemanticPolicy<WalletKey> {
+        Miniscript::<WalletKey, Tap>::from_str(ms)
             .unwrap()
             .lift()
             .unwrap()
             .normalized()
     }
 
-    fn custom_miniscript(ms: &str) -> Miniscript<DescriptorPublicKey, Tap> {
-        Miniscript::<DescriptorPublicKey, Tap>::from_str(ms).unwrap()
+    fn custom_miniscript(ms: &str) -> Miniscript<WalletKey, Tap> {
+        Miniscript::<WalletKey, Tap>::from_str(ms).unwrap()
     }
 
     #[test]

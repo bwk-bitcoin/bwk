@@ -2,13 +2,13 @@
 
 use std::{convert::TryFrom, sync};
 
+use bwk_descriptor::wallet::WalletKey;
 use miniscript::{
-    policy::Concrete as ConcretePolicy, AbsLockTime, DescriptorPublicKey, Miniscript, RelLockTime,
-    Tap, Threshold,
+    policy::Concrete as ConcretePolicy, AbsLockTime, Miniscript, RelLockTime, Tap, Threshold,
 };
 
 use crate::{
-    multipath::deriv_paths_starting_at,
+    multipath::{deriv_paths_starting_at, wallet_key},
     parse::oxpub_to_key,
     path::{Locktime, OXpub, Path, Semantic},
     policy::{PolicyError, PolicyType},
@@ -40,22 +40,27 @@ fn split_m_of_n(n: usize, k: usize) -> Vec<Vec<usize>> {
     out
 }
 
-fn single_to_miniscript_policy(k: &OXpub, cursor: &mut u32) -> ConcretePolicy<DescriptorPublicKey> {
+fn single_to_miniscript_policy(k: &OXpub, cursor: &mut u32) -> ConcretePolicy<WalletKey> {
     let group = deriv_paths_starting_at(*cursor);
     *cursor += 2;
-    ConcretePolicy::Key(oxpub_to_key(k, group))
+    ConcretePolicy::Key(wallet_key(oxpub_to_key(k, group)))
 }
 
 fn multi_to_miniscript_policy(
     keys: &[OXpub],
     threshold: usize,
     cursor: &mut u32,
-) -> Result<ConcretePolicy<DescriptorPublicKey>, PolicyError> {
+) -> Result<ConcretePolicy<WalletKey>, PolicyError> {
     let group = deriv_paths_starting_at(*cursor);
     *cursor += 2;
-    let subs: Vec<sync::Arc<ConcretePolicy<DescriptorPublicKey>>> = keys
+    let subs: Vec<sync::Arc<ConcretePolicy<WalletKey>>> = keys
         .iter()
-        .map(|k| sync::Arc::new(ConcretePolicy::Key(oxpub_to_key(k, group.clone()))))
+        .map(|k| {
+            sync::Arc::new(ConcretePolicy::Key(wallet_key(oxpub_to_key(
+                k,
+                group.clone(),
+            ))))
+        })
         .collect();
     Ok(ConcretePolicy::Thresh(
         Threshold::new(threshold, subs)
@@ -76,7 +81,7 @@ fn nested_mandatory_to_miniscript_policy(
     keys: &[OXpub],
     threshold: usize,
     cursor: &mut u32,
-) -> Result<Vec<ConcretePolicy<DescriptorPublicKey>>, PolicyError> {
+) -> Result<Vec<ConcretePolicy<WalletKey>>, PolicyError> {
     let m = mandatory_keys.len();
     let n = keys.len();
     let mt = mandatory_threshold;
@@ -95,18 +100,15 @@ fn nested_mandatory_to_miniscript_policy(
         for k_subset in &k_subsets {
             let group = deriv_paths_starting_at(*cursor);
             *cursor += 2;
-            let mut subs: Vec<sync::Arc<ConcretePolicy<DescriptorPublicKey>>> =
-                Vec::with_capacity(mt + t);
+            let mut subs: Vec<sync::Arc<ConcretePolicy<WalletKey>>> = Vec::with_capacity(mt + t);
             for &i in mk_subset {
-                subs.push(sync::Arc::new(ConcretePolicy::Key(oxpub_to_key(
-                    &mandatory_keys[i],
-                    group.clone(),
+                subs.push(sync::Arc::new(ConcretePolicy::Key(wallet_key(
+                    oxpub_to_key(&mandatory_keys[i], group.clone()),
                 ))));
             }
             for &i in k_subset {
-                subs.push(sync::Arc::new(ConcretePolicy::Key(oxpub_to_key(
-                    &keys[i],
-                    group.clone(),
+                subs.push(sync::Arc::new(ConcretePolicy::Key(wallet_key(
+                    oxpub_to_key(&keys[i], group.clone()),
                 ))));
             }
             leaves.push(ConcretePolicy::Thresh(
@@ -123,7 +125,7 @@ fn mandatory_to_miniscript_policy(
     mandatory_keys: &[OXpub],
     threshold: usize,
     cursor: &mut u32,
-) -> Result<Vec<ConcretePolicy<DescriptorPublicKey>>, PolicyError> {
+) -> Result<Vec<ConcretePolicy<WalletKey>>, PolicyError> {
     let m = mandatory_keys.len();
     let n = keys.len();
     if threshold <= m || threshold > m + n {
@@ -144,18 +146,15 @@ fn mandatory_to_miniscript_policy(
     for subset in subsets {
         let group = deriv_paths_starting_at(*cursor);
         *cursor += 2;
-        let mut subs: Vec<sync::Arc<ConcretePolicy<DescriptorPublicKey>>> =
-            Vec::with_capacity(threshold);
+        let mut subs: Vec<sync::Arc<ConcretePolicy<WalletKey>>> = Vec::with_capacity(threshold);
         for mk in mandatory_keys {
-            subs.push(sync::Arc::new(ConcretePolicy::Key(oxpub_to_key(
-                mk,
-                group.clone(),
+            subs.push(sync::Arc::new(ConcretePolicy::Key(wallet_key(
+                oxpub_to_key(mk, group.clone()),
             ))));
         }
         for &i in &subset {
-            subs.push(sync::Arc::new(ConcretePolicy::Key(oxpub_to_key(
-                &keys[i],
-                group.clone(),
+            subs.push(sync::Arc::new(ConcretePolicy::Key(wallet_key(
+                oxpub_to_key(&keys[i], group.clone()),
             ))));
         }
         leaves.push(ConcretePolicy::Thresh(
@@ -166,9 +165,9 @@ fn mandatory_to_miniscript_policy(
     Ok(leaves)
 }
 
-pub(super) type TapLeaves = (Vec<Miniscript<DescriptorPublicKey, Tap>>, Vec<u32>);
+pub(super) type TapLeaves = (Vec<Miniscript<WalletKey, Tap>>, Vec<u32>);
 
-/// Emit one or more `Miniscript<DescriptorPublicKey, Tap>` leaves for `path`, advancing
+/// Emit one or more `Miniscript<WalletKey, Tap>` leaves for `path`, advancing
 /// `cursor` per the `+2` (intra-leaf) / `+4` (between-path) convention. For typed shapes
 /// the path's `Locktime` is AND'd into a `ConcretePolicy` and then compiled to Miniscript.
 /// `Semantic::Custom(ms)` bypasses the `ConcretePolicy` pipeline entirely: the consumer-
@@ -186,7 +185,7 @@ pub(super) fn path_into_fragments(path: &Path, cursor: &mut u32) -> Result<TapLe
         return Ok((vec![ms.clone()], vec![start]));
     }
 
-    let mut frags: Vec<ConcretePolicy<DescriptorPublicKey>> = match path.semantic() {
+    let mut frags: Vec<ConcretePolicy<WalletKey>> = match path.semantic() {
         Semantic::Single(k) => vec![single_to_miniscript_policy(k, cursor)],
         Semantic::Multi { keys, threshold } => {
             vec![multi_to_miniscript_policy(keys, *threshold, cursor)?]
@@ -241,7 +240,7 @@ pub(super) fn path_into_fragments(path: &Path, cursor: &mut u32) -> Result<TapLe
     // `+2` boundary so the next path starts at +4 from this path's first leaf group.
     *cursor += 2;
 
-    let leaves: Vec<Miniscript<DescriptorPublicKey, Tap>> = frags
+    let leaves: Vec<Miniscript<WalletKey, Tap>> = frags
         .into_iter()
         .map(|f| {
             f.compile::<Tap>()
@@ -254,8 +253,14 @@ pub(super) fn path_into_fragments(path: &Path, cursor: &mut u32) -> Result<TapLe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::path::{OXpub, TapPosition};
-    use miniscript::bitcoin::{absolute, relative};
+    use crate::{
+        multipath::plain_key,
+        path::{OXpub, TapPosition},
+    };
+    use miniscript::{
+        bitcoin::{absolute, relative},
+        DescriptorPublicKey,
+    };
     use std::str::FromStr;
 
     fn oxpub_from_str(s: &str) -> OXpub {
@@ -291,8 +296,11 @@ mod tests {
 
     /// Read the two multipath-leg indices off a Key fragment. Asserts the wrapped key is a
     /// `MultiXPub` with exactly two single-step paths and returns `(idx0, idx1)`.
-    fn key_indices(p: &ConcretePolicy<DescriptorPublicKey>) -> (u32, u32) {
-        let ConcretePolicy::Key(DescriptorPublicKey::MultiXPub(m)) = p else {
+    fn key_indices(p: &ConcretePolicy<WalletKey>) -> (u32, u32) {
+        let ConcretePolicy::Key(k) = p else {
+            panic!("expected Key(MultiXPub)");
+        };
+        let Some(DescriptorPublicKey::MultiXPub(m)) = plain_key(k) else {
             panic!("expected Key(MultiXPub)");
         };
         let paths = m.derivation_paths.paths();

@@ -5,6 +5,7 @@
 
 use std::str::FromStr;
 
+use bwk_descriptor::wallet::WalletKey;
 use miniscript::{
     bitcoin::{
         bip32,
@@ -13,6 +14,8 @@ use miniscript::{
     },
     descriptor,
 };
+
+use crate::multipath::{plain_key, wallet_key};
 
 /// The BIP-341 NUMS ("Nothing Up My Sleeve") point.
 ///
@@ -28,11 +31,11 @@ pub fn bip341_nums() -> secp256k1::PublicKey {
     .expect("Valid pubkey: NUMS from BIP341")
 }
 
-fn get_multi_xkey(desc_key: &descriptor::DescriptorPublicKey) -> Option<&bip32::Xpub> {
-    if let descriptor::DescriptorPublicKey::MultiXPub(descriptor::DescriptorMultiXKey {
+fn get_multi_xkey(desc_key: &WalletKey) -> Option<&bip32::Xpub> {
+    if let Some(descriptor::DescriptorPublicKey::MultiXPub(descriptor::DescriptorMultiXKey {
         xkey,
         ..
-    }) = desc_key
+    })) = plain_key(desc_key)
     {
         Some(xkey)
     } else {
@@ -46,9 +49,7 @@ fn get_multi_xkey(desc_key: &descriptor::DescriptorPublicKey) -> Option<&bip32::
 /// leaf, or if the keys contained in the descriptor aren't all `MultiXPub`s.
 ///
 /// See <https://delvingbitcoin.org/t/unspendable-keys-in-descriptors/304/21>.
-fn unspendable_internal_xpub(
-    desc: &descriptor::Tr<descriptor::DescriptorPublicKey>,
-) -> Option<bip32::Xpub> {
+fn unspendable_internal_xpub(desc: &descriptor::Tr<WalletKey>) -> Option<bip32::Xpub> {
     let tap_tree = desc.tap_tree().as_ref()?;
 
     let first_key = tap_tree.iter().flat_map(|(_, ms)| ms.iter_pk()).next()?;
@@ -76,12 +77,10 @@ fn unspendable_internal_xpub(
     })
 }
 
-/// Wrap [`unspendable_internal_xpub`] into a multipath `DescriptorPublicKey`. Used by
+/// Wrap [`unspendable_internal_xpub`] into a multipath [`WalletKey`]. Used by
 /// `Policy::from_descriptor` for legacy NUMS detection.
-pub fn unspendable_internal_key(
-    desc: &descriptor::Tr<descriptor::DescriptorPublicKey>,
-) -> Option<descriptor::DescriptorPublicKey> {
-    Some(descriptor::DescriptorPublicKey::MultiXPub(
+pub fn unspendable_internal_key(desc: &descriptor::Tr<WalletKey>) -> Option<WalletKey> {
+    Some(wallet_key(descriptor::DescriptorPublicKey::MultiXPub(
         descriptor::DescriptorMultiXKey {
             origin: None,
             xkey: unspendable_internal_xpub(desc)?,
@@ -92,5 +91,5 @@ pub fn unspendable_internal_key(
             .expect("Non empty vec"),
             wildcard: descriptor::Wildcard::Unhardened,
         },
-    ))
+    )))
 }
