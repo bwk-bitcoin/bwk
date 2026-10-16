@@ -25,7 +25,7 @@ pub enum Error {
 
 impl Error {
     /// `SpkDerivator::new` reports the lowest rank seen over every key.
-    fn rank(&self) -> u8 {
+    pub(crate) fn rank(&self) -> u8 {
         match self {
             Error::NotMultiXpub => 0,
             Error::WrongNetwork => 1,

@@ -56,7 +56,8 @@ tests locally. Commit messages must be single-line and follow existing style
 | bwk-descriptor  | Miniscript and sp() descriptor handling, SpkDerivator       |
 | bwk-bup         | Bitcoin user policy: role-tagged Taproot multipath          |
 |                 | descriptors, compile and read back (BIP draft)              |
-| bwk-keys        | Key derivation utilities (OXpriv, OXpub, KeyDerivator)      |
+| bwk-keys        | Key derivation utilities (OXpriv, OXpub, KeyDerivator),     |
+|                 | MusigKey (BIP-390)                                          |
 | bwk-p2p         | Bitcoin P2P network client, DNS seed resolution             |
 | bwk-coin        | Coin domain types shared by bwk-tx and bwk-electrum         |
 | bwk-persist     | KV persistence: Store, RamStore, JSON/SQLite backends       |

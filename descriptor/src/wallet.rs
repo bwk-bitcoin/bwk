@@ -4,12 +4,18 @@
 use std::convert::Infallible;
 
 #[cfg(feature = "musig")]
-use bwk_keys::musig::{DefiniteMusigKey, MusigKey};
+use bwk_keys::musig::{DefiniteMusigKey, MusigAggregate, MusigKey};
 #[cfg(not(feature = "musig"))]
 use miniscript::DefiniteDescriptorKey;
-use miniscript::{bitcoin::Network, descriptor::Wildcard, DescriptorPublicKey, ForEachKey};
 #[cfg(feature = "musig")]
-use miniscript::{translate_hash_clone, MiniscriptKey, TranslateErr, TranslatePk, Translator};
+use miniscript::{
+    bitcoin::bip32::ChildNumber, translate_hash_clone, MiniscriptKey, TranslateErr, TranslatePk,
+    Translator,
+};
+use miniscript::{bitcoin::Network, descriptor::Wildcard, DescriptorPublicKey, ForEachKey};
+
+#[cfg(feature = "musig")]
+use crate::derivator::Error as DerivatorError;
 
 #[cfg(not(feature = "musig"))]
 pub type WalletKey = DescriptorPublicKey;
@@ -145,7 +151,6 @@ impl WalletKeyExt for DescriptorPublicKey {
 }
 
 #[cfg(feature = "musig")]
-#[allow(unused_variables)]
 impl WalletKeyExt for MusigKey {
     fn plain_keys(&self) -> Vec<&DescriptorPublicKey> {
         MusigKey::plain_keys(self)
@@ -154,8 +159,48 @@ impl WalletKeyExt for MusigKey {
     fn check_derivation(&self, network: Network) -> Result<(), crate::derivator::Error> {
         match self {
             MusigKey::Plain(key) => key.check_derivation(network),
-            MusigKey::Musig(aggregate) => todo!(),
+            MusigKey::Musig(aggregate) => check_musig_derivation(aggregate, network),
         }
+    }
+}
+
+/// The `musig()` expression stands in for a key: its own derivation must be a
+/// multipath one; without one, every cosigner must pass on its own.
+#[cfg(feature = "musig")]
+fn check_musig_derivation(
+    aggregate: &MusigAggregate,
+    network: Network,
+) -> Result<(), DerivatorError> {
+    match aggregate.derivation() {
+        Some(derivation) if derivation.paths.paths().len() > 1 => {
+            let wrong_network = aggregate.cosigners().iter().any(|key| match key {
+                DescriptorPublicKey::Single(_) => false,
+                DescriptorPublicKey::XPub(xpub) => xpub.xkey.network != network.into(),
+                DescriptorPublicKey::MultiXPub(xpub) => xpub.xkey.network != network.into(),
+            });
+            if wrong_network {
+                return Err(DerivatorError::WrongNetwork);
+            }
+            let wrong_multipath = derivation
+                .paths
+                .paths()
+                .iter()
+                .any(|path| path.len() != 1 || path.into_iter().any(ChildNumber::is_hardened));
+            if wrong_multipath {
+                return Err(DerivatorError::MultiPath);
+            }
+            if derivation.wildcard != Wildcard::Unhardened {
+                return Err(DerivatorError::Wildcard);
+            }
+            Ok(())
+        }
+        Some(_) => Err(DerivatorError::NotMultiXpub),
+        None => aggregate
+            .cosigners()
+            .iter()
+            .filter_map(|key| key.check_derivation(network).err())
+            .min_by_key(DerivatorError::rank)
+            .map_or(Ok(()), Err),
     }
 }
 
@@ -235,9 +280,13 @@ impl WalletDescriptorExt for WalletDescriptor {
 mod tests {
     use std::str::FromStr;
 
+    #[cfg(feature = "musig")]
+    use bwk_keys::musig::MusigKey;
     use miniscript::{bitcoin::Network, DescriptorPublicKey};
 
     use crate::wallet::{to_wallet, WalletDescriptor, WalletDescriptorExt};
+    #[cfg(feature = "musig")]
+    use crate::{derivator::Error as DerivatorError, wallet::WalletKeyExt};
 
     const XPUB1: &str = "tpubDDxT9mkZzWwkKwpGT5fY6iiM9muYTPkTx6Eig8dpHR7TChuGGCWYAHVmpW1ciido5RiFWwjzYsF1GZHkEHg2nrYp3zNtx3QQRkznyLhQ77x";
     const XPUB2: &str = "tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B";
@@ -311,5 +360,62 @@ mod tests {
         for d in [wpkh(), tr_with_leaf()] {
             assert!(!to_wallet(d).has_musig());
         }
+    }
+
+    // BIP-390 test vector xpubs (mainnet).
+    #[cfg(feature = "musig")]
+    const X1: &str = "xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL";
+    #[cfg(feature = "musig")]
+    const X2: &str = "xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y";
+
+    #[cfg(feature = "musig")]
+    fn musig(keys: &[&str], suffix: &str) -> MusigKey {
+        MusigKey::from_str(&format!("musig|{}|{suffix}", keys.join("|"))).unwrap()
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_key_plain_keys_lists_cosigners() {
+        let x1 = DescriptorPublicKey::from_str(X1).unwrap();
+        let x2 = DescriptorPublicKey::from_str(X2).unwrap();
+        let key = musig(&[X1, X2], "/<0;1>/*");
+        assert_eq!(WalletKeyExt::plain_keys(&key), vec![&x1, &x2]);
+        let plain = MusigKey::Plain(x1.clone());
+        assert_eq!(WalletKeyExt::plain_keys(&plain), vec![&x1]);
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_key_check_derivation_shapes() {
+        let x1_multipath = format!("{X1}/<0;1>/*");
+        let x2_multipath = format!("{X2}/<0;1>/*");
+        let x2_single = format!("{X2}/0/*");
+        let bitcoin = Network::Bitcoin;
+        assert!(musig(&[X1, X2], "/<0;1>/*")
+            .check_derivation(bitcoin)
+            .is_ok());
+        assert!(matches!(
+            musig(&[X1, X2], "/<0;1>/*").check_derivation(Network::Testnet),
+            Err(DerivatorError::WrongNetwork)
+        ));
+        assert!(matches!(
+            musig(&[X1, X2], "/<0;1>/0/*").check_derivation(bitcoin),
+            Err(DerivatorError::MultiPath)
+        ));
+        assert!(matches!(
+            musig(&[X1, X2], "/<0;1>").check_derivation(bitcoin),
+            Err(DerivatorError::Wildcard)
+        ));
+        assert!(matches!(
+            musig(&[X1, X2], "/0/*").check_derivation(bitcoin),
+            Err(DerivatorError::NotMultiXpub)
+        ));
+        assert!(musig(&[&x1_multipath, &x2_multipath], "")
+            .check_derivation(bitcoin)
+            .is_ok());
+        assert!(matches!(
+            musig(&[&x1_multipath, &x2_single], "").check_derivation(bitcoin),
+            Err(DerivatorError::NotMultiXpub)
+        ));
     }
 }

@@ -54,7 +54,7 @@ Blindbit).
 | bwk-electrum    | Electrum client, scanner, scan stores, header chain   |
 | bwk-sign        | Signers and signing managers (hot, hardware, remote)  |
 | bwk-descriptor  | Miniscript and sp() descriptors, SpkDerivator         |
-| bwk-keys        | Key derivation (OXpriv, OXpub)                        |
+| bwk-keys        | Key derivation (OXpriv, OXpub), MusigKey (BIP-390)    |
 | bwk-p2p         | Bitcoin P2P client                                    |
 | bwk-coin        | Coin domain types shared by bwk-tx and bwk-electrum   |
 | bwk-persist     | KV persistence: Store, RamStore, JSON/SQLite backends |
