@@ -108,6 +108,19 @@ else is `Error::MusigOutsideTr`. `musig_tr` builds the key path descriptor
 `tr(musig(...)/<0;1>/*)` from cosigner xpubs. A descriptor without `musig()`
 prints exactly as without the feature.
 
+## PSBT Updater
+
+`updater::update_input` and `updater::update_output` run miniscript's PSBT
+updater on the derived descriptor; without the `musig` feature that is all they
+do. Under `musig`, each musig() key first goes to miniscript as the derived
+aggregate with its BIP-328 synthetic origin (`to_plain_definite`), then for each
+musig() key of the `tr()` the updater writes the BIP-373 participant field
+(`0x1a` on an input, `0x08` on an output), keyed by the untweaked KeyAgg output,
+with the participants in KeySort order. Every cosigner also gets a
+`tap_key_origins` entry with its own origin and the hashes of every leaf its
+aggregate sits in (none for the internal key), sorted and deduplicated, as
+Bitcoin Core's updater does. Running it twice gives the same result.
+
 ## Silent Payment Keys
 
 `sp_key` encodes a silent payment key pair as one bech32m string, the form
