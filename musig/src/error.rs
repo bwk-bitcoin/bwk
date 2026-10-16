@@ -28,4 +28,10 @@ pub enum Error {
         error("partial signature count does not match")
     )]
     PartialSigCount,
+    /// BIP-327 Sign: the signer's key must be in the key list.
+    #[cfg_attr(feature = "rust-bitcoin", error("signer is not a participant"))]
+    NotParticipant,
+    /// An all-zero rand, a zero or out-of-range k1/k2, or an already used nonce.
+    #[cfg_attr(feature = "rust-bitcoin", error("invalid secret nonce"))]
+    InvalidSecNonce,
 }
