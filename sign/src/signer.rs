@@ -46,6 +46,8 @@ pub trait Signer: Send + Sync {
     /// Request the signer to sign the given psbt. A descriptor must be loaded
     /// prior to call this function.
     /// The signer must return a [`SignerNotif::Signed`] notification.
+    /// One round per call: a PSBT returned with only nonces is success; the caller
+    /// calls again for the next round.
     fn sign_with_descriptor(&self, psbt: Psbt, descriptor: Descriptor);
     /// Request the signer to display the address for verification.
     /// No notification is expected in return.

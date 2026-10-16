@@ -111,6 +111,67 @@ In-memory BIP32 signer from mnemonic. Supports:
 - P2WPKH (segwit)
 - P2TR key-path (tapkey)
 - P2TR script-path (taptree)
+- MuSig2 (BIP-327) key path and script path, behind the `musig` feature
+
+## MuSig2
+
+Under the `musig` feature a `HotSigner` is a MuSig2 participant for the BIP-390
+`musig()` keys of its registered descriptors, and behaves like an external
+device: one round per `inner_sign` / `sign_with_descriptor` call.
+
+The slots (input, participant, aggregate, leaf) come from the registered
+descriptor, never from the PSBT 0x1a. A script path slot exists only for a leaf
+present in the input's `tap_scripts`, and the key path slot only when the input
+carries the 0x1a of the internal aggregate. The signer tells the rounds apart
+from its own 0x1b:
+
+```
++------------------------------+-----------------------------------------------+
+| own 0x1b in the PSBT         | action                                        |
++------------------------------+-----------------------------------------------+
+| on none of its slots         | round 1: add the 0x1b only, no signature      |
+| on all of its slots          | round 2: add the 0x1c, then ordinary sigs     |
+| on some of its slots only    | Error::MusigSession                           |
+| no musig slot                | ordinary signing                              |
++------------------------------+-----------------------------------------------+
+```
+
+Round 1 draws 32 fresh bytes from the OS per slot and binds the nonce to the
+slot's sighash. The secret nonces stay in memory, in a session whose id is the
+sha256 of the unsigned transaction, every spent output, the policy text and the
+signer fingerprint, so a change to any of them between the rounds is refused.
+The store keeps one session per (policy, signer fingerprint): a new round 1 for
+the same wallet replaces the older session, so only the PSBT that ran round 1
+last can finish round 2.
+Round 2 first runs the ordinary signing on a copy, so its failure keeps the
+session. It then takes the session out of the store before any check, so a
+later failure erases it and a nonce never signs twice; it checks the sighash
+and its own 0x1b against the session and needs every cosigner's 0x1b
+(`MusigNonces` otherwise). Losing the session only costs a restart from round 1.
+
+The ordinary pass never signs with a participant key: it skips every origin of
+the signer whose path is exactly a participant path of one of its `musig()`
+cosigner keys in any registered descriptor or the one being signed (the
+cosigner's own path for `musig(A,B)/<0;1>/*`, the cosigner at a derivation index
+for `musig(A/<0;1>/*,B/<0;1>/*)`), whatever the PSBT claims, so signing another
+account cannot use a participant key, and a script path origin whose path does
+not derive its key. A key derived under a cosigner, like the recovery key
+`A/<1024;1025>/*` next to `musig(A,B)/<512;513>/*`, still signs.
+
+`register_descriptor` refuses with `Error::MusigParticipantReuse` a descriptor
+that uses one of the signer's participant keys as a plain key, like
+`tr(A/<0;1>/*)` next to `musig(A/<0;1>/*,B/<0;1>/*)`, or that makes a
+participant of a key already used as a plain key, whatever the registration
+order.
+
+`MusigSessionStore` is a cloneable handle: clones share the sessions. A
+consumer that rebuilds its `HotSigner` per call passes one process-wide store
+with `set_musig_sessions` so round 2 finds the session of round 1.
+
+The finalizer role lives in `bwk_sign::musig`: `musig_status` reports the round
+and each cosigner's progress, and `aggregate_partial_sigs` verifies every 0x1c
+and aggregates each complete slot into `tap_key_sig` or `tap_script_sigs`,
+ready for the miniscript finalizer.
 
 ## HotManager
 

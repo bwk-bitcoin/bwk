@@ -37,6 +37,8 @@ pub enum Error {
     Musig(bwk_musig::Error),
     #[cfg(feature = "musig")]
     MusigField,
+    #[cfg(feature = "musig")]
+    MusigParticipantReuse,
 }
 
 impl Display for Error {
@@ -83,6 +85,10 @@ impl Display for Error {
             Error::Musig(e) => write!(f, "MuSig2 error: {e}"),
             #[cfg(feature = "musig")]
             Error::MusigField => write!(f, "invalid MuSig2 PSBT field"),
+            #[cfg(feature = "musig")]
+            Error::MusigParticipantReuse => {
+                write!(f, "a MuSig2 participant key is also used as a plain key")
+            }
         }
     }
 }
@@ -90,5 +96,19 @@ impl Display for Error {
 impl From<bip39::Error> for Error {
     fn from(value: bip39::Error) -> Self {
         Error::Bip39(value)
+    }
+}
+
+#[cfg(feature = "musig")]
+impl From<bwk_musig::Error> for Error {
+    fn from(value: bwk_musig::Error) -> Self {
+        Error::Musig(value)
+    }
+}
+
+#[cfg(feature = "musig")]
+impl From<bwk_psbt::musig::Error> for Error {
+    fn from(_: bwk_psbt::musig::Error) -> Self {
+        Error::MusigField
     }
 }
