@@ -7,7 +7,7 @@ use bwk_qr_protocol::{
     Message, MessageType, Request, RequestId, Response, MAX_DESCRIPTOR_ALIAS, REQUEST_ID_LEN,
 };
 
-use common::{key_request, xpub};
+use common::{key_request, musig_partial_sigs, musig_pub_nonces, xpub};
 
 // MAGIC is 6 bytes, so VERSION sits at index 6 and MSG_TYPE right after it
 const VERSION_OFFSET: usize = 6;
@@ -16,6 +16,9 @@ const HEADER_LEN: usize = MSG_TYPE_OFFSET + 1 + REQUEST_ID_LEN;
 // STORED's value follows the header, the alias "main" as a STRING (1 + 4),
 // REGISTERED (1 + 1), and STORED's own presence byte
 const STORED_VALUE_OFFSET: usize = HEADER_LEN + 5 + 2 + 1;
+// the first LEAF_HASH presence byte of musig_pub_nonces() follows KIND, the SIG_ENTRY
+// count, INPUT_INDEX, SIG_KIND, PARTICIPANT and AGGREGATE
+const FIRST_LEAF_HASH_PRESENCE_OFFSET: usize = HEADER_LEN + 1 + 1 + 4 + 1 + 33 + 33;
 // the first KIND of get_keys_request() follows the KEYS count and its path m/48'/0'/0'/2'
 // (CHILD_COUNT + 4 steps of 4 bytes)
 const FIRST_KEY_KIND_OFFSET: usize = HEADER_LEN + 1 + 1 + 4 * 4;
@@ -75,6 +78,13 @@ fn error_response(error: response::Error) -> Response {
             error,
             message: "signing was declined".to_string(),
         }),
+    }
+}
+
+fn signatures_response(entries: Vec<response::SignatureEntry>) -> Response {
+    Response {
+        id: id(),
+        body: response::Body::Signed(response::Signed::Signatures(entries)),
     }
 }
 
@@ -419,4 +429,46 @@ mod extended_key {
             ])))
         );
     }
+}
+
+#[test]
+fn musig_signatures_round_trip() {
+    let mut entries = musig_pub_nonces();
+    entries.extend(musig_partial_sigs());
+    let response = signatures_response(entries);
+    let bytes = encode_response(&response).unwrap();
+    assert_eq!(decode(&bytes), Ok(Message::Response(response)));
+}
+
+#[test]
+fn musig_leaf_hash_presence_must_be_zero_or_one() {
+    let mut bytes = encode_response(&signatures_response(musig_pub_nonces())).unwrap();
+    assert_eq!(bytes[FIRST_LEAF_HASH_PRESENCE_OFFSET], 0);
+    bytes[FIRST_LEAF_HASH_PRESENCE_OFFSET] = 0x02;
+    assert_eq!(
+        decode(&bytes),
+        Err(decode::Error::Read(reader::Error::InvalidPresence(0x02)))
+    );
+}
+
+#[test]
+fn truncated_musig_nonce_is_refused() {
+    let bytes = encode_response(&signatures_response(musig_pub_nonces())).unwrap();
+    assert_eq!(
+        decode(&bytes[..bytes.len() - 1]),
+        Err(decode::Error::Read(reader::Error::Truncated))
+    );
+}
+
+#[test]
+fn musig_session_error_code_round_trips() {
+    assert_eq!(u8::from(response::Error::MusigSession), 0x0d);
+    assert_eq!(response::Error::from(0x0d), response::Error::MusigSession);
+    assert_eq!(
+        encode_response(&error_response(response::Error::Unknown(0x0d))),
+        Err(encode::Error::ErrorCodeOutOfRange(0x0d))
+    );
+    let response = error_response(response::Error::Unknown(0x0e));
+    let bytes = encode_response(&response).unwrap();
+    assert_eq!(decode(&bytes), Ok(Message::Response(response)));
 }

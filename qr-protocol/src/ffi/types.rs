@@ -233,7 +233,8 @@ pub union SignedValue {
 #[derive(Clone, Copy)]
 pub struct Signature {
     pub input_index: u32,
-    /// `SIGNATURE_ECDSA`, `SIGNATURE_TAP_KEY` or `SIGNATURE_TAP_SCRIPT`.
+    /// `SIGNATURE_ECDSA`, `SIGNATURE_TAP_KEY`, `SIGNATURE_TAP_SCRIPT`,
+    /// `SIGNATURE_MUSIG_PUB_NONCE` or `SIGNATURE_MUSIG_PARTIAL_SIG`.
     pub kind: u8,
     pub value: SignatureValue,
 }
@@ -285,6 +286,7 @@ pub struct MusigPubNonce {
 pub struct MusigPartialSig {
     pub participant: [u8; PUBLIC_KEY_LEN],
     pub aggregate: [u8; PUBLIC_KEY_LEN],
+    /// 0 or 1.
     pub has_leaf_hash: u8,
     pub leaf_hash: [u8; TAP_LEAF_HASH_LEN],
     pub signature: [u8; MUSIG_PARTIAL_SIG_LEN],

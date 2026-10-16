@@ -232,6 +232,7 @@ impl From<u8> for Error {
             0x0a => Self::InvalidPsbt,
             0x0b => Self::InternalError,
             0x0c => Self::PrivateKeyExportRefused,
+            0x0d => Self::MusigSession,
             0xff => Self::Vendor,
             value => Self::Unknown(value),
         }

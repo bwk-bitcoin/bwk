@@ -5,12 +5,15 @@ mod common;
 use bitcoin::{
     absolute,
     hex::{DisplayHex, FromHex},
-    transaction, Psbt, PublicKey, Transaction,
+    transaction, Psbt, Transaction,
 };
 use bwk_qr_protocol::{self as protocol, request, response, types::Fingerprint, Message};
 use serde_json::Value;
 
-use common::{bip380, bip388, bitcoin_xpub, key_request, path, sp_keys, xpriv, xpub};
+use common::{
+    bip380, bip388, key_request, musig_partial_sigs, musig_pub_nonces, path, sp_keys, xpriv, xpub,
+    xpub_key,
+};
 
 fn id() -> protocol::RequestId {
     protocol::RequestId([0, 1])
@@ -177,9 +180,7 @@ fn signing_messages() -> Vec<(&'static str, Message)> {
             response(response::Body::Signed(response::Signed::Signatures(vec![
                 response::SignatureEntry::Ecdsa {
                     input_index: 0,
-                    public_key: (&PublicKey::new(bitcoin_xpub().public_key))
-                        .try_into()
-                        .unwrap(),
+                    public_key: xpub_key(),
                     signature: vec![0x30; 71],
                 },
                 response::SignatureEntry::TapKey {
@@ -193,6 +194,18 @@ fn signing_messages() -> Vec<(&'static str, Message)> {
                     signature: vec![0x04; 65],
                 },
             ]))),
+        ),
+        (
+            "signing_response_musig_pub_nonces",
+            response(response::Body::Signed(response::Signed::Signatures(
+                musig_pub_nonces(),
+            ))),
+        ),
+        (
+            "signing_response_musig_partial_sigs",
+            response(response::Body::Signed(response::Signed::Signatures(
+                musig_partial_sigs(),
+            ))),
         ),
     ]
 }
@@ -224,10 +237,18 @@ fn error_messages() -> Vec<(&'static str, Message)> {
             })),
         ),
         (
+            "error_response_musig_session",
+            response(response::Body::Error(response::ErrorBody {
+                message_type: protocol::MessageType::Signing,
+                error: response::Error::MusigSession,
+                message: "musig2 session missing".to_string(),
+            })),
+        ),
+        (
             "error_response_reserved_code",
             response(response::Body::Error(response::ErrorBody {
                 message_type: protocol::MessageType::GetKeys,
-                error: response::Error::Unknown(0x0d),
+                error: response::Error::Unknown(0x0e),
                 message: "code added after version 1".to_string(),
             })),
         ),

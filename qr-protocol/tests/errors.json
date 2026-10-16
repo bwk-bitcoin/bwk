@@ -22,10 +22,17 @@
       "decode_only": false
     },
     {
-      "name": "error_response_reserved_code",
-      "description": "Error response to a Get Keys request with ERROR 0x0d, taken from the range reserved for future standard codes. A version 1 parser does not know it and must still accept the message and fall back to ERROR_MESSAGE.",
+      "name": "error_response_musig_session",
+      "description": "Error response to a Signing request: MSG_TYPE 0xc4 is response, error, TYPE 0x04. ERROR is 0x0d (MuSig2 session missing or mismatch) and ERROR_MESSAGE is \"musig2 session missing\" padded with 0x00 up to 32 bytes.",
       "direction": "response",
-      "hex": "42495058585801c100010d636f64652061646465642061667465722076657273696f6e2031000000000000",
+      "hex": "42495058585801c400010d6d75736967322073657373696f6e206d697373696e6700000000000000000000",
+      "decode_only": false
+    },
+    {
+      "name": "error_response_reserved_code",
+      "description": "Error response to a Get Keys request with ERROR 0x0e, taken from the range reserved for future standard codes. A version 1 parser does not know it and must still accept the message and fall back to ERROR_MESSAGE.",
+      "direction": "response",
+      "hex": "42495058585801c100010e636f64652061646465642061667465722076657273696f6e2031000000000000",
       "decode_only": false
     }
   ]

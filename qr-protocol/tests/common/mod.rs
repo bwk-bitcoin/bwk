@@ -3,9 +3,12 @@
 
 #[cfg(feature = "bitcoin")]
 use bitcoin::bip32;
-use bwk_qr_protocol::request;
+use bwk_qr_protocol::{request, types::PublicKey};
 #[cfg(feature = "bitcoin")]
-use bwk_qr_protocol::types::{DerivationPath, ExtendedKey};
+use bwk_qr_protocol::{
+    response,
+    types::{DerivationPath, ExtendedKey},
+};
 
 #[cfg(feature = "bitcoin")]
 pub fn path(path: &str) -> DerivationPath {
@@ -61,4 +64,59 @@ pub fn bip388() -> request::DescriptorBody {
         ],
         policy: "wsh(sortedmulti(2,@0/**,@1/**))".to_string(),
     }
+}
+
+#[cfg(feature = "bitcoin")]
+pub fn xpub_key() -> PublicKey {
+    (&bitcoin::PublicKey::new(bitcoin_xpub().public_key))
+        .try_into()
+        .unwrap()
+}
+
+// The codec does not check points, so any 33 bytes stand for an aggregate key.
+pub fn aggregate(prefix: u8, fill: u8) -> PublicKey {
+    let mut key = [fill; 33];
+    key[0] = prefix;
+    PublicKey(key)
+}
+
+// Two slots of one participant: input 0 on the key path, input 1 on a script path.
+#[cfg(feature = "bitcoin")]
+pub fn musig_pub_nonces() -> Vec<response::SignatureEntry> {
+    vec![
+        response::SignatureEntry::MusigPubNonce {
+            input_index: 0,
+            participant: xpub_key(),
+            aggregate: aggregate(0x02, 0x11),
+            leaf_hash: None,
+            nonce: [0x22; 66],
+        },
+        response::SignatureEntry::MusigPubNonce {
+            input_index: 1,
+            participant: xpub_key(),
+            aggregate: aggregate(0x03, 0x33),
+            leaf_hash: Some([0x44; 32]),
+            nonce: [0x55; 66],
+        },
+    ]
+}
+
+#[cfg(feature = "bitcoin")]
+pub fn musig_partial_sigs() -> Vec<response::SignatureEntry> {
+    vec![
+        response::SignatureEntry::MusigPartialSig {
+            input_index: 0,
+            participant: xpub_key(),
+            aggregate: aggregate(0x02, 0x11),
+            leaf_hash: None,
+            signature: [0x66; 32],
+        },
+        response::SignatureEntry::MusigPartialSig {
+            input_index: 1,
+            participant: xpub_key(),
+            aggregate: aggregate(0x03, 0x33),
+            leaf_hash: Some([0x44; 32]),
+            signature: [0x77; 32],
+        },
+    ]
 }

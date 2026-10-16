@@ -2,7 +2,7 @@ use alloc::{string::String, vec::Vec};
 
 use crate::{
     request, response,
-    types::{DerivationPath, ExtendedKey},
+    types::{DerivationPath, ExtendedKey, PublicKey, TAP_LEAF_HASH_LEN},
     ErrorInfo, MessageType, Request, RequestId, Response, SignResponseKind, DIRECTION_REQUEST,
     DIRECTION_RESPONSE, ERROR_MESSAGE_LEN, MAGIC, MAX_BYTES, MAX_DESCRIPTOR_ALIAS, MAX_VEC,
     MODEL_LEN, REQUEST_ID_LEN, STATUS_ERROR, STATUS_OK, VENDOR_LEN, VERSION,
@@ -10,7 +10,7 @@ use crate::{
 
 pub const MAX_PATH: usize = 255;
 pub const MAX_PATCH: u32 = 0x00ff_ffff;
-const ERROR_CODE_FUTURE_MIN: u8 = 0x0d;
+const ERROR_CODE_FUTURE_MIN: u8 = 0x0e;
 const ERROR_CODE_FUTURE_MAX: u8 = 0xfe;
 const CAPABILITIES_MASK: u32 = 0x0000_000f;
 
@@ -274,17 +274,55 @@ fn write_tap_script_signature(
     write_bytes(out, signature)
 }
 
-#[allow(unused_variables, clippy::ptr_arg)]
 fn write_musig_pub_nonce(out: &mut Vec<u8>, entry: &response::SignatureEntry) -> Result<(), Error> {
-    todo!()
+    let response::SignatureEntry::MusigPubNonce {
+        input_index,
+        participant,
+        aggregate,
+        leaf_hash,
+        nonce,
+    } = entry
+    else {
+        return Err(Error::Unreachable);
+    };
+    write_signature_header(out, *input_index, response::SIGNATURE_MUSIG_PUB_NONCE);
+    write_musig_slot(out, participant, aggregate, leaf_hash.as_ref())?;
+    out.extend_from_slice(nonce);
+    Ok(())
 }
 
-#[allow(unused_variables, clippy::ptr_arg)]
 fn write_musig_partial_sig(
     out: &mut Vec<u8>,
     entry: &response::SignatureEntry,
 ) -> Result<(), Error> {
-    todo!()
+    let response::SignatureEntry::MusigPartialSig {
+        input_index,
+        participant,
+        aggregate,
+        leaf_hash,
+        signature,
+    } = entry
+    else {
+        return Err(Error::Unreachable);
+    };
+    write_signature_header(out, *input_index, response::SIGNATURE_MUSIG_PARTIAL_SIG);
+    write_musig_slot(out, participant, aggregate, leaf_hash.as_ref())?;
+    out.extend_from_slice(signature);
+    Ok(())
+}
+
+fn write_musig_slot(
+    out: &mut Vec<u8>,
+    participant: &PublicKey,
+    aggregate: &PublicKey,
+    leaf_hash: Option<&[u8; TAP_LEAF_HASH_LEN]>,
+) -> Result<(), Error> {
+    out.extend_from_slice(&participant.0);
+    out.extend_from_slice(&aggregate.0);
+    write_option(out, leaf_hash, |out, hash| {
+        out.extend_from_slice(hash);
+        Ok(())
+    })
 }
 
 fn write_signature_header(out: &mut Vec<u8>, input_index: u32, kind: u8) {

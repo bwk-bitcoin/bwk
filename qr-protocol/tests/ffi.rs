@@ -568,6 +568,32 @@ fn signed_signatures_response_encodes_every_kind() {
                     },
                 },
             },
+            types::Signature {
+                input_index: 3,
+                kind: response::SIGNATURE_MUSIG_PUB_NONCE,
+                value: types::SignatureValue {
+                    musig_pub_nonce: types::MusigPubNonce {
+                        participant: [0x07; 33],
+                        aggregate: [0x08; 33],
+                        has_leaf_hash: 0,
+                        leaf_hash: [0; 32],
+                        nonce: [0x09; 66],
+                    },
+                },
+            },
+            types::Signature {
+                input_index: 4,
+                kind: response::SIGNATURE_MUSIG_PARTIAL_SIG,
+                value: types::SignatureValue {
+                    musig_partial_sig: types::MusigPartialSig {
+                        participant: [0x0a; 33],
+                        aggregate: [0x0b; 33],
+                        has_leaf_hash: 1,
+                        leaf_hash: [0x0c; 32],
+                        signature: [0x0d; 32],
+                    },
+                },
+            },
         ];
         let view = response_view(
             MessageType::Signing.value(),
@@ -598,6 +624,20 @@ fn signed_signatures_response_encodes_every_kind() {
                     xonly_public_key: [0x05; 32],
                     tap_leaf_hash: [0x06; 32],
                     signature: tap_script_sig.to_vec(),
+                },
+                response::SignatureEntry::MusigPubNonce {
+                    input_index: 3,
+                    participant: PublicKey([0x07; 33]),
+                    aggregate: PublicKey([0x08; 33]),
+                    leaf_hash: None,
+                    nonce: [0x09; 66],
+                },
+                response::SignatureEntry::MusigPartialSig {
+                    input_index: 4,
+                    participant: PublicKey([0x0a; 33]),
+                    aggregate: PublicKey([0x0b; 33]),
+                    leaf_hash: Some([0x0c; 32]),
+                    signature: [0x0d; 32],
                 },
             ]))
         );
@@ -728,6 +768,38 @@ fn encode_rejects_an_unknown_signature_kind() {
             },
         );
         assert_eq!(encode_failure(&view), Error::UnknownTag.info_owned());
+    }
+}
+
+#[test]
+fn encode_rejects_an_invalid_leaf_hash_presence() {
+    unsafe {
+        let entries = [types::Signature {
+            input_index: 0,
+            kind: response::SIGNATURE_MUSIG_PUB_NONCE,
+            value: types::SignatureValue {
+                musig_pub_nonce: types::MusigPubNonce {
+                    participant: [0x02; 33],
+                    aggregate: [0x03; 33],
+                    has_leaf_hash: 2,
+                    leaf_hash: [0x04; 32],
+                    nonce: [0x05; 66],
+                },
+            },
+        }];
+        let view = response_view(
+            MessageType::Signing.value(),
+            false,
+            types::ResponseBody {
+                signed: types::Signed {
+                    kind: SignResponseKind::Signatures.value(),
+                    value: types::SignedValue {
+                        signatures: list_view(&entries),
+                    },
+                },
+            },
+        );
+        assert_eq!(encode_failure(&view), Error::InvalidBool.info_owned());
     }
 }
 

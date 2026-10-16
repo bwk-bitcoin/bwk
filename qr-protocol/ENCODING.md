@@ -209,13 +209,14 @@ from the C binding return codes documented in `README.md` and
 | 0x0A      | Invalid or unparsable PSBT                           |
 | 0x0B      | Internal device error                                |
 | 0x0C      | Private key export refused (Get Keys)                |
-| 0x0D–0xFE | Reserved for future standard codes                   |
+| 0x0D      | MuSig2 session missing or mismatch (Signing)         |
+| 0x0E–0xFE | Reserved for future standard codes                   |
 | 0xFF      | Vendor-specific (meaning carried by `ERROR_MESSAGE`) |
 +-----------+------------------------------------------------------+
 ```
 
-`0x00` is reserved and MUST NOT be sent. `0x01`–`0x0C` are the standard codes above;
-`0x0D`–`0xFE` are reserved for future standard codes. `0xFF` is vendor-specific: the
+`0x00` is reserved and MUST NOT be sent. `0x01`–`0x0D` are the standard codes above;
+`0x0E`–`0xFE` are reserved for future standard codes. `0xFF` is vendor-specific: the
 code alone is not meaningful, so `ERROR_MESSAGE` carries the description. A receiver
 MUST NOT reject an unrecognized `ERROR`; `STATUS` = `1` already denotes an error,
 and it SHOULD fall back to `ERROR_MESSAGE`.
@@ -320,6 +321,12 @@ Mandatory. Bit 0 is the LSB.
 
 Bit 2 implies the signer can return a signed `PSBT` (Signing response `KIND`
 `0x01`), the only response form carrying the BIP-375 shares and proofs.
+
+Bit 3 means the signer is a BIP-327 MuSig2 participant for BIP-390 `musig()` keys
+inside `tr()` of a registered descriptor (`FORM` `0x01`) or wallet policy (`FORM`
+`0x02`): it reads and writes the BIP-373 PSBT fields, follows the rules of the
+MuSig2 subsection of Signing, and MAY answer with `SIG_KIND` `0x04` / `0x05`. A
+wallet MUST NOT register or send a `musig()` descriptor to a signer without bit 3.
 
 Bits 4–30 are reserved for future capabilities and MUST be `0` in this version; a
 reader MUST ignore an unknown capability bit rather than reject, so a newer signer
@@ -446,15 +453,17 @@ no representation in the signatures-only form.
 `SIG_KIND`: 1-byte unsigned integer.
 
 ```
-+-----------+------------+
-| Value     | Definition |
-+-----------+------------+
-| 0x00      | Reserved   |
-| 0x01      | segwit     |
-| 0x02      | tapkey     |
-| 0x03      | taptree    |
-| 0x04–0xFF | Reserved   |
-+-----------+------------+
++-----------+-------------------+
+| Value     | Definition        |
++-----------+-------------------+
+| 0x00      | Reserved          |
+| 0x01      | segwit            |
+| 0x02      | tapkey            |
+| 0x03      | taptree           |
+| 0x04      | musig pubnonce    |
+| 0x05      | musig partial sig |
+| 0x06–0xFF | Reserved          |
++-----------+-------------------+
 ```
 
 `KIND_FIELDS` depends on `SIG_KIND`:
@@ -469,6 +478,23 @@ no representation in the signatures-only form.
   - `TAP_LEAF_HASH`: 32 bytes. Together with `XONLY_PUBLIC_KEY` it is the key of
     the PSBT `tap_script_sigs` map.
   - `SIGNATURE`: `BYTES`, the signature.
+- `0x04` musig pubnonce: `PARTICIPANT` `AGGREGATE` `LEAF_HASH` `PUB_NONCE`.
+  - `PARTICIPANT`: 33 bytes, the compressed participant key.
+  - `AGGREGATE`: 33 bytes, the compressed key signed for (BIP-373: the taproot
+    output key on the key path, the key as it appears in the leaf on a script
+    path).
+  - `LEAF_HASH`: OPTIONAL, 32 bytes, the BIP-341 tap leaf hash, absent on the key
+    path.
+  - `PUB_NONCE`: 66 bytes, no `LENGTH`.
+
+  Together they are the key and value of the PSBT `PSBT_IN_MUSIG2_PUB_NONCE`
+  (`0x1b`) field.
+- `0x05` musig partial sig: `PARTICIPANT` `AGGREGATE` `LEAF_HASH` `PARTIAL_SIG`.
+  - `PARTICIPANT`, `AGGREGATE`, `LEAF_HASH`: as for `0x04`.
+  - `PARTIAL_SIG`: 32 bytes, no `LENGTH`.
+
+  Together they are the key and value of the PSBT `PSBT_IN_MUSIG2_PARTIAL_SIG`
+  (`0x1c`) field.
 
 The key material travels with the signature because the coordinator inserts each
 signature into its PSBT keyed by those values. No control block is sent: the
@@ -476,6 +502,92 @@ coordinator rebuilds it from the descriptor at finalize time.
 
 Spending an output received via silent payments is an ordinary taproot key-path
 spend, so `0x02` (tapkey) already covers it.
+
+#### MuSig2
+
+This subsection applies to a signer advertising capability bit 3. A MuSig2 key
+uses the BIP-373 PSBT fields: `PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS` (`0x1a`), keyed
+by the untweaked KeyAgg aggregate; `PSBT_IN_MUSIG2_PUB_NONCE` (`0x1b`, 66 bytes)
+and `PSBT_IN_MUSIG2_PARTIAL_SIG` (`0x1c`, 32 bytes), both keyed by
+`participant(33) || aggregate(33) [|| leaf_hash(32)]`, where `aggregate` is the key
+signed for: the taproot output key on the key path (no leaf hash), the key as it
+appears in the leaf on a script path (with the leaf hash).
+
+**Rounds.** Each cosigner takes part in two Signing exchanges; there is no new
+message and `VERSION` stays 1.
+
+- Round 1: the request `PSBT` carries no `0x1b` and no `0x1c` from anyone. The
+  answer carries the signer's own `0x1b` only (`KIND` `0x01` with them in the PSBT,
+  or `KIND` `0x02` with `SIG_KIND` `0x04` entries) and no signature of any kind.
+- Round 2: the request `PSBT` carries every participant's `0x1b` for every slot.
+  The answer carries the signer's `0x1c` (`SIG_KIND` `0x05` entries, or in the
+  PSBT) and its ordinary signatures (`SIG_KIND` `0x01` to `0x03`). A signer that
+  holds every partial signature MAY also aggregate them and add the final
+  signature; the wallet MUST accept either.
+
+**Slots.** A slot is one (input, participant, aggregate, leaf). The signer tells
+the rounds apart from its own `0x1b` over its slots only; foreign `0x1b` / `0x1c`
+never decide the round, and a signer in round 1 ignores them (a wallet still strips
+them, see the wallet rules):
+
+```
++--------------------------------------+----------------------+
+| Signer's own `0x1b` in the PSBT      | Meaning              |
++--------------------------------------+----------------------+
+| on none of its slots                 | Round 1              |
+| on all of its slots                  | Round 2              |
+| on some of its slots only            | Error `0x0D`         |
+| the signer has no MuSig2 slot        | Ordinary signing     |
++--------------------------------------+----------------------+
+```
+
+**Signer rules.** The signer MUST:
+
+- take the cosigners and the slots from the registered descriptor, never from the
+  PSBT `0x1a`, and ignore a `0x1a` whose aggregate it does not know;
+- consider a script-path slot only for a leaf present in the input's
+  `PSBT_IN_TAP_LEAF_SCRIPT`, and the key-path slot only when the input carries the
+  `0x1a` of the internal aggregate;
+- require the session of round 1 for round 2, and answer `0x0D` when that session
+  is missing, when the transaction or a spent output changed, when a recomputed
+  sighash or its own `0x1b` differs from what the session holds, or when any
+  cosigner's `0x1b` is missing;
+- never sign with a participant key outside MuSig2.
+
+**Nonce safety.** The signer MUST:
+
+- draw each secret nonce from BIP-327 `NonceGen` with 32 fresh bytes from a
+  cryptographically secure random source, bound to its slot's key and sighash;
+- bind the session to the unsigned transaction, every spent output, the registered
+  policy and the signer's fingerprint;
+- keep secret nonces in volatile memory only, never export, serialize, log or
+  persist them, and use each at most once;
+- erase the session before a partial signature leaves the signer, and on any
+  round-2 failure after the session was looked up;
+- replace any earlier session for the same transaction on a new round 1.
+
+Losing the session (power cycle, timeout) only costs a restart from round 1, never
+a nonce reuse.
+
+**Wallet rules.** The wallet MUST:
+
+- strip every `0x1b` and `0x1c` from the PSBT before round 1, so no foreign nonce
+  reaches a signer in that round;
+- for an m-of-n policy, restrict the PSBT to one leaf (one m-subset) before round 1,
+  so each cosigner answers for that leaf only;
+- never change the transaction, a spent output or the chosen leaf between the
+  rounds;
+- send round 2 only once every participant's `0x1b` is merged;
+- on `0x0D` from any cosigner, discard every nonce of the attempt and restart
+  round 1 with every cosigner;
+- verify each partial signature (BIP-327 `PartialSigVerify`) before aggregating it
+  into `PSBT_IN_TAP_KEY_SIG` or `PSBT_IN_TAP_SCRIPT_SIG`.
+
+These rules follow Bitcoin Core, Coldcard EDGE (`shared/psbt.py`
+`musig_process_input`: strict round separation, the public nonce recomputed and
+compared with the PSBT's, the session erased after use) and Ledger (no foreign
+nonce in the round-1 PSBT, cosigners rebuilt from the registered policy). The
+reference signer is `bwk_sign::hot_signer::HotSigner` under the `musig` feature.
 
 ### Versioning
 
@@ -577,8 +689,11 @@ checked into `qr-protocol/tests/`:
 - `get_keys.json`: Get Keys request/response.
 - `register_descriptor.json`: Register Descriptor request/response, each `FORM`.
 - `address_verification.json`: Address Verification request/response.
-- `signing.json`: Signing request and both response `KIND`s.
-- `errors.json`: error responses (`STATUS` = `1`), standard and vendor codes.
+- `signing.json`: Signing request and both response `KIND`s, including the MuSig2
+  signatures-only entries (`SIG_KIND` `0x04` and `0x05`, with and without a leaf
+  hash).
+- `errors.json`: error responses (`STATUS` = `1`), standard and vendor codes,
+  including `0x0D` (MuSig2 session).
 - `versioning.json`: forward compatibility, a message whose `VERSION` is above 1
   and which carries trailing bytes a version-1 parser does not know.
 

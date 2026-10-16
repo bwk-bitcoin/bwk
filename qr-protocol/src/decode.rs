@@ -225,6 +225,20 @@ fn read_signature(reader: &mut Reader<'_>) -> Result<response::SignatureEntry, E
             tap_leaf_hash: reader.take_array()?,
             signature: reader.take_bytes()?,
         }),
+        response::SIGNATURE_MUSIG_PUB_NONCE => Ok(response::SignatureEntry::MusigPubNonce {
+            input_index,
+            participant: read_pubkey(reader)?,
+            aggregate: read_pubkey(reader)?,
+            leaf_hash: reader.take_option(|r| r.take_array())?,
+            nonce: reader.take_array()?,
+        }),
+        response::SIGNATURE_MUSIG_PARTIAL_SIG => Ok(response::SignatureEntry::MusigPartialSig {
+            input_index,
+            participant: read_pubkey(reader)?,
+            aggregate: read_pubkey(reader)?,
+            leaf_hash: reader.take_option(|r| r.take_array())?,
+            signature: reader.take_array()?,
+        }),
         value => Err(Error::UnknownSignatureKind(value)),
     }
 }

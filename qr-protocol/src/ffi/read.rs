@@ -10,7 +10,7 @@ use core::ffi::{c_char, CStr};
 use crate::{
     ffi::{types, Error},
     response,
-    types::{ExtendedKey, Fingerprint, PublicKey},
+    types::{ExtendedKey, Fingerprint, PublicKey, TAP_LEAF_HASH_LEN},
     MessageType, RequestId, Response, SignResponseKind,
 };
 
@@ -100,6 +100,26 @@ unsafe fn signature(view: &types::Signature) -> Result<response::SignatureEntry,
             tap_leaf_hash: view.value.tap_script.tap_leaf_hash,
             signature: bytes(view.value.tap_script.signature)?,
         }),
+        response::SIGNATURE_MUSIG_PUB_NONCE => {
+            let value = view.value.musig_pub_nonce;
+            Ok(response::SignatureEntry::MusigPubNonce {
+                input_index,
+                participant: PublicKey(value.participant),
+                aggregate: PublicKey(value.aggregate),
+                leaf_hash: optional_leaf_hash(value.has_leaf_hash, value.leaf_hash)?,
+                nonce: value.nonce,
+            })
+        }
+        response::SIGNATURE_MUSIG_PARTIAL_SIG => {
+            let value = view.value.musig_partial_sig;
+            Ok(response::SignatureEntry::MusigPartialSig {
+                input_index,
+                participant: PublicKey(value.participant),
+                aggregate: PublicKey(value.aggregate),
+                leaf_hash: optional_leaf_hash(value.has_leaf_hash, value.leaf_hash)?,
+                signature: value.signature,
+            })
+        }
         _ => Err(Error::UnknownTag),
     }
 }
@@ -146,6 +166,17 @@ fn optional_bool(value: i8) -> Result<Option<bool>, Error> {
         types::ABSENT_BOOL => Ok(None),
         0 => Ok(Some(false)),
         1 => Ok(Some(true)),
+        _ => Err(Error::InvalidBool),
+    }
+}
+
+fn optional_leaf_hash(
+    has_leaf_hash: u8,
+    leaf_hash: [u8; TAP_LEAF_HASH_LEN],
+) -> Result<Option<[u8; TAP_LEAF_HASH_LEN]>, Error> {
+    match has_leaf_hash {
+        0 => Ok(None),
+        1 => Ok(Some(leaf_hash)),
         _ => Err(Error::InvalidBool),
     }
 }
