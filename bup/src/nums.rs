@@ -6,6 +6,8 @@
 use std::str::FromStr;
 
 use bwk_descriptor::wallet::WalletKey;
+#[cfg(feature = "musig")]
+use bwk_keys::musig::MusigKey;
 use miniscript::{
     bitcoin::{
         bip32,
@@ -31,11 +33,18 @@ pub fn bip341_nums() -> secp256k1::PublicKey {
     .expect("Valid pubkey: NUMS from BIP341")
 }
 
-fn get_multi_xkey(desc_key: &WalletKey) -> Option<&bip32::Xpub> {
+/// The xpub whose public key a leaf key adds to the NUMS chain code: a plain
+/// `MultiXPub`'s own, or with `musig` an aggregate-then-derive musig()'s BIP-328 synthetic
+/// xpub (its public key is the untweaked KeyAgg output). None for any other key.
+pub(crate) fn chain_code_xkey(key: &WalletKey) -> Option<&bip32::Xpub> {
+    #[cfg(feature = "musig")]
+    if let MusigKey::Musig(aggregate) = key {
+        return aggregate.synthetic_xpub();
+    }
     if let Some(descriptor::DescriptorPublicKey::MultiXPub(descriptor::DescriptorMultiXKey {
         xkey,
         ..
-    })) = plain_key(desc_key)
+    })) = plain_key(key)
     {
         Some(xkey)
     } else {
@@ -46,21 +55,22 @@ fn get_multi_xkey(desc_key: &WalletKey) -> Option<&bip32::Xpub> {
 /// Construct an unspendable xpub to be used as internal key in a Taproot descriptor.
 ///
 /// Returns `None` if the descriptor does not contain a tap tree with at least a key in each
-/// leaf, or if the keys contained in the descriptor aren't all `MultiXPub`s.
+/// leaf, or if the keys contained in the descriptor aren't all `MultiXPub`s (or, with
+/// `musig`, aggregate-then-derive musig() keys).
 ///
 /// See <https://delvingbitcoin.org/t/unspendable-keys-in-descriptors/304/21>.
 fn unspendable_internal_xpub(desc: &descriptor::Tr<WalletKey>) -> Option<bip32::Xpub> {
     let tap_tree = desc.tap_tree().as_ref()?;
 
     let first_key = tap_tree.iter().flat_map(|(_, ms)| ms.iter_pk()).next()?;
-    let network = get_multi_xkey(&first_key)?.network;
+    let network = chain_code_xkey(&first_key)?.network;
 
     let concat =
         tap_tree
             .iter()
             .flat_map(|(_, ms)| ms.iter_pk())
             .try_fold(Vec::new(), |mut acc, pk| {
-                let xkey = get_multi_xkey(&pk)?;
+                let xkey = chain_code_xkey(&pk)?;
                 acc.extend_from_slice(&xkey.public_key.serialize());
                 Some(acc)
             })?;

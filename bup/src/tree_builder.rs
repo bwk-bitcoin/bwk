@@ -22,7 +22,7 @@ use miniscript::{
 
 use crate::{
     multipath::{deriv_paths_starting_at, plain_key, wallet_key, NUMS_MARKER_MULTIPATH},
-    nums::bip341_nums,
+    nums::{bip341_nums, chain_code_xkey},
     parse::oxpub_to_key,
     path::{Path, Semantic, TapPosition},
     policy::PolicyError,
@@ -465,11 +465,18 @@ pub(super) fn build(
         .find(|p| matches!(p.position(), TapPosition::InternalKey))
     {
         Some(p) => {
-            let Semantic::Single(key) = p.semantic() else {
-                unreachable!("validated by sanitize");
-            };
             let cursor = p.start_index().expect("set by assign_start_indices");
-            wallet_key(oxpub_to_key(key, deriv_paths_starting_at(cursor)))
+            match p.semantic() {
+                Semantic::Single(key) => {
+                    wallet_key(oxpub_to_key(key, deriv_paths_starting_at(cursor)))
+                }
+                #[cfg(feature = "musig")]
+                Semantic::Multi { keys, .. } => match keys.as_slice() {
+                    [key] => wallet_key(oxpub_to_key(key, deriv_paths_starting_at(cursor))),
+                    _ => crate::musig::musig_key(keys, cursor)?,
+                },
+                _ => unreachable!("validated by sanitize"),
+            }
         }
         None => wallet_key(nums_descriptor_key(network, seed)),
     };
@@ -500,8 +507,8 @@ fn nums_seed_chain_code(builder: &TreeBuilder<Miniscript<WalletKey, Tap>>) -> bi
         DfsSlot::Free => concat.extend_from_slice(&nums),
         DfsSlot::Leaf(ms) => {
             for k in ms.iter_pk() {
-                if let Some(DescriptorPublicKey::MultiXPub(m)) = plain_key(&k) {
-                    concat.extend_from_slice(&m.xkey.public_key.serialize());
+                if let Some(xkey) = chain_code_xkey(&k) {
+                    concat.extend_from_slice(&xkey.public_key.serialize());
                 }
             }
         }

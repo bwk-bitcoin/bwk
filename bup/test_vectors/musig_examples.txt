@@ -1,0 +1,26 @@
+bwk-bup MuSig2 examples, testnet (coin type 1')
+Regenerate: cargo test -p bwk-bup --features musig write_musig_examples -- --ignored
+
+key A
+  mnemonic: abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about
+  path: m/87'/1'/0'/2
+  key: [73c5da0a/87'/1'/0'/2]tpubDEGU7K8ab62XbG1bKoCnHDtUx44DxVKyAQVS96EN1EUVTQRW2KnFEvTtmnUJSonudSK8HcXTexf56Kir1JzoQAzFRHfvNLEcqV7KxUHZVYa
+
+key B
+  mnemonic: legal winner thank year wave sausage worth useful legal winner thank yellow
+  path: m/87'/1'/0'/2
+  key: [b8688df1/87'/1'/0'/2]tpubDDzMtUDKwjvTehAmAfwYiBGzUFDcF8AyEaJf78JhQam5knvsGTgqF7VvhuuDZLYityND66FG88sS3q28Yi5Ysumvx5DfMgdm6nc6zntvpHM
+
+key C
+  mnemonic: letter advice cage absurd amount doctor acoustic avoid letter advice cage above
+  path: m/87'/1'/0'/2
+  key: [28645006/87'/1'/0'/2]tpubDF145QGMpKCb3rFmV6vAufhPQw3Bxahpp4MChSswzes7PFiNnowe3YuH2qebeurohdeeFH853C2et8rLA2kpPPZZKSV7e45nmibbewbMKtn
+
+policy 1: 2-of-3 of A, B, C, no timelock
+  each key sits in two of the three musig() leaves
+  descriptor: tr(tpubD6NzVbkrYhZ4XTMDrtAPvFkBZU6pZNcufLmGNVsh3A78g653rPBBEYwcJ3mXqnpastrSEG4cQqNpYFUwoZoJZsKooNZdvu2EiPVnJnt7c9d/<2147483646;2147483647>/*,{{pk(musig([73c5da0a/87'/1'/0'/2]tpubDEGU7K8ab62XbG1bKoCnHDtUx44DxVKyAQVS96EN1EUVTQRW2KnFEvTtmnUJSonudSK8HcXTexf56Kir1JzoQAzFRHfvNLEcqV7KxUHZVYa,[b8688df1/87'/1'/0'/2]tpubDDzMtUDKwjvTehAmAfwYiBGzUFDcF8AyEaJf78JhQam5knvsGTgqF7VvhuuDZLYityND66FG88sS3q28Yi5Ysumvx5DfMgdm6nc6zntvpHM)/<512;513>/*),pk(musig([73c5da0a/87'/1'/0'/2]tpubDEGU7K8ab62XbG1bKoCnHDtUx44DxVKyAQVS96EN1EUVTQRW2KnFEvTtmnUJSonudSK8HcXTexf56Kir1JzoQAzFRHfvNLEcqV7KxUHZVYa,[28645006/87'/1'/0'/2]tpubDF145QGMpKCb3rFmV6vAufhPQw3Bxahpp4MChSswzes7PFiNnowe3YuH2qebeurohdeeFH853C2et8rLA2kpPPZZKSV7e45nmibbewbMKtn)/<514;515>/*)},{pk(musig([b8688df1/87'/1'/0'/2]tpubDDzMtUDKwjvTehAmAfwYiBGzUFDcF8AyEaJf78JhQam5knvsGTgqF7VvhuuDZLYityND66FG88sS3q28Yi5Ysumvx5DfMgdm6nc6zntvpHM,[28645006/87'/1'/0'/2]tpubDF145QGMpKCb3rFmV6vAufhPQw3Bxahpp4MChSswzes7PFiNnowe3YuH2qebeurohdeeFH853C2et8rLA2kpPPZZKSV7e45nmibbewbMKtn)/<516;517>/*),pk(tpubD6NzVbkrYhZ4XsHAXZStYPovrawxpP3des6WxhdiiKvmUJWXMJWz1hKEHR2GRMhg2umqMr3y1dNqQP4Ybt93J3Ro6LU2Z9pujtP314ttTCG/<2147483646;2147483647>/*)}})#xegkf0p3
+  receive address 0: tb1p4rvus03xps0fjw45s2jhf2lrtxpq7f6yxpx8qleyusv44atyc3xqen5r6d
+policy 2: 2-of-2 of A, B as the internal key, recovery A after older(144)
+  key A sits inside the musig() internal key and alone in the timelocked leaf
+  descriptor: tr(musig([73c5da0a/87'/1'/0'/2]tpubDEGU7K8ab62XbG1bKoCnHDtUx44DxVKyAQVS96EN1EUVTQRW2KnFEvTtmnUJSonudSK8HcXTexf56Kir1JzoQAzFRHfvNLEcqV7KxUHZVYa,[b8688df1/87'/1'/0'/2]tpubDDzMtUDKwjvTehAmAfwYiBGzUFDcF8AyEaJf78JhQam5knvsGTgqF7VvhuuDZLYityND66FG88sS3q28Yi5Ysumvx5DfMgdm6nc6zntvpHM)/<512;513>/*,and_v(v:pk([73c5da0a/87'/1'/0'/2]tpubDEGU7K8ab62XbG1bKoCnHDtUx44DxVKyAQVS96EN1EUVTQRW2KnFEvTtmnUJSonudSK8HcXTexf56Kir1JzoQAzFRHfvNLEcqV7KxUHZVYa/<1024;1025>/*),older(144)))#7q704pcu
+  receive address 0: tb1pryukyhu83adf5yae9wxm7y9hsajkrqrmktd57ky7nhxeu5ycqrts5a3s47

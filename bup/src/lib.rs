@@ -13,6 +13,8 @@ pub mod nums;
 pub mod parse;
 pub mod path;
 pub mod policy;
+#[cfg(all(test, feature = "musig"))]
+mod test_keys;
 pub mod tree_builder;
 
 pub use key_role::{Bip87Account, KeyRoleError, KeyType};

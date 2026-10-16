@@ -178,7 +178,7 @@ pub fn get_multipath_index(key: &WalletKey) -> Result<u32, MultipathError> {
 }
 
 /// The even start `a` of a strict `<a;a+1>` pair of single-step paths.
-fn multipath_start(paths: &[bip32::DerivationPath]) -> Result<u32, MultipathError> {
+pub(crate) fn multipath_start(paths: &[bip32::DerivationPath]) -> Result<u32, MultipathError> {
     if paths.len() != 2 {
         return Err(MultipathError::WrongPathCount(paths.len()));
     }

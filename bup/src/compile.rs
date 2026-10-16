@@ -3,9 +3,9 @@
 use std::{convert::TryFrom, sync};
 
 use bwk_descriptor::wallet::WalletKey;
-use miniscript::{
-    policy::Concrete as ConcretePolicy, AbsLockTime, Miniscript, RelLockTime, Tap, Threshold,
-};
+#[cfg(not(feature = "musig"))]
+use miniscript::Threshold;
+use miniscript::{policy::Concrete as ConcretePolicy, AbsLockTime, Miniscript, RelLockTime, Tap};
 
 use crate::{
     multipath::{deriv_paths_starting_at, wallet_key},
@@ -14,13 +14,13 @@ use crate::{
     policy::{PolicyError, PolicyType},
 };
 
-/// Split a thresh(k, key0, .., key{n-1}) into one thresh(k, ...) per choice of `k`
-/// participating keys. Returns the participating-key indices for each leaf, in
-/// lexicographic order.
+/// Every choice of `k` key indices out of `n`, in lexicographic order. Each choice is
+/// one tap leaf of a k-of-n split.
 ///
 /// Example for `split_m_of_n(3, 2)` (2-of-3):
 ///   `[[0, 1], [0, 2], [1, 2]]`
-/// → three tap leaves: `thresh(2, k0, k1)`, `thresh(2, k0, k2)`, `thresh(2, k1, k2)`.
+/// → three tap leaves: `thresh(2, k0, k1)`, `thresh(2, k0, k2)`, `thresh(2, k1, k2)`
+/// without `musig`, `pk(musig(k0, k1))`, `pk(musig(k0, k2))`, `pk(musig(k1, k2))` with it.
 fn split_m_of_n(n: usize, k: usize) -> Vec<Vec<usize>> {
     let mut out = Vec::new();
     let mut buf = Vec::with_capacity(k);
@@ -46,6 +46,7 @@ fn single_to_miniscript_policy(k: &OXpub, cursor: &mut u32) -> ConcretePolicy<Wa
     ConcretePolicy::Key(wallet_key(oxpub_to_key(k, group)))
 }
 
+#[cfg(not(feature = "musig"))]
 fn multi_to_miniscript_policy(
     keys: &[OXpub],
     threshold: usize,
@@ -68,20 +69,46 @@ fn multi_to_miniscript_policy(
     ))
 }
 
-/// Compile a [`Semantic::MultiMandatoryNested`] into one flat
-/// `thresh(mandatory_threshold + threshold, mk_subset ∪ k_subset)` leaf per
-/// `(mk_subset, k_subset)` pair. Enumeration order: outer loop walks
-/// `split_m_of_n(mandatory_keys.len(), mandatory_threshold)`, inner loop walks
-/// `split_m_of_n(keys.len(), threshold)`. Returns
-/// `C(mandatory_keys.len(), mandatory_threshold) * C(keys.len(), threshold)` leaves.
-/// The cursor advances by `+2` per leaf (same convention as the other helpers).
-fn nested_mandatory_to_miniscript_policy(
-    mandatory_keys: &[OXpub],
-    mandatory_threshold: usize,
+/// The leaf fragments of a [`Semantic::Multi`]: one `thresh(threshold, keys)`.
+#[cfg(not(feature = "musig"))]
+fn multi_fragments(
     keys: &[OXpub],
     threshold: usize,
     cursor: &mut u32,
 ) -> Result<Vec<ConcretePolicy<WalletKey>>, PolicyError> {
+    Ok(vec![multi_to_miniscript_policy(keys, threshold, cursor)?])
+}
+
+/// The leaf fragments of a [`Semantic::Multi`]: one leaf per `threshold`-subset.
+#[cfg(feature = "musig")]
+fn multi_fragments(
+    keys: &[OXpub],
+    threshold: usize,
+    cursor: &mut u32,
+) -> Result<Vec<ConcretePolicy<WalletKey>>, PolicyError> {
+    leaf_policies(multi_key_sets(keys, threshold), cursor)
+}
+
+/// One key set per `threshold`-subset of `keys`, in `split_m_of_n` order.
+#[cfg(feature = "musig")]
+fn multi_key_sets(keys: &[OXpub], threshold: usize) -> Vec<Vec<OXpub>> {
+    split_m_of_n(keys.len(), threshold)
+        .into_iter()
+        .map(|subset| subset.into_iter().map(|i| keys[i].clone()).collect())
+        .collect()
+}
+
+/// The key sets of a [`Semantic::MultiMandatoryNested`], one per
+/// `(mk_subset, k_subset)` pair, mandatory part then cosigner part. Enumeration order:
+/// outer loop walks `split_m_of_n(mandatory_keys.len(), mandatory_threshold)`, inner
+/// loop walks `split_m_of_n(keys.len(), threshold)`. Returns
+/// `C(mandatory_keys.len(), mandatory_threshold) * C(keys.len(), threshold)` sets.
+fn nested_key_sets(
+    mandatory_keys: &[OXpub],
+    mandatory_threshold: usize,
+    keys: &[OXpub],
+    threshold: usize,
+) -> Result<Vec<Vec<OXpub>>, PolicyError> {
     let m = mandatory_keys.len();
     let n = keys.len();
     let mt = mandatory_threshold;
@@ -95,37 +122,25 @@ fn nested_mandatory_to_miniscript_policy(
     }
     let mk_subsets = split_m_of_n(m, mt);
     let k_subsets = split_m_of_n(n, t);
-    let mut leaves = Vec::with_capacity(mk_subsets.len() * k_subsets.len());
+    let mut sets = Vec::with_capacity(mk_subsets.len() * k_subsets.len());
     for mk_subset in &mk_subsets {
         for k_subset in &k_subsets {
-            let group = deriv_paths_starting_at(*cursor);
-            *cursor += 2;
-            let mut subs: Vec<sync::Arc<ConcretePolicy<WalletKey>>> = Vec::with_capacity(mt + t);
-            for &i in mk_subset {
-                subs.push(sync::Arc::new(ConcretePolicy::Key(wallet_key(
-                    oxpub_to_key(&mandatory_keys[i], group.clone()),
-                ))));
-            }
-            for &i in k_subset {
-                subs.push(sync::Arc::new(ConcretePolicy::Key(wallet_key(
-                    oxpub_to_key(&keys[i], group.clone()),
-                ))));
-            }
-            leaves.push(ConcretePolicy::Thresh(
-                Threshold::new(mt + t, subs)
-                    .map_err(|e| PolicyError::Miniscript(miniscript::Error::Threshold(e)))?,
-            ));
+            let mut set = Vec::with_capacity(mt + t);
+            set.extend(mk_subset.iter().map(|&i| mandatory_keys[i].clone()));
+            set.extend(k_subset.iter().map(|&i| keys[i].clone()));
+            sets.push(set);
         }
     }
-    Ok(leaves)
+    Ok(sets)
 }
 
-fn mandatory_to_miniscript_policy(
+/// The key sets of a [`Semantic::MultiMandatory`], one per cosigner subset: every
+/// mandatory key then the subset's keys.
+fn mandatory_key_sets(
     keys: &[OXpub],
     mandatory_keys: &[OXpub],
     threshold: usize,
-    cursor: &mut u32,
-) -> Result<Vec<ConcretePolicy<WalletKey>>, PolicyError> {
+) -> Result<Vec<Vec<OXpub>>, PolicyError> {
     let m = mandatory_keys.len();
     let n = keys.len();
     if threshold <= m || threshold > m + n {
@@ -142,27 +157,44 @@ fn mandatory_to_miniscript_policy(
             PolicyType::CsvWithMandatoryKey,
         ));
     }
-    let mut leaves = Vec::with_capacity(subsets.len());
-    for subset in subsets {
-        let group = deriv_paths_starting_at(*cursor);
-        *cursor += 2;
-        let mut subs: Vec<sync::Arc<ConcretePolicy<WalletKey>>> = Vec::with_capacity(threshold);
-        for mk in mandatory_keys {
-            subs.push(sync::Arc::new(ConcretePolicy::Key(wallet_key(
-                oxpub_to_key(mk, group.clone()),
-            ))));
-        }
-        for &i in &subset {
-            subs.push(sync::Arc::new(ConcretePolicy::Key(wallet_key(
-                oxpub_to_key(&keys[i], group.clone()),
-            ))));
-        }
-        leaves.push(ConcretePolicy::Thresh(
-            Threshold::new(threshold, subs)
-                .map_err(|e| PolicyError::Miniscript(miniscript::Error::Threshold(e)))?,
-        ));
+    Ok(subsets
+        .into_iter()
+        .map(|subset| {
+            let mut set = mandatory_keys.to_vec();
+            set.extend(subset.into_iter().map(|i| keys[i].clone()));
+            set
+        })
+        .collect())
+}
+
+/// The leaf every key of `set` must sign, on the group at `cursor`, then `cursor += 2`:
+/// `thresh(set.len(), set)` without `musig`.
+#[cfg(not(feature = "musig"))]
+fn leaf_policy(set: &[OXpub], cursor: &mut u32) -> Result<ConcretePolicy<WalletKey>, PolicyError> {
+    multi_to_miniscript_policy(set, set.len(), cursor)
+}
+
+/// The leaf every key of `set` must sign, on the group at `cursor`, then `cursor += 2`:
+/// `pk(K)` for one key, `pk(musig(set))` for more.
+#[cfg(feature = "musig")]
+fn leaf_policy(set: &[OXpub], cursor: &mut u32) -> Result<ConcretePolicy<WalletKey>, PolicyError> {
+    let start = *cursor;
+    *cursor += 2;
+    match set {
+        [key] => Ok(ConcretePolicy::Key(wallet_key(oxpub_to_key(
+            key,
+            deriv_paths_starting_at(start),
+        )))),
+        _ => Ok(ConcretePolicy::Key(crate::musig::musig_key(set, start)?)),
     }
-    Ok(leaves)
+}
+
+/// [`leaf_policy`] over `sets`, in order.
+fn leaf_policies(
+    sets: Vec<Vec<OXpub>>,
+    cursor: &mut u32,
+) -> Result<Vec<ConcretePolicy<WalletKey>>, PolicyError> {
+    sets.iter().map(|set| leaf_policy(set, cursor)).collect()
 }
 
 pub(super) type TapLeaves = (Vec<Miniscript<WalletKey, Tap>>, Vec<u32>);
@@ -170,6 +202,9 @@ pub(super) type TapLeaves = (Vec<Miniscript<WalletKey, Tap>>, Vec<u32>);
 /// Emit one or more `Miniscript<WalletKey, Tap>` leaves for `path`, advancing
 /// `cursor` per the `+2` (intra-leaf) / `+4` (between-path) convention. For typed shapes
 /// the path's `Locktime` is AND'd into a `ConcretePolicy` and then compiled to Miniscript.
+/// Without `musig` a `Multi` is one `multi_a` leaf and each mandatory subset one
+/// `thresh` leaf; with `musig` every multisig leaf is `pk(musig(..))` over one key set
+/// (a one-key set is a plain `pk(K)`), one leaf per subset.
 /// `Semantic::Custom(ms)` bypasses the `ConcretePolicy` pipeline entirely: the consumer-
 /// provided miniscript is emitted as-is. Multipath indices on the embedded keys are the
 /// consumer's responsibility: the compiler does not rewrite them. Custom paths require
@@ -187,24 +222,22 @@ pub(super) fn path_into_fragments(path: &Path, cursor: &mut u32) -> Result<TapLe
 
     let mut frags: Vec<ConcretePolicy<WalletKey>> = match path.semantic() {
         Semantic::Single(k) => vec![single_to_miniscript_policy(k, cursor)],
-        Semantic::Multi { keys, threshold } => {
-            vec![multi_to_miniscript_policy(keys, *threshold, cursor)?]
-        }
+        Semantic::Multi { keys, threshold } => multi_fragments(keys, *threshold, cursor)?,
         Semantic::MultiMandatory {
             keys,
             mandatory_keys,
             threshold,
-        } => mandatory_to_miniscript_policy(keys, mandatory_keys, *threshold, cursor)?,
+        } => leaf_policies(
+            mandatory_key_sets(keys, mandatory_keys, *threshold)?,
+            cursor,
+        )?,
         Semantic::MultiMandatoryNested {
             mandatory_keys,
             mandatory_threshold,
             keys,
             threshold,
-        } => nested_mandatory_to_miniscript_policy(
-            mandatory_keys,
-            *mandatory_threshold,
-            keys,
-            *threshold,
+        } => leaf_policies(
+            nested_key_sets(mandatory_keys, *mandatory_threshold, keys, *threshold)?,
             cursor,
         )?,
         Semantic::Custom(_) => unreachable!("handled above"),
@@ -363,6 +396,7 @@ mod tests {
     // multi_to_miniscript_policy
 
     #[test]
+    #[cfg(not(feature = "musig"))]
     fn multi_two_of_three_shared_group_cursor_plus_two() {
         let mut cursor = 100;
         let pol = multi_to_miniscript_policy(&[k1(), k2(), k3()], 2, &mut cursor).unwrap();
@@ -380,6 +414,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "musig"))]
     fn multi_one_of_one_degenerate() {
         let mut cursor = 0;
         let pol = multi_to_miniscript_policy(&[k1()], 1, &mut cursor).unwrap();
@@ -392,6 +427,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "musig"))]
     fn multi_invalid_threshold_propagates_miniscript_error() {
         let mut cursor = 0;
         // threshold > keys.len() makes miniscript's Threshold::new reject.
@@ -405,14 +441,18 @@ mod tests {
         );
     }
 
-    // mandatory_to_miniscript_policy
+    // mandatory_key_sets + leaf_policies
 
     #[test]
+    #[cfg(not(feature = "musig"))]
     fn mandatory_one_mand_two_cosigners_threshold_two() {
         // m=1, n=2, threshold=2 → cosigner_threshold = 1 → C(2,1)=2 leaves.
         let mut cursor = 50;
-        let leaves =
-            mandatory_to_miniscript_policy(&[k2(), k3()], &[k1()], 2, &mut cursor).unwrap();
+        let leaves = leaf_policies(
+            mandatory_key_sets(&[k2(), k3()], &[k1()], 2).unwrap(),
+            &mut cursor,
+        )
+        .unwrap();
         assert_eq!(leaves.len(), 2);
         // Each leaf consumes 2 multipath slots; cursor advanced by 4.
         assert_eq!(cursor, 54);
@@ -436,17 +476,18 @@ mod tests {
     fn mandatory_one_mand_three_cosigners_threshold_three() {
         // m=1, n=3, threshold=3 → cosigner_threshold = 2 → C(3,2)=3 leaves.
         let mut cursor = 0;
-        let leaves =
-            mandatory_to_miniscript_policy(&[k2(), k3(), k4()], &[k1()], 3, &mut cursor).unwrap();
+        let leaves = leaf_policies(
+            mandatory_key_sets(&[k2(), k3(), k4()], &[k1()], 3).unwrap(),
+            &mut cursor,
+        )
+        .unwrap();
         assert_eq!(leaves.len(), 3);
         assert_eq!(cursor, 6);
     }
 
     #[test]
     fn mandatory_threshold_equal_to_m_rejected() {
-        let mut cursor = 0;
-        let err =
-            mandatory_to_miniscript_policy(&[k2(), k3()], &[k1()], 1, &mut cursor).unwrap_err();
+        let err = mandatory_key_sets(&[k2(), k3()], &[k1()], 1).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -462,9 +503,7 @@ mod tests {
 
     #[test]
     fn mandatory_threshold_above_m_plus_n_rejected() {
-        let mut cursor = 0;
-        let err =
-            mandatory_to_miniscript_policy(&[k2(), k3()], &[k1()], 4, &mut cursor).unwrap_err();
+        let err = mandatory_key_sets(&[k2(), k3()], &[k1()], 4).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -502,6 +541,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "musig"))]
     fn fragments_multi_two_of_three_one_fragment() {
         let p = Path::new(
             Semantic::Multi {

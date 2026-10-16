@@ -242,7 +242,9 @@ pub enum NestedSide {
 pub enum Semantic {
     /// `pk(K)` - exactly one signer.
     Single(OXpub),
-    /// `thresh(t, K1, …, Kn)` - `t`-of-`n` multisig.
+    /// `thresh(t, K1, …, Kn)` - `t`-of-`n` multisig. With `musig` it compiles to one
+    /// `pk(musig(..))` leaf per `t`-subset (plain `pk(K)` leaves when `t` is 1), and an
+    /// n-of-n primary to a `musig(..)` internal key.
     Multi { keys: Vec<OXpub>, threshold: usize },
     /// Every key in `mandatory_keys` must sign, plus `(threshold - m)`-of-`keys`.
     /// `threshold` is the total signer count per leaf (mandatory + chosen cosigners),
@@ -484,9 +486,10 @@ pub struct Path {
     /// by `Policy::compile`; remains empty on paths produced by `Policy::from_descriptor`.
     indices: Vec<u32>,
     /// All compiled tap-leaf miniscripts produced for this path. Populated by
-    /// `Policy::compile` (one entry for `Single`/`Multi`, one entry per cosigner-subset
-    /// for `MultiMandatory`); empty for `TapPosition::InternalKey` and for paths
-    /// produced by `Policy::from_descriptor`.
+    /// `Policy::compile`: one entry for `Single` (and for `Multi` without `musig`), one
+    /// entry per cosigner subset for `MultiMandatory` and, with `musig`, per threshold
+    /// subset of a `Multi`. Empty for `TapPosition::InternalKey` and for paths produced by
+    /// `Policy::from_descriptor`.
     leaves: Vec<Miniscript<WalletKey, Tap>>,
 }
 
@@ -525,10 +528,21 @@ impl Path {
 
     /// Number of tap-tree leaves this path expands into during compilation. `0` for shapes
     /// the compiler can't emit (`Or`, `Unknown`) or for an out-of-range mandatory-key
-    /// threshold. `Custom` always expands into a single tap-leaf.
+    /// threshold. `Custom` always expands into a single tap-leaf. A `Multi` is one leaf
+    /// without `musig`, and one leaf per `threshold`-subset of its keys with it (`0` for
+    /// a threshold of `0` or above the key count).
     pub fn leaf_count(&self) -> usize {
         match &self.semantic {
-            Semantic::Single(_) | Semantic::Multi { .. } | Semantic::Custom(_) => 1,
+            Semantic::Single(_) | Semantic::Custom(_) => 1,
+            #[cfg(not(feature = "musig"))]
+            Semantic::Multi { .. } => 1,
+            #[cfg(feature = "musig")]
+            Semantic::Multi { keys, threshold } => {
+                if *threshold == 0 {
+                    return 0;
+                }
+                count_combinations(keys.len(), *threshold)
+            }
             Semantic::MultiMandatory {
                 keys,
                 mandatory_keys,
