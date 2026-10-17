@@ -12,6 +12,7 @@ use bitcoin::{
         self,
         raw::{Key, ProprietaryKey},
     },
+    sighash::{EcdsaSighashType, TapSighashType},
     transaction, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
 };
 
@@ -341,6 +342,17 @@ impl PsbtV2 {
         {
             return Err(Error::CountMismatch);
         }
+        // A v0 PSBT has no TX_MODIFIABLE field, but its unsigned tx is fixed:
+        // no input or output can be added or removed, so both flags are False.
+        // `validate` only accepts the field on a version 2 or later tx.
+        let tx_modifiable =
+            (psbt.unsigned_tx.version.0 >= transaction::Version::TWO.0).then(|| {
+                if psbt.inputs.iter().any(has_sighash_single_sig) {
+                    TxModifiable(TxModifiable::SIGHASH_SINGLE)
+                } else {
+                    TxModifiable::none()
+                }
+            });
         let inputs = psbt
             .unsigned_tx
             .input
@@ -370,7 +382,7 @@ impl PsbtV2 {
         Ok(Self {
             tx_version: psbt.unsigned_tx.version,
             fallback_lock_time: Some(psbt.unsigned_tx.lock_time),
-            tx_modifiable: None,
+            tx_modifiable,
             xpub: psbt.xpub,
             proprietary: psbt.proprietary,
             unknown: psbt.unknown,
@@ -536,6 +548,43 @@ impl PsbtV2 {
         }
         Ok(())
     }
+}
+
+// BIP370 Has SIGHASH_SINGLE flag: the input carries a signature committing
+// to its paired output.
+fn has_sighash_single_sig(input: &psbt::Input) -> bool {
+    let tap_single = |sighash_type: TapSighashType| {
+        matches!(
+            sighash_type,
+            TapSighashType::Single | TapSighashType::SinglePlusAnyoneCanPay
+        )
+    };
+    let ecdsa_single = input.partial_sigs.values().any(|sig| {
+        matches!(
+            sig.sighash_type,
+            EcdsaSighashType::Single | EcdsaSighashType::SinglePlusAnyoneCanPay
+        )
+    });
+    let taproot_single = input
+        .tap_key_sig
+        .is_some_and(|sig| tap_single(sig.sighash_type))
+        || input
+            .tap_script_sigs
+            .values()
+            .any(|sig| tap_single(sig.sighash_type));
+    // A BIP373 partial signature commits to the input's PSBT_IN_SIGHASH_TYPE.
+    #[cfg(feature = "musig")]
+    let musig_single = input
+        .unknown
+        .keys()
+        .any(|key| key.type_value == musig::PSBT_IN_MUSIG2_PARTIAL_SIG)
+        && input
+            .sighash_type
+            .and_then(|sighash_type| sighash_type.taproot_hash_ty().ok())
+            .is_some_and(tap_single);
+    #[cfg(not(feature = "musig"))]
+    let musig_single = false;
+    ecdsa_single || taproot_single || musig_single
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -961,7 +1010,10 @@ mod tests {
         absolute,
         hashes::Hash,
         psbt::{self, raw::Key},
-        transaction, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
+        secp256k1::schnorr::Signature,
+        sighash::TapSighashType,
+        taproot, transaction, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+        Txid,
     };
 
     use crate::{
@@ -1188,6 +1240,52 @@ mod tests {
 
         psbt.tx_modifiable = Some(TxModifiable::none());
         assert!(psbt.serialize().is_ok());
+    }
+
+    #[test]
+    fn v0_round_trip_keeps_a_computed_silent_payment_output_frozen() {
+        let mut psbt = psbt_with_script();
+        sp::set_sp_v0_output(
+            &mut psbt.outputs[0].psbt,
+            public_key(1),
+            public_key(2),
+            None,
+        );
+        psbt.tx_modifiable = Some(TxModifiable::none());
+        psbt.serialize().unwrap();
+
+        let round_trip = PsbtV2::from_bitcoin_psbt(psbt.into_bitcoin_psbt().unwrap()).unwrap();
+
+        assert_eq!(round_trip.tx_modifiable, Some(TxModifiable::none()));
+        assert!(round_trip.serialize().is_ok());
+    }
+
+    #[test]
+    fn from_bitcoin_psbt_flags_a_sighash_single_signature() {
+        let mut v0 = psbt_with_script().into_bitcoin_psbt().unwrap();
+        v0.inputs[0].tap_key_sig = Some(taproot::Signature {
+            signature: Signature::from_slice(&[1; 64]).unwrap(),
+            sighash_type: TapSighashType::SinglePlusAnyoneCanPay,
+        });
+
+        let psbt = PsbtV2::from_bitcoin_psbt(v0).unwrap();
+
+        assert_eq!(
+            psbt.tx_modifiable,
+            Some(TxModifiable::try_from(TxModifiable::SIGHASH_SINGLE).unwrap())
+        );
+    }
+
+    #[test]
+    fn from_bitcoin_psbt_leaves_a_version_one_tx_without_flags() {
+        let mut psbt = psbt_with_script();
+        psbt.tx_version = transaction::Version::ONE;
+        psbt.tx_modifiable = None;
+
+        let round_trip = PsbtV2::from_bitcoin_psbt(psbt.into_bitcoin_psbt().unwrap()).unwrap();
+
+        assert_eq!(round_trip.tx_modifiable, None);
+        assert!(round_trip.serialize().is_ok());
     }
 
     #[test]
