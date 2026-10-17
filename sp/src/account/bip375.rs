@@ -6,21 +6,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bitcoin::{key::TapTweak, Script, ScriptBuf};
+use bwk::bwk_keys::nums::{bip341_nums, is_nums_x_only};
 
 use crate::{
     account::AccountError,
     core::{
         dleq::{self, DleqProof},
-        secp256k1::{constants::ONE, PublicKey, Scalar, Secp256k1, SecretKey},
+        secp256k1::{
+            constants::ONE, Parity, PublicKey, Scalar, Secp256k1, SecretKey, XOnlyPublicKey,
+        },
         utils::hash::calculate_input_hash,
     },
 };
 
 const SIGHASH_ALL: u32 = 1;
-const NUMS_H: [u8; 32] = [
-    0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a, 0x5e,
-    0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80, 0x3a, 0xc0,
-];
 
 /// Resolves the prevout script an input spends, checking `witness_utxo` and
 /// `non_witness_utxo` agree when both are present. `Ok(None)` means the PSBT
@@ -114,35 +113,20 @@ pub fn eligible_input_pubkey(input: &bwk_psbt::Input) -> Result<Option<PublicKey
     if !eligible_script(&script, input.psbt.redeem_script.as_ref())? {
         return Ok(None);
     }
-    // A P2TR input whose internal key is the NUMS point H is provably
-    // script-path-only and BIP352 excludes it. But the claim must be checked
-    // against the script, not trusted: a false claim would silently remove a
-    // real input from the sum and let an attacker redirect the payment.
-    if script.is_p2tr()
-        && input
-            .psbt
-            .tap_internal_key
-            .is_some_and(|key| key.serialize() == NUMS_H)
-    {
-        let bytes = script.as_bytes();
-        return if bytes[2..34] == NUMS_H {
-            Ok(None)
-        } else {
-            Err(AccountError::PsbtV2)
-        };
-    }
     // BIP352 defines the taproot input key as the even-parity lift of the
     // output key, read from the script. Never from bip32_derivation: a PSBT
     // can carry arbitrary derivation entries, and trusting one here hands an
     // attacker control of the input hash.
     if script.is_p2tr() {
-        let bytes = script.as_bytes();
-        let mut pubkey = [0; 33];
-        pubkey[0] = 0x02;
-        pubkey[1..].copy_from_slice(&bytes[2..34]);
-        return PublicKey::from_slice(&pubkey)
-            .map(Some)
-            .map_err(|_| AccountError::PsbtV2);
+        let output_key = XOnlyPublicKey::from_slice(&script.as_bytes()[2..34])
+            .map_err(|_| AccountError::PsbtV2)?;
+        if commits_to_nums_internal_key(&input.psbt, output_key)? {
+            return Ok(None);
+        }
+        return Ok(Some(PublicKey::from_x_only_public_key(
+            output_key,
+            Parity::Even,
+        )));
     }
     let candidates = input
         .psbt
@@ -160,6 +144,37 @@ pub fn eligible_input_pubkey(input: &bwk_psbt::Input) -> Result<Option<PublicKey
     // the PSBT is claiming a key for this input that the script disagrees
     // with.
     Err(AccountError::PsbtV2)
+}
+
+/// Whether a P2TR input's output key commits to the internal key H. Its only
+/// spend is then a script path one revealing H, which BIP352 skips. A PSBT
+/// claiming H is checked against the output key, not trusted: a false claim
+/// would drop a real input from the sum, and the receiver, who counts it,
+/// would miss the payment. With neither an internal key nor a merkle root the
+/// PSBT cannot tell, and the input counts as a key path spend.
+fn commits_to_nums_internal_key(
+    input: &bitcoin::psbt::Input,
+    output_key: XOnlyPublicKey,
+) -> Result<bool, AccountError> {
+    let commits = || {
+        let secp = Secp256k1::verification_only();
+        let (nums, _) = bip341_nums().x_only_public_key();
+        nums.tap_tweak(&secp, input.tap_merkle_root)
+            .0
+            .to_x_only_public_key()
+            == output_key
+    };
+    match input.tap_internal_key {
+        Some(key) if is_nums_x_only(&key) => {
+            if commits() {
+                Ok(true)
+            } else {
+                Err(AccountError::PsbtV2)
+            }
+        }
+        // A merkle root that proves an H commitment wins over a claimed internal key.
+        Some(_) | None => Ok(input.tap_merkle_root.is_some() && commits()),
+    }
 }
 
 pub fn eligible_pubkey_sum(psbt: &bwk_psbt::PsbtV2) -> Result<PublicKey, AccountError> {
@@ -640,22 +655,24 @@ mod tests {
         key::TapTweak,
         psbt::PsbtSighashType,
         secp256k1::Secp256k1,
+        taproot::{LeafVersion, TaprootBuilder, TaprootSpendInfo},
         transaction, Amount, Network, OutPoint, PublicKey as BitcoinPublicKey, ScriptBuf, Sequence,
         TapSighashType, TxIn, TxOut, Txid, Witness, XOnlyPublicKey,
     };
+    use bwk::bwk_keys::nums::bip341_nums;
     use bwk_psbt::sp::{PSBT_GLOBAL_SP_DLEQ, PSBT_GLOBAL_SP_ECDH_SHARE};
-    use secp256k1::{PublicKey, Scalar, SecretKey};
+    use secp256k1::{Parity, PublicKey, Scalar, SecretKey};
 
     use crate::{
         account::{
             bip375::{
                 complete_output_scripts, eligible_input_pubkey, eligible_script, generator,
                 input_hash, input_script_pubkey, validate, validate_input_eligibility,
-                verify_signed, NUMS_H,
+                verify_signed,
             },
             AccountError,
         },
-        core::{dleq, utils::hash::calculate_input_hash},
+        core::{dleq, receiving, utils::hash::calculate_input_hash},
         receiver::SpReceiver,
     };
 
@@ -674,11 +691,43 @@ mod tests {
         }
     }
 
-    fn nums_pubkey() -> PublicKey {
-        let mut bytes = [0u8; 33];
-        bytes[0] = 0x02;
-        bytes[1..].copy_from_slice(&NUMS_H);
-        PublicKey::from_slice(&bytes).unwrap()
+    fn nums() -> XOnlyPublicKey {
+        bip341_nums().x_only_public_key().0
+    }
+
+    fn leaf_script() -> ScriptBuf {
+        ScriptBuf::from_bytes(vec![0x51])
+    }
+
+    /// tr(internal_key, {OP_TRUE}).
+    fn leaf_tree(internal_key: XOnlyPublicKey) -> TaprootSpendInfo {
+        TaprootBuilder::new()
+            .add_leaf(0, leaf_script())
+            .unwrap()
+            .finalize(&Secp256k1::new(), internal_key)
+            .unwrap()
+    }
+
+    /// A P2TR input paying `tree`'s output key, carrying its internal key and
+    /// its merkle root only when asked.
+    fn tree_input(
+        tree: &TaprootSpendInfo,
+        with_internal_key: bool,
+        with_merkle_root: bool,
+    ) -> bitcoin::psbt::Input {
+        bitcoin::psbt::Input {
+            witness_utxo: Some(TxOut {
+                value: Amount::from_sat(10_000),
+                script_pubkey: ScriptBuf::new_p2tr_tweaked(tree.output_key()),
+            }),
+            tap_internal_key: with_internal_key.then(|| tree.internal_key()),
+            tap_merkle_root: tree.merkle_root().filter(|_| with_merkle_root),
+            ..Default::default()
+        }
+    }
+
+    fn output_key(tree: &TaprootSpendInfo) -> PublicKey {
+        PublicKey::from_x_only_public_key(tree.output_key().to_x_only_public_key(), Parity::Even)
     }
 
     fn empty_psbt(inputs: Vec<bwk_psbt::Input>) -> bwk_psbt::PsbtV2 {
@@ -732,30 +781,72 @@ mod tests {
         assert_eq!(result, Some(key_a));
     }
 
+    /// BIP352 skips a P2TR input only when its spend reveals the internal key
+    /// H. The PSBT proves it when its internal key or its merkle root ties the
+    /// output key to H; with neither, the input counts as a key path spend.
     #[test]
-    fn eligible_input_pubkey_excludes_committed_taproot_nums_input() {
-        let nums = nums_pubkey();
-        let mut psbt_input = p2tr_witness_utxo(nums);
-        psbt_input.tap_internal_key = Some(nums.x_only_public_key().0);
-        let input = input_with(psbt_input, OutPoint::null());
+    fn eligible_input_pubkey_skips_taproot_inputs_committing_to_nums() {
+        let secp = Secp256k1::new();
+        let (key, _) = PublicKey::from_secret_key(&secp, &secret(1)).x_only_public_key();
+        let nums_tree = leaf_tree(nums());
+        let key_tree = leaf_tree(key);
+        let key_path = TaprootSpendInfo::new_key_spend(&secp, key, None);
+        let cases = [
+            (&nums_tree, true, true, None),
+            (&nums_tree, false, true, None),
+            (&nums_tree, false, false, Some(output_key(&nums_tree))),
+            (&key_tree, true, true, Some(output_key(&key_tree))),
+            (&key_tree, true, false, Some(output_key(&key_tree))),
+            (&key_tree, false, true, Some(output_key(&key_tree))),
+            (&key_tree, false, false, Some(output_key(&key_tree))),
+            (&key_path, true, false, Some(output_key(&key_path))),
+            (&key_path, false, false, Some(output_key(&key_path))),
+        ];
 
-        let result = eligible_input_pubkey(&input).unwrap();
-
-        assert_eq!(result, None);
+        for (tree, with_internal_key, with_merkle_root, expected) in cases {
+            let input = input_with(
+                tree_input(tree, with_internal_key, with_merkle_root),
+                OutPoint::null(),
+            );
+            assert_eq!(
+                eligible_input_pubkey(&input).unwrap(),
+                expected,
+                "internal key {with_internal_key}, merkle root {with_merkle_root}"
+            );
+        }
     }
 
+    /// An internal key H the output key does not commit to is a false claim,
+    /// not a reason to skip the input.
     #[test]
     fn eligible_input_pubkey_rejects_uncommitted_taproot_nums_internal_key() {
         let secp = Secp256k1::new();
         let key_a = PublicKey::from_secret_key(&secp, &even_secret(1));
-        let nums = nums_pubkey();
         let mut psbt_input = p2tr_witness_utxo(key_a);
-        psbt_input.tap_internal_key = Some(nums.x_only_public_key().0);
+        psbt_input.tap_internal_key = Some(nums());
         let input = input_with(psbt_input, OutPoint::null());
+        assert!(matches!(
+            eligible_input_pubkey(&input),
+            Err(AccountError::PsbtV2)
+        ));
 
-        let result = eligible_input_pubkey(&input);
+        let (key, _) = key_a.x_only_public_key();
+        let mut psbt_input = tree_input(&leaf_tree(key), false, true);
+        psbt_input.tap_internal_key = Some(nums());
+        let input = input_with(psbt_input, OutPoint::null());
+        assert!(matches!(
+            eligible_input_pubkey(&input),
+            Err(AccountError::PsbtV2)
+        ));
 
-        assert!(matches!(result, Err(AccountError::PsbtV2)));
+        let input = input_with(
+            tree_input(&leaf_tree(nums()), true, false),
+            OutPoint::null(),
+        );
+        assert!(matches!(
+            eligible_input_pubkey(&input),
+            Err(AccountError::PsbtV2)
+        ));
     }
 
     fn p2wpkh_input(script_key: PublicKey, bip32_key: PublicKey) -> bwk_psbt::Input {
@@ -900,7 +991,6 @@ mod tests {
     fn input_hash_uses_all_outpoints_but_only_eligible_keys() {
         let secp = Secp256k1::new();
         let key_a = PublicKey::from_secret_key(&secp, &even_secret(1));
-        let nums = nums_pubkey();
 
         let outpoint_a = OutPoint::null();
         let outpoint_b = OutPoint {
@@ -909,9 +999,7 @@ mod tests {
         };
 
         let input_a = input_with(p2tr_witness_utxo(key_a), outpoint_a);
-        let mut nums_psbt_input = p2tr_witness_utxo(nums);
-        nums_psbt_input.tap_internal_key = Some(nums.x_only_public_key().0);
-        let input_b = input_with(nums_psbt_input, outpoint_b);
+        let input_b = input_with(tree_input(&leaf_tree(nums()), true, true), outpoint_b);
 
         let psbt = empty_psbt(vec![input_a, input_b]);
 
@@ -1527,7 +1615,7 @@ mod tests {
         let secp = Secp256k1::new();
         let input_pubkey = PublicKey::from_secret_key(&secp, &even_secret(8));
         let mut input_psbt = p2tr_witness_utxo(input_pubkey);
-        input_psbt.tap_internal_key = Some(XOnlyPublicKey::from_slice(&NUMS_H).unwrap());
+        input_psbt.tap_internal_key = Some(nums());
         psbt.inputs.push(input_with(
             input_psbt,
             OutPoint {
@@ -1541,20 +1629,15 @@ mod tests {
         assert!(matches!(result, Err(AccountError::PsbtV2)));
     }
 
+    /// A tr(H, {leaf}) input is left out of the sum by the sender, and the
+    /// receiver, seeing its script path spend reveal H, leaves it out too.
     #[test]
     fn excludes_committed_taproot_nums_input() {
         let (mut psbt, _) = psbt();
-        let nums = PublicKey::from_slice(&{
-            let mut bytes = [0u8; 33];
-            bytes[0] = 0x02;
-            bytes[1..].copy_from_slice(&NUMS_H);
-            bytes
-        })
-        .unwrap();
-        let mut input_psbt = p2tr_witness_utxo(nums);
-        input_psbt.tap_internal_key = Some(nums.x_only_public_key().0);
+        let secp = Secp256k1::new();
+        let nums_tree = leaf_tree(nums());
         psbt.inputs.push(input_with(
-            input_psbt,
+            tree_input(&nums_tree, true, true),
             OutPoint {
                 txid: Txid::from_byte_array([17; 32]),
                 vout: 0,
@@ -1564,6 +1647,33 @@ mod tests {
         assert!(matches!(eligible_input_pubkey(&psbt.inputs[1]), Ok(None)));
         complete_output_scripts(&mut psbt).unwrap();
         validate(&psbt).unwrap();
+
+        let control_block = nums_tree
+            .control_block(&(leaf_script(), LeafVersion::TapScript))
+            .unwrap();
+        let witnesses = [
+            Witness::from_slice(&[vec![0; 64]]),
+            Witness::from_slice(&[leaf_script().into_bytes(), control_block.serialize()]),
+        ];
+        let receiver_keys = psbt
+            .inputs
+            .iter()
+            .zip(witnesses)
+            .filter_map(|(input, witness)| {
+                let txin = TxIn {
+                    previous_output: input.previous_output,
+                    script_sig: ScriptBuf::new(),
+                    sequence: input.sequence,
+                    witness,
+                };
+                let prevout = input.psbt.witness_utxo.as_ref().unwrap();
+                receiving::eligible_input_pubkey(&txin, prevout).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let input_pubkey = PublicKey::from_secret_key(&secp, &even_secret(5));
+        assert_eq!(receiver_keys, vec![input_pubkey]);
+        let receiver = receiver(secret(6), PublicKey::from_secret_key(&secp, &secret(7)));
+        assert!(receiver_discovers(&psbt, &receiver, &receiver_keys));
     }
 
     #[test]

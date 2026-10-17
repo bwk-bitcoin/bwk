@@ -20,8 +20,11 @@ use std::{
 };
 
 use bitcoin::{
-    absolute::Height, bip32::DerivationPath, hashes::Hash, key::TapTweak, Amount, OutPoint,
-    ScriptBuf, TxOut, Txid, XOnlyPublicKey,
+    absolute::Height,
+    bip32::{ChildNumber, DerivationPath},
+    hashes::Hash,
+    key::TapTweak,
+    Amount, OutPoint, ScriptBuf, TxOut, Txid, XOnlyPublicKey,
 };
 
 use blindbitd::BlindbitD;
@@ -30,10 +33,11 @@ use bwk_utils::{
     test::{corepc_node, temp_dir::TempDir},
 };
 use crossbeam::channel;
+use miniscript::DescriptorPublicKey;
 
 use bwk_sign::{
     bwk_descriptor::{
-        descriptor::Descriptor,
+        descriptor::{tr_path, Descriptor},
         sp_descriptor::SpDescriptor,
         wallet::{WalletDescriptor, WalletDescriptorExt},
     },
@@ -724,10 +728,13 @@ pub fn swap_to_sp(
 
 // TestEnv: integration test harness
 
-use bwk::bwk_electrum::{
-    config::ScannerConfig,
-    notification::{Notification, SignerNotification},
-    scanner::ElectrumScanner,
+use bwk::{
+    bwk_electrum::{
+        config::ScannerConfig,
+        notification::{Notification, SignerNotification},
+        scanner::ElectrumScanner,
+    },
+    bwk_keys::nums::bip341_nums,
 };
 use bwk_coin::{derive_descriptor, Coin, CoinSpendInfo, CoinStatus, KeyChain};
 
@@ -1056,13 +1063,36 @@ impl TestEnv {
     /// Create a funded coin at receive index 0 of `descriptor` via bitcoind.
     ///
     /// Register the descriptor via `add_offline_sub_account()` so
-    /// `sign_and_finalize()` can sign it.
+    /// `sign_and_finalize_v2()` can sign it.
     pub fn create_descriptor_coin(&mut self, descriptor: WalletDescriptor, btc: f64) -> Coin {
         let addr = derive_descriptor(&descriptor, KeyChain::Receive, 0)
             .unwrap()
             .address(bitcoin::Network::Regtest)
             .unwrap();
+        self.create_coin(descriptor, addr, btc)
+    }
 
+    /// Create a funded tr(H,pk(xpub)) coin via bitcoind, to sign with
+    /// `sign_and_finalize_nums_tree_v2()`.
+    pub fn create_nums_tree_coin(&mut self, btc: f64) -> Coin {
+        let descriptor = nums_tree_descriptor();
+        let addr = descriptor.clone().into_single_descriptors().unwrap()[0]
+            .at_derivation_index(0)
+            .unwrap()
+            .address(bitcoin::Network::Regtest)
+            .unwrap();
+        let descriptor = Descriptor::from(descriptor).into_miniscript().unwrap();
+        self.create_coin(descriptor, addr, btc)
+    }
+
+    /// Fund `addr`, the first receive address of `descriptor`, via bitcoind,
+    /// as a coin a TxBuilder takes as a BIP32 input.
+    fn create_coin(
+        &mut self,
+        descriptor: WalletDescriptor,
+        addr: bitcoin::Address,
+        btc: f64,
+    ) -> Coin {
         let txid = bwk_utils::test::send(&mut self.bitcoind.client, addr.clone(), btc).unwrap();
         self.mine(1);
 
@@ -1100,6 +1130,22 @@ impl TestEnv {
             },
         }
     }
+}
+
+/// tr(H,pk(xpub)): the BIP-341 NUMS point itself as internal key, so the
+/// only spend is by script path revealing H, and the BIP32 mnemonic's BIP86
+/// account 1 xpub in the leaf. No sub-account can watch it, as the scanner
+/// takes multipath xpubs only.
+fn nums_tree_descriptor() -> miniscript::Descriptor<DescriptorPublicKey> {
+    let network = bitcoin::Network::Regtest;
+    let signer = HotSigner::new_from_mnemonics(network, bip32_mnemonic()).unwrap();
+    let xpub = signer.xpub(&tr_path(network, ChildNumber::from_hardened_idx(1).unwrap()).unwrap());
+    let (nums, _) = bip341_nums().x_only_public_key();
+    miniscript::Descriptor::from_str(&format!(
+        "tr({nums},pk([{}/{}]{}/<0;1>/*))",
+        xpub.origin.0, xpub.origin.1, xpub.xkey
+    ))
+    .unwrap()
 }
 
 /// Derives a BIP32 input's key from `xprivs` as BIP352 sums it: for a P2TR
@@ -1218,6 +1264,26 @@ pub fn sign_and_finalize_v2(
     if let Some(signer) = sub_accounts_signer(account) {
         signer.sign(&mut v0);
     }
+    *psbt = bwk_psbt::PsbtV2::from_bitcoin_psbt(v0).unwrap();
+    account.finalize(&psbt.serialize().unwrap()).unwrap()
+}
+
+/// `sign_and_finalize_v2()` for a transaction spending silent-payment and
+/// tr(H,pk(xpub)) coins: the leaf key signs from the BIP32 mnemonic, as no
+/// sub-account holds that descriptor.
+pub fn sign_and_finalize_nums_tree_v2(
+    account: &bwk_sp::account::Account,
+    mnemonic: &str,
+    psbt: &mut bwk_psbt::PsbtV2,
+) -> bitcoin::Transaction {
+    sign_v2(mnemonic, account.network(), psbt);
+    let mut v0 = psbt.clone().into_bitcoin_psbt().unwrap();
+    let signer = HotSigner::new_from_mnemonics(account.network(), bip32_mnemonic()).unwrap();
+    v0.sign(
+        &signer.master_xpriv(),
+        &bitcoin::secp256k1::Secp256k1::new(),
+    )
+    .unwrap();
     *psbt = bwk_psbt::PsbtV2::from_bitcoin_psbt(v0).unwrap();
     account.finalize(&psbt.serialize().unwrap()).unwrap()
 }

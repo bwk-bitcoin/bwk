@@ -29,8 +29,8 @@ use bwk_tx::{recipient::Recipient, transaction::Amount};
 use miniscript::{Descriptor, DescriptorPublicKey};
 
 use common::{
-    add_offline_sub_account, bip32_key, sign_and_finalize_v2, test_mnemonic, test_mnemonic_2,
-    TestEnv,
+    add_offline_sub_account, bip32_key, sign_and_finalize_nums_tree_v2, sign_and_finalize_v2,
+    test_mnemonic, test_mnemonic_2, TestEnv,
 };
 
 const TR_INTERNAL_PATH: &str = "m/86'/1'/1'";
@@ -66,6 +66,7 @@ fn test_transactions() {
     test_mixed_sp_taptree_to_sp(&mut env);
     test_mixed_sp_wsh_to_sp(&mut env);
     test_non_eligible_inputs_to_sp(&mut env);
+    test_mixed_sp_nums_tree_to_sp(&mut env);
 }
 
 fn descriptor(descriptor: &str) -> WalletDescriptor {
@@ -869,4 +870,37 @@ fn assert_sp_send_refused(account: &Account, inputs: Vec<Coin>) {
     )
     .unwrap();
     assert!(signer.sign(&mut psbt).is_err());
+}
+
+/// SP + tr(H,pk(xpub)) -> SP address. The tr(H) input is spent by script path
+/// revealing H, so BIP352 leaves it out of the input key sum: the sender must
+/// skip it rather than refuse it, and the receiver skips it as well, so it
+/// finds the payment.
+fn test_mixed_sp_nums_tree_to_sp(env: &mut TestEnv) {
+    let start_height = env.next_scan_height();
+    let mut account = env.sp_account("test");
+    env.fund_sp(&mut account, 0.1);
+    let nums_coin = env.create_nums_tree_coin(0.1);
+
+    let mut builder = account.tx_builder().feerate(1000);
+    builder.send_to_sp(account.sp_address(), 50_000);
+    builder.drain_inputs();
+    builder.add_input(nums_coin);
+    let mut psbt = builder.generate_v2().unwrap();
+    let tx = sign_and_finalize_nums_tree_v2(&account, test_mnemonic(), &mut psbt);
+    assert_eq!(tx.input.len(), 2);
+    env.broadcast_and_mine(&tx);
+
+    account
+        .scan_blocks(Some(start_height), Some(env.height))
+        .unwrap();
+    let new_outputs: Vec<_> = account
+        .coins()
+        .into_iter()
+        .filter(|(op, _)| op.txid == tx.compute_txid())
+        .collect();
+    assert!(
+        !new_outputs.is_empty(),
+        "scanner must detect SP output from mixed SP+tr(H) send"
+    );
 }
