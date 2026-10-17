@@ -33,6 +33,7 @@ use bitcoin::{
     hashes::{hash160, Hash},
     OutPoint, ScriptBuf, TxIn, TxOut,
 };
+use bwk::bwk_keys::nums::BIP341_NUMS;
 use serde::{
     de::{self, SeqAccess, Visitor},
     ser::{SerializeStruct, SerializeTuple},
@@ -122,19 +123,22 @@ pub fn eligible_input_pubkey(input: &TxIn, prevout: &TxOut) -> Result<Option<Pub
                 .last()
                 .and_then(|item| item.first())
                 .is_some_and(|byte| *byte == 0x50);
-        let stack_len = witness.len() - usize::from(has_annex);
-        if stack_len == 0 {
-            return Err(Error::InvalidInput("empty P2TR witness".to_string()));
-        }
-        if stack_len > 1 {
-            // Script path: the control block is the last item, the internal
-            // key its bytes 1..33.
-            let internal_key = witness[stack_len - 1]
-                .get(1..33)
-                .ok_or_else(|| Error::InvalidInput("invalid P2TR control block".to_string()))?;
-            if internal_key == NUMS_H {
-                return Ok(None);
+        let stack = &witness[..witness.len() - usize::from(has_annex)];
+        // A script-path spend is eligible too, unless its control block
+        // reveals the internal key H: then the key path provably has no
+        // spender and the input is skipped.
+        match stack {
+            [] => return Err(Error::InvalidInput("empty P2TR witness".to_string())),
+            [_, .., control_block] => {
+                // The internal key is the control block's bytes 1..33.
+                let internal_key = control_block
+                    .get(1..33)
+                    .ok_or_else(|| Error::InvalidInput("invalid P2TR control block".to_string()))?;
+                if *internal_key == BIP341_NUMS[1..] {
+                    return Ok(None);
+                }
             }
+            [_] => {}
         }
         let xonly = XOnlyPublicKey::from_slice(&spk[2..34])?;
         return Ok(Some(PublicKey::from_x_only_public_key(xonly, Parity::Even)));

@@ -2417,6 +2417,74 @@ mod tests {
         );
     }
 
+    /// BIP352 sums a P2TR script-path spend with the output key, like a key
+    /// path one, and skips it only when the control block's internal key is
+    /// H. An annex after the control block changes neither.
+    #[test]
+    fn p2tr_script_path_eligible_unless_internal_key_is_nums() {
+        let secp = Secp256k1::new();
+        let secret = SecretKey::from_slice(&[1; 32]).unwrap();
+        let (xonly, _) = secret.public_key(&secp).x_only_public_key();
+        let mut p2tr = vec![0x51, 0x20];
+        p2tr.extend(xonly.serialize());
+        let prevout = TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(p2tr),
+        };
+        let txin = |witness: &[Vec<u8>]| bitcoin::TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::new(),
+            sequence: bitcoin::Sequence::ZERO,
+            witness: bitcoin::Witness::from_slice(witness),
+        };
+        let key = Some(PublicKey::from_x_only_public_key(xonly, Parity::Even));
+        let signature = vec![0; 64];
+        let leaf_script = vec![0x51];
+        let annex = vec![0x50, 0x01];
+        let control_block = |internal_key: &[u8]| [&[0xc0], internal_key].concat();
+        let other_internal_key = control_block(&[2; 32]);
+        let nums_internal_key = control_block(&bwk::bwk_keys::nums::BIP341_NUMS[1..]);
+
+        let script_path = txin(&[
+            signature.clone(),
+            leaf_script.clone(),
+            other_internal_key.clone(),
+        ]);
+        assert_eq!(
+            crate::core::receiving::eligible_input_pubkey(&script_path, &prevout).unwrap(),
+            key
+        );
+
+        let script_path_with_annex = txin(&[
+            signature.clone(),
+            leaf_script.clone(),
+            other_internal_key,
+            annex.clone(),
+        ]);
+        assert_eq!(
+            crate::core::receiving::eligible_input_pubkey(&script_path_with_annex, &prevout)
+                .unwrap(),
+            key
+        );
+
+        let nums_script_path = txin(&[
+            signature.clone(),
+            leaf_script.clone(),
+            nums_internal_key.clone(),
+        ]);
+        assert_eq!(
+            crate::core::receiving::eligible_input_pubkey(&nums_script_path, &prevout).unwrap(),
+            None
+        );
+
+        let nums_script_path_with_annex = txin(&[signature, leaf_script, nums_internal_key, annex]);
+        assert_eq!(
+            crate::core::receiving::eligible_input_pubkey(&nums_script_path_with_annex, &prevout)
+                .unwrap(),
+            None
+        );
+    }
+
     /// BIP341 only reads an annex when the witness has at least two elements:
     /// a lone key-path signature whose first byte is 0x50 (1 in 256 Schnorr
     /// signatures) is still the signature.
