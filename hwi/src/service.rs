@@ -19,7 +19,7 @@ use crate::{
     coldcard,
     jade::{self, api::GetInfoResponse, Jade, SerialTransport},
     ledger::{self, bitcoin_client::client::Transport},
-    specter, AddressScript, DeviceKind, Error as HWIError, Version, HWI,
+    specter, AddressScript, DeviceKind, DeviceWallet, Error as HWIError, Version, HWI,
 };
 use bitcoin::{
     bip32::{DerivationPath, Fingerprint, Xpub},
@@ -162,9 +162,9 @@ where
         thread::spawn(move || match (*device).register_wallet(&name, &policy) {
             Ok(hmac) => {
                 tracing::debug!(
-                    "SupportedDevice[{}]::register_wallet: success, hmac={:?}",
+                    "SupportedDevice[{}]::register_wallet: success, hmac returned={}",
                     fg,
-                    hmac
+                    hmac.is_some()
                 );
                 let _ = sender.send(SigningDeviceMsg::WalletRegistered(id, fg, name, hmac).into());
             }
@@ -245,6 +245,69 @@ where
                 let _ = sender.send(SigningDeviceMsg::Error(Some(id), e.to_string()).into());
             }
         });
+    }
+
+    /// Answers `TransactionSigned` or `Error`, like `sign_tx`.
+    pub fn sign_tx_with_wallet(&self, id: Id, tx: Psbt, wallet: DeviceWallet) {
+        let mut tx = tx;
+        let sender = self.sender.clone();
+        let fg = self.fingerprint;
+        let device = self.device.clone();
+        tracing::debug!(
+            "SupportedDevice[{}]::sign_tx_with_wallet: spawning task, wallet={}",
+            fg,
+            wallet.name
+        );
+        thread::spawn(
+            move || match (*device).sign_tx_with_wallet(&mut tx, &wallet) {
+                Ok(()) => {
+                    tracing::debug!("SupportedDevice[{}]::sign_tx_with_wallet: success", fg);
+                    let _ = sender.send(SigningDeviceMsg::TransactionSigned(id, fg, tx).into());
+                }
+                Err(e) => {
+                    tracing::debug!("SupportedDevice[{}]::sign_tx_with_wallet: error={}", fg, e);
+                    let _ = sender.send(SigningDeviceMsg::Error(Some(id), e.to_string()).into());
+                }
+            },
+        );
+    }
+
+    /// Answers `AddressDisplayed` or `Error`, like `display_address`.
+    pub fn display_address_with_wallet(
+        &self,
+        id: Id,
+        script: &AddressScript,
+        wallet: DeviceWallet,
+    ) {
+        let script = script.clone();
+        let sender = self.sender.clone();
+        let fg = self.fingerprint;
+        let device = self.device.clone();
+        tracing::debug!(
+            "SupportedDevice[{}]::display_address_with_wallet: spawning task, script={:?}, wallet={}",
+            fg,
+            script,
+            wallet.name
+        );
+        thread::spawn(
+            move || match (*device).display_address_with_wallet(&script, &wallet) {
+                Ok(()) => {
+                    tracing::debug!(
+                        "SupportedDevice[{}]::display_address_with_wallet: success",
+                        fg
+                    );
+                    let _ = sender.send(SigningDeviceMsg::AddressDisplayed(id, fg, script).into());
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "SupportedDevice[{}]::display_address_with_wallet: error={}",
+                        fg,
+                        e
+                    );
+                    let _ = sender.send(SigningDeviceMsg::Error(Some(id), e.to_string()).into());
+                }
+            },
+        );
     }
 }
 
@@ -371,7 +434,8 @@ pub enum SigningDeviceMsg<Id = ()> {
     Update,
     XPub(Id, Fingerprint, DerivationPath, Xpub),
     Version(Id, Fingerprint, Version),
-    /// Wallet registered with name and optional HMAC.
+    /// Wallet registered with name and optional HMAC: the Ledger HMAC, `None` for
+    /// devices without one. Send it back in `DeviceWallet::hmac`.
     WalletRegistered(Id, Fingerprint, String, Option<[u8; 32]>),
     /// Wallet registration check result.
     WalletIsRegistered(Id, Fingerprint, String, bool),
@@ -1294,6 +1358,10 @@ fn handle_locked_jade<Message, Id>(
     }
 }
 
+/// Speculos, probed on `127.0.0.1:9999` by `handle_ledger_simulator`.
+#[cfg(feature = "ledger")]
+const LEDGER_SIMULATOR_ID: &str = "ledger-simulator";
+
 #[cfg(feature = "ledger")]
 fn handle_ledger_simulator<Message, Id>(
     sender: channel::Sender<Message>,
@@ -1303,7 +1371,6 @@ fn handle_ledger_simulator<Message, Id>(
     Message: From<SigningDeviceMsg<Id>> + Send + Clone + 'static,
     Id: Send + Clone + 'static,
 {
-    const LEDGER_SIMULATOR_ID: &str = "ledger-simulator";
     // If device is already in the map, don't poll it again
     if devices
         .lock()
@@ -1802,7 +1869,10 @@ fn handle_ledger<Message, Id>(
         tracing::trace!("Found {} Ledger device(s)", list.len());
     }
 
-    let connected_ids: Vec<_> = list.iter().map(|d| ledger_id(d)).collect();
+    let mut connected_ids: Vec<_> = list.iter().map(|d| ledger_id(d)).collect();
+    // The simulator shares the "ledger-" prefix but is not a HID device. Its probe only
+    // runs while it is unlisted, so once listed it stays until the service stops.
+    connected_ids.push(LEDGER_SIMULATOR_ID.into());
     tracing::trace!("handle_ledger: connected_ids={:?}", connected_ids);
     cleanup_disconnected(sender, handles, &devices, &connected_ids, "ledger-");
 

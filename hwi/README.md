@@ -25,6 +25,25 @@ pub trait HWI: Debug {
     fn display_address(&self, script: &AddressScript) -> Result<(), Error>;
     /// 7. Sign a partially signed bitcoin transaction (PSBT).
     fn sign_tx(&self, tx: &mut Psbt) -> Result<(), Error>;
+    /// Like 7, for `wallet` (ignored by devices holding their policies).
+    fn sign_tx_with_wallet(&self, tx: &mut Psbt, wallet: &DeviceWallet)
+        -> Result<(), Error>;
+    /// Like 6, for `wallet` (ignored by devices holding their policies).
+    fn display_address_with_wallet(
+        &self,
+        script: &AddressScript,
+        wallet: &DeviceWallet,
+    ) -> Result<(), Error>;
+}
+
+/// A wallet policy as registered on a device, sent with the requests that need it.
+pub struct DeviceWallet {
+    /// Name given at registration (Ledger's HMAC covers it).
+    pub name: String,
+    /// Descriptor with keys inline, as given to `register_wallet`.
+    pub policy: String,
+    /// HMAC returned by `register_wallet` (Ledger), `None` otherwise.
+    pub hmac: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +64,7 @@ A Empty case means the method is unimplemented on the client or device side.
 | BitBox02[^1]         | >= v9.15.0 | >= v9.15.0 | >= v9.15.0 | >= v9.15.0 | >= v9.15.0           | >= v9.15.0 | >= v9.15.0 |
 | Coldcard[^2]         | >= v6.2.1X | >= v6.2.1X | >= v6.2.1X | >= v6.2.1X | >= v6.2.1X           | >= v6.2.1X | >= v6.2.1X |
 | Jade[^3]             | >= v1.0.30 | >= v1.0.30 | >= v1.0.30 | >= v1.0.30 | >= v1.0.30           | >= v1.0.30 | >= v1.0.30 |
-| Ledger Nano S/S+[^4] | >= v2.1.2  | >= v2.1.2  | >= v2.1.2  | >= v2.1.2  | *check hmac presence | >= v2.1.2  | >= v2.1.2  |
+| Ledger Nano S/S+[^4] | >= v2.1.2  | >= v2.1.2  | >= v2.1.2  | >= v2.1.2  | *check hmac presence | >= v2.1.2  | >= v2.1.2[^6] |
 | Specter[^5]          |            | >= v1.8.0  | >= v1.8.0  | >= v1.8.0  |                      |            | >= v1.8.0  |
 
 [^1]: https://github.com/digitalbitbox/bitbox02-firmware
@@ -54,6 +73,9 @@ A Empty case means the method is unimplemented on the client or device side.
 [^3]: https://github.com/Blockstream/Jade
 [^4]: https://github.com/LedgerHQ/app-bitcoin-new
 [^5]: https://github.com/cryptoadvance/specter-diy
+[^6]: The Ledger signs, and shows miniscript addresses, only with the wallet policy and
+    its HMAC: `sign_tx_with_wallet` / `display_address_with_wallet`, or a `Ledger`
+    built with `with_wallet`. Plain `sign_tx` without either is unimplemented.
 
 ## Service Module
 
@@ -108,13 +130,16 @@ app running under [Speculos](https://github.com/LedgerHQ/speculos), and
 `tests/ledger_musig_speculos.rs` (features `ledger,musig`) registers bwk-bup 2-of-2
 `tr(musig(L,H))` and `tr(NUMS,pk(musig(L,H)))` policies and spends both through the two
 MuSig2 rounds with a bwk `HotSigner` as the other cosigner. The tests are
-`#[ignore]`d; run them with `tests/speculos/run.sh [nanox|nanosp]`, or `just test-ledger`
-in `hwi/` for both devices. Docker is the only prerequisite.
+`#[ignore]`d. `tests/ledger_service_speculos.rs` (features `ledger,musig`) goes through
+`HwiService` only: Speculos on `127.0.0.1:9999`, the port the service polls, a plain
+taproot policy and a MuSig2 2-of-2 registered and signed with `sign_tx_with_wallet`,
+and a wrong HMAC refused. Run them with `tests/speculos/run.sh [nanox|nanosp]`, or
+`just test-ledger` in `hwi/` for both devices. Docker is the only prerequisite.
 
 `run.sh` builds the app ELF with the pinned builder image (cached in
-`target/speculos-cache/`), then runs both test binaries with `SPECULOS_BIN` pointing at
-`tests/speculos/speculos-docker.sh`, which runs the pinned Speculos image for the
-`speculos` crate and removes its container when the crate kills it.
+`target/speculos-cache/`), then runs the three test binaries with `SPECULOS_BIN`
+pointing at `tests/speculos/speculos-docker.sh`, which runs the pinned Speculos image
+for the `speculos` crate and removes its container when the crate kills it.
 
 `tests/speculos/versions.env` pins every input, for `run.sh` and CI alike: the app
 version (`LEDGER_APP_VERSION=2.4.6`), the builder image and the Speculos image, both

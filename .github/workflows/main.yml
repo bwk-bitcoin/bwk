@@ -184,3 +184,4 @@ jobs:
         run: |
           cargo test -p bwk-hwi --features ledger --test ledger_speculos -- --ignored --nocapture --test-threads=1
           cargo test -p bwk-hwi --features ledger,musig --test ledger_musig_speculos -- --ignored --nocapture --test-threads=1
+          cargo test -p bwk-hwi --features ledger,musig --test ledger_service_speculos -- --ignored --nocapture --test-threads=1

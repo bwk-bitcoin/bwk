@@ -20,16 +20,17 @@ use bwk_hwi::{
     },
     utils::extract_keys_and_template,
 };
-use bwk_keys::nums::bip341_nums;
 use bwk_psbt::musig::{musig_input_partial_sigs, musig_input_pub_nonces};
 use bwk_sign::musig::{musig_status, MusigRound};
 use common::{
     musig::{
         derived, finalize_and_verify, key_path_2of2, leaf_2of2, ledger_policy, ledger_role_key,
-        ledger_sign_tx, merge_nonces, round1_copy, spend_leaf_hash, spend_psbt, HotCosigner,
-        WALLET_NAME,
+        ledger_sign_tx, merge_nonces, register_steps, round1_copy, spend_leaf_hash, spend_psbt,
+        HotCosigner, WALLET_NAME,
     },
-    speculos::{connect_to, fresh_speculos, register_for_hmac, sign_step_refs, sign_steps},
+    speculos::{
+        connect_to, fresh_speculos, register_for_hmac, screen_seen, sign_step_refs, sign_steps,
+    },
 };
 use speculos::{Button, Speculos};
 
@@ -70,7 +71,7 @@ impl Setup {
         let (result, signed) =
             ledger_sign_tx(&self.sim, &self.policy, self.hmac, round1_copy(psbt), &[]);
         result.unwrap();
-        assert!(!self.screen_seen("Review transaction"));
+        assert!(!screen_seen(&self.sim, "Review transaction"));
         merge_nonces(psbt, &signed);
     }
 
@@ -96,10 +97,6 @@ impl Setup {
         musig_status(psbt, &self.descriptor).unwrap().round
     }
 
-    fn screen_seen(&self, text: &str) -> bool {
-        self.sim.events().unwrap().iter().any(|e| e.text == text)
-    }
-
     /// The leaf of every Ledger 0x1b of input 0.
     fn ledger_nonce_slots(&self, psbt: &Psbt) -> Vec<Option<TapLeafHash>> {
         musig_input_pub_nonces(&psbt.inputs[0])
@@ -119,32 +116,6 @@ impl Setup {
             .map(|s| s.leaf_hash)
             .collect()
     }
-}
-
-/// The registration screens of `policy`: one "Our key", "Their key" or "Dummy key"
-/// (the BIP-341 NUMS point) review per key, in policy order.
-fn register_steps(policy: &str, ledger_key: &OXpub) -> Vec<(String, Button)> {
-    let (_, keys) = extract_keys_and_template::<WalletPubKey>(policy).unwrap();
-    let mut steps: Vec<(String, Button)> = vec![
-        ("Review account".into(), Button::Right),
-        ("Account name".into(), Button::Right),
-        ("Wallet policy".into(), Button::Right),
-        ("Review co-signer".into(), Button::Right),
-    ];
-    for (i, key) in keys.iter().enumerate() {
-        let owner = if key.inner == ledger_key.xkey {
-            "Our"
-        } else if key.inner.public_key == bip341_nums() {
-            "Dummy"
-        } else {
-            "Their"
-        };
-        for page in 1..=3 {
-            steps.push((format!("{owner} key@{i} ({page}/3)"), Button::Right));
-        }
-    }
-    steps.push(("Register account".into(), Button::Both));
-    steps
 }
 
 /// Registers, then the device's receive address 0 equals bwk's.

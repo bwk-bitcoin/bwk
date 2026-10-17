@@ -22,7 +22,7 @@ use crate::{
         wallet::{Version as WalletVersion, WalletPolicy, WalletPubKey},
     },
     ledger::transport_hidapi::TransportNativeHID,
-    parse_version, utils, AddressScript, DeviceKind, Error as HWIError, HWI,
+    parse_version, utils, AddressScript, DeviceKind, DeviceWallet, Error as HWIError, HWI,
 };
 
 #[cfg(feature = "musig")]
@@ -63,11 +63,55 @@ impl<T: Transport> Ledger<T> {
         policy: &str,
         hmac: Option<[u8; 32]>,
     ) -> Result<Self, HWIError> {
-        let (descriptor_template, keys) = utils::extract_keys_and_template::<WalletPubKey>(policy)?;
-        let wallet = WalletPolicy::new(name.into(), WalletVersion::V2, descriptor_template, keys);
-        self.options.wallet = Some((wallet, hmac));
+        self.options.wallet = Some((wallet_policy(&name.into(), policy)?, hmac));
         Ok(self)
     }
+
+    /// Signs with `policy` and merges what the device yields into `psbt` (see
+    /// [`merge_yields`]).
+    ///
+    /// MuSig2 round rule: the app runs MuSig2 round 2 whenever the PSBT carries any
+    /// PSBT_IN_MUSIG2_PUB_NONCE, and round 1 (pubnonces only, no user approval when it
+    /// signs musig keys only) otherwise. Send round 1 with every pubnonce removed
+    /// (`bwk_psbt::musig::remove_musig_input_pub_nonces` on a copy) and merge the
+    /// device's nonces into the shared PSBT; send round 2 once every participant's
+    /// nonce is present, with the same unsigned transaction. This method does not strip
+    /// nonces: the round decision belongs to the caller.
+    fn sign_with(
+        &self,
+        psbt: &mut Psbt,
+        policy: &WalletPolicy,
+        hmac: Option<&[u8; 32]>,
+    ) -> Result<(), HWIError> {
+        let yielded_objects = self.client.sign_psbt(psbt, policy, hmac)?;
+        merge_yields(psbt, yielded_objects)
+    }
+
+    /// Shows address `index` of `policy` on the device.
+    fn display_miniscript(
+        &self,
+        policy: &WalletPolicy,
+        hmac: Option<&[u8; 32]>,
+        index: u32,
+        change: bool,
+    ) -> Result<(), HWIError> {
+        self.client
+            .get_wallet_address(policy, hmac, change, index, true)
+            .map_err(HWIError::from)?;
+        Ok(())
+    }
+}
+
+/// The policy sent to the device for `policy` (keys inline) under `name`. Ledger's HMAC
+/// covers the name, so signing and display must use the name given at registration.
+fn wallet_policy(name: &str, policy: &str) -> Result<WalletPolicy, HWIError> {
+    let (descriptor_template, keys) = utils::extract_keys_and_template::<WalletPubKey>(policy)?;
+    Ok(WalletPolicy::new(
+        name.to_string(),
+        WalletVersion::V2,
+        descriptor_template,
+        keys,
+    ))
 }
 
 /// TODO: remove
@@ -97,9 +141,19 @@ impl<T: Transport> HWI for Ledger<T> {
         Ok(self.client.get_master_fingerprint()?)
     }
 
+    /// Without `display_xpub`, a path the app refuses to export silently (`NotSupported`,
+    /// SW 0x6a82) is asked again with display, for the user to approve on the device: app
+    /// 2.4.x exports BIP-87 paths (`m/87'/..`) only that way. Apps from 2.5.0 export
+    /// standard BIP-87 paths silently and never reach the retry.
     fn get_extended_pubkey(&self, path: &DerivationPath) -> Result<Xpub, HWIError> {
         let display = *self.options.display_xpub.lock().expect("poisoned");
-        Ok(self.client.get_extended_pubkey(path, display)?)
+        match self.client.get_extended_pubkey(path, display) {
+            Err(BitcoinClientError::Device {
+                status: StatusWord::NotSupported,
+                ..
+            }) if !display => Ok(self.client.get_extended_pubkey(path, true)?),
+            result => Ok(result?),
+        }
     }
 
     fn display(&self, display: bool) {
@@ -115,10 +169,7 @@ impl<T: Transport> HWI for Ledger<T> {
                 let fg = self.get_master_fingerprint()?;
                 let xpub = self.get_extended_pubkey(&path)?;
                 let policy = format!("tr({}/**)", key_string_from_parts(fg, path, xpub));
-                let (descriptor_template, keys) =
-                    utils::extract_keys_and_template::<WalletPubKey>(&policy)?;
-                let wallet =
-                    WalletPolicy::new("".into(), WalletVersion::V2, descriptor_template, keys);
+                let wallet = wallet_policy("", &policy)?;
 
                 if ![RECV_INDEX, CHANGE_INDEX].contains(&normal_children[0]) {
                     return Err(HWIError::Bip86ChangeIndex);
@@ -139,56 +190,58 @@ impl<T: Transport> HWI for Ledger<T> {
                     .wallet
                     .as_ref()
                     .ok_or(HWIError::MissingPolicy)?;
-                self.client
-                    .get_wallet_address(policy, hmac.as_ref(), *change, *index, true)
-                    .map_err(HWIError::from)?;
+                self.display_miniscript(policy, hmac.as_ref(), *index, *change)?;
             }
         }
         Ok(())
     }
 
     fn register_wallet(&self, name: &str, policy: &str) -> Result<Option<[u8; 32]>, HWIError> {
-        let (descriptor_template, keys) = utils::extract_keys_and_template::<WalletPubKey>(policy)?;
-        let wallet = WalletPolicy::new(
-            name.to_string(),
-            WalletVersion::V2,
-            descriptor_template,
-            keys,
-        );
-        let (_id, hmac) = self.client.register_wallet(&wallet)?;
+        let (_id, hmac) = self.client.register_wallet(&wallet_policy(name, policy)?)?;
         Ok(Some(hmac))
     }
 
     fn is_wallet_registered(&self, name: &str, policy: &str) -> Result<bool, HWIError> {
         if let Some((wallet, hmac)) = &self.options.wallet {
-            let (descriptor_template, keys) =
-                utils::extract_keys_and_template::<WalletPubKey>(policy)?;
+            let candidate = wallet_policy(name, policy)?;
             Ok(hmac.is_some()
-                && name == wallet.name
-                && descriptor_template == wallet.descriptor_template
-                && keys == wallet.keys)
+                && candidate.name == wallet.name
+                && candidate.descriptor_template == wallet.descriptor_template
+                && candidate.keys == wallet.keys)
         } else {
             Ok(false)
         }
     }
 
-    /// Signs with the registered policy and merges what the device yields into `psbt`
-    /// (see [`merge_yields`]).
-    ///
-    /// MuSig2 round rule: the app runs MuSig2 round 2 whenever the PSBT carries any
-    /// PSBT_IN_MUSIG2_PUB_NONCE, and round 1 (pubnonces only, no user approval when it
-    /// signs musig keys only) otherwise. Send round 1 with every pubnonce removed
-    /// (`bwk_psbt::musig::remove_musig_input_pub_nonces` on a copy) and merge the
-    /// device's nonces into the shared PSBT; send round 2 once every participant's
-    /// nonce is present, with the same unsigned transaction. This method does not strip
-    /// nonces: the round decision belongs to the caller.
+    /// Signs with the policy given to [`Ledger::with_wallet`], `UnimplementedMethod`
+    /// without one. The MuSig2 round rule is on `sign_with`.
     fn sign_tx(&self, psbt: &mut Psbt) -> Result<(), HWIError> {
         if let Some((policy, hmac)) = &self.options.wallet {
-            let yielded_objects = self.client.sign_psbt(psbt, policy, hmac.as_ref())?;
-            merge_yields(psbt, yielded_objects)
+            self.sign_with(psbt, policy, hmac.as_ref())
         } else {
             // Ledger cannot sign without policy.
             Err(HWIError::UnimplementedMethod)
+        }
+    }
+
+    /// Signs with `wallet`, whatever [`Ledger::with_wallet`] set. The MuSig2 round rule
+    /// is on `sign_with`.
+    fn sign_tx_with_wallet(&self, psbt: &mut Psbt, wallet: &DeviceWallet) -> Result<(), HWIError> {
+        let policy = wallet_policy(&wallet.name, &wallet.policy)?;
+        self.sign_with(psbt, &policy, wallet.hmac.as_ref())
+    }
+
+    fn display_address_with_wallet(
+        &self,
+        script: &AddressScript,
+        wallet: &DeviceWallet,
+    ) -> Result<(), HWIError> {
+        match script {
+            AddressScript::P2TR(_) => self.display_address(script),
+            AddressScript::Miniscript { index, change } => {
+                let policy = wallet_policy(&wallet.name, &wallet.policy)?;
+                self.display_miniscript(&policy, wallet.hmac.as_ref(), *index, *change)
+            }
         }
     }
 }
@@ -202,7 +255,7 @@ impl<T: Transport> HWI for Ledger<T> {
 /// slot rule, see `bwk_psbt::musig`); without it they are ignored, as are payloads this
 /// client does not know. The app yields round 1 objects (pubnonces) when the PSBT
 /// carries no pubnonce and round 2 objects (partial signatures) otherwise, see
-/// [`HWI::sign_tx`] on [`Ledger`].
+/// [`Ledger::sign_with`].
 fn merge_yields(
     psbt: &mut Psbt,
     yields: Vec<(usize, SignPsbtYieldedObject)>,
@@ -565,6 +618,39 @@ mod tests {
             merge_yields(&mut psbt, vec![(1, pub_nonce_yield(None))]),
             Err(HWIError::DeviceDidNotSign)
         ));
+    }
+
+    const KEY_A: &str = "[aabbccdd/87'/1'/0'/2]tpubDExA3EC3iAsPxPhFn4j6gMiVup6V2eH3qKyk69RcTc9TTNRfFYVPad8bJD5FCHVQxyBT4izKsvr7Btd2R4xmQ1hZkvsqGBaeE82J71uTK4N";
+    const KEY_B: &str = "[73c5da0a/87'/1'/0'/0]tpubDCtKfsNyRhULjZ9XMS4VKKtVcPdVDi8MKUbcSD9MJDyjRu1A2ND5MiipozyyspBT9bg8upEp7a8EAgFxNxXn1d7QkdbL52Ty5jiSLcxPt1P";
+
+    fn assert_wallet_policy(policy: &str, template: &str) {
+        let wallet = wallet_policy("my wallet", policy).unwrap();
+        assert_eq!(wallet.name, "my wallet");
+        assert_eq!(wallet.version, WalletVersion::V2);
+        assert_eq!(wallet.descriptor_template, template);
+        assert!(
+            wallet.keys
+                == vec![
+                    WalletPubKey::from_str(KEY_A).unwrap(),
+                    WalletPubKey::from_str(KEY_B).unwrap(),
+                ]
+        );
+    }
+
+    #[test]
+    fn wallet_policy_musig() {
+        assert_wallet_policy(
+            &format!("tr(musig({KEY_A},{KEY_B})/<512;513>/*)"),
+            "tr(musig(@0,@1)/<512;513>/*)",
+        );
+    }
+
+    #[test]
+    fn wallet_policy_sortedmulti() {
+        assert_wallet_policy(
+            &format!("wsh(sortedmulti(2,{KEY_A}/**,{KEY_B}/**))"),
+            "wsh(sortedmulti(2,@0/**,@1/**))",
+        );
     }
 
     // This is a foolproof test in case next rust-bitcoin version introduces again the m/

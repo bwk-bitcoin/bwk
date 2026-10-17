@@ -2,7 +2,7 @@
 
 use std::{str::FromStr, time::Duration};
 
-use bitcoin::bip32::DerivationPath;
+use bitcoin::bip32::{DerivationPath, Fingerprint, Xpub};
 use bwk_hwi::{ledger::LedgerSimulator, HWI};
 use regex::Regex;
 use speculos::{Button, Speculos};
@@ -10,11 +10,15 @@ use speculos::{Button, Speculos};
 /// /reset does not fully clear the embedded app's wallet-policy text
 /// buffer or prior register-wallet state, so we boot per-test.
 pub fn fresh_speculos() -> Speculos {
-    let model = std::env::var("SPECULOS_MODEL")
+    Speculos::launch_model(speculos_model()).expect("Speculos::launch_model")
+}
+
+/// The device `SPECULOS_MODEL` names.
+pub fn speculos_model() -> speculos::Model {
+    std::env::var("SPECULOS_MODEL")
         .expect("SPECULOS_MODEL")
         .parse::<speculos::Model>()
-        .expect("parse model");
-    Speculos::launch_model(model).expect("Speculos::launch_model")
+        .expect("parse model")
 }
 
 pub fn connect_to(sim: &Speculos) -> LedgerSimulator {
@@ -29,9 +33,48 @@ pub fn get_xpub_for_path(device: &LedgerSimulator, path: &str) -> String {
     let xpub = device
         .get_extended_pubkey(&derivation)
         .expect("get_extended_pubkey");
-    let path_in_origin = derivation.to_string();
-    let path_in_origin = path_in_origin.trim_start_matches("m/");
-    format!("[{fp:x}/{path_in_origin}]{xpub}")
+    key_origin(fp, &derivation, &xpub)
+}
+
+/// `[fp/path]xpub`, the key text of a wallet policy.
+pub fn key_origin(fingerprint: Fingerprint, path: &DerivationPath, xpub: &Xpub) -> String {
+    let path = path.to_string();
+    let path = path.trim_start_matches("m/");
+    format!("[{fingerprint:x}/{path}]{xpub}")
+}
+
+/// `tr(internal, and_v(v:pk(leaf), older(50)))` single-leaf miniscript.
+pub fn tr_1leaf_policy(internal: &str, leaf: &str) -> String {
+    format!("tr({internal}/**,and_v(v:pk({leaf}/**),older(50)))")
+}
+
+/// Registration of `tr_1leaf_policy` with the device key as the internal key.
+pub const REGISTER_STEPS_TR_1LEAF_ACK: &[(&str, Button)] = &[
+    ("Review account", Button::Right),
+    ("Account name", Button::Right),
+    ("Wallet policy", Button::Right),
+    ("Review co-signer", Button::Right),
+    ("Our key@0 (1/3)", Button::Right),
+    ("Our key@0 (2/3)", Button::Right),
+    ("Our key@0 (3/3)", Button::Right),
+    ("Their key@1 (1/3)", Button::Right),
+    ("Their key@1 (2/3)", Button::Right),
+    ("Their key@1 (3/3)", Button::Right),
+    ("Register account", Button::Both),
+];
+
+/// Display of a `tr_1leaf_policy` address.
+pub const DISPLAY_STEPS_TR_1LEAF: &[(&str, Button)] = &[
+    ("Verify bitcoin", Button::Right),
+    ("Address (1/2)", Button::Right),
+    ("Address (2/2)", Button::Right),
+    ("Account name", Button::Right),
+    ("Confirm", Button::Both),
+];
+
+/// Whether `text` was shown since `sim` started.
+pub fn screen_seen(sim: &Speculos, text: &str) -> bool {
+    sim.events().unwrap().iter().any(|e| e.text == text)
 }
 
 pub fn run_steps(sim: &Speculos, steps: &[(&str, Button)]) {
@@ -115,4 +158,155 @@ pub fn sign_steps(ack: bool, from_screen: bool, to_pages: u32) -> Vec<(String, B
 
 pub fn sign_step_refs(steps: &[(String, Button)]) -> Vec<(&str, Button)> {
     steps.iter().map(|(s, b)| (s.as_str(), *b)).collect()
+}
+
+/// `HwiService` over Speculos: the service finds the simulator on the port it polls.
+#[cfg(feature = "service")]
+pub mod service {
+    use std::{
+        net::{Ipv4Addr, SocketAddr, TcpListener},
+        path::Path,
+        time::{Duration, Instant},
+    };
+
+    use bitcoin::Network;
+    use bwk_hwi::service::{HwiService, SigningDevice, SigningDeviceMsg, SupportedDevice};
+    use crossbeam::channel::{self, Receiver};
+    use speculos::{Button, SpawnOptions, Speculos};
+
+    use crate::common::{
+        speculos::{run_steps, speculos_model},
+        SPECULOS_DEFAULT_FINGERPRINT,
+    };
+
+    /// The APDU port `HwiService` polls for the Ledger simulator.
+    const SERVICE_APDU_PORT: u16 = 9999;
+    /// How long the service gets to list the device or to answer a request.
+    const SERVICE_TIMEOUT: Duration = Duration::from_secs(30);
+    /// The Ledger simulator in the service's device map.
+    pub const SERVICE_DEVICE_ID: &str = "ledger-simulator";
+
+    /// The message type of the test service.
+    #[derive(Debug, Clone)]
+    pub struct Msg(pub SigningDeviceMsg<u64>);
+
+    impl From<SigningDeviceMsg<u64>> for Msg {
+        fn from(msg: SigningDeviceMsg<u64>) -> Self {
+            Self(msg)
+        }
+    }
+
+    /// Speculos on the port the service polls, and a started `HwiService` listing it.
+    /// Dropping it stops the service before Speculos goes.
+    pub struct SpeculosService {
+        pub service: HwiService<Msg, u64>,
+        pub rx: Receiver<Msg>,
+        pub sim: Speculos,
+    }
+
+    impl SpeculosService {
+        /// Waits for the port of the previous test's Speculos, launches Speculos on it,
+        /// starts the service and waits until it lists the device as supported.
+        pub fn launch() -> Self {
+            let apdu = SocketAddr::from((Ipv4Addr::LOCALHOST, SERVICE_APDU_PORT));
+            wait_for_free_port(apdu);
+            let elf = std::env::var("SPECULOS_ELF").expect("SPECULOS_ELF");
+            let options = SpawnOptions {
+                apdu: Some(apdu),
+                api: None,
+                seed: None,
+            };
+            let sim = Speculos::launch_with(Path::new(&elf), speculos_model(), options).unwrap();
+            let service = HwiService::new(Network::Testnet);
+            let (sender, rx) = channel::unbounded();
+            service.start(sender);
+            let this = Self { service, rx, sim };
+            this.wait_for_device();
+            this
+        }
+
+        fn wait_for_device(&self) {
+            let deadline = Instant::now() + SERVICE_TIMEOUT;
+            while Instant::now() < deadline {
+                if let Some(SigningDevice::Supported(device)) =
+                    self.service.list().get(SERVICE_DEVICE_ID)
+                {
+                    assert_eq!(
+                        format!("{:x}", device.fingerprint()),
+                        SPECULOS_DEFAULT_FINGERPRINT
+                    );
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            panic!("the service did not list {SERVICE_DEVICE_ID} as supported");
+        }
+
+        /// The Ledger simulator as the service lists it.
+        pub fn device(&self) -> SupportedDevice<Msg, u64> {
+            match self.service.list().get(SERVICE_DEVICE_ID) {
+                Some(SigningDevice::Supported(device)) => device.clone(),
+                other => panic!("{SERVICE_DEVICE_ID} is not supported: {other:?}"),
+            }
+        }
+
+        /// Sends request `id` through `call`, walks `steps` while it runs, then returns its
+        /// answer.
+        pub fn request(
+            &self,
+            id: u64,
+            steps: &[(&str, Button)],
+            call: impl FnOnce(&SupportedDevice<Msg, u64>, u64),
+        ) -> SigningDeviceMsg<u64> {
+            call(&self.device(), id);
+            run_steps(&self.sim, steps);
+            self.expect_msg(id, SERVICE_TIMEOUT)
+        }
+
+        /// The next message answering request `id`, skipping `Update`, polling errors and
+        /// answers to other requests.
+        pub fn expect_msg(&self, id: u64, timeout: Duration) -> SigningDeviceMsg<u64> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let Msg(msg) = self
+                    .rx
+                    .recv_timeout(left)
+                    .unwrap_or_else(|e| panic!("no answer to request {id}: {e}"));
+                if request_id(&msg) == Some(id) {
+                    return msg;
+                }
+            }
+        }
+    }
+
+    impl Drop for SpeculosService {
+        fn drop(&mut self) {
+            self.service.stop();
+        }
+    }
+
+    fn request_id(msg: &SigningDeviceMsg<u64>) -> Option<u64> {
+        match msg {
+            SigningDeviceMsg::Error(id, _) => *id,
+            SigningDeviceMsg::Update => None,
+            SigningDeviceMsg::XPub(id, ..)
+            | SigningDeviceMsg::Version(id, ..)
+            | SigningDeviceMsg::WalletRegistered(id, ..)
+            | SigningDeviceMsg::WalletIsRegistered(id, ..)
+            | SigningDeviceMsg::AddressDisplayed(id, ..)
+            | SigningDeviceMsg::TransactionSigned(id, ..) => Some(*id),
+        }
+    }
+
+    /// The Speculos container of the previous test leaves within seconds of its kill.
+    fn wait_for_free_port(addr: SocketAddr) {
+        let deadline = Instant::now() + SERVICE_TIMEOUT;
+        while TcpListener::bind(addr).is_err() {
+            if Instant::now() > deadline {
+                panic!("{addr} is taken: the service polls only this port for Speculos, free it");
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
 }

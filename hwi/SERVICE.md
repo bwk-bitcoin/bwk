@@ -67,7 +67,8 @@ pub enum SigningDeviceMsg<Id = ()> {
     XPub(Id, Fingerprint, DerivationPath, Xpub),
     /// Device version retrieved
     Version(Id, Fingerprint, Version),
-    /// Wallet registered with optional HMAC
+    /// Wallet registered with optional HMAC (Ledger), to send back in
+    /// `DeviceWallet::hmac`
     WalletRegistered(Id, Fingerprint, String, Option<[u8; 32]>),
     /// Wallet registration check result
     WalletIsRegistered(Id, Fingerprint, String, bool),
@@ -198,9 +199,44 @@ for (id, device) in devices {
         // Sign a PSBT
         // Results arrive via SigningDeviceMsg::TransactionSigned
         // supported.sign_tx((), psbt);
+
+        // Sign a PSBT or display a miniscript address of a registered wallet: the
+        // name and policy given to register_wallet, and the HMAC it answered
+        use bwk_hwi::DeviceWallet;
+        // From SigningDeviceMsg::WalletRegistered(_, _, _, Some(hmac))
+        let hmac: [u8; 32] = registered_hmac;
+        let wallet = DeviceWallet {
+            name: "My Wallet".into(),
+            policy: "wsh(sortedmulti(2,[aabbccdd/48'/1'/0'/2']tpub.../**,...))".into(),
+            hmac: Some(hmac),
+        };
+        // Results arrive via SigningDeviceMsg::TransactionSigned
+        // supported.sign_tx_with_wallet((), psbt, wallet.clone());
+        // Results arrive via SigningDeviceMsg::AddressDisplayed
+        supported.display_address_with_wallet(
+            (),
+            &AddressScript::Miniscript { index: 0, change: false },
+            wallet,
+        );
     }
 }
 ```
+
+### Ledger
+
+The Ledger holds no wallet: every signing request and every miniscript address
+display needs the wallet policy and the HMAC `register_wallet` answered
+(`SigningDeviceMsg::WalletRegistered`). Send them with `sign_tx_with_wallet` and
+`display_address_with_wallet`; the HMAC covers the wallet name, so the name must be
+the one given at registration. Plain `sign_tx` answers `Error(Some(id), "Unimplemented
+method")` and a miniscript `display_address` `Error(Some(id), "Missing policy")`. A
+wrong HMAC is refused by the device (`Error(Some(id), ..)` with status
+`IncorrectData`). Other devices hold their registered policies and ignore the wallet
+sent with these two requests. The HMAC is never logged.
+
+`get_extended_pubkey` of a path the app refuses to export silently asks again with
+the xpub shown on the device: app 2.4.x exports BIP-87 account xpubs (`m/87'/..`)
+only after the user approves them, 2.5.0 and later without a screen.
 
 ### Using Request IDs
 

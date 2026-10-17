@@ -72,6 +72,28 @@ impl From<bip389::ParseError> for Error {
 
 impl std::error::Error for Error {}
 
+/// A wallet policy as registered on a device, sent with each request that needs it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DeviceWallet {
+    /// Name given at registration (Ledger's HMAC covers it).
+    pub name: String,
+    /// Descriptor with keys inline, as given to `register_wallet`.
+    pub policy: String,
+    /// HMAC returned by `register_wallet` (Ledger), `None` otherwise.
+    pub hmac: Option<[u8; 32]>,
+}
+
+/// Shows whether an HMAC is set, never its bytes.
+impl Debug for DeviceWallet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceWallet")
+            .field("name", &self.name)
+            .field("policy", &self.policy)
+            .field("hmac", &self.hmac.map(|_| ".."))
+            .finish()
+    }
+}
+
 /// HWI is the common Hardware Wallet Interface.
 pub trait HWI: Debug {
     /// Return the device kind
@@ -92,6 +114,20 @@ pub trait HWI: Debug {
     fn display_address(&self, script: &AddressScript) -> Result<(), Error>;
     /// Sign a partially signed bitcoin transaction (PSBT).
     fn sign_tx(&self, tx: &mut Psbt) -> Result<(), Error>;
+    /// Sign `tx` for `wallet`. Devices that hold their policies ignore `wallet`.
+    fn sign_tx_with_wallet(&self, tx: &mut Psbt, wallet: &DeviceWallet) -> Result<(), Error> {
+        let _ = wallet;
+        self.sign_tx(tx)
+    }
+    /// Display an address of `wallet`. Devices that hold their policies ignore `wallet`.
+    fn display_address_with_wallet(
+        &self,
+        script: &AddressScript,
+        wallet: &DeviceWallet,
+    ) -> Result<(), Error> {
+        let _ = wallet;
+        self.display_address(script)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

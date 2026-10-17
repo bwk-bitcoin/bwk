@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use bitcoin::{
     absolute::LockTime,
+    bip32::{DerivationPath, Fingerprint, Xpub},
     hashes::Hash,
     key::{Secp256k1, XOnlyPublicKey},
     psbt::Psbt,
@@ -27,8 +28,12 @@ use bwk_descriptor::{
     updater::update_input,
     wallet::{WalletDefiniteDescriptor, WalletDescriptor, WalletDescriptorExt},
 };
-use bwk_hwi::{ledger::LedgerSimulator, Error as HWIError, HWI};
-use bwk_keys::musig::MusigKey;
+use bwk_hwi::{
+    ledger::{bitcoin_client::wallet::WalletPubKey, LedgerSimulator},
+    utils::extract_keys_and_template,
+    Error as HWIError, HWI,
+};
+use bwk_keys::{musig::MusigKey, nums::bip341_nums};
 use bwk_psbt::musig::{
     musig_input_pub_nonces, remove_musig_input_pub_nonces, set_musig_input_pub_nonce,
 };
@@ -46,29 +51,34 @@ pub const WALLET_NAME: &str = "musig";
 const COIN_SATS: u64 = 100_000;
 const SPEND_SATS: u64 = 90_000;
 
+/// The screens of an xpub export the user approves (app 2.4.6 asks for `m/87'/1'/0'`).
+pub const APPROVE_XPUB_STEPS: &[(&str, Button)] = &[
+    ("Confirm public key", Button::Right),
+    ("Path", Button::Right),
+    ("Public key (1/3)", Button::Right),
+    ("Public key (2/3)", Button::Right),
+    ("Public key (3/3)", Button::Right),
+    ("Approve public key", Button::Both),
+];
+
 /// The Ledger's BIP-87 cosigner role key `[fp/87'/1'/0'/2]tpub`. The app only exports
 /// `m/87'/1'/0'` after the user approves it on screen.
 pub fn ledger_role_key(sim: &Speculos) -> OXpub {
     let device = connect_to(sim).display_xpub(true).unwrap();
     let fingerprint = device.get_master_fingerprint().unwrap();
-    let path = bip87_account_path(NetworkKind::Test, 0);
-    let task = {
-        let path = path.clone();
-        std::thread::spawn(move || device.get_extended_pubkey(&path))
-    };
-    run_steps(
-        sim,
-        &[
-            ("Confirm public key", Button::Right),
-            ("Path", Button::Right),
-            ("Public key (1/3)", Button::Right),
-            ("Public key (2/3)", Button::Right),
-            ("Public key (3/3)", Button::Right),
-            ("Approve public key", Button::Both),
-        ],
-    );
-    let xpub = task.join().unwrap().unwrap();
-    Bip87Account::new(fingerprint, path, xpub)
+    let task = std::thread::spawn(move || device.get_extended_pubkey(&ledger_account_path()));
+    run_steps(sim, APPROVE_XPUB_STEPS);
+    cosigner_role_key(fingerprint, task.join().unwrap().unwrap())
+}
+
+/// `m/87'/1'/0'`, the BIP-87 account the Ledger's role key comes from.
+pub fn ledger_account_path() -> DerivationPath {
+    bip87_account_path(NetworkKind::Test, 0)
+}
+
+/// The cosigner role key of the account `xpub` at `ledger_account_path`.
+pub fn cosigner_role_key(fingerprint: Fingerprint, xpub: Xpub) -> OXpub {
+    Bip87Account::new(fingerprint, ledger_account_path(), xpub)
         .unwrap()
         .role_key(KeyType::Cosigner, 0)
         .unwrap()
@@ -132,6 +142,32 @@ fn nums_tr(placeholder: MusigKey, leaf: TapTree<MusigKey>) -> WalletDescriptor {
     };
     let nums = unspendable_internal_key(&tr).unwrap();
     Descriptor::new_tr(nums, Some(leaf)).unwrap()
+}
+
+/// The registration screens of `policy`: one "Our key", "Their key" or "Dummy key"
+/// (the BIP-341 NUMS point) review per key, in policy order.
+pub fn register_steps(policy: &str, ledger_key: &OXpub) -> Vec<(String, Button)> {
+    let (_, keys) = extract_keys_and_template::<WalletPubKey>(policy).unwrap();
+    let mut steps: Vec<(String, Button)> = vec![
+        ("Review account".into(), Button::Right),
+        ("Account name".into(), Button::Right),
+        ("Wallet policy".into(), Button::Right),
+        ("Review co-signer".into(), Button::Right),
+    ];
+    for (i, key) in keys.iter().enumerate() {
+        let owner = if key.inner == ledger_key.xkey {
+            "Our"
+        } else if key.inner.public_key == bip341_nums() {
+            "Dummy"
+        } else {
+            "Their"
+        };
+        for page in 1..=3 {
+            steps.push((format!("{owner} key@{i} ({page}/3)"), Button::Right));
+        }
+    }
+    steps.push(("Register account".into(), Button::Both));
+    steps
 }
 
 /// The BIP-390 text the Ledger registers.

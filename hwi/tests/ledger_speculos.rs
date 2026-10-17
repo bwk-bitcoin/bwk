@@ -12,7 +12,8 @@ use common::{
     build_wpkh_test_psbt,
     speculos::{
         connect_to, fresh_speculos, get_xpub_for_path, register_for_hmac, run_steps,
-        sign_step_refs, sign_steps,
+        sign_step_refs, sign_steps, tr_1leaf_policy, DISPLAY_STEPS_TR_1LEAF,
+        REGISTER_STEPS_TR_1LEAF_ACK,
     },
     SPECULOS_BIP84_TESTNET_XPUB, SPECULOS_DEFAULT_FINGERPRINT,
 };
@@ -797,12 +798,6 @@ fn speculos_sign_bip86_tr_reject() {
     run_sign_bip86_tr(false);
 }
 
-// `tr(internal, and_v(v:pk(leaf), older(50)))` single-leaf miniscript.
-
-fn tr_1leaf_policy(internal: &str, leaf: &str) -> String {
-    format!("tr({internal}/**,and_v(v:pk({leaf}/**),older(50)))")
-}
-
 fn probe_register_tr_1leaf(ack: bool) {
     let sim = fresh_speculos();
     let device = connect_to(&sim);
@@ -833,20 +828,6 @@ fn probe_register_tr_1leaf(ack: bool) {
         }
     }
 }
-
-const REGISTER_STEPS_TR_1LEAF_ACK: &[(&str, Button)] = &[
-    ("Review account", Button::Right),
-    ("Account name", Button::Right),
-    ("Wallet policy", Button::Right),
-    ("Review co-signer", Button::Right),
-    ("Our key@0 (1/3)", Button::Right),
-    ("Our key@0 (2/3)", Button::Right),
-    ("Our key@0 (3/3)", Button::Right),
-    ("Their key@1 (1/3)", Button::Right),
-    ("Their key@1 (2/3)", Button::Right),
-    ("Their key@1 (3/3)", Button::Right),
-    ("Register account", Button::Both),
-];
 
 #[test]
 #[ignore = "requires SPECULOS_ELF"]
@@ -899,16 +880,7 @@ fn run_display_tr_miniscript_1leaf() {
             change: false,
         })
     });
-    run_steps(
-        &sim,
-        &[
-            ("Verify bitcoin", Button::Right),
-            ("Address (1/2)", Button::Right),
-            ("Address (2/2)", Button::Right),
-            ("Account name", Button::Right),
-            ("Confirm", Button::Both),
-        ],
-    );
+    run_steps(&sim, DISPLAY_STEPS_TR_1LEAF);
     task.join().unwrap().expect("display_address tr-1leaf");
 }
 
