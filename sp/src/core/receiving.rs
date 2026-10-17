@@ -115,10 +115,13 @@ pub fn eligible_input_pubkey(input: &TxIn, prevout: &TxOut) -> Result<Option<Pub
         if !script_sig.is_empty() {
             return Err(Error::InvalidInput("non-empty P2TR scriptSig".to_string()));
         }
-        let has_annex = witness
-            .last()
-            .and_then(|item| item.first())
-            .is_some_and(|byte| *byte == 0x50);
+        // BIP341: the last element is an annex only when there are at least
+        // two, so a lone key-path signature starting with 0x50 is not one.
+        let has_annex = witness.len() > 1
+            && witness
+                .last()
+                .and_then(|item| item.first())
+                .is_some_and(|byte| *byte == 0x50);
         let stack_len = witness.len() - usize::from(has_annex);
         if stack_len == 0 {
             return Err(Error::InvalidInput("empty P2TR witness".to_string()));

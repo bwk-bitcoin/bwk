@@ -2417,6 +2417,43 @@ mod tests {
         );
     }
 
+    /// BIP341 only reads an annex when the witness has at least two elements:
+    /// a lone key-path signature whose first byte is 0x50 (1 in 256 Schnorr
+    /// signatures) is still the signature.
+    #[test]
+    fn p2tr_key_path_signature_starting_with_annex_tag_is_eligible() {
+        let secp = Secp256k1::new();
+        let secret = SecretKey::from_slice(&[1; 32]).unwrap();
+        let (xonly, _) = secret.public_key(&secp).x_only_public_key();
+        let mut p2tr = vec![0x51, 0x20];
+        p2tr.extend(xonly.serialize());
+        let prevout = TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(p2tr),
+        };
+        let mut signature = vec![0; 64];
+        signature[0] = 0x50;
+        let txin = |witness: &[Vec<u8>]| bitcoin::TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::new(),
+            sequence: bitcoin::Sequence::ZERO,
+            witness: bitcoin::Witness::from_slice(witness),
+        };
+        let key = Some(PublicKey::from_x_only_public_key(xonly, Parity::Even));
+
+        let key_path = txin(&[signature.clone()]);
+        assert_eq!(
+            crate::core::receiving::eligible_input_pubkey(&key_path, &prevout).unwrap(),
+            key
+        );
+
+        let key_path_with_annex = txin(&[signature, vec![0x50]]);
+        assert_eq!(
+            crate::core::receiving::eligible_input_pubkey(&key_path_with_annex, &prevout).unwrap(),
+            key
+        );
+    }
+
     #[test]
     fn reads_the_internal_key_of_a_taproot_script_path_spend() {
         let secp = Secp256k1::new();
