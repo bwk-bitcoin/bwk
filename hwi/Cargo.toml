@@ -34,9 +34,13 @@ jade = ["regex", "serde", "serde_bytes", "serde_cbor", "serialport", "ureq"]
 ledger = ["byteorder", "hex", "hidapi", "ledger-apdu", "log", "miniscript", "regex"]
 regex = ["dep:regex"]
 service = ["bitbox", "coldcard", "jade", "ledger", "specter", "tracing", "hex", "crossbeam"]
+# MuSig2 yields of the Ledger app written as BIP-373 fields. bwk-sign and bwk-bup are
+# dev-dependencies: their `musig` only applies to this crate's own tests.
+musig = ["dep:bwk-psbt", "bwk-psbt/musig", "bwk-sign/musig", "bwk-bup/musig"]
 
 [dependencies]
 bitcoin = { version = "0.32", default-features = false, features = ["base64", "serde", "std"] }
+bwk-psbt = { workspace = true, optional = true }
 thiserror.workspace = true
 
 # specter & jade
@@ -85,3 +89,8 @@ hex-literal = "1.1"
 speculos = "0.1"
 regex = "1"
 miniscript.workspace = true
+bwk-sign.workspace = true
+bwk-bup.workspace = true
+bwk-descriptor.workspace = true
+bwk-keys.workspace = true
+bwk-psbt.workspace = true

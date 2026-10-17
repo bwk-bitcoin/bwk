@@ -61,15 +61,58 @@ The `service` module provides automatic device discovery and management with sup
 for multiple concurrent consumers. See [SERVICE.md](SERVICE.md) for detailed
 documentation and usage examples.
 
+## Ledger MuSig2
+
+The `musig` feature (off by default, forwarded by `bwk-sign/musig`) makes the Ledger a
+MuSig2 cosigner: `Ledger::sign_tx` writes what the app yields as BIP-373 fields through
+`bwk_psbt::musig`, keyed by the participant, the aggregate and the leaf hash exactly as
+the device yields them. Without it MuSig2 yields are ignored.
+
+```text
++---------------------------------+---------------------------------------------+
+| yield                           | written to psbt.inputs[i]                   |
++---------------------------------+---------------------------------------------+
+| Partial(Sig(key, sig))          | partial_sigs                                |
+| Partial(TapScriptSig(k,Some,s)) | tap_script_sigs                             |
+| Partial(TapScriptSig(_,None,s)) | tap_key_sig                                 |
+| MusigPubNonce (musig)           | 0x1b via set_musig_input_pub_nonce          |
+| MusigPartialSignature (musig)   | 0x1c via set_musig_input_partial_sig        |
+| MusigPubNonce / PartialSig      | ignored without the musig feature           |
+| Unknown, any other variant      | ignored                                     |
++---------------------------------+---------------------------------------------+
+```
+
+Round rule: the app runs MuSig2 round 2 whenever the PSBT carries any
+`PSBT_IN_MUSIG2_PUB_NONCE`, and round 1 (pubnonces only, no user approval when it signs
+musig keys only) otherwise. The caller sends round 1 with every pubnonce removed
+(`bwk_psbt::musig::remove_musig_input_pub_nonces` on a copy) and merges the device's
+nonces into the shared PSBT, then sends round 2 once every participant's nonce is
+there, with the same unsigned transaction. `sign_tx` does not strip nonces itself. A
+round 1 sent with a cosigner's nonce runs round 2: after the approval the app asks for
+its own missing pubnonce, the client cannot answer, and `sign_tx` fails with
+`Error::Device("Interpreter(\n    UnknownHash,\n)")`.
+
+The PSBT goes to the device as bwk's updater writes it: next to the aggregate's
+`[agg_fp]/<a or a+1>/i` `tap_key_origins` entry, each cosigner's own
+`[fp/87'/1'/0'/R]` entry. App 2.4.6 accepts it (it only matches musig() keys against
+2-step entries under the aggregate's fingerprint), so nothing is stripped.
+
+Registration and address checks of `musig()` policies work as is: the client's paranoid
+check replaces each `musig()` by its aggregate xpub before miniscript parses the
+descriptor.
+
 ## Speculos tests
 
 `tests/ledger_speculos.rs` drives `LedgerSimulator` against the Ledger Bitcoin Test
-app running under [Speculos](https://github.com/LedgerHQ/speculos). The tests are
+app running under [Speculos](https://github.com/LedgerHQ/speculos), and
+`tests/ledger_musig_speculos.rs` (features `ledger,musig`) registers bwk-bup 2-of-2
+`tr(musig(L,H))` and `tr(NUMS,pk(musig(L,H)))` policies and spends both through the two
+MuSig2 rounds with a bwk `HotSigner` as the other cosigner. The tests are
 `#[ignore]`d; run them with `tests/speculos/run.sh [nanox|nanosp]`, or `just test-ledger`
 in `hwi/` for both devices. Docker is the only prerequisite.
 
 `run.sh` builds the app ELF with the pinned builder image (cached in
-`target/speculos-cache/`), then runs `cargo test` with `SPECULOS_BIN` pointing at
+`target/speculos-cache/`), then runs both test binaries with `SPECULOS_BIN` pointing at
 `tests/speculos/speculos-docker.sh`, which runs the pinned Speculos image for the
 `speculos` crate and removes its container when the crate kills it.
 

@@ -146,6 +146,42 @@ pub(crate) fn replace_musigs(desc: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    use miniscript::{Descriptor, DescriptorPublicKey};
+
+    use crate::ledger::bitcoin_client::wallet::{Version, WalletPolicy, WalletPubKey};
+
+    const PLAIN_KEY: &str = "tpubDCwYjpDhUdPGQWG6wG6hkBJuWFZEtrn7j3xwG3i8XcQabcGC53xWZm1hSXrUPFS5UvZ3QhdPSjXWNfWmFGTioARHuG5J7XguEjgg7p8PxAm";
+    const COSIGNER_A: &str = "[76223a6e/87'/1'/0'/2]tpubDE7NQymr4AFtewpAsWtnreyq9ghkzQBXpCZjWLFVRAvnbf7vya2eMTvT2fPapNqL8SuVvLQdbUbMfWLVDCZKnsEBqp6UK93QEzL8Ck23AwF";
+    const COSIGNER_B: &str = "[f5acc2fd/87'/1'/0'/2]tpubDFAqEGNyad35aBCKUAXbQGDjdVhNueno5ZZVEn3sQbW5ci457gLR7HyTmHBg93oourBssgUxuWz1jX5uhc1qaqFo9VsybY1J5FuedLfm4dK";
+
+    // The paranoid client path: a policy's descriptor with its musig() keys replaced
+    // by their aggregate must parse as a miniscript descriptor, for both change values.
+    fn assert_policy_parses(template: &str, keys: &[&str]) {
+        let keys = keys
+            .iter()
+            .map(|k| WalletPubKey::from_str(k).unwrap())
+            .collect::<Vec<_>>();
+        let policy = WalletPolicy::new("t".to_string(), Version::V2, template.to_string(), keys);
+        for change in [false, true] {
+            let desc = replace_musigs(&policy.get_descriptor(change).unwrap()).unwrap();
+            assert!(!desc.contains("musig("), "{desc}");
+            Descriptor::<DescriptorPublicKey>::from_str(&desc).unwrap();
+        }
+    }
+
+    #[test]
+    fn replace_musigs_parses_musig_leaf_policy() {
+        assert_policy_parses(
+            "tr(@0/<2147483646;2147483647>/*,pk(musig(@1,@2)/<512;513>/*))",
+            &[PLAIN_KEY, COSIGNER_A, COSIGNER_B],
+        );
+    }
+
+    #[test]
+    fn replace_musigs_parses_musig_key_path_policy() {
+        assert_policy_parses("tr(musig(@0,@1)/<0;1>/*)", &[COSIGNER_A, COSIGNER_B]);
+    }
+
     #[test]
     fn test_replace_musigs() {
         // (input, expected_output): None means the result should be an error

@@ -46,4 +46,4 @@ sp = []
 # dependency does not exist) resolves cleanly. Code paths that touch `bwk_hwi`
 # are additionally gated with `not(target_os = "android")`.
 hwi = ["dep:bwk-hwi"]
-musig = ["bwk-descriptor/musig", "bwk-psbt/musig", "bwk-keys/musig", "dep:bwk-musig", "dep:getrandom", "bwk-bup/musig"]
+musig = ["bwk-descriptor/musig", "bwk-psbt/musig", "bwk-keys/musig", "dep:bwk-musig", "dep:getrandom", "bwk-bup/musig", "bwk-hwi?/musig"]

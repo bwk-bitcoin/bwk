@@ -165,7 +165,8 @@ attached signing manager under `Notification::Signer`). Call
   anchor then rests on proof of work alone); without it, opening one is an
   error.
 - `musig`: MuSig2 wallets: `WalletKey` becomes `MusigKey`, BIP-373 fields, hot
-  signer rounds; forwarded by bwk-keys, bwk-psbt, bwk-descriptor, bwk-sign.
+  signer rounds, Ledger MuSig2 yields; forwarded by bwk-keys, bwk-psbt,
+  bwk-descriptor, bwk-sign, bwk-hwi.
 - `test`: see below.
 
 ## Testing

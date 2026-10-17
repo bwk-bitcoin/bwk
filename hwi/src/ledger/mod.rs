@@ -25,6 +25,11 @@ use crate::{
     parse_version, utils, AddressScript, DeviceKind, Error as HWIError, HWI,
 };
 
+#[cfg(feature = "musig")]
+use bwk_psbt::musig::{
+    set_musig_input_partial_sig, set_musig_input_pub_nonce, MusigPartialSig, MusigPubNonce,
+};
+
 pub mod bitcoin_client;
 mod transport_hidapi;
 
@@ -167,32 +172,82 @@ impl<T: Transport> HWI for Ledger<T> {
         }
     }
 
+    /// Signs with the registered policy and merges what the device yields into `psbt`
+    /// (see [`merge_yields`]).
+    ///
+    /// MuSig2 round rule: the app runs MuSig2 round 2 whenever the PSBT carries any
+    /// PSBT_IN_MUSIG2_PUB_NONCE, and round 1 (pubnonces only, no user approval when it
+    /// signs musig keys only) otherwise. Send round 1 with every pubnonce removed
+    /// (`bwk_psbt::musig::remove_musig_input_pub_nonces` on a copy) and merge the
+    /// device's nonces into the shared PSBT; send round 2 once every participant's
+    /// nonce is present, with the same unsigned transaction. This method does not strip
+    /// nonces: the round decision belongs to the caller.
     fn sign_tx(&self, psbt: &mut Psbt) -> Result<(), HWIError> {
         if let Some((policy, hmac)) = &self.options.wallet {
             let yielded_objects = self.client.sign_psbt(psbt, policy, hmac.as_ref())?;
-            for (i, obj) in yielded_objects {
-                let input = psbt.inputs.get_mut(i).ok_or(HWIError::DeviceDidNotSign)?;
-                // Ignore MuSig2 and unknown payloads.
-                if let SignPsbtYieldedObject::Partial(sig) = obj {
-                    match sig {
-                        PartialSignature::Sig(key, sig) => {
-                            input.partial_sigs.insert(key, sig);
-                        }
-                        PartialSignature::TapScriptSig(key, Some(tapleaf_hash), sig) => {
-                            input.tap_script_sigs.insert((key, tapleaf_hash), sig);
-                        }
-                        PartialSignature::TapScriptSig(_, None, sig) => {
-                            input.tap_key_sig = Some(sig);
-                        }
-                    }
-                }
-            }
-            Ok(())
+            merge_yields(psbt, yielded_objects)
         } else {
             // Ledger cannot sign without policy.
             Err(HWIError::UnimplementedMethod)
         }
     }
+}
+
+/// Writes the objects yielded by `sign_psbt` into `psbt`.
+///
+/// Plain signatures go to `partial_sigs`, `tap_script_sigs` or `tap_key_sig`. With the
+/// `musig` feature, MuSig2 pubnonces become PSBT_IN_MUSIG2_PUB_NONCE (0x1b) and MuSig2
+/// partial signatures PSBT_IN_MUSIG2_PARTIAL_SIG (0x1c) entries, keyed by the
+/// participant, the aggregate and the leaf hash as the device yields them (the BIP-373
+/// slot rule, see `bwk_psbt::musig`); without it they are ignored, as are payloads this
+/// client does not know. The app yields round 1 objects (pubnonces) when the PSBT
+/// carries no pubnonce and round 2 objects (partial signatures) otherwise, see
+/// [`HWI::sign_tx`] on [`Ledger`].
+fn merge_yields(
+    psbt: &mut Psbt,
+    yields: Vec<(usize, SignPsbtYieldedObject)>,
+) -> Result<(), HWIError> {
+    for (i, obj) in yields {
+        let input = psbt.inputs.get_mut(i).ok_or(HWIError::DeviceDidNotSign)?;
+        match obj {
+            SignPsbtYieldedObject::Partial(PartialSignature::Sig(key, sig)) => {
+                input.partial_sigs.insert(key, sig);
+            }
+            SignPsbtYieldedObject::Partial(PartialSignature::TapScriptSig(
+                key,
+                Some(tapleaf_hash),
+                sig,
+            )) => {
+                input.tap_script_sigs.insert((key, tapleaf_hash), sig);
+            }
+            SignPsbtYieldedObject::Partial(PartialSignature::TapScriptSig(_, None, sig)) => {
+                input.tap_key_sig = Some(sig);
+            }
+            #[cfg(feature = "musig")]
+            SignPsbtYieldedObject::MusigPubNonce(n) => set_musig_input_pub_nonce(
+                input,
+                &MusigPubNonce {
+                    participant: n.participant_pubkey.inner,
+                    aggregate: n.aggregate_pubkey.inner,
+                    leaf_hash: n.tapleaf_hash,
+                    nonce: n.pubnonce,
+                },
+            ),
+            #[cfg(feature = "musig")]
+            SignPsbtYieldedObject::MusigPartialSignature(s) => set_musig_input_partial_sig(
+                input,
+                &MusigPartialSig {
+                    participant: s.participant_pubkey.inner,
+                    aggregate: s.aggregate_pubkey.inner,
+                    leaf_hash: s.tapleaf_hash,
+                    signature: s.partial_signature,
+                },
+            ),
+            // MuSig2 yields without the musig feature, unknown payloads, future variants.
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn key_string_from_parts(fg: Fingerprint, path: DerivationPath, xpub: Xpub) -> String {
@@ -340,6 +395,177 @@ mod tests {
 
     use super::*;
     use std::str::FromStr;
+
+    use crate::ledger::bitcoin_client::protocol;
+    use bitcoin::{
+        absolute::LockTime,
+        ecdsa,
+        hashes::Hash,
+        secp256k1::{Keypair, Message, PublicKey, Secp256k1, SecretKey},
+        taproot::{self, TapLeafHash},
+        transaction::Version as TxVersion,
+        TapSighashType, Transaction, TxIn,
+    };
+
+    #[cfg(feature = "musig")]
+    use bwk_psbt::musig::{musig_input_partial_sigs, musig_input_pub_nonces};
+
+    fn key(byte: u8) -> SecretKey {
+        SecretKey::from_slice(&[byte; 32]).unwrap()
+    }
+
+    fn pubkey(byte: u8) -> PublicKey {
+        key(byte).public_key(&Secp256k1::new())
+    }
+
+    fn one_input_psbt() -> Psbt {
+        Psbt::from_unsigned_tx(Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![],
+        })
+        .unwrap()
+    }
+
+    fn leaf() -> TapLeafHash {
+        TapLeafHash::from_byte_array([7; 32])
+    }
+
+    fn pub_nonce_yield(leaf_hash: Option<TapLeafHash>) -> SignPsbtYieldedObject {
+        SignPsbtYieldedObject::MusigPubNonce(protocol::MusigPubNonce {
+            participant_pubkey: bitcoin::PublicKey::new(pubkey(1)),
+            aggregate_pubkey: bitcoin::PublicKey::new(pubkey(2)),
+            tapleaf_hash: leaf_hash,
+            pubnonce: [0xaa; 66],
+        })
+    }
+
+    fn partial_sig_yield(leaf_hash: Option<TapLeafHash>) -> SignPsbtYieldedObject {
+        SignPsbtYieldedObject::MusigPartialSignature(protocol::MusigPartialSignature {
+            participant_pubkey: bitcoin::PublicKey::new(pubkey(1)),
+            aggregate_pubkey: bitcoin::PublicKey::new(pubkey(2)),
+            tapleaf_hash: leaf_hash,
+            partial_signature: [0xbb; 32],
+        })
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn merge_yields_writes_musig_pubnonce() {
+        for leaf_hash in [None, Some(leaf())] {
+            let mut psbt = one_input_psbt();
+            merge_yields(&mut psbt, vec![(0, pub_nonce_yield(leaf_hash))]).unwrap();
+            assert_eq!(
+                musig_input_pub_nonces(&psbt.inputs[0]).unwrap(),
+                vec![MusigPubNonce {
+                    participant: pubkey(1),
+                    aggregate: pubkey(2),
+                    leaf_hash,
+                    nonce: [0xaa; 66],
+                }]
+            );
+        }
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn merge_yields_writes_musig_partial_sig() {
+        for leaf_hash in [None, Some(leaf())] {
+            let mut psbt = one_input_psbt();
+            merge_yields(&mut psbt, vec![(0, partial_sig_yield(leaf_hash))]).unwrap();
+            assert_eq!(
+                musig_input_partial_sigs(&psbt.inputs[0]).unwrap(),
+                vec![MusigPartialSig {
+                    participant: pubkey(1),
+                    aggregate: pubkey(2),
+                    leaf_hash,
+                    signature: [0xbb; 32],
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn merge_yields_keeps_plain_signatures() {
+        let secp = Secp256k1::new();
+        let message = Message::from_digest([1; 32]);
+        let ecdsa_sig = ecdsa::Signature::sighash_all(secp.sign_ecdsa(&message, &key(3)));
+        let keypair = Keypair::from_secret_key(&secp, &key(4));
+        let xonly = keypair.x_only_public_key().0;
+        let schnorr_sig = taproot::Signature {
+            signature: secp.sign_schnorr_no_aux_rand(&message, &keypair),
+            sighash_type: TapSighashType::Default,
+        };
+        let ecdsa_key = bitcoin::PublicKey::new(pubkey(3));
+        let mut psbt = one_input_psbt();
+        merge_yields(
+            &mut psbt,
+            vec![
+                (
+                    0,
+                    SignPsbtYieldedObject::Partial(PartialSignature::Sig(ecdsa_key, ecdsa_sig)),
+                ),
+                (
+                    0,
+                    SignPsbtYieldedObject::Partial(PartialSignature::TapScriptSig(
+                        xonly,
+                        Some(leaf()),
+                        schnorr_sig,
+                    )),
+                ),
+                (
+                    0,
+                    SignPsbtYieldedObject::Partial(PartialSignature::TapScriptSig(
+                        xonly,
+                        None,
+                        schnorr_sig,
+                    )),
+                ),
+            ],
+        )
+        .unwrap();
+        let input = &psbt.inputs[0];
+        assert_eq!(input.partial_sigs.get(&ecdsa_key), Some(&ecdsa_sig));
+        assert_eq!(
+            input.tap_script_sigs.get(&(xonly, leaf())),
+            Some(&schnorr_sig)
+        );
+        assert_eq!(input.tap_key_sig, Some(schnorr_sig));
+        assert!(input.unknown.is_empty());
+    }
+
+    #[test]
+    fn merge_yields_ignores_unknown() {
+        let mut psbt = one_input_psbt();
+        merge_yields(
+            &mut psbt,
+            vec![(0, SignPsbtYieldedObject::Unknown(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        assert_eq!(psbt, one_input_psbt());
+    }
+
+    #[cfg(not(feature = "musig"))]
+    #[test]
+    fn merge_yields_ignores_musig_without_feature() {
+        let mut psbt = one_input_psbt();
+        merge_yields(
+            &mut psbt,
+            vec![(0, pub_nonce_yield(None)), (0, partial_sig_yield(None))],
+        )
+        .unwrap();
+        assert_eq!(psbt, one_input_psbt());
+    }
+
+    #[test]
+    fn merge_yields_rejects_out_of_range_input() {
+        let mut psbt = one_input_psbt();
+        assert!(matches!(
+            merge_yields(&mut psbt, vec![(1, pub_nonce_yield(None))]),
+            Err(HWIError::DeviceDidNotSign)
+        ));
+    }
 
     // This is a foolproof test in case next rust-bitcoin version introduces again the m/
     #[test]

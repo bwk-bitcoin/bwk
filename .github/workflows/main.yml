@@ -181,4 +181,6 @@ jobs:
           SPECULOS_ELF: ${{ github.workspace }}/ledger_app/app.elf
           SPECULOS_BIN: ${{ github.workspace }}/hwi/tests/speculos/speculos-docker.sh
           SPECULOS_MODEL: ${{ matrix.device }}
-        run: cargo test -p bwk-hwi --features ledger --test ledger_speculos -- --ignored --nocapture --test-threads=1
+        run: |
+          cargo test -p bwk-hwi --features ledger --test ledger_speculos -- --ignored --nocapture --test-threads=1
+          cargo test -p bwk-hwi --features ledger,musig --test ledger_musig_speculos -- --ignored --nocapture --test-threads=1

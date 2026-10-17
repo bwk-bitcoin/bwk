@@ -95,10 +95,13 @@ echo "==> Using speculos: $SPECULOS_BIN ($SPECULOS_IMAGE)"
 # Remove Speculos containers left by a run that was killed mid-flight.
 docker ps -aq --filter name=bwk-speculos- | xargs -r docker rm -f >/dev/null
 
-# Run the ignored speculos tests.
+# Run the ignored speculos tests; a filter in EXTRA_ARGS applies to both binaries.
 export SPECULOS_ELF="$ELF"
 export SPECULOS_MODEL="$DEVICE"
 echo "==> SPECULOS_ELF=$SPECULOS_ELF SPECULOS_MODEL=$SPECULOS_MODEL"
 cargo test --features ledger --test ledger_speculos -- \
+    --ignored --nocapture --test-threads=1 \
+    "${EXTRA_ARGS[@]}"
+cargo test --features ledger,musig --test ledger_musig_speculos -- \
     --ignored --nocapture --test-threads=1 \
     "${EXTRA_ARGS[@]}"

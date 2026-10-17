@@ -5,6 +5,10 @@
 
 #[cfg(all(feature = "coldcard", unix))]
 pub mod coldcard_sim;
+#[cfg(all(feature = "ledger", feature = "musig"))]
+pub mod musig;
+#[cfg(feature = "ledger")]
+pub mod speculos;
 
 use std::{
     str::FromStr,
