@@ -60,6 +60,27 @@ The `service` module provides automatic device discovery and management with sup
 for multiple concurrent consumers. See [SERVICE.md](SERVICE.md) for detailed
 documentation and usage examples.
 
+## Speculos tests
+
+`tests/ledger_speculos.rs` drives `LedgerSimulator` against the Ledger Bitcoin Test
+app running under [Speculos](https://github.com/LedgerHQ/speculos). The tests are
+`#[ignore]`d; run them with `tests/speculos/run.sh [nanox|nanosp]`, or `just test-ledger`
+in `hwi/` for both devices. Docker is the only prerequisite.
+
+`run.sh` builds the app ELF with the pinned builder image (cached in
+`target/speculos-cache/`), then runs `cargo test` with `SPECULOS_BIN` pointing at
+`tests/speculos/speculos-docker.sh`, which runs the pinned Speculos image for the
+`speculos` crate and removes its container when the crate kills it.
+
+`tests/speculos/versions.env` pins every input, for `run.sh` and CI alike: the app
+version (`LEDGER_APP_VERSION=2.4.6`), the builder image and the Speculos image, both
+by digest. 2.4.6 is the newest 2.4.x, runs the same MuSig2 round model as 2.4.2, and
+its screens are the ones the tests expect (2.4.2 fails 33 of the 44 tests).
+
+- `SPECULOS_ELF`: a prebuilt ELF of `LEDGER_APP_VERSION` for the device, used as is
+  instead of building one.
+- `SPECULOS_BIN`: overrides the wrapper (e.g. a local `speculos`).
+
 ## License
 
 - bwk code: MIT, see [LICENSE-MIT](LICENSE-MIT)

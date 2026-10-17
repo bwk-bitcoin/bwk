@@ -82,6 +82,8 @@ fn speculos_get_version() {
     // Pinned to app-bitcoin-new 2.4.6 in CI.
     assert_eq!(version.major, 2, "got version {version}");
     assert_eq!(version.minor, 4, "got version {version}");
+    // versions.env LEDGER_APP_VERSION
+    assert_eq!(version.patch, 6, "got version {version}");
 }
 
 #[test]
@@ -1539,7 +1541,8 @@ fn speculos_sign_wpkh_unverified_inputs() {
         &sim,
         &[
             ("Security risk", Button::Right),
-            ("Update your wallet software", Button::Right),
+            // Speculos reports the two lines of this page apart.
+            ("software", Button::Right),
             ("Continue anyway", Button::Both),
             ("Review transaction", Button::Right),
             ("Amount", Button::Right),

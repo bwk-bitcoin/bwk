@@ -8,6 +8,6 @@ test-ledger:
         tests/speculos/run.sh "$device"
     done
 
-# Wipe cargo build outputs and the speculos cache (built .elfs, venv, logs).
+# Wipe cargo build outputs and the speculos cache (built .elfs).
 clean:
     cargo clean

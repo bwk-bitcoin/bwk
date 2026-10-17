@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn test_replace_musigs() {
-        // (input, expected_output) — None means the result should be an error
+        // (input, expected_output): None means the result should be an error
         let cases: &[(&str, Option<&str>)] = &[
             // No musig: descriptor is returned unchanged
             (

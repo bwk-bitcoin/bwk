@@ -354,7 +354,9 @@ pub fn build_wsh_test_psbt_with_sequence(
 }
 
 /// Re-parse the descriptor and return the receive-side pubkey for each
-/// key at child index `child` (under the `0` multipath branch).
+/// key at child index `child` (under the `0` multipath branch), in
+/// declaration order. For `tr()` the internal key comes first, then the
+/// leaf keys in tree order (`for_each_key` visits the leaves first).
 fn extract_descriptor_pubkeys(
     policy: &str,
     expected_count: &usize,
@@ -369,13 +371,28 @@ fn extract_descriptor_pubkeys(
         .into_iter()
         .next()
         .expect("at least one branch");
-    let mut pks = Vec::with_capacity(*expected_count);
-    single.for_each_key(|k: &DescriptorPublicKey| {
+    let derive = |k: &DescriptorPublicKey| {
         let derived = k.clone().at_derivation_index(child).expect("at child");
-        let pk = derived.derive_public_key(secp).expect("derive_public_key");
-        pks.push(pk.inner);
-        true
-    });
+        derived
+            .derive_public_key(secp)
+            .expect("derive_public_key")
+            .inner
+    };
+    let mut pks = Vec::with_capacity(*expected_count);
+    match &single {
+        Descriptor::Tr(tr) => {
+            pks.push(derive(tr.internal_key()));
+            for (_depth, ms) in tr.iter_scripts() {
+                pks.extend(ms.iter_pk().map(|k| derive(&k)));
+            }
+        }
+        _ => {
+            single.for_each_key(|k: &DescriptorPublicKey| {
+                pks.push(derive(k));
+                true
+            });
+        }
+    }
     pks
 }
 
