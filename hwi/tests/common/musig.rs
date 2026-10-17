@@ -9,7 +9,8 @@ use bitcoin::{
     bip32::{DerivationPath, Fingerprint, Xpub},
     hashes::Hash,
     key::{Secp256k1, XOnlyPublicKey},
-    psbt::{Input, Psbt},
+    psbt::Psbt,
+    relative,
     secp256k1::{schnorr, Message, PublicKey, SecretKey},
     sighash::{Prevouts, SighashCache},
     taproot::{LeafVersion, TapLeafHash},
@@ -25,6 +26,7 @@ use bwk_bup::{
 };
 use bwk_descriptor::{
     musig::musig_descriptor_to_string,
+    restrict::{restrict_input_to_key_path, restrict_input_to_leaf},
     updater::{update_input, update_output},
     wallet::{WalletDefiniteDescriptor, WalletDescriptor, WalletDescriptorExt},
 };
@@ -37,7 +39,6 @@ use bwk_keys::{musig::MusigKey, nums::bip341_nums};
 use bwk_psbt::musig::{
     musig_input_partial_sigs, musig_input_pub_nonces, remove_musig_input_partial_sigs,
     remove_musig_input_pub_nonces, set_musig_input_partial_sig, set_musig_input_pub_nonce,
-    PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS,
 };
 use bwk_sign::{hot_signer::HotSigner, musig::aggregate_partial_sigs};
 use miniscript::{descriptor::TapTree, psbt::PsbtExt, Descriptor};
@@ -49,6 +50,8 @@ use crate::common::speculos::{connect_to, run_steps};
 pub const WALLET_NAME: &str = "musig";
 const COIN_SATS: u64 = 100_000;
 const SPEND_SATS: u64 = 90_000;
+/// The relative timelock of `key_path_2_of_2_with_recovery`'s recovery leaf.
+const RECOVERY_BLOCKS: u16 = 144;
 /// The fee of `offline_psbt`.
 const OFFLINE_FEE: Amount = Amount::from_sat(1_000);
 
@@ -169,6 +172,31 @@ pub fn policy_2_of_3(a: &OXpub, b: &OXpub, c: &OXpub) -> WalletDescriptor {
     descriptor
 }
 
+/// bwk-bup's 2-of-2 of `a` and `c` with a recovery path for `b` after 144 blocks:
+/// `musig(a,c)` as the internal key, a spendable key path next to the leaf.
+pub fn key_path_2_of_2_with_recovery(a: &OXpub, b: &OXpub, c: &OXpub) -> WalletDescriptor {
+    let primary = Semantic::Multi {
+        keys: vec![a.clone(), c.clone()],
+        threshold: 2,
+    };
+    let paths = vec![
+        Path::new(primary, Locktime::None, TapPosition::TapTree(vec![])),
+        Path::new(
+            Semantic::Single(b.clone()),
+            Locktime::Relative(relative::LockTime::from_height(RECOVERY_BLOCKS)),
+            TapPosition::TapTree(vec![]),
+        ),
+    ];
+    let mut policy = Policy::new(paths, PolicyType::Csv).unwrap();
+    let descriptor = policy.compile().unwrap().clone();
+    let Descriptor::Tr(tr) = &descriptor else {
+        panic!("expected tr()");
+    };
+    assert!(tr.internal_key().is_musig());
+    assert_eq!(tr.iter_scripts().count(), 1);
+    descriptor
+}
+
 /// A tr() whose only leaf is `leaf`, under the NUMS internal key bwk-bup derives
 /// from it (`placeholder` stands in for the internal key until then).
 fn nums_tr(placeholder: MusigKey, leaf: TapTree<MusigKey>) -> WalletDescriptor {
@@ -262,21 +290,11 @@ pub fn spend_leaf(
         .unwrap()
 }
 
-/// Only `leaf`: its script and the 0x1a of `aggregate`. Port of
-/// sign/tests/musig_core_interop.rs:285-300 (af8cdf5) without the `tap_key_origins`
-/// restriction: the Coldcard matches an input against the enrolled wallet by its
-/// whole origin list (`MiniScriptWallet.matching_subpaths`, coldcard/firmware
-/// 04e949d6 `shared/wallet.py`) and skips an input that lists only the leaf's keys.
-fn keep_leaf(input: &mut Input, leaf: TapLeafHash, aggregate: PublicKey) {
-    input
-        .tap_scripts
-        .retain(|_, (script, version)| TapLeafHash::from_script(script, *version) == leaf);
-    input.unknown.retain(|key, _| {
-        key.type_value != PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS || key.key == aggregate.serialize()
-    });
-}
-
-/// `psbt` restricted to the leaf of `signers` (keep_leaf on every input).
+/// `psbt` restricted to the leaf of `signers` as `bwk::Account::restrict_spend_path`
+/// does it (`bwk_descriptor::restrict`). Every key origin stays: the Coldcard matches
+/// an input against the enrolled wallet by its whole origin list
+/// (`MiniScriptWallet.matching_subpaths`, coldcard/firmware 04e949d6
+/// `shared/wallet.py`).
 pub fn restrict_to_leaf(
     psbt: &mut Psbt,
     descriptor: &WalletDescriptor,
@@ -284,27 +302,43 @@ pub fn restrict_to_leaf(
     index: u32,
     signers: [Fingerprint; 2],
 ) {
-    let (leaf, aggregate) = spend_leaf(descriptor, keychain, index, signers);
+    let (leaf, _) = spend_leaf(descriptor, keychain, index, signers);
+    let Descriptor::Tr(tr) = derived(descriptor, keychain, index) else {
+        panic!("expected tr()");
+    };
+    let (_, ms) = tr
+        .iter_scripts()
+        .find(|(_, ms)| TapLeafHash::from_script(&ms.encode(), LeafVersion::TapScript) == leaf)
+        .unwrap();
     for input in &mut psbt.inputs {
-        keep_leaf(input, leaf, aggregate);
+        restrict_input_to_leaf(input, ms);
     }
 }
 
-/// 1-in 1-out PSBT spending a fake funding output of `value` at (keychain, index) of
-/// `descriptor` to `output`, the input filled by bwk's updater.
-fn spend_coin(
+/// `psbt` restricted to the key path as `bwk::Account::restrict_spend_path` does it.
+pub fn restrict_to_key_path(
+    psbt: &mut Psbt,
+    descriptor: &WalletDescriptor,
+    keychain: usize,
+    index: u32,
+) {
+    let Descriptor::Tr(tr) = derived(descriptor, keychain, index) else {
+        panic!("expected tr()");
+    };
+    for input in &mut psbt.inputs {
+        restrict_input_to_key_path(input, &tr);
+    }
+}
+
+/// A transaction paying `value` to (keychain, index) of `descriptor` at vout 0,
+/// spending nothing real.
+fn fake_funding(
     descriptor: &WalletDescriptor,
     keychain: usize,
     index: u32,
     value: Amount,
-    output: TxOut,
-) -> Psbt {
-    let definite = derived(descriptor, keychain, index);
-    let coin = TxOut {
-        value,
-        script_pubkey: definite.script_pubkey(),
-    };
-    let funding = Transaction {
+) -> Transaction {
+    Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
@@ -313,25 +347,46 @@ fn spend_coin(
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
         }],
-        output: vec![coin.clone()],
-    };
+        output: vec![TxOut {
+            value,
+            script_pubkey: derived(descriptor, keychain, index).script_pubkey(),
+        }],
+    }
+}
+
+/// 1-in 1-out PSBT spending output `vout` of `prev_tx`, the coin at (keychain, index)
+/// of `descriptor`, to `to` minus `fee`; the input filled by bwk's updater, the output
+/// left as is.
+pub fn psbt_spending(
+    descriptor: &WalletDescriptor,
+    keychain: usize,
+    index: u32,
+    prev_tx: &Transaction,
+    vout: u32,
+    to: ScriptBuf,
+    fee: Amount,
+) -> Psbt {
+    let coin = prev_tx.output[vout as usize].clone();
     let tx = Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
             previous_output: OutPoint {
-                txid: funding.compute_txid(),
-                vout: 0,
+                txid: prev_tx.compute_txid(),
+                vout,
             },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
         }],
-        output: vec![output],
+        output: vec![TxOut {
+            value: coin.value - fee,
+            script_pubkey: to,
+        }],
     };
     let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
     psbt.inputs[0].witness_utxo = Some(coin);
-    update_input(&mut psbt, 0, &definite).unwrap();
+    update_input(&mut psbt, 0, &derived(descriptor, keychain, index)).unwrap();
     psbt
 }
 
@@ -343,11 +398,16 @@ pub fn spend_psbt(descriptor: &WalletDescriptor) -> Psbt {
         .unwrap()
         .x_only_public_key(&secp)
         .0;
-    let output = TxOut {
-        value: Amount::from_sat(SPEND_SATS),
-        script_pubkey: ScriptBuf::new_p2tr(&secp, external, None),
-    };
-    spend_coin(descriptor, 0, 0, Amount::from_sat(COIN_SATS), output)
+    let funding = fake_funding(descriptor, 0, 0, Amount::from_sat(COIN_SATS));
+    psbt_spending(
+        descriptor,
+        0,
+        0,
+        &funding,
+        0,
+        ScriptBuf::new_p2tr(&secp, external, None),
+        Amount::from_sat(COIN_SATS - SPEND_SATS),
+    )
 }
 
 /// 1-in 1-out PSBT spending a fake funding output of `value` at (keychain, index) of
@@ -360,11 +420,16 @@ pub fn offline_psbt(
     value: Amount,
 ) -> Psbt {
     let receive_0 = derived(descriptor, 0, 0);
-    let output = TxOut {
-        value: value - OFFLINE_FEE,
-        script_pubkey: receive_0.script_pubkey(),
-    };
-    let mut psbt = spend_coin(descriptor, keychain, index, value, output);
+    let funding = fake_funding(descriptor, keychain, index, value);
+    let mut psbt = psbt_spending(
+        descriptor,
+        keychain,
+        index,
+        &funding,
+        0,
+        receive_0.script_pubkey(),
+        OFFLINE_FEE,
+    );
     update_output(&mut psbt, 0, &receive_0).unwrap();
     psbt
 }

@@ -7,6 +7,7 @@ use std::sync::Mutex;
 
 use bitcoin::{
     bip32::{ChildNumber, DerivationPath, Fingerprint, Xpub},
+    key::XOnlyPublicKey,
     psbt::Psbt,
 };
 
@@ -29,6 +30,7 @@ use crate::{
 use bwk_psbt::musig::{
     set_musig_input_partial_sig, set_musig_input_pub_nonce, MusigPartialSig, MusigPubNonce,
 };
+use bwk_psbt::taproot::is_partial_tap_tree;
 
 pub mod bitcoin_client;
 mod transport_hidapi;
@@ -85,7 +87,7 @@ impl<T: Transport> Ledger<T> {
     ) -> Result<(), HWIError> {
         let yielded_objects = self
             .client
-            .sign_psbt(psbt, policy, hmac)
+            .sign_psbt(&ledger_view(psbt), policy, hmac)
             .map_err(|e| sign_error(e, psbt))?;
         merge_yields(psbt, yielded_objects)
     }
@@ -103,6 +105,30 @@ impl<T: Transport> Ledger<T> {
             .map_err(HWIError::from)?;
         Ok(())
     }
+}
+
+/// `psbt` as it is sent to the device: without the `tap_key_origins` entries that
+/// have no leaf hash and are not a 0x1a participant, nor the internal key on an input
+/// whose `tap_scripts` hold the whole tree. These are the keys outside the spend path
+/// of a restricted PSBT (`bwk::Account::restrict_spend_path`, which keeps them all for
+/// the Coldcard). App 2.4.6 takes every musig() aggregate listed there as one more
+/// spend, whatever the leaf hashes and `tap_scripts` say: it yields a pubnonce for each
+/// in round 1, then fails round 2 on the cosigners' missing ones. And it would sign the
+/// key path of a PSBT restricted to a leaf.
+fn ledger_view(psbt: &Psbt) -> Psbt {
+    let mut view = psbt.clone();
+    for input in &mut view.inputs {
+        let participants: Vec<XOnlyPublicKey> = utils::musig_participants(input)
+            .map(|participant| participant.x_only_public_key().0)
+            .collect();
+        let internal = input
+            .tap_internal_key
+            .filter(|_| !is_partial_tap_tree(input));
+        input.tap_key_origins.retain(|key, (leaf_hashes, _)| {
+            !leaf_hashes.is_empty() || Some(*key) == internal || participants.contains(key)
+        });
+    }
+    view
 }
 
 /// The policy sent to the device for `policy` (keys inline) under `name`. Ledger's HMAC
@@ -472,9 +498,9 @@ mod tests {
         hashes::Hash,
         psbt::raw,
         secp256k1::{Keypair, Message, PublicKey, Secp256k1, SecretKey},
-        taproot::{self, TapLeafHash},
+        taproot::{self, LeafVersion, TapLeafHash, TaprootBuilder},
         transaction::Version as TxVersion,
-        TapSighashType, Transaction, TxIn,
+        ScriptBuf, TapSighashType, Transaction, TxIn,
     };
 
     #[cfg(feature = "musig")]
@@ -708,6 +734,72 @@ mod tests {
             sign_error(device_error(StatusWord::Deny), &psbt),
             HWIError::UserRefused
         ));
+    }
+
+    #[test]
+    fn ledger_view_drops_the_keys_outside_the_leaf() {
+        let path = DerivationPath::from_str("m/87'/1'/0'/2/0").unwrap();
+        let x_only = |byte| pubkey(byte).x_only_public_key().0;
+        let mut psbt = one_input_psbt();
+        let input = &mut psbt.inputs[0];
+        input.tap_internal_key = Some(x_only(1));
+        input.unknown.insert(
+            raw::Key {
+                type_value: 0x1a,
+                key: pubkey(9).serialize().to_vec(),
+            },
+            [pubkey(2).serialize(), pubkey(3).serialize()].concat(),
+        );
+        // internal key, the leaf's aggregate and participants, two keys outside it
+        for (byte, leaf_hashes) in [
+            (1, vec![]),
+            (2, vec![]),
+            (3, vec![leaf()]),
+            (4, vec![leaf()]),
+            (5, vec![]),
+            (6, vec![]),
+        ] {
+            input.tap_key_origins.insert(
+                x_only(byte),
+                (leaf_hashes, (Fingerprint::from([byte; 4]), path.clone())),
+            );
+        }
+
+        let view = ledger_view(&psbt);
+
+        let kept: Vec<_> = view.inputs[0].tap_key_origins.keys().copied().collect();
+        let mut expected = vec![x_only(1), x_only(2), x_only(3), x_only(4)];
+        expected.sort();
+        assert_eq!(kept, expected);
+        let mut without_origins = view.clone();
+        without_origins.inputs[0].tap_key_origins = psbt.inputs[0].tap_key_origins.clone();
+        assert_eq!(without_origins, psbt);
+
+        // one leaf of two listed: restricted to it, the key path is not asked
+        let secp = Secp256k1::new();
+        let leaves = [
+            ScriptBuf::from_bytes(vec![0x51]),
+            ScriptBuf::from_bytes(vec![0x52]),
+        ];
+        let info = TaprootBuilder::new()
+            .add_leaf(1, leaves[0].clone())
+            .unwrap()
+            .add_leaf(1, leaves[1].clone())
+            .unwrap()
+            .finalize(&secp, x_only(1))
+            .unwrap();
+        let leaf = (leaves[0].clone(), LeafVersion::TapScript);
+        psbt.inputs[0]
+            .tap_scripts
+            .insert(info.control_block(&leaf).unwrap(), leaf);
+        let kept: Vec<_> = ledger_view(&psbt).inputs[0]
+            .tap_key_origins
+            .keys()
+            .copied()
+            .collect();
+        let mut expected = vec![x_only(2), x_only(3), x_only(4)];
+        expected.sort();
+        assert_eq!(kept, expected);
     }
 
     // This is a foolproof test in case next rust-bitcoin version introduces again the m/

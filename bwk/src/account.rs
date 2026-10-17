@@ -44,11 +44,12 @@ use bwk_coin::{
     TAPROOT_KEYSPEND_SATISFACTION_WU,
 };
 #[cfg(feature = "musig")]
-use bwk_descriptor::wallet::{WalletDefiniteKey, WalletDescriptorExt, WalletKey};
+use bwk_descriptor::{
+    restrict::{restrict_input_to_key_path, restrict_input_to_leaf},
+    wallet::{WalletDefiniteKey, WalletDescriptorExt, WalletKey},
+};
 #[cfg(feature = "musig")]
 use bwk_keys::{musig::MusigKey, nums};
-#[cfg(feature = "musig")]
-use bwk_tx::bwk_psbt::musig::PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS;
 use miniscript::{
     bitcoin::{self, secp256k1::Secp256k1, Txid},
     psbt::PsbtExt,
@@ -58,14 +59,12 @@ use miniscript::{
     bitcoin::{
         absolute,
         bip32::Fingerprint,
-        psbt::Input,
         relative,
-        secp256k1::PublicKey,
         taproot::{LeafVersion, TapLeafHash, TAPROOT_CONTROL_BASE_SIZE, TAPROOT_CONTROL_NODE_SIZE},
-        OutPoint, Sequence, VarInt, XOnlyPublicKey,
+        OutPoint, Sequence, VarInt,
     },
     descriptor::{SinglePubKey, Tr},
-    DescriptorPublicKey, Miniscript, MiniscriptKey, Tap, Terminal, ToPublicKey,
+    DescriptorPublicKey, Miniscript, MiniscriptKey, Tap, Terminal,
 };
 
 use crate::config::Config;
@@ -1246,6 +1245,10 @@ impl<P: ScanProfile> Account<P> {
     /// leaf hashes in `tap_key_origins`, and the 0x1a entries of aggregates `path`
     /// does not use. Called on the prepared PSBT before round 1.
     ///
+    /// Every `tap_key_origins` entry stays, with no leaf hash on the key path and
+    /// for a key outside the leaf: a Coldcard skips an input whose origins do not
+    /// list every key of its enrolled wallet (`bwk_descriptor::restrict`).
+    ///
     /// Only inputs spending a coin of this account are touched. A `Leaf` hash is
     /// resolved to its depth-first position through any owned input holding it,
     /// then every owned input keeps its own leaf at that position: inputs at
@@ -1257,6 +1260,10 @@ impl<P: ScanProfile> Account<P> {
     ///
     /// A `Leaf` also writes its timelocks, which the signature covers: the leaf's
     /// `older()` as each owned input's sequence, its `after()` as the locktime.
+    ///
+    /// Signers skip the key path of a PSBT restricted to a leaf, except on a
+    /// single-leaf tree: restricted to its leaf it is the unrestricted PSBT, so a
+    /// holder of a plain internal key may still sign the key path.
     #[cfg(feature = "musig")]
     pub fn restrict_spend_path(
         &self,
@@ -1286,7 +1293,7 @@ impl<P: ScanProfile> Account<P> {
             SpendPath::KeyPath => {
                 for (input_index, input) in psbt.inputs.iter_mut().enumerate() {
                     if let Some(tr) = owned.get(&input_index) {
-                        keep_key_path(input, tr);
+                        restrict_input_to_key_path(input, tr);
                     }
                 }
             }
@@ -1315,7 +1322,7 @@ impl<P: ScanProfile> Account<P> {
                     .collect::<Result<BTreeMap<_, _>, _>>()?;
                 for (input_index, input) in psbt.inputs.iter_mut().enumerate() {
                     if let Some(ms) = leaves.get(&input_index) {
-                        keep_leaf(input, ms);
+                        restrict_input_to_leaf(input, ms);
                     }
                 }
                 set_leaf_locks(&mut psbt.unsigned_tx, &leaves);
@@ -1534,59 +1541,6 @@ fn set_leaf_locks(
             tx.lock_time = absolute::LockTime::from_consensus(lock_time);
         }
     }
-}
-
-/// Key path only: no leaf, the internal key and its cosigners' origins with no
-/// leaf hash, and the internal aggregate's 0x1a only.
-#[cfg(feature = "musig")]
-fn keep_key_path(input: &mut Input, tr: &Tr<WalletDefiniteKey>) {
-    let internal = tr.internal_key();
-    let mut keys: Vec<XOnlyPublicKey> = internal
-        .plain_keys()
-        .into_iter()
-        .map(|key| key.to_x_only_pubkey())
-        .collect();
-    keys.push(internal.to_x_only_pubkey());
-    input.tap_scripts.clear();
-    input.tap_key_origins.retain(|key, _| keys.contains(key));
-    for (leaf_hashes, _) in input.tap_key_origins.values_mut() {
-        leaf_hashes.clear();
-    }
-    keep_participants(input, internal.as_musig().map(|agg| agg.aggregate()));
-}
-
-/// Only the leaf `ms`: its script, the origins of its keys with its hash only,
-/// and the 0x1a of its aggregates.
-#[cfg(feature = "musig")]
-fn keep_leaf(input: &mut Input, ms: &Miniscript<WalletDefiniteKey, Tap>) {
-    let hash = leaf_hash(ms);
-    input
-        .tap_scripts
-        .retain(|_, (script, version)| TapLeafHash::from_script(script, *version) == hash);
-    input
-        .tap_key_origins
-        .retain(|_, (leaf_hashes, _)| leaf_hashes.contains(&hash));
-    for (leaf_hashes, _) in input.tap_key_origins.values_mut() {
-        *leaf_hashes = vec![hash];
-    }
-    keep_participants(
-        input,
-        ms.iter_pk()
-            .filter_map(|key| key.as_musig().map(|agg| agg.aggregate())),
-    );
-}
-
-/// Drops every 0x1a entry whose aggregate is not one of `aggregates`.
-#[cfg(feature = "musig")]
-fn keep_participants(input: &mut Input, aggregates: impl IntoIterator<Item = PublicKey>) {
-    let kept: Vec<[u8; 33]> = aggregates
-        .into_iter()
-        .map(|aggregate| aggregate.serialize())
-        .collect();
-    input.unknown.retain(|key, _| {
-        key.type_value != PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS
-            || kept.iter().any(|aggregate| key.key == aggregate[..])
-    });
 }
 
 impl<P: ScanProfile> AccountHistory for Account<P> {
@@ -2709,7 +2663,7 @@ mod integration_tests {
     use miniscript::{
         bitcoin::{
             absolute,
-            bip32::{ChainCode, DerivationPath, Xpub},
+            bip32::{ChainCode, DerivationPath, Fingerprint, Xpub},
             hashes::Hash,
             taproot::TapLeafHash,
             NetworkKind, OutPoint, Psbt, Sequence,
@@ -3808,6 +3762,41 @@ mod integration_tests {
         musig_descriptor_to_string(policy.compile().unwrap(), false)
     }
 
+    /// `restricted` keeps every key origin of `before`, each with only the hash of
+    /// its input's one leaf left, or none for a key outside it: the keys of `inside`
+    /// all have the hash, the keys of `outside` none.
+    #[cfg(feature = "musig")]
+    fn assert_leaf_origins(
+        before: &Psbt,
+        restricted: &Psbt,
+        inside: &[Fingerprint],
+        outside: &[Fingerprint],
+    ) {
+        for (before, after) in before.inputs.iter().zip(&restricted.inputs) {
+            let kept: Vec<TapLeafHash> = after
+                .tap_scripts
+                .values()
+                .map(|(script, version)| TapLeafHash::from_script(script, *version))
+                .collect();
+            assert_eq!(kept.len(), 1);
+            assert_eq!(
+                after.tap_key_origins.keys().collect::<Vec<_>>(),
+                before.tap_key_origins.keys().collect::<Vec<_>>()
+            );
+            for (key, (leaf_hashes, (fingerprint, path))) in &after.tap_key_origins {
+                let (before_hashes, before_source) = &before.tap_key_origins[key];
+                assert_eq!(&(*fingerprint, path.clone()), before_source);
+                if inside.contains(fingerprint) {
+                    assert_eq!(leaf_hashes, &kept);
+                }
+                if outside.contains(fingerprint) {
+                    assert!(leaf_hashes.is_empty());
+                    assert!(!before_hashes.is_empty());
+                }
+            }
+        }
+    }
+
     #[cfg(feature = "musig")]
     #[test]
     fn spend_leaves_lists_musig_key_path() {
@@ -3914,6 +3903,7 @@ mod integration_tests {
             .account
             .restrict_spend_path(&mut psbt, leaves[2].path)
             .unwrap();
+        assert_leaf_origins(&before, &psbt, &[b, c], &[a]);
         wallet.round(&mut psbt, &[1, 2]);
         wallet.round(&mut psbt, &[1, 2]);
         assert_eq!(wallet.status(&psbt), MusigRound::Ready);
@@ -3967,6 +3957,7 @@ mod integration_tests {
         assert!(matches!(ab_leaves[0].path, SpendPath::Leaf(_)));
 
         let mut psbt = wallet.psbt();
+        let before = psbt.clone();
         wallet
             .account
             .restrict_spend_path(&mut psbt, ab_leaves[0].path)
@@ -3975,6 +3966,7 @@ mod integration_tests {
             assert_eq!(input.tap_scripts.len(), 1);
             assert_eq!(musig_input_participants_all(input).unwrap().len(), 1);
         }
+        assert_leaf_origins(&before, &psbt, &ab, &[wallet.fingerprint(2)]);
         // The two inputs sit at different indexes: same leaf, different hashes.
         let hashes: BTreeSet<TapLeafHash> = psbt
             .inputs
@@ -4143,18 +4135,31 @@ mod integration_tests {
             assert_eq!(input.tap_scripts.len(), 3);
             assert_eq!(musig_input_participants_all(input).unwrap().len(), 3);
         }
+        let before = psbt.clone();
         wallet
             .account
             .restrict_spend_path(&mut psbt, SpendPath::KeyPath)
             .unwrap();
-        for input in &psbt.inputs {
+        for (input, before) in psbt.inputs.iter().zip(&before.inputs) {
             assert!(input.tap_scripts.is_empty());
             // The internal key D is plain: no aggregate is left.
             assert!(musig_input_participants_all(input).unwrap().is_empty());
-            assert_eq!(input.tap_key_origins.len(), 1);
-            let (leaf_hashes, (fingerprint, _)) = input.tap_key_origins.values().next().unwrap();
-            assert!(leaf_hashes.is_empty());
-            assert_eq!(*fingerprint, wallet.fingerprint(3));
+            // Every origin stays (a Coldcard needs them all), none with a leaf hash.
+            assert_eq!(
+                input.tap_key_origins.keys().collect::<Vec<_>>(),
+                before.tap_key_origins.keys().collect::<Vec<_>>()
+            );
+            let fingerprints: BTreeSet<Fingerprint> = input
+                .tap_key_origins
+                .values()
+                .map(|(leaf_hashes, (fingerprint, _))| {
+                    assert!(leaf_hashes.is_empty());
+                    *fingerprint
+                })
+                .collect();
+            for cosigner in 0..4 {
+                assert!(fingerprints.contains(&wallet.fingerprint(cosigner)));
+            }
         }
     }
 

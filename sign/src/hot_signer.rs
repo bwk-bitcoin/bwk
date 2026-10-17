@@ -28,7 +28,7 @@ use bwk_musig::{nonce_gen_with_rand, partial_sign, rust_bitcoin::RustBitcoin};
 use bwk_psbt::musig::{
     set_musig_input_partial_sig, set_musig_input_pub_nonce, MusigPartialSig, MusigPubNonce,
 };
-use bwk_psbt::PsbtV2;
+use bwk_psbt::{taproot::is_partial_tap_tree, PsbtV2};
 use miniscript::{
     bitcoin::{bip32::ChildNumber, hashes::Hash, key::TapTweak, ScriptBuf},
     psbt::PsbtExt,
@@ -863,6 +863,11 @@ impl HotSigner {
         let prevouts = sighash::Prevouts::All(&prevouts);
 
         let input = psbt.inputs.get_mut(index).ok_or(Error::InputIndex)?;
+        // restricted to a leaf (`bwk::Account::restrict_spend_path`): the key path is
+        // not asked, though the internal key keeps its origin
+        if is_partial_tap_tree(input) {
+            return Err(Error::NotTapKey);
+        }
 
         // Sign
         if let Some(ref int_key) = input.tap_internal_key {
@@ -2274,8 +2279,11 @@ mod tests {
 mod musig_tests {
     use std::str::FromStr;
 
+    use bwk_bup::{Locktime, OXpub, Path, Policy, PolicyType, Semantic, TapPosition};
     use bwk_descriptor::{
         descriptor::Descriptor,
+        musig::musig_descriptor_to_string,
+        restrict::restrict_input_to_leaf,
         updater::update_input,
         wallet::{WalletDescriptor, WalletDescriptorExt},
     };
@@ -2389,12 +2397,23 @@ mod musig_tests {
         TapLeafHash::from_script(&ms.encode(), LeafVersion::TapScript)
     }
 
-    fn keep_leaf(psbt: &mut Psbt, leaf_hash: TapLeafHash) {
+    /// Restricts every input to the `position`-th leaf of the receive descriptor at
+    /// `index`, as `Account::restrict_spend_path` does; its hash.
+    fn restrict_to_leaf(
+        psbt: &mut Psbt,
+        descriptor: &WalletDescriptor,
+        index: u32,
+        position: usize,
+    ) -> TapLeafHash {
+        let receive = descriptor.single_paths().unwrap()[0].clone();
+        let miniscript::Descriptor::Tr(tr) = receive.derive_at(index).unwrap() else {
+            panic!("not a tr() descriptor");
+        };
+        let (_, ms) = tr.iter_scripts().nth(position).unwrap();
         for input in &mut psbt.inputs {
-            input.tap_scripts.retain(|_, (script, version)| {
-                TapLeafHash::from_script(script, *version) == leaf_hash
-            });
+            restrict_input_to_leaf(input, ms);
         }
+        TapLeafHash::from_script(&ms.encode(), LeafVersion::TapScript)
     }
 
     /// Aggregates then runs the miniscript finalizer; the count aggregated.
@@ -2571,8 +2590,7 @@ mod musig_tests {
         );
         let d = register(&mut [&mut a, &mut b, &mut c], &text);
         let mut psbt = musig_psbt(&d, &[0]);
-        let ab_leaf = leaf_hash(&d, 0, 0);
-        keep_leaf(&mut psbt, ab_leaf);
+        let ab_leaf = restrict_to_leaf(&mut psbt, &d, 0, 0);
 
         assert_eq!(own_slots(&psbt, &d, a.fingerprint()).unwrap().len(), 1);
         assert_eq!(own_slots(&psbt, &d, b.fingerprint()).unwrap().len(), 1);
@@ -2594,6 +2612,110 @@ mod musig_tests {
 
         assert_eq!(finalize(&mut psbt, &d), 1);
         assert!(psbt.inputs[0].final_script_witness.is_some());
+    }
+
+    /// A plain internal key keeps its origin under a leaf restriction (a Coldcard
+    /// needs it): its holder C signs the key path of the whole PSBT, not of one
+    /// restricted to the leaf of A and B.
+    #[test]
+    fn plain_internal_key_skips_a_leaf_restricted_psbt() {
+        let [mut a, mut b, mut c, mut e]: [HotSigner; 4] = musig_signers(4).try_into().unwrap();
+        let text = format!(
+            "tr({}/<0;1>/*,{{pk(musig({},{})/<0;1>/*),pk({}/<0;1>/*)}})",
+            plain(&c),
+            cosigner(&a),
+            cosigner(&b),
+            plain(&e),
+        );
+        let d = register(&mut [&mut a, &mut b, &mut c, &mut e], &text);
+        let whole = musig_psbt(&d, &[0]);
+        let mut signed = whole.clone();
+        c.inner_sign(&mut signed, &d).unwrap();
+        assert!(signed.inputs[0].tap_key_sig.is_some());
+
+        let mut psbt = whole;
+        restrict_to_leaf(&mut psbt, &d, 0, 0);
+        let internal = psbt.inputs[0].tap_internal_key.unwrap();
+        assert!(psbt.inputs[0].tap_key_origins.contains_key(&internal));
+        let before = psbt.clone();
+        assert_eq!(c.inner_sign(&mut psbt, &d), Err(Error::SigningInfo));
+        assert_eq!(psbt, before);
+
+        both_round_one(&mut psbt, &d, &a, &b);
+        a.inner_sign(&mut psbt, &d).unwrap();
+        b.inner_sign(&mut psbt, &d).unwrap();
+        assert_eq!(c.inner_sign(&mut psbt, &d), Err(Error::SigningInfo));
+        assert!(psbt.inputs[0].tap_key_sig.is_none());
+        assert_eq!(finalize(&mut psbt, &d), 1);
+        assert_eq!(
+            psbt.inputs[0].final_script_witness.as_ref().unwrap().len(),
+            3
+        );
+    }
+
+    /// bwk-bup's 2-of-3 over a, b, c: three musig pair leaves and a padding leaf
+    /// under the NUMS internal key.
+    fn bup_two_of_three(signers: &mut [&mut HotSigner]) -> WalletDescriptor {
+        let path = DerivationPath::from_str(COSIGNER_PATH).unwrap();
+        let keys = signers
+            .iter()
+            .map(|signer| {
+                let xpub = signer.xpub(&path);
+                OXpub::new(Some(xpub.origin), xpub.xkey)
+            })
+            .collect();
+        let semantic = Semantic::Multi { keys, threshold: 2 };
+        let path = Path::new(semantic, Locktime::None, TapPosition::TapTree(vec![]));
+        let mut policy = Policy::new(vec![path], PolicyType::PrimaryOnly).unwrap();
+        let text = musig_descriptor_to_string(policy.compile().unwrap(), false);
+        register(signers, &text)
+    }
+
+    /// A PSBT restricted to the leaf of A and B the way `Account::restrict_spend_path`
+    /// does it keeps C's origins with no leaf hash: C signs nothing, A and B only
+    /// sign the leaf through MuSig2, never the key path or C's leaves.
+    #[test]
+    fn origins_outside_the_leaf_get_no_signature() {
+        let [mut a, mut b, mut c]: [HotSigner; 3] = musig_signers(3).try_into().unwrap();
+        let d = bup_two_of_three(&mut [&mut a, &mut b, &mut c]);
+        let mut psbt = musig_psbt(&d, &[0]);
+        let ab_leaf = restrict_to_leaf(&mut psbt, &d, 0, 0);
+        let input = &psbt.inputs[0];
+        let c_origins: Vec<_> = input
+            .tap_key_origins
+            .values()
+            .filter(|(_, (fingerprint, _))| *fingerprint == c.fingerprint())
+            .collect();
+        assert!(!c_origins.is_empty());
+        assert!(c_origins
+            .iter()
+            .all(|(leaf_hashes, _)| leaf_hashes.is_empty()));
+        assert!(
+            input
+                .tap_key_origins
+                .values()
+                .filter(|(_, (fingerprint, _))| [a.fingerprint(), b.fingerprint()]
+                    .contains(fingerprint))
+                .all(|(leaf_hashes, _)| *leaf_hashes == vec![ab_leaf])
+        );
+
+        let before = psbt.clone();
+        assert_eq!(c.inner_sign(&mut psbt, &d), Err(Error::SigningInfo));
+        assert_eq!(psbt, before);
+
+        both_round_one(&mut psbt, &d, &a, &b);
+        assert_eq!(c.inner_sign(&mut psbt, &d), Err(Error::SigningInfo));
+        a.inner_sign(&mut psbt, &d).unwrap();
+        b.inner_sign(&mut psbt, &d).unwrap();
+        assert_eq!(c.inner_sign(&mut psbt, &d), Err(Error::SigningInfo));
+        assert_eq!(round(&psbt, &d), MusigRound::Ready);
+        let input = &psbt.inputs[0];
+        assert!(input.tap_key_sig.is_none());
+        assert!(input.tap_script_sigs.is_empty());
+        let partial_sigs = musig_input_partial_sigs(input).unwrap();
+        assert_eq!(partial_sigs.len(), 2);
+        assert!(partial_sigs.iter().all(|s| s.leaf_hash == Some(ab_leaf)));
+        assert_eq!(finalize(&mut psbt, &d), 1);
     }
 
     #[test]
@@ -2988,8 +3110,7 @@ mod musig_tests {
         );
         let d = register(&mut [&mut a, &mut b], &text);
         let mut psbt = musig_psbt(&d, &[0]);
-        let recovery_leaf = leaf_hash(&d, 0, 0);
-        keep_leaf(&mut psbt, recovery_leaf);
+        let recovery_leaf = restrict_to_leaf(&mut psbt, &d, 0, 0);
         psbt.inputs[0].unknown.clear();
         let participant_key = participant(&a).x_only_public_key().0;
         psbt.inputs[0].tap_key_origins.insert(

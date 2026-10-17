@@ -37,11 +37,11 @@ service = ["bitbox", "coldcard", "jade", "ledger", "specter", "tracing", "hex", 
 # MuSig2 yields of the Ledger app written as BIP-373 fields. bwk-sign, bwk-bup,
 # bwk-descriptor and bwk-keys are dev-dependencies: their `musig` only applies to this
 # crate's own tests.
-musig = ["dep:bwk-psbt", "bwk-psbt/musig", "bwk-sign/musig", "bwk-bup/musig", "bwk-descriptor/musig", "bwk-keys/musig"]
+musig = ["bwk-psbt/musig", "bwk-sign/musig", "bwk-bup/musig", "bwk-descriptor/musig", "bwk-keys/musig"]
 
 [dependencies]
 bitcoin = { version = "0.32", default-features = false, features = ["base64", "serde", "std"] }
-bwk-psbt = { workspace = true, optional = true }
+bwk-psbt.workspace = true
 thiserror.workspace = true
 
 # specter & jade
@@ -95,4 +95,6 @@ bwk-sign.workspace = true
 bwk-bup.workspace = true
 bwk-descriptor.workspace = true
 bwk-keys.workspace = true
-bwk-psbt.workspace = true
+bwk-utils = { workspace = true, features = ["test"] }
+serde_json.workspace = true
+ureq.workspace = true

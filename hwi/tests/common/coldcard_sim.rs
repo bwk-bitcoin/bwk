@@ -31,6 +31,7 @@ pub const SEED_A_FINGERPRINT: &str = "73c5da0a";
 pub const SEED_A_BIP87_TPUB: &str = "tpubDCChhoz5Qdrkn7Z7KXawq6Ad6r3A4MUkCoVTqeWxfTkA6bHNJ3CHUEtALQdkNeixNz4446PcAmw4WKcj3mV2vb29H7sg9EPzbyCU1y2merw";
 
 const START_TIMEOUT: Duration = Duration::from_secs(90);
+const REGISTERED_TIMEOUT: Duration = Duration::from_secs(10);
 const START_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const APPROVER_POLL_INTERVAL: Duration = Duration::from_millis(300);
@@ -213,6 +214,27 @@ impl Drop for Approver {
             }
         }
     }
+}
+
+/// Enrolls `policy` as `name` with an approver running, waits (up to 10 s) until it
+/// is listed and returns the device bound to it.
+pub fn enroll(socket: &Path, coldcard: Coldcard, name: &str, policy: &str) -> Coldcard {
+    let approver = Approver::spawn(socket);
+    assert_eq!(coldcard.register_wallet(name, policy).unwrap(), None);
+    let deadline = Instant::now() + REGISTERED_TIMEOUT;
+    while !matches!(coldcard.is_wallet_registered(name, policy), Ok(true)) {
+        assert!(
+            Instant::now() < deadline,
+            "{name} not registered after {REGISTERED_TIMEOUT:?}"
+        );
+        thread::sleep(Duration::from_millis(500));
+    }
+    let stories = approver.stories();
+    println!("stories seen while enrolling: {stories:#?}");
+    assert!(stories
+        .iter()
+        .any(|(title, body)| title.contains("miniscript") || body.contains("miniscript")));
+    coldcard.with_wallet_name(name.to_owned())
 }
 
 /// `title\0body` as `cap_story` writes it; `None` when no story is shown.

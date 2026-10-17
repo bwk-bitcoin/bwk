@@ -413,16 +413,23 @@ again from round 1 with every signer.
 +----------+--------------------------------------------------------------------+
 | Ledger   | SW_BAD_STATE (0xB007) on a PSBT carrying a pubnonce (0x1b): round  |
 |          | 2 without the session round 1 stored (restart, round 2 sent twice) |
-| Coldcard | "musig needs restart" or "resign" in the error, or "Signing failed |
-|          | late" on a PSBT where the device is a MuSig2 participant (round 1  |
-|          | holding its own pubnonce after a restart, round 1 sent twice)      |
+| Coldcard | "musig needs restart" or "resign" as a line of the error, or       |
+|          | "Signing failed late" on a PSBT where the device is a MuSig2       |
+|          | participant (round 1 holding its own pubnonce after a restart,     |
+|          | round 1 sent twice)                                                |
 +----------+--------------------------------------------------------------------+
 ```
 
 The same SW_BAD_STATE without a pubnonce, and "Signing failed late" on a PSBT the
 Coldcard is no MuSig2 participant of, stay `Error::Device`.
 
-A Coldcard answer keeps its BIP-373 entries: participants (0x1a), pubnonces (0x1b)
-and partial signatures (0x1c) are copied into the PSBT next to the signatures. The
-Coldcard only signs an input whose `tap_key_origins` list every key of the enrolled
-wallet: a PSBT restricted to one leaf must keep them all.
+"Signing failed late" is all the Coldcard answers for any failure after the user
+approved: on a participant PSBT it is read as a lost session, but it may hide another
+late failure, whose reason is only shown on the device screen.
+
+A Coldcard answer keeps its own BIP-373 entries: the pubnonces (0x1b) and partial
+signatures (0x1c) whose participant key has a `tap_key_origins` entry with the
+device's fingerprint are copied into the PSBT next to the signatures; another
+cosigner's entry is never written. The Coldcard only signs an input whose
+`tap_key_origins` list every key of the enrolled wallet: a PSBT restricted to one leaf
+or to the key path must keep them all, as `bwk::Account::restrict_spend_path` does.

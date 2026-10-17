@@ -18,19 +18,17 @@ use bwk_bup::{
 };
 use bwk_descriptor::{
     musig::musig_descriptor_to_string,
+    restrict::restrict_input_to_leaf,
     wallet::{WalletDefiniteDescriptor, WalletDescriptor, WalletDescriptorExt},
 };
 use bwk_keys::musig::MusigKey;
-use bwk_psbt::musig::{
-    musig_input_partial_sigs, musig_input_pub_nonces, PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS,
-};
+use bwk_psbt::musig::{musig_input_partial_sigs, musig_input_pub_nonces};
 use bwk_sign::{hot_signer::HotSigner, musig::aggregate_partial_sigs};
 use bwk_utils::test::{corepc_node, generate_blocks};
 use miniscript::{
     bitcoin::{
         bip32::Fingerprint,
         consensus::encode::serialize_hex,
-        psbt::Input,
         secp256k1::{PublicKey, Secp256k1},
         taproot::{LeafVersion, TapLeafHash},
         Address, Network, NetworkKind, Psbt, Txid,
@@ -282,23 +280,6 @@ fn derived(descriptor: &WalletDescriptor, keychain: usize, index: u32) -> Wallet
         .unwrap()
 }
 
-/// Only `leaf`: its script, the origins of its keys and the 0x1a of `aggregate`,
-/// as `Account::restrict_spend_path` leaves an input.
-fn keep_leaf(input: &mut Input, leaf: TapLeafHash, aggregate: PublicKey) {
-    input
-        .tap_scripts
-        .retain(|_, (script, version)| TapLeafHash::from_script(script, *version) == leaf);
-    input
-        .tap_key_origins
-        .retain(|_, (leaf_hashes, _)| leaf_hashes.contains(&leaf));
-    for (leaf_hashes, _) in input.tap_key_origins.values_mut() {
-        *leaf_hashes = vec![leaf];
-    }
-    input.unknown.retain(|key, _| {
-        key.type_value != PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS || key.key == aggregate.serialize()
-    });
-}
-
 /// The (participant, aggregate, leaf) of every 0x1b or 0x1c entry `decodepsbt`
 /// lists under `field`, for input 0.
 fn core_entries(decoded: &Value, field: &str) -> BTreeSet<(String, String, String)> {
@@ -377,9 +358,18 @@ impl Coin<'_> {
     /// Restricts every input of `psbt` to the spend path.
     fn restrict(&self, psbt: &mut Psbt) {
         if let Spend::Leaf(signers) = self.spend {
-            let (leaf, aggregate) = spend_leaf(self.descriptor, self.keychain, self.index, signers);
+            let (leaf, _) = spend_leaf(self.descriptor, self.keychain, self.index, signers);
+            let Descriptor::Tr(tr) = derived(self.descriptor, self.keychain, self.index) else {
+                panic!("expected tr()");
+            };
+            let (_, ms) = tr
+                .iter_scripts()
+                .find(|(_, ms)| {
+                    TapLeafHash::from_script(&ms.encode(), LeafVersion::TapScript) == leaf
+                })
+                .unwrap();
             for input in &mut psbt.inputs {
-                keep_leaf(input, leaf, aggregate);
+                restrict_input_to_leaf(input, ms);
             }
         }
     }

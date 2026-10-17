@@ -10,16 +10,13 @@ use std::{
 use bitcoin::{
     bip32::{DerivationPath, Fingerprint, Xpub},
     psbt::Psbt,
-    secp256k1::PublicKey,
 };
 use hidapi::DeviceInfo;
 
 use coldcard::protocol::DescriptorName;
 
 use crate::{
-    parse_version,
-    utils::{self, PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS},
-    AddressScript, DeviceKind, DeviceWallet, Error as HWIError, Version, HWI,
+    parse_version, utils, AddressScript, DeviceKind, DeviceWallet, Error as HWIError, Version, HWI,
 };
 pub use coldcard as api;
 
@@ -33,7 +30,6 @@ const MUSIG_SESSION_TEXTS: [&str; 2] = ["musig needs restart", "resign"];
 /// approved (`shared/auth.py`, `ApproveTransaction.interact`, same commit); the reason
 /// only goes to the screen.
 const SIGNING_FAILED_LATE: &str = "Signing failed late";
-const PUBLIC_KEY_LEN: usize = 33;
 
 #[derive(Debug)]
 pub struct Coldcard {
@@ -105,8 +101,10 @@ impl Coldcard {
             None
         };
 
-        let tx =
-            sign_and_wait(&mut cc, psbt, wallet_name).map_err(|e| sign_error(&mut cc, e, psbt))?;
+        // read before signing: a failure after the device signed would lose its answer
+        let fingerprint = master_fingerprint(&mut cc)?;
+        let tx = sign_and_wait(&mut cc, psbt, wallet_name)
+            .map_err(|e| sign_error(e, psbt, fingerprint))?;
 
         let new_psbt = Psbt::deserialize(&tx).map_err(|e| HWIError::Device(e.to_string()))?;
         if new_psbt.inputs.len() != psbt.inputs.len() {
@@ -118,7 +116,7 @@ impl Coldcard {
         }
 
         utils::merge_signatures(psbt, &new_psbt);
-        utils::merge_musig_fields(psbt, &new_psbt);
+        utils::merge_musig_fields(psbt, &new_psbt, fingerprint);
 
         Ok(())
     }
@@ -233,14 +231,12 @@ fn sign_and_wait(
     }
 }
 
-/// `MusigSession` when the device error means it lost the MuSig2 session of `psbt`
-/// (see [`musig_session_error`]), else the plain mapping. The fingerprint is only
-/// read for a protocol error.
-fn sign_error(cc: &mut coldcard::Coldcard, e: api::Error, psbt: &Psbt) -> HWIError {
+/// `MusigSession` when the device (`fingerprint`) error means it lost the MuSig2
+/// session of `psbt` (see [`musig_session_error`]), else the plain mapping.
+fn sign_error(e: api::Error, psbt: &Psbt, fingerprint: Fingerprint) -> HWIError {
     match e {
         api::Error::Decoding(api::protocol::DecodeError::Protocol(ref text))
-            if master_fingerprint(cc)
-                .is_ok_and(|fingerprint| musig_session_error(text, psbt, fingerprint)) =>
+            if musig_session_error(text, psbt, fingerprint) =>
         {
             HWIError::MusigSession
         }
@@ -249,12 +245,10 @@ fn sign_error(cc: &mut coldcard::Coldcard, e: api::Error, psbt: &Psbt) -> HWIErr
 }
 
 /// True when the device error `text` reports a lost MuSig2 session: the firmware's
-/// own reason when it forwards it, or "Signing failed late" on a PSBT where the
-/// device (`fingerprint`) is a MuSig2 participant.
+/// own reason as a whole line when it forwards it, or "Signing failed late" on a
+/// PSBT where the device (`fingerprint`) is a MuSig2 participant.
 fn musig_session_error(text: &str, psbt: &Psbt, fingerprint: Fingerprint) -> bool {
-    MUSIG_SESSION_TEXTS
-        .iter()
-        .any(|reason| text.contains(reason))
+    text.lines().any(|line| MUSIG_SESSION_TEXTS.contains(&line))
         || (text == SIGNING_FAILED_LATE && is_musig_participant(psbt, fingerprint))
 }
 
@@ -262,18 +256,12 @@ fn musig_session_error(text: &str, psbt: &Psbt, fingerprint: Fingerprint) -> boo
 /// entry with `fingerprint`.
 fn is_musig_participant(psbt: &Psbt, fingerprint: Fingerprint) -> bool {
     psbt.inputs.iter().any(|input| {
-        input
-            .unknown
-            .iter()
-            .filter(|(key, _)| key.type_value == PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS)
-            .flat_map(|(_, participants)| participants.chunks(PUBLIC_KEY_LEN))
-            .filter_map(|participant| PublicKey::from_slice(participant).ok())
-            .any(|participant| {
-                input
-                    .tap_key_origins
-                    .get(&participant.x_only_public_key().0)
-                    .is_some_and(|(_, (origin, _))| *origin == fingerprint)
-            })
+        utils::musig_participants(input).any(|participant| {
+            input
+                .tap_key_origins
+                .get(&participant.x_only_public_key().0)
+                .is_some_and(|(_, (origin, _))| *origin == fingerprint)
+        })
     })
 }
 
@@ -393,6 +381,23 @@ mod tests {
             &one_input_psbt(),
             device()
         ));
+    }
+
+    #[test]
+    fn firmware_reason_is_matched_as_a_whole_line() {
+        assert!(musig_session_error(
+            "Signing failed late\n\nresign\n\npsbt.py:2772",
+            &one_input_psbt(),
+            other()
+        ));
+        for text in [
+            "presigned",
+            "resign later",
+            "cannot resign",
+            "musig needs restart now",
+        ] {
+            assert!(!musig_session_error(text, &one_input_psbt(), other()));
+        }
     }
 
     #[test]

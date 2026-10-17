@@ -117,7 +117,16 @@ its own missing pubnonce, the client cannot answer, and `sign_tx` fails with
 The PSBT goes to the device as bwk's updater writes it: next to the aggregate's
 `[agg_fp]/<a or a+1>/i` `tap_key_origins` entry, each cosigner's own
 `[fp/87'/1'/0'/R]` entry. App 2.4.6 accepts it (it only matches musig() keys against
-2-step entries under the aggregate's fingerprint), so nothing is stripped.
+2-step entries under the aggregate's fingerprint). One thing is stripped from the copy
+sent to the device: the `tap_key_origins` entries with no leaf hash that are not a
+0x1a participant, nor the internal key of an input whose `tap_scripts` hold the whole
+tree (`bwk_psbt::taproot::is_partial_tap_tree`). These are the keys outside the spend
+path of a PSBT restricted by `bwk::Account::restrict_spend_path`, which keeps them for
+the Coldcard. The app takes every musig() aggregate listed there as a spend, whatever
+the leaf hashes and `tap_scripts` say: on a 2-of-3 restricted to one leaf it yields a
+pubnonce for each of its two leaves, then fails round 2 with `Interpreter(UnknownHash)`
+on the missing cosigner nonce. A plain internal key left listed would be signed on the
+key path of a PSBT restricted to a leaf.
 
 Registration and address checks of `musig()` policies work as is: the client's paranoid
 check replaces each `musig()` by its aggregate xpub before miniscript parses the
@@ -149,6 +158,27 @@ its screens are the ones the tests expect (2.4.2 fails 33 of the 44 tests).
 - `SPECULOS_ELF`: a prebuilt ELF of `LEDGER_APP_VERSION` for the device, used as is
   instead of building one.
 - `SPECULOS_BIN`: overrides the wrapper (e.g. a local `speculos`).
+
+## Device tests
+
+Every device test is `#[ignore]`d and needs its simulator:
+
+- Ledger: `tests/speculos/run.sh [nanox|nanosp]` (Docker), see above.
+- Coldcard: `tests/coldcard_simulator.rs` and `tests/coldcard_simulator_musig.rs`
+  start the simulator of a built firmware checkout themselves, one per test:
+  `COLDCARD_SIM_UNIX_DIR` (its `unix` directory), `COLDCARD_SIM_PYTHON` (a Python with
+  the simulator requirements), optional `COLDCARD_SIM_LOG_DIR`;
+  `cargo test -p bwk-hwi --features musig --test coldcard_simulator --test
+  coldcard_simulator_musig -- --ignored --test-threads=1`.
+- Both and a hot key: `tests/devices/run.sh [-- <cargo test args>]` runs
+  `tests/musig_devices.rs`, a bwk-bup 2-of-3 MuSig2 wallet over a hot key, the Ledger
+  and the Coldcard, registered on both devices and spent on regtest through each of
+  its three 2-key leaves. It starts Speculos (the pinned `SPECULOS_IMAGE` of
+  `tests/speculos/versions.env`, nanosp) and the Coldcard simulator with fixed seeds,
+  approves their screens, and tears both down on exit. It needs `docker`,
+  `SPECULOS_ELF` (the nanosp ELF of `LEDGER_APP_VERSION`), `COLDCARD_SIM_UNIX_DIR`,
+  `COLDCARD_SIM_PYTHON` and `BITCOIND_V31_EXE` (a Bitcoin Core v31 `bitcoind`);
+  `LOG_DIR` (default `target/devices-logs`) gets the simulator and Speculos logs.
 
 ## License
 

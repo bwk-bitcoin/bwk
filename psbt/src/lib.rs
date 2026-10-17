@@ -3,6 +3,7 @@
 #[cfg(feature = "musig")]
 pub mod musig;
 pub mod sp;
+pub mod taproot;
 
 use std::collections::{BTreeMap, BTreeSet};
 

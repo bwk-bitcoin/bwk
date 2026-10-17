@@ -1,6 +1,7 @@
 //! The Coldcard simulator (seed C) as a MuSig2 participant next to bwk `HotSigner`s
 //! (A and B), on the bwk-bup 2-of-3 compiled to 3 `pk(musig(..))` leaves, spending
-//! the leaf of A and C (see `common::coldcard_sim` for the environment).
+//! the leaf of A and C, and on a `musig(A,C)` key path next to a recovery leaf of B
+//! (see `common::coldcard_sim` for the environment).
 
 #![cfg(all(feature = "coldcard", feature = "ledger", feature = "musig", unix))]
 
@@ -20,16 +21,16 @@ use bwk_psbt::musig::{
 };
 
 use common::{
-    coldcard_sim::{Approver, SimProcess},
+    coldcard_sim::{enroll, Approver, SimProcess},
     musig::{
-        device_key, finalize_and_verify, merge_round, offline_psbt, policy_2_of_3,
-        restrict_to_leaf, spend_leaf, without_nonces, HotParticipant,
+        device_key, finalize_and_verify, key_path_2_of_2_with_recovery, merge_round, offline_psbt,
+        policy_2_of_3, restrict_to_key_path, restrict_to_leaf, spend_leaf, without_nonces,
+        HotParticipant,
     },
     SEED_A, SEED_B, SEED_C,
 };
 
 const WALLET_NAME: &str = "bwk-musig-2of3";
-const REGISTERED_TIMEOUT: Duration = Duration::from_secs(10);
 /// The failure story comes after the `stok` answer.
 const STORY_TIMEOUT: Duration = Duration::from_secs(5);
 const COIN: Amount = Amount::from_sat(100_000);
@@ -45,17 +46,22 @@ struct Setup {
 }
 
 impl Setup {
-    /// Starts the simulator, reads C's role key from it, compiles the policy over
-    /// A, B and C and enrolls it.
+    /// `with(policy_2_of_3)`.
     fn new() -> Self {
+        Self::with(policy_2_of_3)
+    }
+
+    /// Starts the simulator, reads C's role key from it, compiles `policy` over A, B
+    /// and C and enrolls it.
+    fn with(policy: fn(&OXpub, &OXpub, &OXpub) -> WalletDescriptor) -> Self {
         let sim = SimProcess::start(SEED_C);
         let coldcard = Coldcard::connect_simulator(sim.socket()).unwrap();
         let a = HotParticipant::new(SEED_A, KeyType::Internal);
         let b = HotParticipant::new(SEED_B, KeyType::Cosigner);
         let c_key = device_key(&coldcard, KeyType::External);
         assert_eq!(c_key, HotParticipant::new(SEED_C, KeyType::External).key);
-        let descriptor = policy_2_of_3(&a.key, &b.key, &c_key);
-        let coldcard = enroll(&sim, coldcard, &descriptor);
+        let descriptor = policy(&a.key, &b.key, &c_key);
+        let coldcard = enroll_descriptor(&sim, coldcard, &descriptor);
         Self {
             sim,
             coldcard,
@@ -69,7 +75,7 @@ impl Setup {
     fn restart(&mut self) {
         self.sim.restart();
         let coldcard = Coldcard::connect_simulator(self.sim.socket()).unwrap();
-        self.coldcard = enroll(&self.sim, coldcard, &self.descriptor);
+        self.coldcard = enroll_descriptor(&self.sim, coldcard, &self.descriptor);
     }
 
     /// The receive coin at index 0, restricted to the leaf of A and C.
@@ -152,26 +158,14 @@ impl Setup {
     }
 }
 
-/// Enrolls `descriptor` as `WALLET_NAME` with an approver running, waits until it
-/// is listed and returns the device bound to it.
-fn enroll(sim: &SimProcess, coldcard: Coldcard, descriptor: &WalletDescriptor) -> Coldcard {
+/// Enrolls `descriptor` as `WALLET_NAME`.
+fn enroll_descriptor(
+    sim: &SimProcess,
+    coldcard: Coldcard,
+    descriptor: &WalletDescriptor,
+) -> Coldcard {
     let text = musig_descriptor_to_string(descriptor, false);
-    let approver = Approver::spawn(sim.socket());
-    assert_eq!(coldcard.register_wallet(WALLET_NAME, &text).unwrap(), None);
-    let deadline = Instant::now() + REGISTERED_TIMEOUT;
-    while !matches!(coldcard.is_wallet_registered(WALLET_NAME, &text), Ok(true)) {
-        assert!(
-            Instant::now() < deadline,
-            "{WALLET_NAME} not registered after {REGISTERED_TIMEOUT:?}"
-        );
-        thread::sleep(Duration::from_millis(500));
-    }
-    let stories = approver.stories();
-    println!("stories seen while enrolling: {stories:#?}");
-    assert!(stories
-        .iter()
-        .any(|(title, body)| title.contains("miniscript") || body.contains("miniscript")));
-    coldcard.with_wallet_name(WALLET_NAME.to_owned())
+    enroll(sim.socket(), coldcard, WALLET_NAME, &text)
 }
 
 #[test]
@@ -263,4 +257,33 @@ fn coldcard_sim_musig_replayed_round_1_is_resign() {
     let answer = setup.coldcard_sign(&sent);
     assert_eq!(musig_input_pub_nonces(&answer.inputs[0]).unwrap().len(), 1);
     setup.coldcard_lost_session(&sent, "resign");
+}
+
+/// The key path of `musig(A,C)`, restricted as `Account::restrict_spend_path` does
+/// it: the recovery leaf goes, B's origin stays with no leaf hash, and the Coldcard
+/// still matches its enrolled wallet.
+#[test]
+#[ignore = "needs COLDCARD_SIM_UNIX_DIR and COLDCARD_SIM_PYTHON"]
+fn coldcard_sim_musig_key_path_next_to_a_leaf() {
+    let setup = Setup::with(key_path_2_of_2_with_recovery);
+    let mut psbt = offline_psbt(&setup.descriptor, 0, 0, COIN);
+    restrict_to_key_path(&mut psbt, &setup.descriptor, 0, 0);
+    let b = HotParticipant::new(SEED_B, KeyType::Cosigner);
+    let input = &psbt.inputs[0];
+    assert!(input.tap_scripts.is_empty());
+    assert!(input
+        .tap_key_origins
+        .values()
+        .any(
+            |(leaf_hashes, (fingerprint, _))| *fingerprint == b.signer.fingerprint()
+                && leaf_hashes.is_empty()
+        ));
+
+    setup.round_1(&mut psbt);
+    let nonces = musig_input_pub_nonces(&psbt.inputs[0]).unwrap();
+    assert_eq!(nonces.len(), 2);
+    assert!(nonces.iter().all(|nonce| nonce.leaf_hash.is_none()));
+    setup.round_2(&mut psbt);
+    assert_eq!(musig_input_partial_sigs(&psbt.inputs[0]).unwrap().len(), 2);
+    finalize_and_verify(psbt, &setup.descriptor);
 }

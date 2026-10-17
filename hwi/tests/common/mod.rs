@@ -7,8 +7,10 @@
 pub mod coldcard_sim;
 #[cfg(all(feature = "ledger", feature = "musig"))]
 pub mod musig;
+pub mod regtest;
 #[cfg(feature = "ledger")]
 pub mod speculos;
+pub mod speculos_clicker;
 
 use std::{
     str::FromStr,
@@ -26,8 +28,8 @@ use bitcoin::{
 };
 use miniscript::{descriptor::DescriptorPublicKey, Descriptor, ForEachKey};
 
-/// Test seeds: A is a hot signer (fingerprint `73c5da0a`), B a hot signer, C the
-/// Coldcard simulator's seed in the MuSig2 tests.
+/// Test seeds: A is a hot signer (fingerprint `73c5da0a`), B a hot signer or the
+/// Ledger's seed, C the Coldcard simulator's seed in the MuSig2 tests.
 pub const SEED_A: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 pub const SEED_B: &str =
