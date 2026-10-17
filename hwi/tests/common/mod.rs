@@ -3,6 +3,9 @@
 
 #![allow(dead_code)] // each test binary uses a subset of these
 
+#[cfg(all(feature = "coldcard", unix))]
+pub mod coldcard_sim;
+
 use std::{
     str::FromStr,
     sync::{Mutex, OnceLock},

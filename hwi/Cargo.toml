@@ -61,7 +61,7 @@ serde_json = { version = "1.0", optional = true }
 zeroize = { version = "1", optional = true }
 
 # coldcard
-coldcard = { version = "0.13.0", optional = true }
+coldcard = { path = "coldcard", optional = true }
 
 # ledger
 miniscript = { version = "12.2", features = ["no-std"], default-features = false, optional = true }
@@ -84,4 +84,4 @@ crossbeam = { version = "0.8.4", features = ["crossbeam-channel"], optional = tr
 hex-literal = "1.1"
 speculos = "0.1"
 regex = "1"
-miniscript = "12"
+miniscript.workspace = true

@@ -49,7 +49,8 @@ A Empty case means the method is unimplemented on the client or device side.
 | Specter[^5]          |            | >= v1.8.0  | >= v1.8.0  | >= v1.8.0  |                      |            | >= v1.8.0  |
 
 [^1]: https://github.com/digitalbitbox/bitbox02-firmware
-[^2]: https://github.com/alfred-hodler/rust-coldcard
+[^2]: https://github.com/alfred-hodler/rust-coldcard, vendored as a fork in `hwi/coldcard`:
+    USB HID and the simulator's Unix socket (see [coldcard/README.md](coldcard/README.md)).
 [^3]: https://github.com/Blockstream/Jade
 [^4]: https://github.com/LedgerHQ/app-bitcoin-new
 [^5]: https://github.com/cryptoadvance/specter-diy

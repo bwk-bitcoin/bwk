@@ -190,6 +190,7 @@ impl std::fmt::Display for Version {
 pub enum DeviceKind {
     BitBox02,
     Coldcard,
+    ColdcardSimulator,
     Specter,
     SpecterSimulator,
     Ledger,
@@ -202,6 +203,7 @@ impl std::fmt::Display for DeviceKind {
         match self {
             DeviceKind::BitBox02 => write!(f, "bitbox02"),
             DeviceKind::Coldcard => write!(f, "coldcard"),
+            DeviceKind::ColdcardSimulator => write!(f, "coldcard-simulator"),
             DeviceKind::Specter => write!(f, "specter"),
             DeviceKind::SpecterSimulator => write!(f, "specter-simulator"),
             DeviceKind::Ledger => write!(f, "ledger"),
@@ -217,6 +219,7 @@ impl std::str::FromStr for DeviceKind {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "bitbox02" => Ok(DeviceKind::BitBox02),
+            "coldcard-simulator" => Ok(DeviceKind::ColdcardSimulator),
             "specter" => Ok(DeviceKind::Specter),
             "specter-simulator" => Ok(DeviceKind::SpecterSimulator),
             "ledger" => Ok(DeviceKind::Ledger),
@@ -231,6 +234,15 @@ impl std::str::FromStr for DeviceKind {
 mod tests {
     #[cfg(feature = "regex")]
     use super::*;
+
+    use crate::DeviceKind;
+
+    #[test]
+    fn coldcard_simulator_kind_round_trips() {
+        let kind = DeviceKind::ColdcardSimulator;
+        assert_eq!(kind.to_string(), "coldcard-simulator");
+        assert_eq!("coldcard-simulator".parse::<DeviceKind>(), Ok(kind));
+    }
 
     #[cfg(feature = "regex")]
     #[test]

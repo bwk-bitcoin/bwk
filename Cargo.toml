@@ -18,6 +18,7 @@ members = [
     "musig",
     "bup",
     "hwi", "hwi/cli",
+    "hwi/coldcard",
     "secp256k1_spscan-sys",
 ]
 

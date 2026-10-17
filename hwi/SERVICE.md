@@ -327,6 +327,21 @@ pub enum UnsupportedReason {
 }
 ```
 
+## Simulators
+
+The Ledger simulator (Speculos) is probed on `127.0.0.1:9999` every poll cycle and
+listed as `ledger-simulator`.
+
+The Coldcard simulator is probed only when `BWK_COLDCARD_SIMULATOR`
+(`service::COLDCARD_SIMULATOR_ENV`, Unix only) holds the path of its socket, for
+example `/tmp/ckcc-simulator.sock` or `/tmp/ckcc-simulator-<pid>.sock` with
+`--segregate`. The variable is read when the listener starts; when it is unset the
+service never touches a socket. The device is listed as `coldcard-simulator` with
+kind `ColdcardSimulator` and no firmware version gate, since the simulator only
+reports its bootloader version.
+
+Like the Ledger simulator, it stays listed until the service restarts.
+
 ## Taproot Miniscript Compatibility
 
 Check if a device supports Taproot Miniscript:
@@ -344,5 +359,6 @@ let compatible = is_compatible_with_tapminiscript(
 Minimum versions for Taproot Miniscript support:
 - Ledger: v2.2.0
 - Coldcard: v6.3.3
+- Coldcard simulator: All versions
 - BitBox02: v9.21.0
 - Specter: All versions

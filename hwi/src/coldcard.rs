@@ -1,6 +1,10 @@
+#[cfg(unix)]
+use std::{io::ErrorKind, path::Path};
 use std::{
     str::FromStr,
     sync::{Arc, Mutex, MutexGuard},
+    thread,
+    time::Duration,
 };
 
 use bitcoin::{
@@ -14,13 +18,39 @@ use coldcard::protocol::DescriptorName;
 use crate::{parse_version, AddressScript, DeviceKind, Error as HWIError, Version, HWI};
 pub use coldcard as api;
 
+/// Pause between two `get_signed_tx` polls while the user reviews the transaction.
+const SIGNED_TX_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 #[derive(Debug)]
 pub struct Coldcard {
     device: Arc<Mutex<coldcard::Coldcard>>,
     wallet_name: Option<String>,
+    kind: DeviceKind,
 }
 
+/// The Coldcard simulator, reached over its Unix datagram socket.
+pub type ColdcardSimulator = Coldcard;
+
 impl Coldcard {
+    /// Connects to the simulator at `socket` as ckcc-protocol's
+    /// `ColdcardDevice(sn=<socket>)` does; kind `ColdcardSimulator`.
+    #[cfg(unix)]
+    pub fn connect_simulator(socket: &Path) -> Result<Self, HWIError> {
+        let (cc, _) = api::Coldcard::open_simulator(socket, None).map_err(|e| match e {
+            api::Error::Io(e)
+                if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) =>
+            {
+                HWIError::DeviceNotFound
+            }
+            e => e.into(),
+        })?;
+        Ok(Coldcard {
+            device: Arc::new(Mutex::new(cc)),
+            wallet_name: None,
+            kind: DeviceKind::ColdcardSimulator,
+        })
+    }
+
     pub fn with_wallet_name(mut self, wallet_name: String) -> Self {
         self.wallet_name = Some(wallet_name);
         self
@@ -38,13 +68,14 @@ impl From<coldcard::Coldcard> for Coldcard {
         Coldcard {
             device: Arc::new(Mutex::new(cc)),
             wallet_name: None,
+            kind: DeviceKind::Coldcard,
         }
     }
 }
 
 impl HWI for Coldcard {
     fn device_kind(&self) -> DeviceKind {
-        DeviceKind::Coldcard
+        self.kind
     }
 
     /// The first semver version returned by coldcard is the firmware version.
@@ -104,11 +135,10 @@ impl HWI for Coldcard {
             .map_err(|_| HWIError::UnsupportedInput)?;
         let desc = self.device()?.miniscript_get(descriptor_name)?;
         if let Some(desc) = desc {
-            if let Some((policy, _)) = policy.replace('\'', "h").split_once('#') {
-                Ok(desc.contains(policy))
-            } else {
-                Ok(desc.contains(policy))
-            }
+            // the device answers with `h` hardened markers
+            let policy = policy.replace('\'', "h");
+            let policy = policy.split_once('#').map_or(policy.as_str(), |(p, _)| p);
+            Ok(desc.contains(policy))
         } else {
             Ok(false)
         }
@@ -132,6 +162,7 @@ impl HWI for Coldcard {
             if let Some(tx) = cc.get_signed_tx()? {
                 break tx;
             }
+            thread::sleep(SIGNED_TX_POLL_INTERVAL);
         };
 
         let mut new_psbt = Psbt::deserialize(&tx).map_err(|e| HWIError::Device(e.to_string()))?;

@@ -31,6 +31,9 @@ use hidapi::{DeviceInfo, HidApi};
 use serde::{Deserialize, Serialize};
 use std::thread::{self, JoinHandle};
 
+#[cfg(all(feature = "coldcard", unix))]
+use std::path::PathBuf;
+
 #[cfg(feature = "bitbox")]
 use crate::bitbox::api::noise::{ConfigError, NoiseConfig, NoiseConfigData};
 
@@ -582,6 +585,11 @@ where
     }))
 }
 
+/// Socket path of a running Coldcard simulator. Read once when the listener starts;
+/// when unset the service never touches a socket.
+#[cfg(all(feature = "coldcard", unix))]
+pub const COLDCARD_SIMULATOR_ENV: &str = "BWK_COLDCARD_SIMULATOR";
+
 fn listen<Message, Id>(
     sender: channel::Sender<Message>,
     devices: Arc<Mutex<BTreeMap<String, SigningDevice<Message, Id>>>>,
@@ -614,6 +622,10 @@ fn listen<Message, Id>(
     let mut jade_handles = BTreeMap::<String, JoinHandle<()>>::new();
     #[cfg(feature = "ledger")]
     let mut ledger_simulator_handle = None;
+    #[cfg(all(feature = "coldcard", unix))]
+    let coldcard_simulator_socket = std::env::var_os(COLDCARD_SIMULATOR_ENV).map(PathBuf::from);
+    #[cfg(all(feature = "coldcard", unix))]
+    let mut coldcard_simulator_handle = None;
     #[cfg(feature = "bitbox")]
     let mut bitbox02_handles = BTreeMap::<String, JoinHandle<()>>::new();
     #[cfg(feature = "coldcard")]
@@ -657,6 +669,16 @@ fn listen<Message, Id>(
             &mut ledger_simulator_handle,
             devices.clone(),
         );
+
+        #[cfg(all(feature = "coldcard", unix))]
+        if let Some(socket) = &coldcard_simulator_socket {
+            handle_coldcard_simulator(
+                sender.clone(),
+                &mut coldcard_simulator_handle,
+                devices.clone(),
+                socket.clone(),
+            );
+        }
 
         let list = hid.device_list().collect::<Vec<_>>();
         tracing::trace!("HID device list contains {} device(s)", list.len());
@@ -1533,6 +1555,74 @@ fn handle_locked_bitbox<Message, Id>(
     }
 }
 
+/// The simulator reports no firmware version (its `vers` only carries the bootloader
+/// one), so no version gate applies, unlike `handle_coldcard`.
+#[cfg(all(feature = "coldcard", unix))]
+fn handle_coldcard_simulator<Message, Id>(
+    sender: channel::Sender<Message>,
+    handle: &mut Option<JoinHandle<()>>,
+    devices: Arc<Mutex<BTreeMap<String, SigningDevice<Message, Id>>>>,
+    socket: PathBuf,
+) where
+    Message: From<SigningDeviceMsg<Id>> + Send + Clone + 'static,
+    Id: Send + Clone + 'static,
+{
+    const COLDCARD_SIMULATOR_ID: &str = "coldcard-simulator";
+    if devices
+        .lock()
+        .expect("poisoned")
+        .contains_key(COLDCARD_SIMULATOR_ID)
+    {
+        tracing::trace!("handle_coldcard_simulator: device already in map, skipping");
+        return;
+    }
+    if let Some(h) = handle {
+        if !h.is_finished() {
+            tracing::debug!("handle_coldcard_simulator: previous handle still running, skipping");
+            return;
+        }
+    }
+    tracing::trace!("handle_coldcard_simulator: spawning task");
+    let jh = thread::spawn(
+        move || match coldcard::Coldcard::connect_simulator(&socket) {
+            Ok(device) => {
+                tracing::debug!("Coldcard Simulator connected");
+                match SigningDevice::new(
+                    COLDCARD_SIMULATOR_ID.into(),
+                    Arc::new(device),
+                    sender.clone(),
+                ) {
+                    Ok(hw) => {
+                        devices
+                            .lock()
+                            .expect("poisoned")
+                            .insert(COLDCARD_SIMULATOR_ID.into(), hw);
+                        let _ = sender.send(SigningDeviceMsg::Update.into());
+                    }
+                    Err(e) => {
+                        tracing::debug!("Failed to initialize Coldcard Simulator: {}", e);
+                    }
+                }
+            }
+            Err(HWIError::DeviceNotFound) => {
+                let was_present = devices
+                    .lock()
+                    .expect("poisoned")
+                    .remove(COLDCARD_SIMULATOR_ID)
+                    .is_some();
+                if was_present {
+                    tracing::info!("Coldcard Simulator disconnected");
+                    let _ = sender.send(SigningDeviceMsg::Update.into());
+                }
+            }
+            Err(e) => {
+                tracing::trace!("Coldcard Simulator not available: {}", e);
+            }
+        },
+    );
+    *handle = Some(jh);
+}
+
 #[cfg(feature = "coldcard")]
 fn handle_coldcard<Message, Id>(
     sender: &channel::Sender<Message>,
@@ -1906,7 +1996,7 @@ fn ledger_version_supported(version: &Version) -> bool {
 }
 
 /// (DeviceKind, min version) - None means all versions support it.
-const DEVICES_COMPATIBLE_WITH_TAPMINISCRIPT: [(DeviceKind, Option<Version>); 5] = [
+const DEVICES_COMPATIBLE_WITH_TAPMINISCRIPT: [(DeviceKind, Option<Version>); 6] = [
     (
         DeviceKind::Ledger,
         Some(Version {
@@ -1927,6 +2017,7 @@ const DEVICES_COMPATIBLE_WITH_TAPMINISCRIPT: [(DeviceKind, Option<Version>); 5] 
             prerelease: None,
         }),
     ),
+    (DeviceKind::ColdcardSimulator, None),
     (
         DeviceKind::BitBox02,
         Some(Version {
@@ -1953,4 +2044,17 @@ pub fn is_compatible_with_tapminiscript(
                     (None, None) => true,
                 }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{service::is_compatible_with_tapminiscript, DeviceKind};
+
+    #[test]
+    fn coldcard_simulator_is_compatible_with_tapminiscript() {
+        assert!(is_compatible_with_tapminiscript(
+            &DeviceKind::ColdcardSimulator,
+            None
+        ));
+    }
 }
