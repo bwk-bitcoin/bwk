@@ -376,7 +376,8 @@ service never touches a socket. The device is listed as `coldcard-simulator` wit
 kind `ColdcardSimulator` and no firmware version gate, since the simulator only
 reports its bootloader version.
 
-Like the Ledger simulator, it stays listed until the service restarts.
+It is dropped when its socket goes away or the path names another file (a
+restarted simulator), and found again once a simulator answers on the path.
 
 ## Taproot Miniscript Compatibility
 

@@ -4,6 +4,8 @@
 
 mod common;
 
+#[cfg(feature = "service")]
+use std::{fs, os::unix::fs::symlink, path::PathBuf};
 use std::{
     str::FromStr,
     thread,
@@ -21,7 +23,7 @@ use bitcoin::{
 };
 #[cfg(feature = "service")]
 use bwk_hwi::service::{HwiService, SigningDeviceMsg, COLDCARD_SIMULATOR_ENV};
-use bwk_hwi::{coldcard::Coldcard, DeviceKind, HWI};
+use bwk_hwi::{coldcard::Coldcard, AddressScript, DeviceKind, DeviceWallet, HWI};
 
 use common::{
     build_tr_keypath_test_psbt,
@@ -33,8 +35,16 @@ const WALLET_NAME: &str = "bwk-plain-tr";
 const COSIGNER_FINGERPRINT: &str = "a5a5a5a5";
 const ACCOUNT_PATH: &str = "m/87'/1'/0'";
 const REGISTERED_TIMEOUT: Duration = Duration::from_secs(10);
+/// Receive address 0 of `plain_tr_policy`.
+const PLAIN_TR_FIRST_ADDRESS: &str =
+    "tb1pmupsjkxjcr6j4379lj4knfghv42p8ngwymh5ekyd9hm9n3w6kvesm2gqdq";
+/// Until the approver has seen the address story.
+const STORY_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(feature = "service")]
 const SERVICE_LIST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Until a restarted simulator's entry is dropped.
+#[cfg(feature = "service")]
+const SERVICE_DROP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Three poll cycles of the service.
 #[cfg(feature = "service")]
 const SERVICE_STAY_LISTED: Duration = Duration::from_secs(6);
@@ -152,6 +162,49 @@ fn coldcard_sim_signs_plain_psbt() {
     println!("key path signature verified against {output_key}");
 }
 
+#[test]
+#[ignore = "needs COLDCARD_SIM_UNIX_DIR and COLDCARD_SIM_PYTHON"]
+fn coldcard_sim_display_address_with_wallet() {
+    let sim = SimProcess::start(SEED_A);
+    let cc = Coldcard::connect_simulator(sim.socket()).unwrap();
+    let policy = enroll_plain_tr(&sim, &cc);
+
+    // no `with_wallet_name`: the name comes with the request, as from the service
+    let wallet = DeviceWallet {
+        name: WALLET_NAME.to_owned(),
+        policy,
+        hmac: None,
+    };
+    cc.display_address_with_wallet(
+        &AddressScript::Miniscript {
+            index: 0,
+            change: false,
+        },
+        &wallet,
+    )
+    .unwrap();
+
+    let approver = Approver::spawn(sim.socket());
+    let deadline = Instant::now() + STORY_TIMEOUT;
+    while approver.stories().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "no address story after {STORY_TIMEOUT:?}"
+        );
+        thread::sleep(Duration::from_millis(300));
+    }
+    let stories = approver.stories();
+    println!("stories seen while displaying: {stories:#?}");
+    let (title, body) = &stories[0];
+    assert_eq!(title, "Address:");
+    assert!(body.contains(PLAIN_TR_FIRST_ADDRESS), "{body}");
+    assert!(
+        body.contains(&format!("Wallet:\n  {WALLET_NAME}")),
+        "{body}"
+    );
+    assert!(body.contains("Index:\n  0\n\nChange:\n  False"), "{body}");
+}
+
 #[cfg(feature = "service")]
 /// The test only reads the device map, so the messages are dropped.
 #[derive(Debug, Clone)]
@@ -203,4 +256,61 @@ fn coldcard_sim_service_lists_simulator() {
     assert!(device.is_supported());
     assert_eq!(device.fingerprint(), Some(expected));
     assert_eq!(device.kind(), &DeviceKind::ColdcardSimulator);
+}
+
+/// Waits until the service lists `coldcard-simulator` (`listed`) or no longer does.
+#[cfg(feature = "service")]
+fn wait_listed(service: &HwiService<SigningDeviceMsg>, listed: bool, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while service.list().contains_key("coldcard-simulator") != listed {
+        assert!(
+            Instant::now() < deadline,
+            "coldcard-simulator listed is not {listed} after {timeout:?}"
+        );
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+#[cfg(feature = "service")]
+#[test]
+#[ignore = "needs COLDCARD_SIM_UNIX_DIR and COLDCARD_SIM_PYTHON"]
+fn coldcard_sim_service_drops_a_restarted_simulator() {
+    let mut sim = SimProcess::start(SEED_A);
+    // a fixed path the test points at each simulator's own socket
+    let link = PathBuf::from(format!("/tmp/bwk-cc-sim-link-{}.sock", std::process::id()));
+    let _ = fs::remove_file(&link);
+    symlink(sim.socket(), &link).unwrap();
+    // tests run single threaded, nothing else reads the environment meanwhile
+    std::env::set_var(COLDCARD_SIMULATOR_ENV, &link);
+
+    let service: HwiService<SigningDeviceMsg> = HwiService::new(Network::Testnet);
+    let (sender, receiver) = crossbeam::channel::unbounded();
+    service.start(sender);
+    wait_listed(&service, true, SERVICE_LIST_TIMEOUT);
+
+    let old_socket = sim.socket().to_owned();
+    receiver.try_iter().for_each(drop);
+    sim.restart();
+    assert_ne!(sim.socket(), old_socket);
+    wait_listed(&service, false, SERVICE_DROP_TIMEOUT);
+    assert!(
+        receiver
+            .try_iter()
+            .any(|msg| matches!(msg, SigningDeviceMsg::Update)),
+        "no Update sent when the simulator was dropped"
+    );
+
+    // the path names the new simulator's socket: found again
+    fs::remove_file(&link).unwrap();
+    symlink(sim.socket(), &link).unwrap();
+    wait_listed(&service, true, SERVICE_LIST_TIMEOUT);
+    let device = service.list().remove("coldcard-simulator").unwrap();
+    service.stop();
+    std::env::remove_var(COLDCARD_SIMULATOR_ENV);
+    fs::remove_file(&link).unwrap();
+
+    assert_eq!(
+        device.fingerprint(),
+        Some(Fingerprint::from_hex(SEED_A_FINGERPRINT).unwrap())
+    );
 }

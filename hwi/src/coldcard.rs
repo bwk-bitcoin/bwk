@@ -19,7 +19,7 @@ use coldcard::protocol::DescriptorName;
 use crate::{
     parse_version,
     utils::{self, PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS},
-    AddressScript, DeviceKind, Error as HWIError, Version, HWI,
+    AddressScript, DeviceKind, DeviceWallet, Error as HWIError, Version, HWI,
 };
 pub use coldcard as api;
 
@@ -75,6 +75,53 @@ impl Coldcard {
             .lock()
             .map_err(|_| HWIError::Unexpected("Failed to unlock"))
     }
+
+    /// Displays the address `script` of the enrolled wallet `name`; a Coldcard only
+    /// shows addresses of an enrolled wallet.
+    fn display_named(&self, script: &AddressScript, name: Option<&str>) -> Result<(), HWIError> {
+        let Some(name) = name else {
+            return Err(HWIError::UnimplementedMethod);
+        };
+        let descriptor_name = DescriptorName::new(name).map_err(|_| HWIError::UnsupportedInput)?;
+        if let AddressScript::Miniscript { index, change } = script {
+            self.device()?
+                .miniscript_address(descriptor_name, *change, *index)?;
+            Ok(())
+        } else {
+            Err(HWIError::UnimplementedMethod)
+        }
+    }
+
+    /// Signs `psbt` with the enrolled wallet `name`, or lets the device pick one.
+    fn sign_named(&self, psbt: &mut Psbt, name: Option<&str>) -> Result<(), HWIError> {
+        let mut cc = self.device()?;
+
+        let wallet_name = if let Some(name) = name {
+            Some(
+                DescriptorName::new(name)
+                    .map_err(|_| HWIError::Unexpected("Coldcard: Invalid wallet name"))?,
+            )
+        } else {
+            None
+        };
+
+        let tx =
+            sign_and_wait(&mut cc, psbt, wallet_name).map_err(|e| sign_error(&mut cc, e, psbt))?;
+
+        let new_psbt = Psbt::deserialize(&tx).map_err(|e| HWIError::Device(e.to_string()))?;
+        if new_psbt.inputs.len() != psbt.inputs.len() {
+            return Err(HWIError::Device(format!(
+                "Coldcard returned a PSBT with {} inputs, expected {}",
+                new_psbt.inputs.len(),
+                psbt.inputs.len()
+            )));
+        }
+
+        utils::merge_signatures(psbt, &new_psbt);
+        utils::merge_musig_fields(psbt, &new_psbt);
+
+        Ok(())
+    }
 }
 
 impl From<coldcard::Coldcard> for Coldcard {
@@ -121,19 +168,7 @@ impl HWI for Coldcard {
     }
 
     fn display_address(&self, script: &AddressScript) -> Result<(), HWIError> {
-        if let Some(name) = &self.wallet_name {
-            let descriptor_name = coldcard::protocol::DescriptorName::new(name)
-                .map_err(|_| HWIError::UnsupportedInput)?;
-            if let AddressScript::Miniscript { index, change } = script {
-                self.device()?
-                    .miniscript_address(descriptor_name, *change, *index)?;
-                Ok(())
-            } else {
-                Err(HWIError::UnimplementedMethod)
-            }
-        } else {
-            Err(HWIError::UnimplementedMethod)
-        }
+        self.display_named(script, self.wallet_name.as_deref())
     }
 
     fn register_wallet(&self, name: &str, policy: &str) -> Result<Option<[u8; 32]>, HWIError> {
@@ -157,33 +192,23 @@ impl HWI for Coldcard {
     }
 
     fn sign_tx(&self, psbt: &mut Psbt) -> Result<(), HWIError> {
-        let mut cc = self.device()?;
+        self.sign_named(psbt, self.wallet_name.as_deref())
+    }
 
-        let wallet_name = if let Some(name) = self.wallet_name.clone() {
-            Some(
-                DescriptorName::new(name)
-                    .map_err(|_| HWIError::Unexpected("Coldcard: Invalid wallet name"))?,
-            )
-        } else {
-            None
-        };
+    /// Signs with the enrolled wallet named `wallet.name`. The `policy` and `hmac` are
+    /// not used: the Coldcard holds its enrolled policies.
+    fn sign_tx_with_wallet(&self, psbt: &mut Psbt, wallet: &DeviceWallet) -> Result<(), HWIError> {
+        self.sign_named(psbt, Some(&wallet.name))
+    }
 
-        let tx =
-            sign_and_wait(&mut cc, psbt, wallet_name).map_err(|e| sign_error(&mut cc, e, psbt))?;
-
-        let new_psbt = Psbt::deserialize(&tx).map_err(|e| HWIError::Device(e.to_string()))?;
-        if new_psbt.inputs.len() != psbt.inputs.len() {
-            return Err(HWIError::Device(format!(
-                "Coldcard returned a PSBT with {} inputs, expected {}",
-                new_psbt.inputs.len(),
-                psbt.inputs.len()
-            )));
-        }
-
-        utils::merge_signatures(psbt, &new_psbt);
-        utils::merge_musig_fields(psbt, &new_psbt);
-
-        Ok(())
+    /// Displays an address of the enrolled wallet named `wallet.name`. The `policy`
+    /// and `hmac` are not used: the Coldcard holds its enrolled policies.
+    fn display_address_with_wallet(
+        &self,
+        script: &AddressScript,
+        wallet: &DeviceWallet,
+    ) -> Result<(), HWIError> {
+        self.display_named(script, Some(&wallet.name))
     }
 }
 

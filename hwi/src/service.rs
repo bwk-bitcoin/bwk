@@ -32,7 +32,10 @@ use serde::{Deserialize, Serialize};
 use std::thread::{self, JoinHandle};
 
 #[cfg(all(feature = "coldcard", unix))]
-use std::path::PathBuf;
+use std::{
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
+};
 
 #[cfg(feature = "bitbox")]
 use crate::bitbox::api::noise::{ConfigError, NoiseConfig, NoiseConfigData};
@@ -690,6 +693,8 @@ fn listen<Message, Id>(
     let coldcard_simulator_socket = std::env::var_os(COLDCARD_SIMULATOR_ENV).map(PathBuf::from);
     #[cfg(all(feature = "coldcard", unix))]
     let mut coldcard_simulator_handle = None;
+    #[cfg(all(feature = "coldcard", unix))]
+    let mut coldcard_simulator_identity = None;
     #[cfg(feature = "bitbox")]
     let mut bitbox02_handles = BTreeMap::<String, JoinHandle<()>>::new();
     #[cfg(feature = "coldcard")]
@@ -739,6 +744,7 @@ fn listen<Message, Id>(
             handle_coldcard_simulator(
                 sender.clone(),
                 &mut coldcard_simulator_handle,
+                &mut coldcard_simulator_identity,
                 devices.clone(),
                 socket.clone(),
             );
@@ -1626,12 +1632,24 @@ fn handle_locked_bitbox<Message, Id>(
 #[cfg(all(feature = "coldcard", unix))]
 const COLDCARD_SIMULATOR_ID: &str = "coldcard-simulator";
 
+/// Device and inode of the file at `socket`, `None` when there is none.
+#[cfg(all(feature = "coldcard", unix))]
+fn socket_identity(socket: &Path) -> Option<(u64, u64)> {
+    std::fs::metadata(socket)
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+}
+
 /// The simulator reports no firmware version (its `vers` only carries the bootloader
-/// one), so no version gate applies, unlike `handle_coldcard`.
+/// one), so no version gate applies, unlike `handle_coldcard`. `identity` is the
+/// socket file found when the listed simulator was connected: once the path is gone
+/// or names another file (a restarted simulator), the entry is dropped and the next
+/// cycle connects again.
 #[cfg(all(feature = "coldcard", unix))]
 fn handle_coldcard_simulator<Message, Id>(
     sender: channel::Sender<Message>,
     handle: &mut Option<JoinHandle<()>>,
+    identity: &mut Option<(u64, u64)>,
     devices: Arc<Mutex<BTreeMap<String, SigningDevice<Message, Id>>>>,
     socket: PathBuf,
 ) where
@@ -1643,7 +1661,18 @@ fn handle_coldcard_simulator<Message, Id>(
         .expect("poisoned")
         .contains_key(COLDCARD_SIMULATOR_ID)
     {
-        tracing::trace!("handle_coldcard_simulator: device already in map, skipping");
+        let current = socket_identity(&socket);
+        if current.is_some() && current == *identity {
+            tracing::trace!("handle_coldcard_simulator: device already in map, skipping");
+            return;
+        }
+        devices
+            .lock()
+            .expect("poisoned")
+            .remove(COLDCARD_SIMULATOR_ID);
+        *identity = None;
+        tracing::info!("Coldcard Simulator socket went away, dropped");
+        let _ = sender.send(SigningDeviceMsg::Update.into());
         return;
     }
     if let Some(h) = handle {
@@ -1653,6 +1682,7 @@ fn handle_coldcard_simulator<Message, Id>(
         }
     }
     tracing::trace!("handle_coldcard_simulator: spawning task");
+    *identity = socket_identity(&socket);
     let jh = thread::spawn(
         move || match coldcard::Coldcard::connect_simulator(&socket) {
             Ok(device) => {
