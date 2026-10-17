@@ -26,6 +26,15 @@ use bitcoin::{
 };
 use miniscript::{descriptor::DescriptorPublicKey, Descriptor, ForEachKey};
 
+/// Test seeds: A is a hot signer (fingerprint `73c5da0a`), B a hot signer, C the
+/// Coldcard simulator's seed in the MuSig2 tests.
+pub const SEED_A: &str =
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+pub const SEED_B: &str =
+    "legal winner thank year wave sausage worth useful legal winner thank yellow";
+pub const SEED_C: &str =
+    "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
+
 /// Master fingerprint produced by Speculos's default BIP39 seed.
 pub const SPECULOS_DEFAULT_FINGERPRINT: &str = "f5acc2fd";
 

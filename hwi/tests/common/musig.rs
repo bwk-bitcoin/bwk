@@ -1,21 +1,21 @@
-//! MuSig2 helpers for the Ledger Speculos tests: the Ledger's and a hot signer's
-//! BIP-87 role keys, the bwk-bup 2-of-2 descriptors, the spend PSBT, the PSBT
-//! handling of the two rounds and the check of the final signature.
+//! MuSig2 helpers for the Ledger Speculos and Coldcard simulator tests: the devices'
+//! and hot signers' BIP-87 role keys, the bwk-bup descriptors, the spend PSBTs, the
+//! PSBT handling of the two rounds and the check of the final signature.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use bitcoin::{
     absolute::LockTime,
     bip32::{DerivationPath, Fingerprint, Xpub},
     hashes::Hash,
     key::{Secp256k1, XOnlyPublicKey},
-    psbt::Psbt,
-    secp256k1::{schnorr, Message, SecretKey},
+    psbt::{Input, Psbt},
+    secp256k1::{schnorr, Message, PublicKey, SecretKey},
     sighash::{Prevouts, SighashCache},
     taproot::{LeafVersion, TapLeafHash},
     transaction::Version,
     Amount, Network, NetworkKind, OutPoint, ScriptBuf, Sequence, TapSighashType, Transaction, TxIn,
-    TxOut, Txid, Witness,
+    TxOut, Witness,
 };
 use bwk_bup::{
     key_role::bip87_account_path,
@@ -25,7 +25,7 @@ use bwk_bup::{
 };
 use bwk_descriptor::{
     musig::musig_descriptor_to_string,
-    updater::update_input,
+    updater::{update_input, update_output},
     wallet::{WalletDefiniteDescriptor, WalletDescriptor, WalletDescriptorExt},
 };
 use bwk_hwi::{
@@ -35,7 +35,9 @@ use bwk_hwi::{
 };
 use bwk_keys::{musig::MusigKey, nums::bip341_nums};
 use bwk_psbt::musig::{
-    musig_input_pub_nonces, remove_musig_input_pub_nonces, set_musig_input_pub_nonce,
+    musig_input_partial_sigs, musig_input_pub_nonces, remove_musig_input_partial_sigs,
+    remove_musig_input_pub_nonces, set_musig_input_partial_sig, set_musig_input_pub_nonce,
+    PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS,
 };
 use bwk_sign::{hot_signer::HotSigner, musig::aggregate_partial_sigs};
 use miniscript::{descriptor::TapTree, psbt::PsbtExt, Descriptor};
@@ -43,13 +45,24 @@ use speculos::{Button, Speculos};
 
 use crate::common::speculos::{connect_to, run_steps};
 
-/// The hot cosigner's seed: fingerprint `73c5da0a`, not the Speculos seed.
-const HOT_MNEMONIC: &str =
-    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-/// The name the policies are registered under.
+/// The name the policies are registered under on the Ledger.
 pub const WALLET_NAME: &str = "musig";
 const COIN_SATS: u64 = 100_000;
 const SPEND_SATS: u64 = 90_000;
+/// The fee of `offline_psbt`.
+const OFFLINE_FEE: Amount = Amount::from_sat(1_000);
+
+/// The role key `[fp/87'/1'/0'/R]tpub` of the BIP-87 account 0 whose xpub is `account`.
+fn role_key(fingerprint: Fingerprint, account: Xpub, key_type: KeyType) -> OXpub {
+    Bip87Account::new(
+        fingerprint,
+        bip87_account_path(NetworkKind::Test, 0),
+        account,
+    )
+    .unwrap()
+    .role_key(key_type, 0)
+    .unwrap()
+}
 
 /// The screens of an xpub export the user approves (app 2.4.6 asks for `m/87'/1'/0'`).
 pub const APPROVE_XPUB_STEPS: &[(&str, Button)] = &[
@@ -78,28 +91,29 @@ pub fn ledger_account_path() -> DerivationPath {
 
 /// The cosigner role key of the account `xpub` at `ledger_account_path`.
 pub fn cosigner_role_key(fingerprint: Fingerprint, xpub: Xpub) -> OXpub {
-    Bip87Account::new(fingerprint, ledger_account_path(), xpub)
-        .unwrap()
-        .role_key(KeyType::Cosigner, 0)
-        .unwrap()
+    role_key(fingerprint, xpub, KeyType::Cosigner)
 }
 
-/// The other cosigner: a bwk hot signer and its BIP-87 internal role key
-/// `[73c5da0a/87'/1'/0'/0]tpub`.
-pub struct HotCosigner {
+/// The role key of a device at `m/87'/1'/0'` (fingerprint and xpub read from it).
+pub fn device_key(device: &dyn HWI, key_type: KeyType) -> OXpub {
+    let account = device
+        .get_extended_pubkey(&bip87_account_path(NetworkKind::Test, 0))
+        .unwrap();
+    role_key(device.get_master_fingerprint().unwrap(), account, key_type)
+}
+
+/// A hot participant: its signer and its role key `[fp/87'/1'/0'/R]tpub`. Port of
+/// `Participant` (sign/tests/musig_core_interop.rs:55-71 at af8cdf5).
+pub struct HotParticipant {
     pub signer: HotSigner,
     pub key: OXpub,
 }
 
-impl HotCosigner {
-    pub fn new() -> Self {
-        let signer = HotSigner::new_from_mnemonics(Network::Testnet, HOT_MNEMONIC).unwrap();
-        let path = bip87_account_path(NetworkKind::Test, 0);
-        let account = signer.xpub(&path);
-        let key = Bip87Account::new(signer.fingerprint(), path, account.xkey)
-            .unwrap()
-            .role_key(KeyType::Internal, 0)
-            .unwrap();
+impl HotParticipant {
+    pub fn new(seed: &str, key_type: KeyType) -> Self {
+        let signer = HotSigner::new_from_mnemonics(Network::Testnet, seed).unwrap();
+        let account = signer.xpub(&bip87_account_path(NetworkKind::Test, 0));
+        let key = role_key(signer.fingerprint(), account.xkey, key_type);
         Self { signer, key }
     }
 }
@@ -132,6 +146,27 @@ pub fn leaf_2of2(l: &OXpub, h: &OXpub) -> WalletDescriptor {
     let keys = [l.clone(), h.clone()];
     let leaf = TapTree::Leaf(Arc::new(musig_leaf(&keys, 0).unwrap()));
     nums_tr(musig_key(&keys, 2).unwrap(), leaf)
+}
+
+/// bwk-bup 2-of-3 MuSig2 over [a, b, c]: 3 `pk(musig(..))` leaves under a NUMS
+/// internal key, as sign/tests/musig_core_interop.rs:509-530 (af8cdf5) compiles it.
+pub fn policy_2_of_3(a: &OXpub, b: &OXpub, c: &OXpub) -> WalletDescriptor {
+    let semantic = Semantic::Multi {
+        keys: vec![a.clone(), b.clone(), c.clone()],
+        threshold: 2,
+    };
+    let path = Path::new(semantic, Locktime::None, TapPosition::TapTree(vec![]));
+    let mut policy = Policy::new(vec![path], PolicyType::PrimaryOnly).unwrap();
+    let descriptor = policy.compile().unwrap().clone();
+    let Descriptor::Tr(tr) = &descriptor else {
+        panic!("expected tr()");
+    };
+    let musig_leaves = tr
+        .iter_scripts()
+        .filter(|(_, ms)| ms.iter_pk().any(|key| key.is_musig()))
+        .count();
+    assert_eq!(musig_leaves, 3);
+    descriptor
 }
 
 /// A tr() whose only leaf is `leaf`, under the NUMS internal key bwk-bup derives
@@ -175,7 +210,8 @@ pub fn ledger_policy(descriptor: &WalletDescriptor) -> String {
     musig_descriptor_to_string(descriptor, false)
 }
 
-/// `descriptor` at `index` of `keychain` (0 receive, 1 change).
+/// `descriptor` at `index` of `keychain` (0 receive, 1 change). Port of
+/// sign/tests/musig_core_interop.rs:279-283 (af8cdf5).
 pub fn derived(
     descriptor: &WalletDescriptor,
     keychain: usize,
@@ -195,56 +231,163 @@ pub fn spend_leaf_hash(descriptor: &WalletDescriptor) -> TapLeafHash {
     TapLeafHash::from_script(&ms.encode(), LeafVersion::TapScript)
 }
 
-/// Spends the receive coin at index 0 (`COIN_SATS`) to a fixed external P2TR
-/// (`SPEND_SATS`), the input filled by bwk's updater.
-pub fn spend_psbt(descriptor: &WalletDescriptor) -> Psbt {
-    let secp = Secp256k1::new();
-    let external = SecretKey::from_slice(&[9; 32])
+/// The leaf of `signers` in the `keychain` descriptor at `index`: its hash and the
+/// KeyAgg output of its musig(). Port of sign/tests/musig_core_interop.rs:248-276
+/// (af8cdf5).
+pub fn spend_leaf(
+    descriptor: &WalletDescriptor,
+    keychain: usize,
+    index: u32,
+    signers: [Fingerprint; 2],
+) -> (TapLeafHash, PublicKey) {
+    let Descriptor::Tr(tr) = derived(descriptor, keychain, index) else {
+        panic!("expected tr()");
+    };
+    let wanted: BTreeSet<Fingerprint> = signers.into_iter().collect();
+    tr.iter_scripts()
+        .find_map(|(_, ms)| {
+            let agg = ms.iter_pk().find_map(|key| key.as_musig().cloned())?;
+            let fingerprints: BTreeSet<Fingerprint> = agg
+                .cosigners()
+                .iter()
+                .map(|key| key.master_fingerprint())
+                .collect();
+            (fingerprints == wanted).then(|| {
+                (
+                    TapLeafHash::from_script(&ms.encode(), LeafVersion::TapScript),
+                    agg.aggregate(),
+                )
+            })
+        })
         .unwrap()
-        .x_only_public_key(&secp)
-        .0;
+}
+
+/// Only `leaf`: its script and the 0x1a of `aggregate`. Port of
+/// sign/tests/musig_core_interop.rs:285-300 (af8cdf5) without the `tap_key_origins`
+/// restriction: the Coldcard matches an input against the enrolled wallet by its
+/// whole origin list (`MiniScriptWallet.matching_subpaths`, coldcard/firmware
+/// 04e949d6 `shared/wallet.py`) and skips an input that lists only the leaf's keys.
+fn keep_leaf(input: &mut Input, leaf: TapLeafHash, aggregate: PublicKey) {
+    input
+        .tap_scripts
+        .retain(|_, (script, version)| TapLeafHash::from_script(script, *version) == leaf);
+    input.unknown.retain(|key, _| {
+        key.type_value != PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS || key.key == aggregate.serialize()
+    });
+}
+
+/// `psbt` restricted to the leaf of `signers` (keep_leaf on every input).
+pub fn restrict_to_leaf(
+    psbt: &mut Psbt,
+    descriptor: &WalletDescriptor,
+    keychain: usize,
+    index: u32,
+    signers: [Fingerprint; 2],
+) {
+    let (leaf, aggregate) = spend_leaf(descriptor, keychain, index, signers);
+    for input in &mut psbt.inputs {
+        keep_leaf(input, leaf, aggregate);
+    }
+}
+
+/// 1-in 1-out PSBT spending a fake funding output of `value` at (keychain, index) of
+/// `descriptor` to `output`, the input filled by bwk's updater.
+fn spend_coin(
+    descriptor: &WalletDescriptor,
+    keychain: usize,
+    index: u32,
+    value: Amount,
+    output: TxOut,
+) -> Psbt {
+    let definite = derived(descriptor, keychain, index);
+    let coin = TxOut {
+        value,
+        script_pubkey: definite.script_pubkey(),
+    };
+    let funding = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![coin.clone()],
+    };
     let tx = Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
             previous_output: OutPoint {
-                txid: Txid::from_byte_array([1; 32]),
+                txid: funding.compute_txid(),
                 vout: 0,
             },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(SPEND_SATS),
-            script_pubkey: ScriptBuf::new_p2tr(&secp, external, None),
-        }],
+        output: vec![output],
     };
     let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
-    let definite = derived(descriptor, 0, 0);
-    psbt.inputs[0].witness_utxo = Some(TxOut {
-        value: Amount::from_sat(COIN_SATS),
-        script_pubkey: definite.script_pubkey(),
-    });
+    psbt.inputs[0].witness_utxo = Some(coin);
     update_input(&mut psbt, 0, &definite).unwrap();
     psbt
 }
 
-/// The PSBT the Ledger gets for round 1: `psbt` without any pubnonce, since one
-/// pubnonce makes the app run round 2.
-pub fn round1_copy(psbt: &Psbt) -> Psbt {
+/// Spends the receive coin at index 0 (`COIN_SATS`) to a fixed external P2TR
+/// (`SPEND_SATS`).
+pub fn spend_psbt(descriptor: &WalletDescriptor) -> Psbt {
+    let secp = Secp256k1::new();
+    let external = SecretKey::from_slice(&[9; 32])
+        .unwrap()
+        .x_only_public_key(&secp)
+        .0;
+    let output = TxOut {
+        value: Amount::from_sat(SPEND_SATS),
+        script_pubkey: ScriptBuf::new_p2tr(&secp, external, None),
+    };
+    spend_coin(descriptor, 0, 0, Amount::from_sat(COIN_SATS), output)
+}
+
+/// 1-in 1-out PSBT spending a fake funding output of `value` at (keychain, index) of
+/// `descriptor` back to its receive index 0, inputs and outputs filled by bwk's
+/// updater (as bwk builds them).
+pub fn offline_psbt(
+    descriptor: &WalletDescriptor,
+    keychain: usize,
+    index: u32,
+    value: Amount,
+) -> Psbt {
+    let receive_0 = derived(descriptor, 0, 0);
+    let output = TxOut {
+        value: value - OFFLINE_FEE,
+        script_pubkey: receive_0.script_pubkey(),
+    };
+    let mut psbt = spend_coin(descriptor, keychain, index, value, output);
+    update_output(&mut psbt, 0, &receive_0).unwrap();
+    psbt
+}
+
+/// A copy of `psbt` without any 0x1b / 0x1c: the round 1 input for every signer (one
+/// pubnonce makes the Ledger run round 2).
+pub fn without_nonces(psbt: &Psbt) -> Psbt {
     let mut copy = psbt.clone();
     for input in &mut copy.inputs {
         remove_musig_input_pub_nonces(input);
+        remove_musig_input_partial_sigs(input);
     }
     copy
 }
 
-/// Copies every pubnonce of `from` into `into`, input by input.
-pub fn merge_nonces(into: &mut Psbt, from: &Psbt) {
-    for (input, from) in into.inputs.iter_mut().zip(&from.inputs) {
-        for nonce in musig_input_pub_nonces(from).unwrap() {
+/// Adds the 0x1b and 0x1c entries of `answer` to `master`, input by input.
+pub fn merge_round(master: &mut Psbt, answer: &Psbt) {
+    for (input, answer) in master.inputs.iter_mut().zip(&answer.inputs) {
+        for nonce in musig_input_pub_nonces(answer).unwrap() {
             set_musig_input_pub_nonce(input, &nonce);
+        }
+        for sig in musig_input_partial_sigs(answer).unwrap() {
+            set_musig_input_partial_sig(input, &sig);
         }
     }
 }

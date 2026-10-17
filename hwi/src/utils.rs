@@ -11,6 +11,12 @@ use bitcoin::{
 
 use crate::{Error, HWI};
 
+// BIP-373 input fields, kept as raw unknown entries so no bwk-psbt dependency is
+// needed (they must be copied without the `musig` feature).
+pub(crate) const PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS: u8 = 0x1a;
+const PSBT_IN_MUSIG2_PUB_NONCE: u8 = 0x1b;
+const PSBT_IN_MUSIG2_PARTIAL_SIG: u8 = 0x1c;
+
 pub struct Bip32DerivationFilter<'a> {
     psbt: &'a mut Psbt,
     ignored_bip32_derivations: Vec<BTreeMap<PublicKey, KeySource>>,
@@ -115,6 +121,35 @@ pub fn merge_signatures(psbt: &mut Psbt, signed_psbt: &Psbt) {
     }
 }
 
+/// Copies the BIP-373 MuSig2 entries (participants, public nonces, partial
+/// signatures) of every input of `signed_psbt` into the same input of `psbt`; an
+/// entry already there takes the device's value. Other unknown entries are not
+/// copied.
+pub fn merge_musig_fields(psbt: &mut Psbt, signed_psbt: &Psbt) {
+    for (psbtin, signed_psbtin) in psbt.inputs.iter_mut().zip(&signed_psbt.inputs) {
+        for (key, value) in &signed_psbtin.unknown {
+            if matches!(
+                key.type_value,
+                PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS
+                    | PSBT_IN_MUSIG2_PUB_NONCE
+                    | PSBT_IN_MUSIG2_PARTIAL_SIG
+            ) {
+                psbtin.unknown.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+/// True when an input of `psbt` carries a MuSig2 public nonce (0x1b).
+pub(crate) fn psbt_has_musig_pub_nonce(psbt: &Psbt) -> bool {
+    psbt.inputs.iter().any(|input| {
+        input
+            .unknown
+            .keys()
+            .any(|key| key.type_value == PSBT_IN_MUSIG2_PUB_NONCE)
+    })
+}
+
 pub fn bip86_path_child_numbers(path: DerivationPath) -> Result<Vec<ChildNumber>, Error> {
     let children: Vec<ChildNumber> = path.into();
     if children.len() != 5
@@ -164,6 +199,97 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
+
+    use bitcoin::{
+        absolute::LockTime,
+        psbt::{
+            raw::{Key, ProprietaryKey},
+            PsbtSighashType,
+        },
+        transaction::Version,
+        Transaction, TxIn,
+    };
+
+    fn psbt_with_inputs(count: usize) -> Psbt {
+        Psbt::from_unsigned_tx(Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn::default(); count],
+            output: vec![],
+        })
+        .unwrap()
+    }
+
+    fn raw_key(type_value: u8, key: u8) -> Key {
+        Key {
+            type_value,
+            key: vec![key; 66],
+        }
+    }
+
+    #[test]
+    fn merge_musig_fields_copies_only_bip373_entries() {
+        let mut psbt = psbt_with_inputs(1);
+        psbt.inputs[0]
+            .unknown
+            .insert(raw_key(PSBT_IN_MUSIG2_PUB_NONCE, 1), vec![0xaa]);
+        psbt.inputs[0].unknown.insert(raw_key(0x99, 1), vec![0x01]);
+        psbt.inputs[0].sighash_type = Some(PsbtSighashType::from_u32(1));
+        let original = psbt.clone();
+
+        let mut signed = psbt_with_inputs(2);
+        for input in &mut signed.inputs {
+            input
+                .unknown
+                .insert(raw_key(PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS, 2), vec![0x1a]);
+            input
+                .unknown
+                .insert(raw_key(PSBT_IN_MUSIG2_PUB_NONCE, 1), vec![0xbb]);
+            input
+                .unknown
+                .insert(raw_key(PSBT_IN_MUSIG2_PARTIAL_SIG, 3), vec![0x1c]);
+            input.unknown.insert(raw_key(0x99, 2), vec![0x02]);
+            input.proprietary.insert(
+                ProprietaryKey {
+                    prefix: b"bwk".to_vec(),
+                    subtype: 0x1b,
+                    key: vec![],
+                },
+                vec![0x03],
+            );
+        }
+
+        merge_musig_fields(&mut psbt, &signed);
+
+        assert_eq!(psbt.inputs.len(), 1);
+        let unknown = &psbt.inputs[0].unknown;
+        assert_eq!(unknown.len(), 4);
+        assert_eq!(
+            unknown[&raw_key(PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS, 2)],
+            vec![0x1a]
+        );
+        assert_eq!(unknown[&raw_key(PSBT_IN_MUSIG2_PUB_NONCE, 1)], vec![0xbb]);
+        assert_eq!(unknown[&raw_key(PSBT_IN_MUSIG2_PARTIAL_SIG, 3)], vec![0x1c]);
+        assert_eq!(unknown[&raw_key(0x99, 1)], vec![0x01]);
+        let mut expected = original.inputs[0].clone();
+        expected.unknown = unknown.clone();
+        assert_eq!(psbt.inputs[0], expected);
+        assert_eq!(psbt.unsigned_tx, original.unsigned_tx);
+    }
+
+    #[test]
+    fn psbt_has_musig_pub_nonce_needs_a_0x1b() {
+        let mut psbt = psbt_with_inputs(2);
+        assert!(!psbt_has_musig_pub_nonce(&psbt));
+        psbt.inputs[1]
+            .unknown
+            .insert(raw_key(PSBT_IN_MUSIG2_PARTIAL_SIG, 1), vec![0x1c]);
+        assert!(!psbt_has_musig_pub_nonce(&psbt));
+        psbt.inputs[1]
+            .unknown
+            .insert(raw_key(PSBT_IN_MUSIG2_PUB_NONCE, 1), vec![0x1b]);
+        assert!(psbt_has_musig_pub_nonce(&psbt));
+    }
 
     #[test]
     fn test_sort_bip32_derivations() {

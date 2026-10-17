@@ -26,8 +26,6 @@ pub const SIM_PYTHON_ENV: &str = "COLDCARD_SIM_PYTHON";
 /// When set, each simulator writes its output to `<dir>/sim-<pid>.log`.
 pub const SIM_LOG_DIR_ENV: &str = "COLDCARD_SIM_LOG_DIR";
 
-pub const SEED_A: &str =
-    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 pub const SEED_A_FINGERPRINT: &str = "73c5da0a";
 /// `m/87'/1'/0'` of `SEED_A`.
 pub const SEED_A_BIP87_TPUB: &str = "tpubDCChhoz5Qdrkn7Z7KXawq6Ad6r3A4MUkCoVTqeWxfTkA6bHNJ3CHUEtALQdkNeixNz4446PcAmw4WKcj3mV2vb29H7sg9EPzbyCU1y2merw";
@@ -36,6 +34,11 @@ const START_TIMEOUT: Duration = Duration::from_secs(90);
 const START_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const APPROVER_POLL_INTERVAL: Duration = Duration::from_millis(300);
+/// The simulator answers the last sender, so a story poll landing inside a
+/// multi-packet upload of the device link breaks both links. The approver waits
+/// this long before its first poll, for the upload the caller starts right after
+/// spawning it (enroll payload, PSBT) to finish.
+const APPROVER_UPLOAD_GRACE: Duration = Duration::from_secs(1);
 /// ckcc-protocol's `cap_story`, short enough for one packet.
 const CAP_STORY: &str = "RV.write('\\0'.join(sim_display.story or[]).encode())";
 
@@ -173,6 +176,7 @@ impl Approver {
             let stories = stories.clone();
             let stop = stop.clone();
             thread::spawn(move || {
+                thread::sleep(APPROVER_UPLOAD_GRACE);
                 let mut previous = None;
                 while !stop.load(Ordering::Relaxed) {
                     let story = parse_story(&link.exec(CAP_STORY).unwrap());

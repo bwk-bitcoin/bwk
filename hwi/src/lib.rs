@@ -23,6 +23,11 @@ use std::{cmp::Ordering, fmt::Debug};
 #[cfg(feature = "regex")]
 use std::str::FromStr;
 
+/// The text of [`Error::MusigSession`]. The service forwards device errors as text
+/// (`SigningDeviceMsg::Error(_, String)`), so a consumer recognises this one by
+/// comparing with `MUSIG_SESSION_ERROR`.
+pub const MUSIG_SESSION_ERROR: &str = "MuSig2 session lost on the device, start again from round 1";
+
 #[derive(Debug, Clone)]
 pub enum Error {
     ParsingPolicy(bip389::ParseError),
@@ -39,6 +44,9 @@ pub enum Error {
     UserRefused,
     NetworkMismatch,
     Bip86ChangeIndex,
+    /// The device no longer holds the MuSig2 session of this PSBT (restarted, or a
+    /// round sent twice): every signer starts again from round 1.
+    MusigSession,
 }
 
 impl std::fmt::Display for Error {
@@ -60,6 +68,7 @@ impl std::fmt::Display for Error {
             Error::Bip86ChangeIndex => {
                 write!(f, "Ledger devices only accept 0 or 1 as`change` index value for BIP86 derivation path")
             }
+            Error::MusigSession => write!(f, "{MUSIG_SESSION_ERROR}"),
         }
     }
 }
@@ -271,7 +280,12 @@ mod tests {
     #[cfg(feature = "regex")]
     use super::*;
 
-    use crate::DeviceKind;
+    use crate::{DeviceKind, Error, MUSIG_SESSION_ERROR};
+
+    #[test]
+    fn musig_session_error_text() {
+        assert_eq!(Error::MusigSession.to_string(), MUSIG_SESSION_ERROR);
+    }
 
     #[test]
     fn coldcard_simulator_kind_round_trips() {

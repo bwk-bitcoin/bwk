@@ -1622,6 +1622,10 @@ fn handle_locked_bitbox<Message, Id>(
     }
 }
 
+/// Device map id of the Coldcard simulator.
+#[cfg(all(feature = "coldcard", unix))]
+const COLDCARD_SIMULATOR_ID: &str = "coldcard-simulator";
+
 /// The simulator reports no firmware version (its `vers` only carries the bootloader
 /// one), so no version gate applies, unlike `handle_coldcard`.
 #[cfg(all(feature = "coldcard", unix))]
@@ -1634,7 +1638,6 @@ fn handle_coldcard_simulator<Message, Id>(
     Message: From<SigningDeviceMsg<Id>> + Send + Clone + 'static,
     Id: Send + Clone + 'static,
 {
-    const COLDCARD_SIMULATOR_ID: &str = "coldcard-simulator";
     if devices
         .lock()
         .expect("poisoned")
@@ -1717,7 +1720,12 @@ fn handle_coldcard<Message, Id>(
         tracing::debug!("Found {} potential Coldcard device(s)", list.len());
     }
 
-    let connected_ids: Vec<_> = list.iter().map(|d| coldcard_id(d)).collect();
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut connected_ids: Vec<_> = list.iter().map(|d| coldcard_id(d)).collect();
+    // the simulator shares the "coldcard-" prefix but is not a HID device: its own
+    // handler removes it
+    #[cfg(unix)]
+    connected_ids.push(COLDCARD_SIMULATOR_ID.into());
     tracing::trace!("handle_coldcard: connected_ids={:?}", connected_ids);
     cleanup_disconnected(sender, handles, &devices, &connected_ids, "coldcard-");
 

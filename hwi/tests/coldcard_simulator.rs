@@ -25,8 +25,8 @@ use bwk_hwi::{coldcard::Coldcard, DeviceKind, HWI};
 
 use common::{
     build_tr_keypath_test_psbt,
-    coldcard_sim::{Approver, SimProcess, SEED_A, SEED_A_BIP87_TPUB, SEED_A_FINGERPRINT},
-    cosigner_origin, KeyOrigin,
+    coldcard_sim::{Approver, SimProcess, SEED_A_BIP87_TPUB, SEED_A_FINGERPRINT},
+    cosigner_origin, KeyOrigin, SEED_A,
 };
 
 const WALLET_NAME: &str = "bwk-plain-tr";
@@ -35,6 +35,9 @@ const ACCOUNT_PATH: &str = "m/87'/1'/0'";
 const REGISTERED_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(feature = "service")]
 const SERVICE_LIST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Three poll cycles of the service.
+#[cfg(feature = "service")]
+const SERVICE_STAY_LISTED: Duration = Duration::from_secs(6);
 
 /// `tr(<SEED_A account>/<0;1>/*,pk(<cosigner>/<0;1>/*))`
 fn plain_tr_policy() -> String {
@@ -185,6 +188,9 @@ fn coldcard_sim_service_lists_simulator() {
         );
         thread::sleep(Duration::from_millis(500));
     };
+    // the HID cleanup of the next poll cycles must keep it
+    thread::sleep(SERVICE_STAY_LISTED);
+    assert!(service.list().contains_key("coldcard-simulator"));
     service.stop();
     std::env::remove_var(COLDCARD_SIMULATOR_ENV);
 

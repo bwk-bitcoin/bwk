@@ -83,7 +83,10 @@ impl<T: Transport> Ledger<T> {
         policy: &WalletPolicy,
         hmac: Option<&[u8; 32]>,
     ) -> Result<(), HWIError> {
-        let yielded_objects = self.client.sign_psbt(psbt, policy, hmac)?;
+        let yielded_objects = self
+            .client
+            .sign_psbt(psbt, policy, hmac)
+            .map_err(|e| sign_error(e, psbt))?;
         merge_yields(psbt, yielded_objects)
     }
 
@@ -432,6 +435,19 @@ impl Transport for TransportTcp {
     }
 }
 
+/// `MusigSession` when the app answers SW_BAD_STATE to a PSBT carrying a pubnonce:
+/// round 2 found no session stored by round 1 (`musigsession_round2_initialize`,
+/// app-bitcoin-new 2.4.6). SW_BAD_STATE without a pubnonce keeps the plain mapping.
+fn sign_error<E: core::fmt::Debug>(e: BitcoinClientError<E>, psbt: &Psbt) -> HWIError {
+    match e {
+        BitcoinClientError::Device {
+            status: StatusWord::BadState,
+            ..
+        } if utils::psbt_has_musig_pub_nonce(psbt) => HWIError::MusigSession,
+        e => e.into(),
+    }
+}
+
 impl<T: core::fmt::Debug> From<BitcoinClientError<T>> for HWIError {
     fn from(e: BitcoinClientError<T>) -> HWIError {
         if let BitcoinClientError::Device { status, .. } = e {
@@ -454,6 +470,7 @@ mod tests {
         absolute::LockTime,
         ecdsa,
         hashes::Hash,
+        psbt::raw,
         secp256k1::{Keypair, Message, PublicKey, Secp256k1, SecretKey},
         taproot::{self, TapLeafHash},
         transaction::Version as TxVersion,
@@ -651,6 +668,46 @@ mod tests {
             &format!("wsh(sortedmulti(2,{KEY_A}/**,{KEY_B}/**))"),
             "wsh(sortedmulti(2,@0/**,@1/**))",
         );
+    }
+
+    fn device_error(status: StatusWord) -> BitcoinClientError<()> {
+        BitcoinClientError::Device {
+            command: 0x04,
+            status,
+        }
+    }
+
+    #[test]
+    fn sign_error_bad_state_with_a_pubnonce_is_musig_session() {
+        let mut psbt = one_input_psbt();
+        psbt.inputs[0].unknown.insert(
+            raw::Key {
+                type_value: 0x1b,
+                key: [pubkey(1).serialize(), pubkey(2).serialize()].concat(),
+            },
+            vec![0xaa; 66],
+        );
+        assert!(matches!(
+            sign_error(device_error(StatusWord::BadState), &psbt),
+            HWIError::MusigSession
+        ));
+        assert!(matches!(
+            sign_error(device_error(StatusWord::Deny), &psbt),
+            HWIError::UserRefused
+        ));
+    }
+
+    #[test]
+    fn sign_error_bad_state_without_a_pubnonce_is_device() {
+        let psbt = one_input_psbt();
+        assert!(matches!(
+            sign_error(device_error(StatusWord::BadState), &psbt),
+            HWIError::Device(_)
+        ));
+        assert!(matches!(
+            sign_error(device_error(StatusWord::Deny), &psbt),
+            HWIError::UserRefused
+        ));
     }
 
     // This is a foolproof test in case next rust-bitcoin version introduces again the m/

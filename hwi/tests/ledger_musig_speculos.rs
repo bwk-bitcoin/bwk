@@ -8,7 +8,7 @@
 mod common;
 
 use bitcoin::{psbt::Psbt, taproot::TapLeafHash, Network};
-use bwk_bup::OXpub;
+use bwk_bup::{KeyType, OXpub};
 use bwk_descriptor::wallet::WalletDescriptor;
 use bwk_hwi::{
     ledger::{
@@ -25,12 +25,13 @@ use bwk_sign::musig::{musig_status, MusigRound};
 use common::{
     musig::{
         derived, finalize_and_verify, key_path_2of2, leaf_2of2, ledger_policy, ledger_role_key,
-        ledger_sign_tx, merge_nonces, register_steps, round1_copy, spend_leaf_hash, spend_psbt,
-        HotCosigner, WALLET_NAME,
+        ledger_sign_tx, merge_round, register_steps, spend_leaf_hash, spend_psbt, without_nonces,
+        HotParticipant, WALLET_NAME,
     },
     speculos::{
         connect_to, fresh_speculos, register_for_hmac, screen_seen, sign_step_refs, sign_steps,
     },
+    SEED_A,
 };
 use speculos::{Button, Speculos};
 
@@ -39,7 +40,7 @@ use speculos::{Button, Speculos};
 struct Setup {
     sim: Speculos,
     ledger_key: OXpub,
-    hot: HotCosigner,
+    hot: HotParticipant,
     descriptor: WalletDescriptor,
     policy: String,
     hmac: [u8; 32],
@@ -49,7 +50,7 @@ impl Setup {
     fn new(shape: fn(&OXpub, &OXpub) -> WalletDescriptor) -> Self {
         let sim = fresh_speculos();
         let ledger_key = ledger_role_key(&sim);
-        let hot = HotCosigner::new();
+        let hot = HotParticipant::new(SEED_A, KeyType::Internal);
         let descriptor = shape(&ledger_key, &hot.key);
         let policy = ledger_policy(&descriptor);
         let steps = register_steps(&policy, &ledger_key);
@@ -65,14 +66,19 @@ impl Setup {
         }
     }
 
-    /// Ledger round 1 on `round1_copy(psbt)`, its nonces merged into `psbt`. No
+    /// Ledger round 1 on `without_nonces(psbt)`, its nonces merged into `psbt`. No
     /// screen: the app asks nothing when it only produces pubnonces.
     fn ledger_round1(&self, psbt: &mut Psbt) {
-        let (result, signed) =
-            ledger_sign_tx(&self.sim, &self.policy, self.hmac, round1_copy(psbt), &[]);
+        let (result, signed) = ledger_sign_tx(
+            &self.sim,
+            &self.policy,
+            self.hmac,
+            without_nonces(psbt),
+            &[],
+        );
         result.unwrap();
         assert!(!screen_seen(&self.sim, "Review transaction"));
-        merge_nonces(psbt, &signed);
+        merge_round(psbt, &signed);
     }
 
     /// Ledger round 2 on `psbt` as it is, approved on screen.
@@ -210,4 +216,34 @@ fn speculos_musig_round1_with_a_cosigner_nonce_is_round2() {
     );
     assert!(setup.ledger_nonce_slots(&signed).is_empty());
     assert_eq!(signed, psbt);
+}
+
+/// Round 2 pops the session round 1 stored: the same round 2 PSBT sent again is
+/// approved, then answered SW_BAD_STATE, which a PSBT carrying pubnonces maps to
+/// `MusigSession`. Nothing is merged.
+#[test]
+#[ignore = "requires SPECULOS_ELF"]
+fn speculos_musig_replayed_round_2_is_musig_session() {
+    let setup = Setup::new(key_path_2of2);
+    let mut psbt = spend_psbt(&setup.descriptor);
+    setup.ledger_round1(&mut psbt);
+    setup.hot_sign(&mut psbt);
+    assert_eq!(setup.round(&psbt), MusigRound::PartialSigs);
+
+    let signed = setup.ledger_round2(psbt.clone());
+    assert_eq!(setup.ledger_partial_sig_slots(&signed), vec![None]);
+
+    let steps = sign_steps(true, true, 2);
+    let (result, replayed) = ledger_sign_tx(
+        &setup.sim,
+        &setup.policy,
+        setup.hmac,
+        psbt.clone(),
+        &sign_step_refs(&steps),
+    );
+    assert!(
+        matches!(result, Err(bwk_hwi::Error::MusigSession)),
+        "{result:?}"
+    );
+    assert_eq!(replayed, psbt);
 }

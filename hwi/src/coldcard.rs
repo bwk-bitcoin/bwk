@@ -10,16 +10,30 @@ use std::{
 use bitcoin::{
     bip32::{DerivationPath, Fingerprint, Xpub},
     psbt::Psbt,
+    secp256k1::PublicKey,
 };
 use hidapi::DeviceInfo;
 
 use coldcard::protocol::DescriptorName;
 
-use crate::{parse_version, AddressScript, DeviceKind, Error as HWIError, Version, HWI};
+use crate::{
+    parse_version,
+    utils::{self, PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS},
+    AddressScript, DeviceKind, Error as HWIError, Version, HWI,
+};
 pub use coldcard as api;
 
 /// Pause between two `get_signed_tx` polls while the user reviews the transaction.
 const SIGNED_TX_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// What the firmware raises on a lost MuSig2 session (`shared/psbt.py`,
+/// `musig_process_input`, at coldcard/firmware 04e949d6): its own pubnonce in a
+/// round 1 PSBT, or missing from a round 2 one.
+const MUSIG_SESSION_TEXTS: [&str; 2] = ["musig needs restart", "resign"];
+/// The answer to the signed transaction poll when signing raised after the user
+/// approved (`shared/auth.py`, `ApproveTransaction.interact`, same commit); the reason
+/// only goes to the screen.
+const SIGNING_FAILED_LATE: &str = "Signing failed late";
+const PUBLIC_KEY_LEN: usize = 33;
 
 #[derive(Debug)]
 pub struct Coldcard {
@@ -90,9 +104,7 @@ impl HWI for Coldcard {
     }
 
     fn get_master_fingerprint(&self) -> Result<Fingerprint, HWIError> {
-        let s = self.device()?.xpub(None)?;
-        let xpub = Xpub::from_str(&s).map_err(|e| HWIError::Device(e.to_string()))?;
-        Ok(xpub.fingerprint())
+        master_fingerprint(&mut *self.device()?)
     }
 
     fn get_extended_pubkey(&self, path: &DerivationPath) -> Result<Xpub, HWIError> {
@@ -156,31 +168,88 @@ impl HWI for Coldcard {
             None
         };
 
-        cc.sign_psbt_miniscript(&psbt.serialize(), api::SignMode::Signed, wallet_name)?;
+        let tx =
+            sign_and_wait(&mut cc, psbt, wallet_name).map_err(|e| sign_error(&mut cc, e, psbt))?;
 
-        let tx = loop {
-            if let Some(tx) = cc.get_signed_tx()? {
-                break tx;
-            }
-            thread::sleep(SIGNED_TX_POLL_INTERVAL);
-        };
-
-        let mut new_psbt = Psbt::deserialize(&tx).map_err(|e| HWIError::Device(e.to_string()))?;
-
-        for i in 0..new_psbt.inputs.len() {
-            psbt.inputs[i]
-                .partial_sigs
-                .append(&mut new_psbt.inputs[i].partial_sigs);
-            psbt.inputs[i]
-                .tap_script_sigs
-                .append(&mut new_psbt.inputs[i].tap_script_sigs);
-            if let Some(sig) = new_psbt.inputs[i].tap_key_sig {
-                psbt.inputs[i].tap_key_sig = Some(sig);
-            }
+        let new_psbt = Psbt::deserialize(&tx).map_err(|e| HWIError::Device(e.to_string()))?;
+        if new_psbt.inputs.len() != psbt.inputs.len() {
+            return Err(HWIError::Device(format!(
+                "Coldcard returned a PSBT with {} inputs, expected {}",
+                new_psbt.inputs.len(),
+                psbt.inputs.len()
+            )));
         }
+
+        utils::merge_signatures(psbt, &new_psbt);
+        utils::merge_musig_fields(psbt, &new_psbt);
 
         Ok(())
     }
+}
+
+fn master_fingerprint(cc: &mut coldcard::Coldcard) -> Result<Fingerprint, HWIError> {
+    let s = cc.xpub(None)?;
+    let xpub = Xpub::from_str(&s).map_err(|e| HWIError::Device(e.to_string()))?;
+    Ok(xpub.fingerprint())
+}
+
+/// Sends `psbt` for signing and polls until the device answers with the signed PSBT.
+fn sign_and_wait(
+    cc: &mut coldcard::Coldcard,
+    psbt: &Psbt,
+    wallet_name: Option<DescriptorName>,
+) -> Result<Vec<u8>, api::Error> {
+    cc.sign_psbt_miniscript(&psbt.serialize(), api::SignMode::Signed, wallet_name)?;
+    loop {
+        if let Some(tx) = cc.get_signed_tx()? {
+            return Ok(tx);
+        }
+        thread::sleep(SIGNED_TX_POLL_INTERVAL);
+    }
+}
+
+/// `MusigSession` when the device error means it lost the MuSig2 session of `psbt`
+/// (see [`musig_session_error`]), else the plain mapping. The fingerprint is only
+/// read for a protocol error.
+fn sign_error(cc: &mut coldcard::Coldcard, e: api::Error, psbt: &Psbt) -> HWIError {
+    match e {
+        api::Error::Decoding(api::protocol::DecodeError::Protocol(ref text))
+            if master_fingerprint(cc)
+                .is_ok_and(|fingerprint| musig_session_error(text, psbt, fingerprint)) =>
+        {
+            HWIError::MusigSession
+        }
+        e => e.into(),
+    }
+}
+
+/// True when the device error `text` reports a lost MuSig2 session: the firmware's
+/// own reason when it forwards it, or "Signing failed late" on a PSBT where the
+/// device (`fingerprint`) is a MuSig2 participant.
+fn musig_session_error(text: &str, psbt: &Psbt, fingerprint: Fingerprint) -> bool {
+    MUSIG_SESSION_TEXTS
+        .iter()
+        .any(|reason| text.contains(reason))
+        || (text == SIGNING_FAILED_LATE && is_musig_participant(psbt, fingerprint))
+}
+
+/// True when a participant key of an input's 0x1a entries has a `tap_key_origins`
+/// entry with `fingerprint`.
+fn is_musig_participant(psbt: &Psbt, fingerprint: Fingerprint) -> bool {
+    psbt.inputs.iter().any(|input| {
+        input
+            .unknown
+            .iter()
+            .filter(|(key, _)| key.type_value == PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS)
+            .flat_map(|(_, participants)| participants.chunks(PUBLIC_KEY_LEN))
+            .filter_map(|participant| PublicKey::from_slice(participant).ok())
+            .any(|participant| {
+                input
+                    .tap_key_origins
+                    .get(&participant.x_only_public_key().0)
+                    .is_some_and(|(_, (origin, _))| *origin == fingerprint)
+            })
+    })
 }
 
 impl From<api::Error> for HWIError {
@@ -207,4 +276,106 @@ impl From<Coldcard> for Arc<dyn HWI + Sync + Send> {
 
 pub fn is_coldcard(device_info: &DeviceInfo) -> bool {
     device_info.vendor_id() == api::COINKITE_VID && device_info.product_id() == api::CKCC_PID
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use bitcoin::{
+        absolute::LockTime,
+        bip32::{DerivationPath, Fingerprint},
+        psbt::{raw::Key, Psbt},
+        secp256k1::{PublicKey, Secp256k1, SecretKey},
+        transaction::Version,
+        Transaction, TxIn,
+    };
+
+    use crate::{
+        coldcard::{musig_session_error, SIGNING_FAILED_LATE},
+        utils::PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS,
+    };
+
+    /// The fingerprint of the device under test.
+    fn device() -> Fingerprint {
+        Fingerprint::from([0xcc; 4])
+    }
+
+    fn other() -> Fingerprint {
+        Fingerprint::from([0xdd; 4])
+    }
+
+    fn pubkey(byte: u8) -> PublicKey {
+        SecretKey::from_slice(&[byte; 32])
+            .unwrap()
+            .public_key(&Secp256k1::new())
+    }
+
+    fn one_input_psbt() -> Psbt {
+        Psbt::from_unsigned_tx(Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![],
+        })
+        .unwrap()
+    }
+
+    /// An input with a 0x1a entry of the keys 1 and 2, key 2 having an origin with
+    /// the `device()` fingerprint.
+    fn musig_psbt() -> Psbt {
+        let mut psbt = one_input_psbt();
+        let input = &mut psbt.inputs[0];
+        input.unknown.insert(
+            Key {
+                type_value: PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS,
+                key: pubkey(3).serialize().to_vec(),
+            },
+            [pubkey(1).serialize(), pubkey(2).serialize()].concat(),
+        );
+        input.tap_key_origins.insert(
+            pubkey(2).x_only_public_key().0,
+            (
+                vec![],
+                (device(), DerivationPath::from_str("m/87'/1'/0'/2").unwrap()),
+            ),
+        );
+        psbt
+    }
+
+    #[test]
+    fn firmware_reason_is_a_musig_session_error() {
+        for text in ["musig needs restart", "resign"] {
+            assert!(musig_session_error(text, &one_input_psbt(), other()));
+            assert!(musig_session_error(text, &musig_psbt(), device()));
+        }
+    }
+
+    #[test]
+    fn signing_failed_late_needs_a_participant() {
+        assert!(musig_session_error(
+            SIGNING_FAILED_LATE,
+            &musig_psbt(),
+            device()
+        ));
+        assert!(!musig_session_error(
+            SIGNING_FAILED_LATE,
+            &musig_psbt(),
+            other()
+        ));
+        assert!(!musig_session_error(
+            SIGNING_FAILED_LATE,
+            &one_input_psbt(),
+            device()
+        ));
+    }
+
+    #[test]
+    fn other_errors_are_not_musig_session_errors() {
+        assert!(!musig_session_error(
+            "Invalid PSBT",
+            &musig_psbt(),
+            device()
+        ));
+    }
 }

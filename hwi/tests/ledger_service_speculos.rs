@@ -25,15 +25,18 @@ use common::{
 use speculos::Button;
 
 #[cfg(feature = "musig")]
+use bwk_bup::KeyType;
+#[cfg(feature = "musig")]
 use bwk_psbt::musig::musig_input_pub_nonces;
 #[cfg(feature = "musig")]
 use common::{
     musig::{
         cosigner_role_key, finalize_and_verify, key_path_2of2, ledger_account_path, ledger_policy,
-        merge_nonces, register_steps, round1_copy, spend_psbt, HotCosigner, APPROVE_XPUB_STEPS,
-        WALLET_NAME,
+        merge_round, register_steps, spend_psbt, without_nonces, HotParticipant,
+        APPROVE_XPUB_STEPS, WALLET_NAME,
     },
     speculos::screen_seen,
+    SEED_A,
 };
 
 const TR_1LEAF_NAME: &str = "tr-1leaf";
@@ -188,7 +191,7 @@ fn speculos_service_musig_two_rounds() {
         SigningDeviceMsg::XPub(_, fingerprint, _, xpub) => cosigner_role_key(fingerprint, xpub),
         other => panic!("get_extended_pubkey: {other:?}"),
     };
-    let hot = HotCosigner::new();
+    let hot = HotParticipant::new(SEED_A, KeyType::Internal);
     let descriptor = key_path_2of2(&ledger_key, &hot.key);
     let policy = ledger_policy(&descriptor);
     let steps = register_steps(&policy, &ledger_key);
@@ -201,9 +204,9 @@ fn speculos_service_musig_two_rounds() {
 
     // Round 1 on the copy without nonces: no screen, one Ledger 0x1b.
     let mut psbt = spend_psbt(&descriptor);
-    let nonces = sign_with_wallet(&svc, 3, round1_copy(&psbt), &wallet, &[]);
+    let nonces = sign_with_wallet(&svc, 3, without_nonces(&psbt), &wallet, &[]);
     assert!(!screen_seen(&svc.sim, "Review transaction"));
-    merge_nonces(&mut psbt, &nonces);
+    merge_round(&mut psbt, &nonces);
     let ledger_nonces = musig_input_pub_nonces(&psbt.inputs[0])
         .unwrap()
         .into_iter()

@@ -398,3 +398,30 @@ Minimum versions for Taproot Miniscript support:
 - Coldcard simulator: All versions
 - BitBox02: v9.21.0
 - Specter: All versions
+
+## MuSig2 Session Errors
+
+`SigningDeviceMsg::Error` carries the error as text. A device that no longer holds
+the MuSig2 session of a PSBT answers `Error::MusigSession`, whose text is
+`bwk_hwi::MUSIG_SESSION_ERROR`; compare with it to tell this case apart, then start
+again from round 1 with every signer.
+
+```
++----------+--------------------------------------------------------------------+
+| Device   | When                                                               |
++----------+--------------------------------------------------------------------+
+| Ledger   | SW_BAD_STATE (0xB007) on a PSBT carrying a pubnonce (0x1b): round  |
+|          | 2 without the session round 1 stored (restart, round 2 sent twice) |
+| Coldcard | "musig needs restart" or "resign" in the error, or "Signing failed |
+|          | late" on a PSBT where the device is a MuSig2 participant (round 1  |
+|          | holding its own pubnonce after a restart, round 1 sent twice)      |
++----------+--------------------------------------------------------------------+
+```
+
+The same SW_BAD_STATE without a pubnonce, and "Signing failed late" on a PSBT the
+Coldcard is no MuSig2 participant of, stay `Error::Device`.
+
+A Coldcard answer keeps its BIP-373 entries: participants (0x1a), pubnonces (0x1b)
+and partial signatures (0x1c) are copied into the PSBT next to the signatures. The
+Coldcard only signs an input whose `tap_key_origins` list every key of the enrolled
+wallet: a PSBT restricted to one leaf must keep them all.
