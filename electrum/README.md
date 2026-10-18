@@ -61,7 +61,9 @@ dropped. A dropped connection is not retried: `start()` opens a new one.
 
 Every listener connection (the scan's, and the header store's two) sends
 `server.ping` every 20 seconds, so a server does not drop it as idle. A ping
-that fails to send ends the connection the same way as a drop.
+that fails to send, or that gets no answer within 5 seconds, ends the connection
+the same way as a drop: a write to a silently dead socket can still succeed for
+many minutes.
 
 ### Async Listener (Recommended)
 
