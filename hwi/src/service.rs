@@ -121,6 +121,10 @@ where
         &self.kind
     }
 
+    pub fn capabilities(&self) -> Capabilities {
+        capabilities(&self.kind, self.version.as_ref())
+    }
+
     pub fn get_extended_pubkey(&self, id: Id, path: &DerivationPath, display: bool) {
         let path = path.clone();
         let sender = self.sender.clone();
@@ -2148,21 +2152,78 @@ const DEVICES_COMPATIBLE_WITH_TAPMINISCRIPT: [(DeviceKind, Option<Version>); 6] 
     ),
 ];
 
+/// (DeviceKind, min version) - None means all versions support it. The Ledger Bitcoin
+/// app signs `musig()` policies from 2.4.0, the Coldcard from EDGE firmware 6.5.0X.
+const DEVICES_COMPATIBLE_WITH_MUSIG: [(DeviceKind, Option<Version>); 4] = [
+    (
+        DeviceKind::Ledger,
+        Some(Version {
+            major: 2,
+            minor: 4,
+            patch: 0,
+            prerelease: None,
+        }),
+    ),
+    (
+        DeviceKind::LedgerSimulator,
+        Some(Version {
+            major: 2,
+            minor: 4,
+            patch: 0,
+            prerelease: None,
+        }),
+    ),
+    (
+        DeviceKind::Coldcard,
+        Some(Version {
+            major: 6,
+            minor: 5,
+            patch: 0,
+            prerelease: None,
+        }),
+    ),
+    (DeviceKind::ColdcardSimulator, None),
+];
+
+/// Whether `table` lists `device_kind` at `version` or later.
+fn listed(
+    table: &[(DeviceKind, Option<Version>)],
+    device_kind: &DeviceKind,
+    version: Option<&Version>,
+) -> bool {
+    table.iter().any(|(kind, minimal_version)| {
+        device_kind == kind
+            && match (version, minimal_version) {
+                (Some(v1), Some(v2)) => v1 >= v2,
+                (None, Some(_)) => false,
+                (Some(_), None) => true,
+                (None, None) => true,
+            }
+    })
+}
+
 pub fn is_compatible_with_tapminiscript(
     device_kind: &DeviceKind,
     version: Option<&Version>,
 ) -> bool {
-    DEVICES_COMPATIBLE_WITH_TAPMINISCRIPT
-        .iter()
-        .any(|(kind, minimal_version)| {
-            device_kind == kind
-                && match (version, minimal_version) {
-                    (Some(v1), Some(v2)) => v1 >= v2,
-                    (None, Some(_)) => false,
-                    (Some(_), None) => true,
-                    (None, None) => true,
-                }
-        })
+    listed(&DEVICES_COMPATIBLE_WITH_TAPMINISCRIPT, device_kind, version)
+}
+
+/// What a signing device can do, for a consumer to gate its features on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    /// Signs silent payment inputs and exports the BIP-352 scan and spend keys.
+    pub silent_payments: bool,
+    /// Signs `musig()` key expressions in taproot policies (both MuSig2 rounds).
+    pub musig: bool,
+}
+
+pub fn capabilities(device_kind: &DeviceKind, version: Option<&Version>) -> Capabilities {
+    Capabilities {
+        // No USB signing device supports silent payments yet.
+        silent_payments: false,
+        musig: listed(&DEVICES_COMPATIBLE_WITH_MUSIG, device_kind, version),
+    }
 }
 
 #[cfg(test)]
@@ -2174,11 +2235,46 @@ mod tests {
 
     use crate::{
         service::{
-            is_compatible_with_tapminiscript, should_poll, SigningDevice, SigningDeviceMsg,
-            UnsupportedReason,
+            capabilities, is_compatible_with_tapminiscript, should_poll, Capabilities,
+            SigningDevice, SigningDeviceMsg, UnsupportedReason,
         },
-        DeviceKind,
+        DeviceKind, Version,
     };
+
+    fn version(major: u32, minor: u32, patch: u32) -> Version {
+        Version {
+            major,
+            minor,
+            patch,
+            prerelease: None,
+        }
+    }
+
+    #[test]
+    fn musig_capability_follows_the_minimal_firmware() {
+        let cases = [
+            (DeviceKind::Ledger, Some(version(2, 3, 9)), false),
+            (DeviceKind::Ledger, Some(version(2, 4, 0)), true),
+            (DeviceKind::Ledger, None, false),
+            (DeviceKind::LedgerSimulator, Some(version(2, 4, 6)), true),
+            (DeviceKind::Coldcard, Some(version(6, 4, 0)), false),
+            (DeviceKind::Coldcard, Some(version(6, 5, 0)), true),
+            (DeviceKind::ColdcardSimulator, None, true),
+            (DeviceKind::BitBox02, Some(version(9, 21, 0)), false),
+            (DeviceKind::Jade, Some(version(1, 0, 30)), false),
+            (DeviceKind::Specter, None, false),
+        ];
+        for (kind, version, musig) in cases {
+            assert_eq!(
+                capabilities(&kind, version.as_ref()),
+                Capabilities {
+                    silent_payments: false,
+                    musig,
+                },
+                "{kind} at {version:?}"
+            );
+        }
+    }
 
     #[test]
     fn unsupported_device_in_the_map_is_polled_again() {
