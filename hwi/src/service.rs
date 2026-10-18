@@ -902,13 +902,24 @@ where
     Message: From<SigningDeviceMsg<Id>> + Send + Clone + 'static,
     Id: Send + Clone + 'static,
 {
-    // If device is already in the map, don't poll it again
-    if devices.lock().expect("poisoned").contains_key(id) {
-        tracing::trace!(
-            "should_poll({}): device already in map, returning false",
-            id
-        );
-        return false;
+    // If device is already in the map and supported or locked, don't poll it again: an
+    // unsupported one is polled until it turns supported (a Ledger app opened).
+    match devices.lock().expect("poisoned").get(id) {
+        Some(SigningDevice::Supported(_)) => {
+            tracing::trace!(
+                "should_poll({}): supported device already in map, returning false",
+                id
+            );
+            return false;
+        }
+        Some(SigningDevice::Locked { .. }) => {
+            tracing::trace!(
+                "should_poll({}): locked device already in map, returning false",
+                id
+            );
+            return false;
+        }
+        _ => {}
     }
 
     let result = match handles.get(id) {
@@ -2156,7 +2167,37 @@ pub fn is_compatible_with_tapminiscript(
 
 #[cfg(test)]
 mod tests {
-    use crate::{service::is_compatible_with_tapminiscript, DeviceKind};
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+    };
+
+    use crate::{
+        service::{
+            is_compatible_with_tapminiscript, should_poll, SigningDevice, SigningDeviceMsg,
+            UnsupportedReason,
+        },
+        DeviceKind,
+    };
+
+    #[test]
+    fn unsupported_device_in_the_map_is_polled_again() {
+        let id = "ledger-test";
+        let devices = Arc::new(Mutex::new(BTreeMap::new()));
+        devices.lock().expect("poisoned").insert(
+            id.to_string(),
+            SigningDevice::<SigningDeviceMsg>::Unsupported {
+                id: id.to_string(),
+                kind: DeviceKind::Ledger,
+                version: None,
+                reason: UnsupportedReason::AppIsNotOpen,
+            },
+        );
+        assert!(
+            should_poll(&BTreeMap::new(), &devices, id),
+            "a Ledger listed with its app closed must be polled until the app opens"
+        );
+    }
 
     #[test]
     fn coldcard_simulator_is_compatible_with_tapminiscript() {
