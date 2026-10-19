@@ -31,6 +31,9 @@ impl Cipher for Xor {
             .map(|body| body.iter().map(|b| b ^ 0x5a).collect())
             .ok_or_else(|| PersistError::Cipher("not sealed".into()))
     }
+    fn extension(&self) -> &str {
+        "sealed"
+    }
 }
 
 #[test]
@@ -54,7 +57,11 @@ fn backends_write_through_the_installed_cipher() {
         Some(b"{\"v\":42}".to_vec())
     );
     assert_eq!(json.get_rows("coins").unwrap().len(), 2);
-    let file = std::fs::read(dir.path().join("sealed").join("coins.json")).unwrap();
+    assert!(
+        !dir.path().join("sealed").join("coins.json").exists(),
+        "no .json file"
+    );
+    let file = std::fs::read(dir.path().join("sealed").join("coins.sealed")).unwrap();
     assert!(file.starts_with(MAGIC), "the store file is sealed");
     assert!(
         !String::from_utf8_lossy(&file).contains("42"),
@@ -81,11 +88,12 @@ fn backends_write_through_the_installed_cipher() {
             ("11".into(), vec![5, 6, 7, 8])
         ]
     );
-    assert!(std::fs::read(&path).unwrap().starts_with(MAGIC));
+    let sealed_path = dir.path().join("headers.sealed");
+    assert!(std::fs::read(&sealed_path).unwrap().starts_with(MAGIC));
     drop(headers);
 
     // A header cache the cipher does not open is a cache: wiped, not an error.
-    std::fs::write(&path, b"BWKH\0\0\0\0garbage!").unwrap();
+    std::fs::write(&sealed_path, b"BWKH\0\0\0\0garbage!").unwrap();
     let headers = HeaderBackend::open(path.clone(), 4).unwrap();
     assert_eq!(headers.get_rows("headers").unwrap(), vec![]);
 
@@ -93,7 +101,7 @@ fn backends_write_through_the_installed_cipher() {
     let store: FileConfigStore<Vec<u32>> = FileConfigStore::new(dir.path().join("config.json"));
     store.save(&vec![1, 2, 3]).unwrap();
     assert_eq!(store.load().unwrap(), Some(vec![1, 2, 3]));
-    assert!(std::fs::read(dir.path().join("config.json"))
+    assert!(std::fs::read(dir.path().join("config.sealed"))
         .unwrap()
         .starts_with(MAGIC));
 

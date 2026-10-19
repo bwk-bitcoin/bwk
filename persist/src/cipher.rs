@@ -19,6 +19,9 @@ use crate::PersistError;
 pub trait Cipher: Send + Sync + std::fmt::Debug {
     fn seal(&self, plain: &[u8]) -> Result<Vec<u8>, PersistError>;
     fn open(&self, sealed: &[u8]) -> Result<Vec<u8>, PersistError>;
+    /// The file extension of what it seals, in place of the clear format's (`json`,
+    /// `bin`): a sealed store is no longer JSON.
+    fn extension(&self) -> &str;
 }
 
 static CIPHER: RwLock<Option<Arc<dyn Cipher>>> = RwLock::new(None);
@@ -33,6 +36,14 @@ pub fn set_cipher(cipher: Option<Arc<dyn Cipher>>) {
 /// The cipher installed, `None` when the state is written in clear.
 pub fn cipher() -> Option<Arc<dyn Cipher>> {
     CIPHER.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// `path` with the installed cipher's extension, unchanged without one.
+pub fn sealed_path(path: &std::path::Path) -> std::path::PathBuf {
+    match cipher() {
+        Some(cipher) => path.with_extension(cipher.extension()),
+        None => path.to_path_buf(),
+    }
 }
 
 /// `plain` sealed with the cipher installed, unchanged without one.

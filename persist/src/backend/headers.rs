@@ -51,6 +51,7 @@ impl HeaderBackend {
                 PersistError::Io(format!("create_dir_all {}: {e}", parent.display()))
             })?;
         }
+        let path = cipher::sealed_path(&path);
         let lock = DirLock::acquire_path(Self::lock_path(&path))?;
         Ok(Self {
             path,

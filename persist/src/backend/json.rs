@@ -74,7 +74,7 @@ impl JsonBackend {
 
     /// Internal: filesystem path of `store`'s rows file.
     fn store_path(&self, store: &str) -> PathBuf {
-        self.dir.join(format!("{store}.json"))
+        cipher::sealed_path(&self.dir.join(format!("{store}.json")))
     }
 
     /// Path to the file that holds `store`'s rows.
@@ -147,6 +147,15 @@ impl JsonBackend {
     /// the file is absent.
     fn read_store(&self, store: &str) -> Result<BTreeMap<String, Value>, PersistError> {
         let path = self.store_path(store);
+        // A store left in clear is refused rather than read as empty: the wallet would
+        // start over beside it.
+        let clear = self.dir.join(format!("{store}.json"));
+        if path != clear && !path.exists() && clear.exists() {
+            return Err(PersistError::Cipher(format!(
+                "{} is not encrypted",
+                clear.display()
+            )));
+        }
         match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice::<BTreeMap<String, Value>>(&cipher::open(&bytes)?)
                 .map_err(|e| PersistError::Serde(format!("parse {}: {e}", path.display()))),
