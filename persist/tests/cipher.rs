@@ -68,10 +68,19 @@ fn backends_write_through_the_installed_cipher() {
         "nothing in clear"
     );
 
+    // The version file is sealed too: it cannot be changed under the wallet.
+    let sealed_dir = dir.path().join("sealed");
+    assert!(!sealed_dir.join("version").exists(), "no version in clear");
+    assert!(std::fs::read(sealed_dir.join("version.sealed"))
+        .unwrap()
+        .starts_with(MAGIC));
+    drop(json);
+    let json = JsonBackend::open(sealed_dir.clone()).expect("reopens through the cipher");
+    assert_eq!(json.get_rows("coins").unwrap().len(), 2);
+
     // A store written in clear does not open once a cipher is installed.
-    let clear = JsonBackend::open(dir.path().join("clear")).unwrap();
     assert!(matches!(
-        clear.get_rows("coins"),
+        JsonBackend::open(dir.path().join("clear")),
         Err(PersistError::Cipher(_))
     ));
 

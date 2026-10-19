@@ -88,7 +88,7 @@ impl JsonBackend {
     }
 
     fn version_path(&self) -> PathBuf {
-        self.dir.join(VERSION_FILENAME)
+        version_path(&self.dir)
     }
 
     /// Write [`DB_VERSION`] into the version file if this backend
@@ -102,7 +102,8 @@ impl JsonBackend {
         if self.stamped.load(Ordering::Acquire) {
             return Ok(());
         }
-        Self::atomic_write(&self.version_path(), format!("{DB_VERSION}\n").as_bytes())?;
+        let version = cipher::seal(format!("{DB_VERSION}\n").as_bytes())?;
+        Self::atomic_write(&self.version_path(), &version)?;
         self.stamped.store(true, Ordering::Release);
         Ok(())
     }
@@ -177,10 +178,25 @@ impl JsonBackend {
 ///
 /// Never creates the file. Stamping is deferred to the first actual
 /// write; see [`JsonBackend::stamp_version_if_needed`].
+/// The version file: sealed like the stores while a cipher is installed, so it cannot
+/// be changed under the wallet.
+fn version_path(dir: &std::path::Path) -> PathBuf {
+    cipher::sealed_path(&dir.join(VERSION_FILENAME))
+}
+
 fn check_version(dir: &std::path::Path) -> Result<Option<u32>, PersistError> {
-    let vp = dir.join(VERSION_FILENAME);
-    match fs::read_to_string(&vp) {
-        Ok(s) => {
+    let vp = version_path(dir);
+    let clear = dir.join(VERSION_FILENAME);
+    if vp != clear && !vp.exists() && clear.exists() {
+        return Err(PersistError::Cipher(format!(
+            "{} is not encrypted",
+            clear.display()
+        )));
+    }
+    match fs::read(&vp) {
+        Ok(bytes) => {
+            let bytes = cipher::open(&bytes)?;
+            let s = String::from_utf8_lossy(&bytes);
             let v: u32 = s.trim().parse().map_err(|e| {
                 PersistError::Serde(format!("parse version file {}: {e}", vp.display()))
             })?;
