@@ -357,22 +357,16 @@ impl<P: ScanProfile> ElectrumScanner<P> {
             .record_unconfirmed_tx(tx.clone());
     }
 
-    /// Updates the label of a coin identified by the given outpoint.
+    /// Updates the label of a coin identified by the given outpoint, and writes
+    /// it through the backend.
     ///
     /// An empty `label` removes the label instead of setting it.
     pub fn update_coin_label(&self, outpoint: String, label: String) {
         if let Ok(outpoint) = bitcoin::OutPoint::from_str(&outpoint) {
-            if !label.is_empty() {
-                self.label_store
-                    .lock()
-                    .expect("poisoned")
-                    .edit(LabelKey::OutPoint(outpoint), Some(label));
-            } else {
-                self.label_store
-                    .lock()
-                    .expect("poisoned")
-                    .remove(LabelKey::OutPoint(outpoint));
-            }
+            let mut store = self.label_store.lock().expect("poisoned");
+            let value = (!label.is_empty()).then_some(label);
+            store.edit(LabelKey::OutPoint(outpoint), value);
+            store.persist();
         }
         if let Ok(mut store) = self.coin_store.try_lock() {
             store.generate();
@@ -785,6 +779,52 @@ mod tests {
             ElectrumScanner::<RamProfile<DefaultBackend>>::try_new(config),
             Err(open::Error::Descriptor(derivator::Error::NotMultiXpub))
         ));
+    }
+
+    /// A coin label survives a reopen: it is written through the backend as it is
+    /// set, and removed the same way.
+    #[test]
+    fn a_coin_label_is_persisted() {
+        use crate::label_store::LabelKey;
+        use bwk_persist::PersistenceKind;
+
+        let dir = temp_dir::TempDir::new().unwrap();
+        let mnemo = Mnemonic::generate(12).unwrap();
+        let signer = HotSigner::new_from_mnemonics(Network::Regtest, &mnemo.to_string()).unwrap();
+        let xpub = signer.xpub(&DerivationPath::from_str("m/84'/0'/0'").unwrap());
+        let descriptor = Descriptor::<DescriptorPublicKey>::from_str(&format!(
+            "wpkh([{}/{}]{}/<0;1>/*)",
+            xpub.origin.0, xpub.origin.1, xpub.xkey
+        ))
+        .unwrap();
+        let config = ScannerConfig::new(
+            descriptor.into(),
+            dir.path().to_path_buf(),
+            "labels".into(),
+            "test".into(),
+            Network::Regtest,
+            Some(PersistenceKind::Json),
+        );
+        let outpoint = miniscript::bitcoin::OutPoint::from_str(
+            "1111111111111111111111111111111111111111111111111111111111111111:0",
+        )
+        .unwrap();
+        let key = LabelKey::OutPoint(outpoint);
+        let open =
+            || ElectrumScanner::<RamProfile<DefaultBackend>>::try_new(config.clone()).unwrap();
+
+        let scanner = open();
+        scanner.update_coin_label(outpoint.to_string(), "rent".into());
+        drop(scanner);
+        let scanner = open();
+        assert_eq!(
+            scanner.label_store().lock().unwrap().get(&key).as_deref(),
+            Some("rent")
+        );
+
+        scanner.update_coin_label(outpoint.to_string(), String::new());
+        drop(scanner);
+        assert_eq!(open().label_store().lock().unwrap().get(&key), None);
     }
 
     /// A tx the server reported confirmed but the chain has not promoted yet
