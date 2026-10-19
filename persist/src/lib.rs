@@ -55,6 +55,7 @@ use crate::backend::sqlite::SqliteBackend;
 use crate::backend::{json::JsonBackend, noop::NoopBackend, PersistenceBackend};
 
 pub mod backend;
+pub mod cipher;
 pub mod config_store;
 pub mod storage;
 
@@ -136,6 +137,9 @@ pub enum PersistError {
     Sqlite(String),
     #[error("sqlite support disabled: rebuild with feature `sqlite`")]
     SqliteDisabled,
+    /// The installed [`cipher::Cipher`] refused to seal or open the bytes.
+    #[error("encryption error: {0}")]
+    Cipher(String),
     /// Caller passed a `store` name that isn't in [`KNOWN_STORES`].
     #[error("unknown store {found:?} (expected one of {:?})", KNOWN_STORES)]
     UnknownStore { found: String },

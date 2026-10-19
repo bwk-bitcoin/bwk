@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::Value;
 
 use super::{lock::DirLock, PersistenceBackend};
-use crate::{PersistError, DB_VERSION};
+use crate::{cipher, PersistError, DB_VERSION};
 
 const VERSION_FILENAME: &str = "version";
 
@@ -148,7 +148,7 @@ impl JsonBackend {
     fn read_store(&self, store: &str) -> Result<BTreeMap<String, Value>, PersistError> {
         let path = self.store_path(store);
         match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice::<BTreeMap<String, Value>>(&bytes)
+            Ok(bytes) => serde_json::from_slice::<BTreeMap<String, Value>>(&cipher::open(&bytes)?)
                 .map_err(|e| PersistError::Serde(format!("parse {}: {e}", path.display()))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
             Err(e) => Err(PersistError::Io(format!("read {}: {e}", path.display()))),
@@ -158,7 +158,7 @@ impl JsonBackend {
     fn write_store(&self, store: &str, rows: &BTreeMap<String, Value>) -> Result<(), PersistError> {
         let bytes = serde_json::to_vec_pretty(rows)
             .map_err(|e| PersistError::Serde(format!("serialize {store}: {e}")))?;
-        Self::atomic_write(&self.store_path(store), &bytes)
+        Self::atomic_write(&self.store_path(store), &cipher::seal(&bytes)?)
     }
 }
 

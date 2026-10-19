@@ -24,7 +24,7 @@ use std::{
 
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::PersistError;
+use crate::{cipher, PersistError};
 
 /// Persistence interface for a wallet `Config` struct.
 ///
@@ -93,6 +93,7 @@ where
     fn save(&self, config: &C) -> Result<(), PersistError> {
         let bytes = serde_json::to_vec_pretty(config)
             .map_err(|e| PersistError::Serde(format!("serialize config: {e}")))?;
+        let bytes = cipher::seal(&bytes)?;
 
         if let Some(parent) = self.path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -132,7 +133,7 @@ where
     fn load(&self) -> Result<Option<C>, PersistError> {
         match fs::read(&self.path) {
             Ok(bytes) => {
-                let cfg: C = serde_json::from_slice(&bytes).map_err(|e| {
+                let cfg: C = serde_json::from_slice(&cipher::open(&bytes)?).map_err(|e| {
                     PersistError::Serde(format!("parse {}: {e}", self.path.display()))
                 })?;
                 Ok(Some(cfg))

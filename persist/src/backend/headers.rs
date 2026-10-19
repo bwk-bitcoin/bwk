@@ -14,7 +14,7 @@ use std::{
 };
 
 use super::{lock::DirLock, PersistenceBackend};
-use crate::PersistError;
+use crate::{cipher, PersistError};
 
 const CACHE_MAGIC: [u8; 4] = *b"BWKH";
 const CACHE_PREFIX_LEN: usize = 8;
@@ -80,6 +80,19 @@ impl HeaderBackend {
 
     fn load_map(&self) -> Result<BTreeMap<u32, Vec<u8>>, PersistError> {
         let bytes = match fs::read(&self.path) {
+            Ok(b) if cipher::cipher().is_some() && !b.is_empty() => match cipher::open(&b) {
+                Ok(plain) => plain,
+                Err(e) => {
+                    // A refetchable cache, as below: one the cipher does not open is
+                    // wiped and resynced.
+                    log::warn!(
+                        "HeaderBackend: header cache at {:?} does not open ({e}); wiping",
+                        self.path
+                    );
+                    let _ = fs::remove_file(&self.path);
+                    return Ok(BTreeMap::new());
+                }
+            },
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
             Err(e) => {
@@ -144,7 +157,7 @@ impl HeaderBackend {
             }
             bytes.extend_from_slice(raw);
         }
-        fs::write(&self.path, &bytes)
+        fs::write(&self.path, cipher::seal(&bytes)?)
             .map_err(|e| PersistError::Io(format!("write {}: {e}", self.path.display())))
     }
 
@@ -158,6 +171,12 @@ impl HeaderBackend {
         }
         let height = Self::parse_key(key)?;
         let rows = self.load_map()?;
+        // A sealed file has no positional record to overwrite: it is rewritten whole.
+        if cipher::cipher().is_some() {
+            let mut rows = rows;
+            rows.insert(height, bytes.to_vec());
+            return self.write_map(&rows);
+        }
         let Some(min_stored) = rows.keys().next().copied() else {
             let mut rows = BTreeMap::new();
             rows.insert(height, bytes.to_vec());
