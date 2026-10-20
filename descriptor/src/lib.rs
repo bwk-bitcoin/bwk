@@ -6,5 +6,6 @@ pub mod musig;
 pub mod restrict;
 pub mod sp_descriptor;
 pub mod sp_key;
+pub mod spend;
 pub mod updater;
 pub mod wallet;

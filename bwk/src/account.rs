@@ -1162,6 +1162,25 @@ impl<P: ScanProfile> Account<P> {
 
 // Spend paths, MuSig2 status and finalize
 impl<P: ScanProfile> Account<P> {
+    /// Complete transaction-independent alternatives for one coin. Maturity is
+    /// evaluated separately with an explicit chain snapshot, never device state.
+    #[cfg(feature = "musig")]
+    pub fn spend_variants(
+        &self,
+        outpoint: &OutPoint,
+    ) -> Result<bwk_descriptor::spend::SpendVariants, Error> {
+        let (_, (keychain, index)) = self
+            .bip32_coin(outpoint)
+            .ok_or_else(|| Error::Musig(format!("unknown coin {outpoint}")))?;
+        let keychain = match keychain {
+            KeyChain::Receive => 0,
+            KeyChain::Change => 1,
+            KeyChain::Custom(_) => return Err(Error::Musig("unsupported keychain".into())),
+        };
+        bwk_descriptor::spend::spend_variants(&self.scanner.descriptor(), keychain, index)
+            .map_err(to_musig)
+    }
+
     /// Every spend path of the descriptor, key path first then leaves in DFS order,
     /// `spendable` evaluated for `outpoints` against the current tip.
     ///
@@ -3809,6 +3828,37 @@ mod integration_tests {
             leaves[0].signers,
             vec![wallet.fingerprint(0), wallet.fingerprint(1)]
         );
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn spend_variants_funded_witness_bounds() {
+        for leaf in [false, true] {
+            let wallet = MusigWallet::new(4, two_of_three, 1);
+            let exported = wallet.account.spend_variants(&wallet.coins[0]).unwrap();
+            let variant = &exported.variants[usize::from(leaf)];
+            let mut psbt = wallet.psbt();
+            let (_, (_, index)) = wallet.account.bip32_coin(&wallet.coins[0]).unwrap();
+            bwk_descriptor::spend::restrict_variant(
+                &exported.descriptor,
+                0,
+                index,
+                &variant.id,
+                &mut psbt,
+                0,
+            )
+            .unwrap();
+            if leaf {
+                wallet.round(&mut psbt, &[0, 1]);
+                wallet.round(&mut psbt, &[0, 1]);
+            } else {
+                wallet.round(&mut psbt, &[3]);
+            }
+            let tx = wallet.account.finalize(&mut psbt).unwrap();
+            assert!(tx.input[0].witness.size() as u64 <= variant.satisfaction_wu);
+            assert!(!tx.input[0].witness.is_empty());
+            wallet.mine(&tx);
+        }
     }
 
     #[cfg(feature = "musig")]

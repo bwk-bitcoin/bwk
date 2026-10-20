@@ -121,6 +121,69 @@ with the participants in KeySort order. Every cosigner also gets a
 aggregate sits in (none for the internal key), sorted and deduplicated, as
 Bitcoin Core's updater does. Running it twice gives the same result.
 
+## Spending metadata
+
+`spend::spend_variants(descriptor, keychain, index)` returns the original wallet
+descriptor and every supported satisfaction alternative. `Account::spend_variants`
+under `musig` resolves the derivation for one owned coin. The descriptor-level API
+also works without `musig`, including BIP32 subaccounts of an SP wallet.
+
+Each `SpendVariant` carries:
+
+- A `PathId`: SHA256 of the underived descriptor's standard text without checksum,
+  key path/DFS leaf position/script, and alternative index. It is independent of
+  coin derivation, chain state and device availability. Persist the complete ID
+  with the policy, not a derived tapleaf hash. `Display` is a fallback path label.
+- Required `WalletKey` expressions, preserving origins and MuSig participants,
+  and typed hash-preimage requirements. Every listed key is required; each
+  threshold subset is a separate alternative. No signer roster is consulted.
+- `Locks` using Bitcoin's absolute height/time and relative block/time enums.
+  Relative time values are in 512-second intervals, not seconds.
+- A conservative satisfaction bound in weight units, not vbytes or a minimum.
+  It covers the maximum satisfaction of the selected leaf/script, including
+  scriptSig, witness script, control block and witness count framing, without an
+  annex. It excludes the base input, transaction marker/flag and outputs. Add it
+  to the weight of an empty input and budget transaction overhead separately.
+  For non-witness scripts the extra witness count WU is harmless overestimation.
+
+`Locks::maturity` checks timelocks for the block following an explicit
+`ChainContext`. Supply a coherent tip hash/height/MTP and coin confirmation from
+that chain. CSV time uses the MTP of the block before confirmation. CLTV time
+uses tip MTP, never wall-clock time. Missing data returns `Unknown`; a known
+unmet constraint returns `Immature`. `Mature` is only timelock eligibility, not
+coinbase maturity, unspent status or signer readiness. Recompute on every chain
+change, including reorgs; never reuse confirmation data from another tip.
+
+`Locks::apply` sets the minimum transaction version, locktime and input sequence
+before signing. `validate_transaction` checks an assembled transaction. CLTV
+height/time conflicts are errors; CSV block/time choices on different inputs
+are independent. `Locks::merge` combines requirements for the same input only.
+
+Under `musig`, `restrict_variant` reuses the input restriction helpers, checks
+the selected ID and prevout script, applies its locks, and preserves unrelated
+inputs and global metadata. Errors leave the PSBT unchanged. Selection must
+precede signatures and MuSig nonces. A PSBT leaf restriction cannot force one
+satisfaction within that leaf (or exclude a known internal-key spender on a
+single-leaf tree). Keep the selected ID with the request, provide the specified
+signers/preimages, and validate the finalized spend against that selection.
+
+For PSBTv2 construction, use `Coin::to_psbt_input()` and the existing
+`SpInputUpdater` for the input metadata. Keep the prevout, scripts, origins,
+BIP373 participant fields and required proprietary fields intact. Carry the
+original descriptor separately for hardware registration. Assemble inputs and
+outputs into `bwk_psbt::PsbtV2`, with each input's selected absolute requirement
+in its required height/time field and CSV in its sequence. Merge global maps
+with conflict detection; do not combine complete account transactions blindly.
+The v0/v2 bridge preserves populated input and global maps, but callers must
+retain alternative selection IDs separately.
+
+Reusable templates must not contain signatures, nonces, attempt IDs, private
+keys or transaction-dependent SP shares/proofs. This API does not implement SP
+multi-owner contributions, SP foreign-input bookkeeping, a coordinator, or a
+transaction builder. Unsupported backend combinations must still be reported
+explicitly by the consumer. Existing `SpendLeaf` and restriction APIs remain
+available; use this export rather than their height-only summary for templates.
+
 ## Silent Payment Keys
 
 `sp_key` encodes a silent payment key pair as one bech32m string, the form
