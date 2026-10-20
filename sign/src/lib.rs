@@ -1,4 +1,6 @@
 pub mod error;
+#[cfg(feature = "musig")]
+pub mod hot_musig;
 pub mod hot_signer;
 #[cfg(all(feature = "hwi", not(target_os = "android")))]
 pub mod hwi;

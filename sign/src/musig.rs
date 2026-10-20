@@ -62,8 +62,8 @@ pub(crate) struct MusigSession {
 /// fingerprint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct MusigSessionKey {
-    policy: [u8; 32],
-    fingerprint: Fingerprint,
+    pub(crate) policy: [u8; 32],
+    pub(crate) fingerprint: Fingerprint,
 }
 
 impl MusigSessionKey {
@@ -123,13 +123,15 @@ impl std::fmt::Debug for MusigSessionStore {
 }
 
 /// A slot with what signing or aggregating it needs.
-pub(crate) struct SlotInfo {
-    pub(crate) slot: MusigSlot,
-    pub(crate) agg: DefiniteMusigAggregate,
+pub struct SlotInfo {
+    pub slot: MusigSlot,
+    /// Internal key first, then DFS leaf keys; plain and foreign keys count too.
+    pub expression_index: usize,
+    pub agg: DefiniteMusigAggregate,
     /// The descriptor's merkle root, for the key path taptweak.
-    pub(crate) merkle_root: Option<TapNodeHash>,
+    pub merkle_root: Option<TapNodeHash>,
     /// Master fingerprint and full path of the participant's cosigner key.
-    pub(crate) signer: (Fingerprint, DerivationPath),
+    pub signer: (Fingerprint, DerivationPath),
 }
 
 impl SlotInfo {
@@ -235,10 +237,7 @@ pub fn own_slots(
 }
 
 /// One slot per (input, participant, aggregate, leaf) the PSBT asks for.
-pub(crate) fn slot_infos(
-    psbt: &Psbt,
-    descriptor: &WalletDescriptor,
-) -> Result<Vec<SlotInfo>, Error> {
+pub fn slot_infos(psbt: &Psbt, descriptor: &WalletDescriptor) -> Result<Vec<SlotInfo>, Error> {
     let single_paths = descriptor
         .single_paths()
         .map_err(|_| Error::DerivationPath)?;
@@ -291,48 +290,76 @@ fn input_slots(
     definite: &WalletDefiniteDescriptor,
     slots: &mut Vec<SlotInfo>,
 ) -> Result<(), Error> {
-    let Descriptor::Tr(tr) = definite else {
-        return Ok(());
-    };
-    let merkle_root = tr.spend_info().merkle_root();
-    if let Some(agg) = tr.internal_key().as_musig() {
-        if musig_input_participants(input, agg.aggregate())?.is_some() {
-            let key_agg = agg
-                .key_path_key_agg(merkle_root)
-                .map_err(|_| Error::DerivationPath)?;
-            let output_key =
-                PublicKey::from_slice(&key_agg.output_key()).map_err(|_| Error::DerivationPath)?;
-            push_slots(input_index, agg, output_key, None, merkle_root, slots)?;
-        }
-    }
     let asked: BTreeSet<TapLeafHash> = input
         .tap_scripts
         .values()
         .map(|(script, version)| TapLeafHash::from_script(script, *version))
         .collect();
-    for (_, ms) in tr.iter_scripts() {
-        let leaf_hash = TapLeafHash::from_script(&ms.encode(), LeafVersion::TapScript);
-        if !asked.contains(&leaf_hash) {
-            continue;
-        }
-        for agg in ms.iter_pk().filter_map(|key| key.as_musig().cloned()) {
-            let key = agg.key();
-            push_slots(input_index, &agg, key, Some(leaf_hash), merkle_root, slots)?;
+    for info in expression_slots(input_index, definite)? {
+        let requested = match info.slot.leaf_hash {
+            None => musig_input_participants(input, info.agg.aggregate())?.is_some(),
+            Some(leaf_hash) => asked.contains(&leaf_hash),
+        };
+        if requested {
+            slots.push(info);
         }
     }
     Ok(())
 }
 
-/// One slot per participant of `agg`, signing for `aggregate`.
+/// All MuSig expression occurrences, independent of the selected spend path.
+/// Derive `definite` with `single_paths()` and `derive_at()` for prefetch.
+pub fn expression_slots(
+    input_index: usize,
+    definite: &WalletDefiniteDescriptor,
+) -> Result<Vec<SlotInfo>, Error> {
+    let Descriptor::Tr(tr) = definite else {
+        return Ok(Vec::new());
+    };
+    let merkle_root = tr.spend_info().merkle_root();
+    let mut slots = Vec::new();
+    if let Some(agg) = tr.internal_key().as_musig() {
+        push_slots(input_index, 0, agg, None, merkle_root, &mut slots)?;
+    }
+    let mut expression_index = 1;
+    for (_, ms) in tr.iter_scripts() {
+        let leaf_hash = TapLeafHash::from_script(&ms.encode(), LeafVersion::TapScript);
+        for key in ms.iter_pk() {
+            if let Some(agg) = key.as_musig() {
+                push_slots(
+                    input_index,
+                    expression_index,
+                    agg,
+                    Some(leaf_hash),
+                    merkle_root,
+                    &mut slots,
+                )?;
+            }
+            expression_index += 1;
+        }
+    }
+    Ok(slots)
+}
+
+/// One slot per participant, signing for the key-path or script-path aggregate.
 fn push_slots(
     input_index: usize,
+    expression_index: usize,
     agg: &DefiniteMusigAggregate,
-    aggregate: PublicKey,
     leaf_hash: Option<TapLeafHash>,
     merkle_root: Option<TapNodeHash>,
     infos: &mut Vec<SlotInfo>,
 ) -> Result<(), Error> {
     let secp = Secp256k1::verification_only();
+    let aggregate = match leaf_hash {
+        None => {
+            let key_agg = agg
+                .key_path_key_agg(merkle_root)
+                .map_err(|_| Error::DerivationPath)?;
+            PublicKey::from_slice(&key_agg.output_key()).map_err(|_| Error::DerivationPath)?
+        }
+        Some(_) => agg.key(),
+    };
     for participant in agg.participants() {
         let mut signer = None;
         for cosigner in agg.cosigners() {
@@ -349,6 +376,7 @@ fn push_slots(
         }
         let signer = signer.ok_or(Error::DerivationPath)?;
         infos.push(SlotInfo {
+            expression_index,
             slot: MusigSlot {
                 input_index,
                 participant: *participant,

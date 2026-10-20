@@ -173,6 +173,77 @@ and each cosigner's progress, and `aggregate_partial_sigs` verifies every 0x1c
 and aggregates each complete slot into `tap_key_sig` or `tap_script_sigs`,
 ready for the miniscript finalizer.
 
+### Persisted hot sessions
+
+`hot_musig::HotMusigSession` is a transaction-independent secret value for an
+application-owned encrypted cache. It adds no store or cache inside bwk. Use it
+instead of `inner_sign` when supplying cached hot nonces:
+
+```rust
+let session = hot.create_musig_session(&descriptor, caller_id, 8)?;
+// Optional: every owned expression at all eight input positions, including paths
+// not selected in a transaction. Repeat for the desired public derivation indexes.
+let public = session.public_nonces(&descriptor, keychain, derivation_index)?;
+let plaintext = session.encode(); // consumes session; encrypt plaintext.as_bytes()
+// Drop plaintext after encryption; both the value and bytes erase on drop.
+
+// Later, without unlocking the hot signer:
+let session = HotMusigSession::decode(
+    HotMusigSessionBytes::from_bytes(decrypted_bytes),
+    &descriptor,
+    fingerprint,
+)?;
+// Durably allocate the entry to this signing attempt before publishing.
+session.publish_nonces(&mut psbt, &descriptor)?;
+
+// Once every participant has published, unlock hot and durably burn the entry.
+hot.sign_musig_session(&mut psbt, &descriptor, session)?;
+```
+
+Import both secret types from `bwk_sign::hot_musig`. `caller_id` is a
+`musig::MusigSessionId([u8; 32])`; every creation draws a fresh 32-byte root,
+including repeated IDs. The application owns atomic same-ID replacement,
+invalidation of old allocations, FIFO ordering, and durable consumption. Neither
+the session nor its exported plaintext is `Clone` or `Debug`. Copies made by a
+caller or restored from persistence cannot be revoked by a pure value API.
+
+Coverage is one to eight absolute input positions. Every owned MuSig expression
+is available on every public keychain and derivation index the policy supports.
+Creation requires the ordinary signer's descriptor shape: two unhardened
+receive/change paths with wildcards on the signer network. Unsupported shapes
+return `Error::Derivator` at creation or consuming signing, including restored
+sessions; decode alone checks the stored public binding, not signer support.
+`public_nonces` prefetches all owned occurrences; `publish_nonces` resolves only
+the slots requested by the real PSBT. No mnemonic is needed for either public
+operation. Creation and signing verify actual participant public keys against
+the hot signer, including rejection of forged fingerprint claims.
+
+Nonce randomness is domain-separated SHA256 of the fresh root, caller ID, policy,
+owner, input position and expression occurrence. BIP-327 NonceGen receives the
+participant public key and omits the optional secret key, aggregate key and
+message. Signing regenerates the secret nonce from that root, checks the own
+published nonce, and uses the real tweaked key aggregation and BIP-341 sighash.
+The entire session is consumed by one signing call, on success or any failure,
+including failure of ordinary signing. A failed call leaves the PSBT unchanged.
+The ordinary pass retains its participant-key cross-protocol reuse guards.
+
+The fixed 102-byte encoding is version (one byte), caller ID (32), canonical
+policy SHA256 (32), fingerprint (four), input coverage (one), and secret root
+(32). Decode rejects wrong lengths, versions, owners, policies, invalid coverage
+and a zero root, and erases its input bytes on success and failure. Persist only
+authenticated encrypted bytes; this encoding provides no encryption or MAC.
+
+`musig::SlotInfo` exposes the existing slot, aggregate, origin and merkle root,
+plus `expression_index`. `musig::slot_infos` resolves selected PSBT slots;
+`musig::expression_slots` lists all occurrences of a definite descriptor for
+hardware adapters too. Index zero is the internal key; DFS leaf `iter_pk()` order
+follows, counting all plain and foreign keys before ownership filtering. Spend
+path selection never renumbers indexes. BIP-373 cannot distinguish duplicate
+slots within the same leaf, so the cached API rejects those ambiguous requests.
+Slot eligibility retains the existing 0x1a and `tap_scripts` rules. If the same
+aggregate appears in the root and a selected leaf, retaining their shared 0x1a
+still requests the key path too; partial leaf data does not disable it.
+
 ## HotManager
 
 The hot back end: a set of `HotSigner`s behind the `SigningManager` trait. Hot

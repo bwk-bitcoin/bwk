@@ -37,7 +37,9 @@ Nonce rules:
   out-of-range one (`InvalidSecNonce`), with an error instead of libsecp's abort.
 - A `SecNonce` dropped without signing (or refused with `NotParticipant`) is not
   wiped: the upstream type has no `Drop`. It never leaves memory, but sign promptly.
-- `nonce_gen_with_rand` exists for the vectors: never reuse a `rand`.
+- `nonce_gen_with_rand` supports vectors and root-backed sessions such as
+  bwk-sign's hot cache API. Regenerate only for one signing call per session;
+  reusing nonces across signing calls leaks the secret key.
 - Never `Debug` the backend's nonce (`RustBitcoin::nonce_gen` output): the upstream
   type prints its secret bytes.
 

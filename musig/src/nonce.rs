@@ -71,10 +71,12 @@ pub fn nonce_gen<B: MusigBackend, R: Rng>(
     result
 }
 
-/// NonceGen with explicit `rand`, for the BIP-327 vectors and tests only.
+/// NonceGen with explicit `rand`, for vectors or root-backed nonce sessions.
 ///
 /// Two calls with the same `rand` give the same nonce, and signing two messages with
-/// it leaks the secret key: never reuse `rand`, wallets call [`nonce_gen`].
+/// it leaks the secret key. Wallets call [`nonce_gen`] unless they enforce
+/// whole-session consumption and derive fresh per-slot randomness from a secret
+/// random root. Regeneration is only safe for one signing call per session.
 pub fn nonce_gen_with_rand<B: MusigBackend>(
     backend: &B,
     rand: &[u8; 32],

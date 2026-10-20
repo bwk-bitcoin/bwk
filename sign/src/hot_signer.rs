@@ -2,14 +2,18 @@ use std::{collections::BTreeSet, str::FromStr};
 
 use crossbeam::channel;
 
-#[cfg(feature = "musig")]
-use crate::musig::{
-    self, MusigSession, MusigSessionId, MusigSessionKey, MusigSessionStore, PendingNonce, SlotInfo,
-};
 use crate::{
     error::Error,
     send,
     signer::{Signer, SignerNotif},
+};
+#[cfg(feature = "musig")]
+use crate::{
+    hot_musig::HotMusigSession,
+    musig::{
+        self, MusigSession, MusigSessionId, MusigSessionKey, MusigSessionStore, PendingNonce,
+        SlotInfo,
+    },
 };
 use bwk_descriptor::{
     derivator::SpkDerivator,
@@ -293,6 +297,85 @@ impl HotSigner {
     #[cfg(feature = "musig")]
     pub fn musig_sessions(&self) -> MusigSessionStore {
         self.musig_sessions.clone()
+    }
+
+    /// Creates fresh, transaction-independent material for every owned MuSig
+    /// expression. Coverage is one to eight absolute input positions. All public
+    /// derivation indexes and keychains of this descriptor remain available.
+    /// `Error::Derivator` unless it supports the ordinary signer's two unhardened
+    /// receive/change paths with wildcards on this signer's network.
+    #[cfg(feature = "musig")]
+    pub fn create_musig_session(
+        &self,
+        descriptor: &WalletDescriptor,
+        id: MusigSessionId,
+        max_inputs: u8,
+    ) -> Result<HotMusigSession, Error> {
+        SpkDerivator::new(descriptor.clone(), self.network).map_err(|_| Error::Derivator)?;
+        let paths = descriptor
+            .single_paths()
+            .map_err(|_| Error::DerivationPath)?;
+        for path in paths {
+            let definite = path.derive_at(0).map_err(|_| Error::DerivationPath)?;
+            let candidates: Vec<_> = musig::expression_slots(0, &definite)?
+                .into_iter()
+                .filter(|info| info.signer.0 == self.fingerprint())
+                .collect();
+            let count = candidates.len();
+            if count == 0 || self.own_slot_infos(candidates).len() != count {
+                return Err(Error::InputNotOwned);
+            }
+        }
+        HotMusigSession::create(descriptor, self.fingerprint(), id, max_inputs)
+    }
+
+    /// Burns the whole session on any outcome. The application MUST remove its
+    /// durable entry before calling. No partial PSBT changes escape on failure.
+    /// Ordinary signing retains the participant-key cross-protocol reuse guard.
+    #[cfg(feature = "musig")]
+    pub fn sign_musig_session(
+        &self,
+        psbt: &mut Psbt,
+        descriptor: &WalletDescriptor,
+        session: HotMusigSession,
+    ) -> Result<(), Error> {
+        session.validate(descriptor, self.fingerprint())?;
+        let candidates = session.slot_infos(psbt, descriptor)?;
+        let count = candidates.len();
+        let own = self.own_slot_infos(candidates);
+        if own.len() != count {
+            return Err(Error::InputNotOwned);
+        }
+        let participant_paths = KeyPaths::participants(
+            self.miniscript_descriptors().chain([descriptor]),
+            self.fingerprint(),
+        );
+        let mut signed = psbt.clone();
+        match self.sign_ordinary(&mut signed, descriptor, &participant_paths) {
+            Ok(()) | Err(Error::SigningInfo) => {}
+            Err(e) => return Err(e),
+        }
+        let mut pending = MusigSession {
+            id: session.id(),
+            nonces: Default::default(),
+        };
+        for info in &own {
+            let (secnonce, pubnonce) = session.nonce(info)?;
+            pending.nonces.insert(
+                info.slot,
+                PendingNonce {
+                    secnonce,
+                    pubnonce,
+                    sighash: musig::slot_sighash(psbt, &info.slot)?,
+                },
+            );
+        }
+        let partial_sigs = self.musig_partial_sigs(psbt, pending, &own)?;
+        for sig in partial_sigs {
+            set_musig_input_partial_sig(&mut signed.inputs[sig.input_index], &sig.partial_sig);
+        }
+        *psbt = signed;
+        Ok(())
     }
 
     /// Registers a descriptor for the signer.
@@ -649,7 +732,8 @@ impl HotSigner {
         participant_paths: &KeyPaths,
     ) -> Result<(), Error> {
         let mut cache = sighash::SighashCache::new(psbt.unsigned_tx.clone());
-        let derivator = SpkDerivator::new(descriptor.clone(), self.network).unwrap();
+        let derivator =
+            SpkDerivator::new(descriptor.clone(), self.network).map_err(|_| Error::Derivator)?;
         let mut signed_any = false;
         for index in 0..psbt.inputs.len() {
             match (
@@ -1347,7 +1431,7 @@ struct InputPartialSig {
 /// Fills `rand` from the OS for one nonce, in place so no copy is left to wipe.
 /// A failure is `MusigSession`: the host restarts round 1.
 #[cfg(feature = "musig")]
-fn fresh_rand(rand: &mut [u8; 32]) -> Result<(), Error> {
+pub(crate) fn fresh_rand(rand: &mut [u8; 32]) -> Result<(), Error> {
     getrandom::getrandom(rand).map_err(|e| {
         log::error!("musig: no randomness for a nonce: {e}");
         Error::MusigSession
@@ -1357,7 +1441,7 @@ fn fresh_rand(rand: &mut [u8; 32]) -> Result<(), Error> {
 /// Zeroes a secret with volatile writes, which the compiler cannot drop as dead
 /// stores.
 #[cfg(feature = "musig")]
-fn wipe(secret: &mut [u8; 32]) {
+pub(crate) fn wipe(secret: &mut [u8]) {
     for byte in secret.iter_mut() {
         // SAFETY: `byte` is a valid, aligned, exclusive reference.
         unsafe { std::ptr::write_volatile(byte, 0) };
@@ -2283,7 +2367,7 @@ mod musig_tests {
     use bwk_descriptor::{
         descriptor::Descriptor,
         musig::musig_descriptor_to_string,
-        restrict::restrict_input_to_leaf,
+        restrict::{restrict_input_to_key_path, restrict_input_to_leaf},
         updater::update_input,
         wallet::{WalletDescriptor, WalletDescriptorExt},
     };
@@ -2291,14 +2375,14 @@ mod musig_tests {
     use bwk_psbt::musig::{
         musig_input_partial_sig, musig_input_partial_sigs, musig_input_pub_nonces,
         remove_musig_input_pub_nonces, set_musig_input_partial_sig, set_musig_input_participants,
-        MusigPartialSig,
+        set_musig_input_pub_nonce, MusigPartialSig,
     };
     use bwk_utils::test::{random_output, txid};
     use crossbeam::channel;
     use miniscript::{
         bitcoin::{
             absolute::{Height, LockTime},
-            bip32::DerivationPath,
+            bip32::{DerivationPath, Xpriv},
             hex::DisplayHex,
             secp256k1::{PublicKey, Secp256k1, SecretKey, XOnlyPublicKey},
             taproot::{LeafVersion, TapLeafHash},
@@ -2311,13 +2395,479 @@ mod musig_tests {
 
     use crate::{
         error::Error,
+        hot_musig::{HotMusigSession, HotMusigSessionBytes},
         hot_signer::HotSigner,
-        musig::{aggregate_partial_sigs, musig_status, own_slots, MusigRound},
+        musig::{aggregate_partial_sigs, musig_status, own_slots, MusigRound, MusigSessionId},
         signer::{Signer, SignerNotif},
     };
 
     const COSIGNER_PATH: &str = "m/87'/1'/0'/2";
     const PLAIN_PATH: &str = "m/86'/1'/0'";
+
+    fn persisted_signers() -> [HotSigner; 2] {
+        [1, 2].map(|seed| {
+            HotSigner::new_from_xpriv(
+                Network::Regtest,
+                Xpriv::new_master(Network::Regtest, &[seed; 32]).unwrap(),
+            )
+        })
+    }
+
+    #[test]
+    fn persisted_sessions_reject_unsupported_descriptor_shapes_without_panicking() {
+        let [a, b] = persisted_signers();
+        let id = MusigSessionId([8; 32]);
+        for suffix in ["0/*", "<0;1;2>/*", "<0;1>"] {
+            let text = format!("tr(musig({},{})/{suffix})", cosigner(&a), cosigner(&b));
+            let d = Descriptor::from_str(&text)
+                .unwrap()
+                .into_miniscript()
+                .unwrap();
+            assert!(matches!(
+                a.create_musig_session(&d, id, 8),
+                Err(Error::Derivator)
+            ));
+
+            // A restored value can carry a structurally valid policy that was
+            // not created through HotSigner. Consumption must still be fallible.
+            let session = HotMusigSession::create(&d, a.fingerprint(), id, 8).unwrap();
+            let session = reopen(session, &d, &a);
+            let mut psbt = keychain_psbt(&d, 0, &[0]);
+            session.publish_nonces(&mut psbt, &d).unwrap();
+            let before = psbt.clone();
+            assert_eq!(
+                a.sign_musig_session(&mut psbt, &d, session),
+                Err(Error::Derivator)
+            );
+            assert_eq!(psbt, before);
+        }
+    }
+
+    fn role_aggregate(a: &HotSigner, b: &HotSigner, role: u32) -> String {
+        let path = DerivationPath::from_str(&format!("m/87'/1'/0'/{role}")).unwrap();
+        format!("musig({},{})/<512;513>/*", a.xpub(&path), b.xpub(&path))
+    }
+
+    fn persisted_descriptor(a: &mut HotSigner, b: &mut HotSigner) -> WalletDescriptor {
+        let root = role_aggregate(a, b, 2);
+        let first_leaf = role_aggregate(a, b, 3);
+        let second_leaf = role_aggregate(a, b, 4);
+        let text = format!(
+            "tr({root},{{pk({}/<512;513>/*),{{pk({first_leaf}),and_v(v:pk({second_leaf}),older(1))}}}})",
+            plain(b)
+        );
+        register(&mut [a, b], &text)
+    }
+
+    fn reopen(
+        session: HotMusigSession,
+        descriptor: &WalletDescriptor,
+        signer: &HotSigner,
+    ) -> HotMusigSession {
+        let bytes = session.encode();
+        HotMusigSession::decode(bytes, descriptor, signer.fingerprint()).unwrap()
+    }
+
+    fn persisted_session_spend(count: u32, keychain: usize, spend: CachedSpend) {
+        let [mut a, mut b] = persisted_signers();
+        let d = persisted_descriptor(&mut a, &mut b);
+        let sa = a
+            .create_musig_session(&d, MusigSessionId([1; 32]), count as u8)
+            .unwrap();
+        let sb = b
+            .create_musig_session(&d, MusigSessionId([2; 32]), count as u8)
+            .unwrap();
+        let prefetched = sa.public_nonces(&d, keychain, 3).unwrap();
+        assert_eq!(prefetched.len(), count as usize * 3);
+        assert_eq!(
+            prefetched[..3]
+                .iter()
+                .map(|n| n.expression_index)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3]
+        );
+        assert_ne!(prefetched[0].nonce.nonce, prefetched[1].nonce.nonce);
+        assert_ne!(prefetched[1].nonce.nonce, prefetched[2].nonce.nonce);
+        if count > 1 {
+            assert_ne!(prefetched[0].nonce.nonce, prefetched[3].nonce.nonce);
+        }
+        let indexes: Vec<_> = (3..3 + count).collect();
+        let mut psbt = keychain_psbt(&d, keychain, &indexes);
+        for input in &mut psbt.unsigned_tx.input {
+            input.sequence = Sequence(1);
+        }
+        if !matches!(spend, CachedSpend::All) {
+            let single = d.single_paths().unwrap()[keychain].clone();
+            for (input, index) in psbt.inputs.iter_mut().zip(&indexes) {
+                let miniscript::Descriptor::Tr(tr) = single.derive_at(*index).unwrap() else {
+                    panic!("not taproot");
+                };
+                match spend {
+                    CachedSpend::KeyPath => restrict_input_to_key_path(input, &tr),
+                    CachedSpend::Leaf(leaf) => {
+                        let (_, ms) = tr.iter_scripts().nth(leaf).unwrap();
+                        restrict_input_to_leaf(input, ms);
+                    }
+                    CachedSpend::All => unreachable!(),
+                }
+            }
+        }
+        let sa = reopen(sa, &d, &a);
+        sa.publish_nonces(&mut psbt, &d).unwrap();
+        sb.publish_nonces(&mut psbt, &d).unwrap();
+        let [a, b] = persisted_signers();
+        let sa = reopen(sa, &d, &a);
+        let sb = reopen(sb, &d, &b);
+        // Change the transaction after creation/publication: cached
+        // nonces bind only when signing the actual sighash.
+        psbt.unsigned_tx.output[0].value = Amount::from_sat(10_000);
+        a.sign_musig_session(&mut psbt, &d, sa).unwrap();
+        b.sign_musig_session(&mut psbt, &d, sb).unwrap();
+        let expressions = if matches!(spend, CachedSpend::All) {
+            3
+        } else {
+            1
+        };
+        assert_eq!(partial_sig_count(&psbt), count as usize * expressions * 2);
+        assert_eq!(
+            aggregate_partial_sigs(&mut psbt, &d).unwrap(),
+            count as usize * expressions
+        );
+        psbt.finalize_mut(&Secp256k1::verification_only()).unwrap();
+        assert!(psbt
+            .inputs
+            .iter()
+            .all(|input| input.final_script_witness.is_some()));
+    }
+
+    #[test]
+    fn persisted_sessions_all_paths_inputs_and_public_derivations() {
+        for count in [1, 2, 8] {
+            for keychain in [0, 1] {
+                for spend in [
+                    CachedSpend::All,
+                    CachedSpend::KeyPath,
+                    CachedSpend::Leaf(1),
+                    CachedSpend::Leaf(2),
+                ] {
+                    persisted_session_spend(count, keychain, spend);
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum CachedSpend {
+        All,
+        KeyPath,
+        Leaf(usize),
+    }
+
+    #[derive(Clone, Copy)]
+    enum CachedFailure {
+        MissingCosignerNonce,
+        ReplacedOwnNonce,
+        Coverage,
+        Sighash,
+        WrongSigner,
+        MissingOwnNonce,
+        OrdinarySigning,
+    }
+
+    #[test]
+    fn persisted_sessions_preserve_shared_aggregate_key_path_with_partial_leaves() {
+        let [mut a, mut b] = persisted_signers();
+        let agg = role_aggregate(&a, &b, 2);
+        let text = format!(
+            "tr({agg},{{pk({}/<512;513>/*),{{pk({agg}),and_v(v:pk({agg}),older(1))}}}})",
+            plain(&b)
+        );
+        let d = register(&mut [&mut a, &mut b], &text);
+        let session = a
+            .create_musig_session(&d, MusigSessionId([5; 32]), 8)
+            .unwrap();
+        let public = session.public_nonces(&d, 0, 0).unwrap();
+        assert_eq!(public.len(), 24);
+        assert_eq!(
+            public[..3]
+                .iter()
+                .map(|n| n.expression_index)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3]
+        );
+        assert_ne!(public[0].nonce.nonce, public[1].nonce.nonce);
+        assert_ne!(public[1].nonce.nonce, public[2].nonce.nonce);
+
+        let mut psbt = keychain_psbt(&d, 0, &[0]);
+        restrict_to_leaf(&mut psbt, &d, 0, 1);
+        assert_eq!(psbt.inputs[0].tap_scripts.len(), 1);
+        let selected = crate::musig::slot_infos(&psbt, &d).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|info| info.expression_index)
+                .collect::<Vec<_>>(),
+            vec![0, 0, 2, 2]
+        );
+        session.publish_nonces(&mut psbt, &d).unwrap();
+        b.inner_sign(&mut psbt, &d).unwrap();
+        a.sign_musig_session(&mut psbt, &d, session).unwrap();
+        b.inner_sign(&mut psbt, &d).unwrap();
+        assert_eq!(aggregate_partial_sigs(&mut psbt, &d).unwrap(), 2);
+        assert!(psbt.inputs[0].tap_key_sig.is_some());
+        assert_eq!(psbt.inputs[0].tap_script_sigs.len(), 1);
+    }
+
+    #[test]
+    fn persisted_sessions_check_actual_keys_and_count_foreign_expressions() {
+        let [mut a, mut b] = persisted_signers();
+        let c = HotSigner::new_from_xpriv(
+            Network::Regtest,
+            Xpriv::new_master(Network::Regtest, &[3; 32]).unwrap(),
+        );
+        let text = format!(
+            "tr({}/<0;1>/*,{{pk(musig({},{})/<0;1>/*),{{pk({}/<0;1>/*),pk(musig({},{})/<0;1>/*)}}}})",
+            plain(&c), cosigner(&b), cosigner(&c), plain(&c), cosigner(&a), cosigner(&b)
+        );
+        let d = register(&mut [&mut a, &mut b], &text);
+        let id = MusigSessionId([6; 32]);
+        let session = a.create_musig_session(&d, id, 8).unwrap();
+        let public = session.public_nonces(&d, 0, 0).unwrap();
+        assert_eq!(public.len(), 8);
+        assert!(public.iter().all(|nonce| nonce.expression_index == 3));
+        let mut psbt = musig_psbt(&d, &[0]);
+        restrict_to_leaf(&mut psbt, &d, 0, 2);
+        let selected = crate::musig::slot_infos(&psbt, &d).unwrap();
+        assert_eq!(selected.len(), 2);
+        assert!(selected.iter().all(|info| info.expression_index == 3));
+        session.publish_nonces(&mut psbt, &d).unwrap();
+        assert_eq!(
+            musig_input_pub_nonces(&psbt.inputs[0]).unwrap(),
+            vec![public[0].nonce]
+        );
+
+        let spoofed_text = text.replace(&a.fingerprint().to_string(), &b.fingerprint().to_string());
+        let spoofed = Descriptor::from_str(&spoofed_text)
+            .unwrap()
+            .into_miniscript()
+            .unwrap();
+        assert!(matches!(
+            b.create_musig_session(&spoofed, id, 8),
+            Err(Error::InputNotOwned)
+        ));
+        // Restoration can check public bindings only; signing must also reject
+        // a claimed fingerprint whose participant is another private key.
+        let forged = HotMusigSession::create(&spoofed, b.fingerprint(), id, 8).unwrap();
+        let mut psbt = musig_psbt(&spoofed, &[0]);
+        forged.publish_nonces(&mut psbt, &spoofed).unwrap();
+        let before = psbt.clone();
+        assert_eq!(
+            b.sign_musig_session(&mut psbt, &spoofed, forged),
+            Err(Error::InputNotOwned)
+        );
+        assert_eq!(psbt, before);
+    }
+
+    #[test]
+    fn persisted_sessions_keep_ordinary_participant_reuse_guard() {
+        let [mut a, mut b] = persisted_signers();
+        let text = format!(
+            "tr(musig({}/<0;1>/*,{}/<0;1>/*),pk({}/<0;1>/*))",
+            cosigner(&a),
+            cosigner(&b),
+            cosigner(&a)
+        );
+        let d = register(&mut [&mut a, &mut b], &text);
+        let session = a
+            .create_musig_session(&d, MusigSessionId([4; 32]), 8)
+            .unwrap();
+        let mut psbt = musig_psbt(&d, &[0]);
+        session.publish_nonces(&mut psbt, &d).unwrap();
+        b.inner_sign(&mut psbt, &d).unwrap();
+        a.sign_musig_session(&mut psbt, &d, session).unwrap();
+        assert_eq!(partial_sig_count(&psbt), 1);
+        assert!(psbt.inputs[0].tap_script_sigs.is_empty());
+        assert!(psbt.inputs[0].tap_key_sig.is_none());
+    }
+
+    #[test]
+    fn persisted_sessions_cover_multiple_owned_participants_in_one_expression() {
+        let [mut a, mut b] = persisted_signers();
+        let text = format!(
+            "tr(musig({},{},{})/<0;1>/*)",
+            cosigner(&a),
+            plain(&a),
+            cosigner(&b)
+        );
+        let d = register(&mut [&mut a, &mut b], &text);
+        let session = a
+            .create_musig_session(&d, MusigSessionId([7; 32]), 8)
+            .unwrap();
+        let public = session.public_nonces(&d, 0, 0).unwrap();
+        assert_eq!(public.len(), 16);
+        assert_eq!(public[0].expression_index, 0);
+        assert_eq!(public[1].expression_index, 0);
+        assert_ne!(public[0].nonce.participant, public[1].nonce.participant);
+        assert_ne!(public[0].nonce.nonce, public[1].nonce.nonce);
+        let mut psbt = musig_psbt(&d, &[0]);
+        session.publish_nonces(&mut psbt, &d).unwrap();
+        b.inner_sign(&mut psbt, &d).unwrap();
+        a.sign_musig_session(&mut psbt, &d, session).unwrap();
+        assert_eq!(partial_sig_count(&psbt), 2);
+        b.inner_sign(&mut psbt, &d).unwrap();
+        assert_eq!(finalize(&mut psbt, &d), 1);
+    }
+
+    #[test]
+    fn persisted_sessions_fresh_same_id_and_encoding_validation() {
+        let [mut a, mut b] = persisted_signers();
+        let d = two_of_two(&mut a, &mut b);
+        let id = MusigSessionId([42; 32]);
+        let first = a.create_musig_session(&d, id, 8).unwrap();
+        let second = a.create_musig_session(&d, id, 8).unwrap();
+        assert_eq!(first.id(), second.id());
+        assert_eq!(first.max_inputs(), 8);
+        assert_ne!(
+            first.public_nonces(&d, 0, 0).unwrap(),
+            second.public_nonces(&d, 0, 0).unwrap()
+        );
+        let expected = first.public_nonces(&d, 1, 5).unwrap();
+        let first = reopen(first, &d, &a);
+        assert_eq!(first.public_nonces(&d, 1, 5).unwrap(), expected);
+        assert!(a.create_musig_session(&d, id, 0).is_err());
+        assert!(a.create_musig_session(&d, id, 9).is_err());
+        assert!(first.public_nonces(&d, 2, 0).is_err());
+        assert!(first.public_nonces(&d, 0, 1 << 31).is_err());
+        let encoded = first.encode();
+        assert_eq!(encoded.as_bytes().len(), 102);
+        assert!(HotMusigSession::decode(
+            HotMusigSessionBytes::from_bytes(encoded.as_bytes().to_vec()),
+            &d,
+            b.fingerprint()
+        )
+        .is_err());
+        let other = persisted_descriptor(&mut a, &mut b);
+        assert!(HotMusigSession::decode(
+            HotMusigSessionBytes::from_bytes(encoded.as_bytes().to_vec()),
+            &other,
+            a.fingerprint()
+        )
+        .is_err());
+        for offset in [0, 33, 65, 69, 70] {
+            let mut bytes = encoded.as_bytes().to_vec();
+            match offset {
+                69 => bytes[offset] = 0,
+                70 => bytes[offset..].fill(0),
+                _ => bytes[offset] ^= 1,
+            }
+            assert!(HotMusigSession::decode(
+                HotMusigSessionBytes::from_bytes(bytes),
+                &d,
+                a.fingerprint()
+            )
+            .is_err());
+        }
+        for len in [0, 1, 101, 103] {
+            assert!(HotMusigSession::decode(
+                HotMusigSessionBytes::from_bytes(vec![0; len]),
+                &d,
+                a.fingerprint()
+            )
+            .is_err());
+        }
+        assert!(second.public_nonces(&other, 0, 0).is_err());
+    }
+
+    #[test]
+    fn persisted_sessions_refuse_bad_nonces_coverage_and_owner_without_psbt_changes() {
+        let [mut a, mut b] = persisted_signers();
+        let d = two_of_two(&mut a, &mut b);
+        let id = MusigSessionId([9; 32]);
+        for (failure, expected) in [
+            (CachedFailure::MissingCosignerNonce, Error::MusigNonces),
+            (CachedFailure::ReplacedOwnNonce, Error::MusigSession),
+            (CachedFailure::Coverage, Error::MusigSession),
+            (CachedFailure::Sighash, Error::SighashFail),
+            (CachedFailure::WrongSigner, Error::MusigSession),
+            (CachedFailure::MissingOwnNonce, Error::MusigSession),
+            (CachedFailure::OrdinarySigning, Error::MixedSigningInfo),
+        ] {
+            let session = a.create_musig_session(&d, id, 1).unwrap();
+            let mut psbt = musig_psbt(&d, &[0]);
+            session.publish_nonces(&mut psbt, &d).unwrap();
+            b.inner_sign(&mut psbt, &d).unwrap();
+            match failure {
+                CachedFailure::MissingCosignerNonce => {
+                    let own_nonce = musig_input_pub_nonces(&psbt.inputs[0])
+                        .unwrap()
+                        .into_iter()
+                        .find(|n| n.participant == participant(&a))
+                        .unwrap();
+                    remove_musig_input_pub_nonces(&mut psbt.inputs[0]);
+                    set_musig_input_pub_nonce(&mut psbt.inputs[0], &own_nonce);
+                }
+                CachedFailure::ReplacedOwnNonce => {
+                    let fresh = a.create_musig_session(&d, id, 1).unwrap();
+                    assert_eq!(
+                        fresh.publish_nonces(&mut psbt, &d),
+                        Err(Error::MusigSession)
+                    );
+                    remove_musig_input_pub_nonces(&mut psbt.inputs[0]);
+                    fresh.publish_nonces(&mut psbt, &d).unwrap();
+                }
+                CachedFailure::Coverage => {
+                    psbt = musig_psbt(&d, &[0, 1]);
+                }
+                CachedFailure::Sighash => {
+                    psbt.inputs[0].sighash_type =
+                        Some(miniscript::bitcoin::TapSighashType::All.into())
+                }
+                CachedFailure::WrongSigner => {}
+                CachedFailure::MissingOwnNonce => {
+                    let b_nonce = musig_input_pub_nonces(&psbt.inputs[0])
+                        .unwrap()
+                        .into_iter()
+                        .find(|n| n.participant == participant(&b))
+                        .unwrap();
+                    remove_musig_input_pub_nonces(&mut psbt.inputs[0]);
+                    set_musig_input_pub_nonce(&mut psbt.inputs[0], &b_nonce);
+                }
+                CachedFailure::OrdinarySigning => {
+                    psbt.inputs[0].bip32_derivation.insert(
+                        participant(&a),
+                        (
+                            a.fingerprint(),
+                            DerivationPath::from_str(COSIGNER_PATH).unwrap(),
+                        ),
+                    );
+                }
+            }
+            let before = psbt.clone();
+            let mut allocated = Some(session);
+            let signer = if matches!(failure, CachedFailure::WrongSigner) {
+                &b
+            } else {
+                &a
+            };
+            assert_eq!(
+                signer.sign_musig_session(&mut psbt, &d, allocated.take().unwrap()),
+                Err(expected)
+            );
+            assert!(allocated.is_none());
+            assert_eq!(psbt, before);
+        }
+        let small = a.create_musig_session(&d, id, 1).unwrap();
+        let mut too_many = musig_psbt(&d, &[0, 1]);
+        let before = too_many.clone();
+        assert_eq!(
+            small.publish_nonces(&mut too_many, &d),
+            Err(Error::MusigSession)
+        );
+        assert_eq!(too_many, before);
+        let other_text = format!("tr(musig({},{})/<0;1>/*)", cosigner(&a), plain(&a));
+        let other = register(&mut [&mut a], &other_text);
+        assert!(b.create_musig_session(&other, id, 8).is_err());
+    }
 
     fn musig_signers(n: usize) -> Vec<HotSigner> {
         (0..n)
