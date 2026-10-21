@@ -15,6 +15,9 @@ pub mod tx_store;
 pub mod unified;
 pub mod updater;
 
+#[cfg(all(test, feature = "mnemonic", unix))]
+mod label_tests;
+
 #[cfg(feature = "mnemonic")]
 use {
     crate::{
@@ -958,18 +961,42 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
 
     /// Update the label for a coin.
     pub fn update_coin_label(&self, outpoint: OutPoint, label: String) {
+        if let Err(e) = self.try_update_coin_label(outpoint, label) {
+            log::error!("Account::update_coin_label: {e}");
+        }
+    }
+
+    /// Updates and persists a coin label, returning any store or flush error.
+    /// An empty label deletes it. RAM changes remain usable after a failed flush;
+    /// retry this method to save them later.
+    pub fn try_update_coin_label(
+        &self,
+        outpoint: OutPoint,
+        label: String,
+    ) -> Result<(), AccountError> {
         let mut store = self.label_store.lock().expect("poisoned");
         let value = (!label.is_empty()).then_some(label);
-        store.edit(LabelKey::OutPoint(outpoint), value);
-        store.persist();
+        store.try_edit(LabelKey::OutPoint(outpoint), value)?;
+        store.try_persist()?;
+        Ok(())
     }
 
     /// Update the label for a transaction.
     pub fn update_tx_label(&self, txid: Txid, label: String) {
+        if let Err(e) = self.try_update_tx_label(txid, label) {
+            log::error!("Account::update_tx_label: {e}");
+        }
+    }
+
+    /// Updates and persists a transaction label, returning any store or flush error.
+    /// An empty label deletes it. RAM changes remain usable after a failed flush;
+    /// retry this method to save them later.
+    pub fn try_update_tx_label(&self, txid: Txid, label: String) -> Result<(), AccountError> {
         let mut store = self.label_store.lock().expect("poisoned");
         let value = (!label.is_empty()).then_some(label);
-        store.edit(LabelKey::Transaction(txid), value);
-        store.persist();
+        store.try_edit(LabelKey::Transaction(txid), value)?;
+        store.try_persist()?;
+        Ok(())
     }
 
     /// Get the label for a coin.

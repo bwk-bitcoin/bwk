@@ -93,9 +93,15 @@ impl<P: ScanProfile> LabelStore<P> {
 
     /// Persists pending changes through the configured backend.
     pub fn persist(&mut self) {
-        if let Err(e) = self.store.flush() {
+        if let Err(e) = self.try_persist() {
             log::error!("LabelStore::persist() flush: {e}");
         }
+    }
+
+    /// Persists pending changes, returning any backend error. With a RAM profile,
+    /// failed writes remain in memory and pending for the next call.
+    pub fn try_persist(&mut self) -> Result<(), PersistError> {
+        self.store.flush()
     }
 
     /// Retrieves the label associated with the given key (owned clone).
@@ -105,25 +111,29 @@ impl<P: ScanProfile> LabelStore<P> {
 
     /// Edits the label associated with the given key.
     pub fn edit(&mut self, key: LabelKey, value: Option<String>) {
+        if let Err(e) = self.try_edit(key, value) {
+            log::error!("LabelStore::edit: {e}");
+        }
+    }
+
+    /// Edits or deletes a label without flushing, returning any store error.
+    pub fn try_edit(&mut self, key: LabelKey, value: Option<String>) -> Result<(), PersistError> {
         match value {
-            Some(v) => {
-                if let Err(e) = self.store.insert(key, v) {
-                    log::error!("LabelStore::edit insert: {e}");
-                }
-            }
-            None => {
-                if let Err(e) = self.store.remove(&key) {
-                    log::error!("LabelStore::edit remove: {e}");
-                }
-            }
+            Some(v) => self.store.insert(key, v).map(|_| ()),
+            None => self.try_remove(key),
         }
     }
 
     /// Removes the label associated with the given key.
     pub fn remove(&mut self, key: LabelKey) {
-        if let Err(e) = self.store.remove(&key) {
+        if let Err(e) = self.try_remove(key) {
             log::error!("LabelStore::remove: {e}");
         }
+    }
+
+    /// Removes a label without flushing, returning any store error.
+    pub fn try_remove(&mut self, key: LabelKey) -> Result<(), PersistError> {
+        self.store.remove(&key).map(|_| ())
     }
 
     /// Retrieves the label associated with the given Bitcoin address.
@@ -139,5 +149,44 @@ impl<P: ScanProfile> LabelStore<P> {
     /// Retrieves the label associated with the given transaction ID.
     pub fn transaction(&self, txid: bitcoin::Txid) -> Option<String> {
         self.get(&LabelKey::Transaction(txid))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, sync::Arc};
+
+    use bwk_persist::{backend::json::JsonBackend, PersistError};
+    use miniscript::bitcoin::OutPoint;
+
+    use crate::label_store::{LabelKey, LabelStore, STORE_KEY};
+
+    #[test]
+    fn failed_label_flush_retains_edits_and_deletions_for_retry() {
+        let key = LabelKey::OutPoint(OutPoint::null());
+
+        for value in [Some("new".to_string()), None] {
+            let dir = temp_dir::TempDir::new().unwrap();
+            let backend = Arc::new(JsonBackend::open(dir.path().to_path_buf()).unwrap());
+            let mut store = LabelStore::load_from_backend(backend.clone(), STORE_KEY).unwrap();
+            let blocked = backend.path_for(STORE_KEY).with_extension("json.tmp");
+            store.try_edit(key.clone(), Some("old".into())).unwrap();
+            store.try_persist().unwrap();
+            fs::create_dir(&blocked).unwrap();
+            store.try_edit(key.clone(), value.clone()).unwrap();
+            assert!(matches!(store.try_persist(), Err(PersistError::Io(_))));
+            assert_eq!(store.get(&key), value);
+            let disk = LabelStore::load_from_backend(backend.clone(), STORE_KEY).unwrap();
+            assert_eq!(disk.get(&key).as_deref(), Some("old"));
+            drop(disk);
+            fs::remove_dir(&blocked).unwrap();
+            store.try_persist().unwrap();
+            drop(store);
+            drop(backend);
+
+            let reopened = Arc::new(JsonBackend::open(dir.path().to_path_buf()).unwrap());
+            let store = LabelStore::load_from_backend(reopened, STORE_KEY).unwrap();
+            assert_eq!(store.get(&key), value);
+        }
     }
 }
