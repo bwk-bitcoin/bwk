@@ -88,6 +88,12 @@ Notification ──► Account consumer
 - `bwk_electrum::label_store::LabelStore`: User labels for coins and transactions (shared with bwk)
 - `ScanState`: Scan progress and checkpoint management
 
+Use `Account::try_update_coin_label` and `try_update_tx_label` to update and save
+labels with error reporting. Empty labels delete the entry. Store and flush
+failures return `AccountError::Persist`. With RAM stores, failed writes leave
+the edited value or deletion in memory; retry the same update after restoring
+storage access. The existing `update_*_label` methods only log failures.
+
 ## Packaging
 
 `bwk-sp` depends on `secp256k1_spscan-sys`, whose C sources live in the

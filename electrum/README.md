@@ -59,6 +59,14 @@ The scan reports its connection as `Notification::Electrum(TxListenerNotif)`.
 It sends `Stopped` once a `stop()` lands, and `Disconnected` when the connection
 dropped. A dropped connection is not retried: `start()` opens a new one.
 
+Use `ElectrumScanner::try_update_coin_label(OutPoint, String)` when the caller
+needs to report write failures. An empty label deletes it. For direct label
+edits, use `LabelStore::try_edit` or `try_remove`, then `try_persist`; a successful
+edit alone does not mean it was saved. These methods return `PersistError`.
+With RAM stores, a failed flush keeps the edited value or deletion in memory
+and pending for retry through `try_persist`. The existing methods without the
+`try_` prefix remain logging wrappers, not confirmation that a write succeeded.
+
 Every listener connection (the scan's, and the header store's two) sends
 `server.ping` every 20 seconds, so a server does not drop it as idle. A ping
 that fails to send, or that gets no answer within 5 seconds, ends the connection

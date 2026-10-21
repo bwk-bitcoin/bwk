@@ -26,7 +26,7 @@ use std::{
 
 use bwk_coin::{Coin, KeyChain};
 use bwk_descriptor::{derivator::SpkDerivator, wallet::WalletDescriptor};
-use bwk_persist::{backend::PersistenceBackend, storage::Store};
+use bwk_persist::{backend::PersistenceBackend, storage::Store, PersistError};
 use miniscript::bitcoin::{self, OutPoint, Txid};
 
 use crate::{
@@ -363,14 +363,30 @@ impl<P: ScanProfile> ElectrumScanner<P> {
     /// An empty `label` removes the label instead of setting it.
     pub fn update_coin_label(&self, outpoint: String, label: String) {
         if let Ok(outpoint) = bitcoin::OutPoint::from_str(&outpoint) {
+            if let Err(e) = self.try_update_coin_label(outpoint, label) {
+                log::error!("ElectrumScanner::update_coin_label: {e}");
+            }
+        }
+    }
+
+    /// Updates and persists a coin label, returning any store or flush error.
+    /// An empty label deletes it. RAM changes remain usable after a failed flush;
+    /// retry this method or call `LabelStore::try_persist` to save them later.
+    pub fn try_update_coin_label(
+        &self,
+        outpoint: OutPoint,
+        label: String,
+    ) -> Result<(), PersistError> {
+        let result = {
             let mut store = self.label_store.lock().expect("poisoned");
             let value = (!label.is_empty()).then_some(label);
-            store.edit(LabelKey::OutPoint(outpoint), value);
-            store.persist();
-        }
+            store.try_edit(LabelKey::OutPoint(outpoint), value)?;
+            store.try_persist()
+        };
         if let Ok(mut store) = self.coin_store.try_lock() {
             store.generate();
         }
+        result
     }
 
     /// Generates a new receiving address entry.
@@ -739,6 +755,9 @@ impl ElectrumScanner<RamProfile<DefaultBackend>> {
 #[cfg(test)]
 mod tests {
     use bwk_descriptor::derivator;
+    #[cfg(unix)]
+    use bwk_persist::PersistError;
+    use bwk_persist::PersistenceKind;
     use bwk_sign::{bip39::Mnemonic, hot_signer::HotSigner};
     use miniscript::{
         bitcoin::{bip32::DerivationPath, Network},
@@ -749,6 +768,7 @@ mod tests {
     use crate::{
         coin_store::PaymentStatus,
         config::ScannerConfig,
+        label_store::LabelKey,
         notification::Notification,
         open,
         profile::{DefaultBackend, RamProfile},
@@ -785,26 +805,8 @@ mod tests {
     /// set, and removed the same way.
     #[test]
     fn a_coin_label_is_persisted() {
-        use crate::label_store::LabelKey;
-        use bwk_persist::PersistenceKind;
-
         let dir = temp_dir::TempDir::new().unwrap();
-        let mnemo = Mnemonic::generate(12).unwrap();
-        let signer = HotSigner::new_from_mnemonics(Network::Regtest, &mnemo.to_string()).unwrap();
-        let xpub = signer.xpub(&DerivationPath::from_str("m/84'/0'/0'").unwrap());
-        let descriptor = Descriptor::<DescriptorPublicKey>::from_str(&format!(
-            "wpkh([{}/{}]{}/<0;1>/*)",
-            xpub.origin.0, xpub.origin.1, xpub.xkey
-        ))
-        .unwrap();
-        let config = ScannerConfig::new(
-            descriptor.into(),
-            dir.path().to_path_buf(),
-            "labels".into(),
-            "test".into(),
-            Network::Regtest,
-            Some(PersistenceKind::Json),
-        );
+        let config = label_test_config(dir.path().to_path_buf());
         let outpoint = miniscript::bitcoin::OutPoint::from_str(
             "1111111111111111111111111111111111111111111111111111111111111111:0",
         )
@@ -825,6 +827,86 @@ mod tests {
         scanner.update_coin_label(outpoint.to_string(), String::new());
         drop(scanner);
         assert_eq!(open().label_store().lock().unwrap().get(&key), None);
+    }
+
+    fn label_test_config(dir: PathBuf) -> ScannerConfig {
+        let mnemo = Mnemonic::generate(12).unwrap();
+        let signer = HotSigner::new_from_mnemonics(Network::Regtest, &mnemo.to_string()).unwrap();
+        let xpub = signer.xpub(&DerivationPath::from_str("m/84'/0'/0'").unwrap());
+        let descriptor = Descriptor::<DescriptorPublicKey>::from_str(&format!(
+            "wpkh([{}/{}]{}/<0;1>/*)",
+            xpub.origin.0, xpub.origin.1, xpub.xkey
+        ))
+        .unwrap();
+        ScannerConfig::new(
+            descriptor.into(),
+            dir,
+            "labels".into(),
+            "test".into(),
+            Network::Regtest,
+            Some(PersistenceKind::Json),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn coin_label_write_errors_survive_retry_and_reopen() {
+        for value in ["new", ""] {
+            check_label_write_retry(value);
+        }
+    }
+
+    #[cfg(unix)]
+    fn check_label_write_retry(value: &str) {
+        let dir = temp_dir::TempDir::new().unwrap();
+        let config = label_test_config(dir.path().to_path_buf());
+        let outpoint = miniscript::bitcoin::OutPoint::null();
+        let key = LabelKey::OutPoint(outpoint);
+        let open =
+            || ElectrumScanner::<RamProfile<DefaultBackend>>::try_new(config.clone()).unwrap();
+        let scanner = open();
+        scanner
+            .try_update_coin_label(outpoint, "old".into())
+            .unwrap();
+        let failed = update_in_read_only_dir(&scanner, outpoint, value);
+        assert!(matches!(failed, Err(PersistError::Io(_))));
+        let expected = (!value.is_empty()).then_some(value);
+        assert_eq!(
+            scanner.label_store().lock().unwrap().get(&key).as_deref(),
+            expected
+        );
+        drop(scanner);
+        let scanner = open();
+        assert_eq!(
+            scanner.label_store().lock().unwrap().get(&key).as_deref(),
+            Some("old")
+        );
+        assert!(matches!(
+            update_in_read_only_dir(&scanner, outpoint, value),
+            Err(PersistError::Io(_))
+        ));
+        scanner.label_store().lock().unwrap().try_persist().unwrap();
+        drop(scanner);
+        assert_eq!(
+            open().label_store().lock().unwrap().get(&key).as_deref(),
+            expected
+        );
+    }
+
+    #[cfg(unix)]
+    fn update_in_read_only_dir(
+        scanner: &ElectrumScanner,
+        outpoint: miniscript::bitcoin::OutPoint,
+        label: &str,
+    ) -> Result<(), PersistError> {
+        let dir = scanner.config().account_dir();
+        let permissions = std::fs::metadata(&dir).unwrap().permissions();
+        let mut readonly = permissions.clone();
+        readonly.set_readonly(true);
+        std::fs::set_permissions(&dir, readonly).unwrap();
+        let result = scanner.try_update_coin_label(outpoint, label.into());
+        std::fs::set_permissions(&dir, permissions).unwrap();
+        result
     }
 
     /// A tx the server reported confirmed but the chain has not promoted yet
