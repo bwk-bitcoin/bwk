@@ -72,6 +72,31 @@ same policy to its scanner connection and to both of the header store's
 connections. Pointing the config at another endpoint puts the check back, so
 the choice is made once per server.
 
+## Caller-owned persistence
+
+`Account::try_with_backend_factory(config, factory, config_store, header_store)`
+opens all wallet stores through a `bwk_electrum::persistence::BackendFactory`.
+It also opens owned headers there, unless given a shared `HeaderStore`. The
+existing constructors use the same factory if it is set on the runtime config.
+Without a factory they retain the configured JSON/SQLite/no-op behavior.
+
+Factory requests carry `BackendIdentity { account, network, kind }`, not native
+paths. `Wallet` and `Headers` are separate scopes. Backends still receive logical
+store names and byte rows through `PersistenceBackend`; typed stores use the
+existing `RamStore` layer. The caller owns identity separation, authorization,
+version checks, blob layout and storage limits. Account names used as identities
+must remain stable, or the caller must map them to its stable IDs.
+
+Runtime config clones retain the factory. Serialization skips it: reattach it
+after loading metadata using the constructor above. The config callback remains
+independent of wallet rows. Neither the factory nor these APIs provide a sandbox.
+
+`Account::try_persist` reports wallet, header and config callback failures instead
+of just logging them. Stop account work first: scanner flush joins stopped
+listeners and recovers their statuses through the supplied backend, but a flush
+is not backend destruction or permission to delete storage. RAM stores retain
+failed dirty writes for retry. Background/best-effort APIs still log failures.
+
 ## Architecture
 
 `Account` owns two independent halves and reconciles them. The scanner records

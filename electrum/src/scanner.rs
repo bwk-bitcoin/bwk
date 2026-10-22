@@ -160,16 +160,47 @@ impl<P: OpenScanFromBackend> ElectrumScanner<P> {
         let stores = P::open(backend.clone())?;
         let reopen_statuses: ReopenStatuses<P> =
             Arc::new(move || P::open_statuses(backend.clone()));
-        Ok(Self::from_stores(
-            config,
-            sender,
-            stores,
-            Some(reopen_statuses),
-        ))
+        let mut scanner = Self::from_stores(config, sender, stores, Some(reopen_statuses));
+        scanner.try_persist()?;
+        Ok(scanner)
     }
 }
 
 impl<P: ScanProfile> ElectrumScanner<P> {
+    /// Flush wallet rows. Refuses a running listener; after `stop`, joins pending
+    /// listeners and flushes the handed-back statuses too. Does not stop other
+    /// owners of these stores, such as a reconciler.
+    pub fn try_persist(&mut self) -> Result<(), PersistError> {
+        if self.listener.running() {
+            return Err(PersistError::Io("stop the scanner before flushing".into()));
+        }
+        self.listener.join();
+        if let Some(rx) = self.statuses_rx.as_ref() {
+            self.statuses_store = Some(match rx.recv() {
+                Ok(store) => store,
+                Err(_) => match &self.reopen_statuses {
+                    Some(reopen) => reopen()?,
+                    None => return Err(PersistError::Io("statuses store unavailable".into())),
+                },
+            });
+            self.statuses_rx = None;
+        }
+        {
+            let mut coins = self.coin_store.lock().expect("poisoned");
+            coins.tx_store_mut().try_persist()?;
+            coins
+                .address_store()
+                .lock()
+                .expect("poisoned")
+                .try_persist()?;
+        }
+        self.label_store.lock().expect("poisoned").try_persist()?;
+        if let Some(statuses) = self.statuses_store.as_mut() {
+            statuses.flush()?;
+        }
+        Ok(())
+    }
+
     /// Build a scanner over already-open stores. `reopen_statuses` is the
     /// panicked-listener recovery path; pass `None` when there is no backend
     /// to reopen from. The caller owns the descriptor check
@@ -755,25 +786,75 @@ impl ElectrumScanner<RamProfile<DefaultBackend>> {
 #[cfg(test)]
 mod tests {
     use bwk_descriptor::derivator;
-    #[cfg(unix)]
-    use bwk_persist::PersistError;
-    use bwk_persist::PersistenceKind;
+    use bwk_persist::{storage::Store, PersistError, PersistenceKind, STATUSES_STORE_KEY};
     use bwk_sign::{bip39::Mnemonic, hot_signer::HotSigner};
     use miniscript::{
         bitcoin::{bip32::DerivationPath, Network},
         Descriptor, DescriptorPublicKey,
     };
-    use std::{collections::BTreeMap, path::PathBuf, str::FromStr, sync::mpsc};
+    #[cfg(feature = "test")]
+    use std::collections::BTreeMap;
+    use std::{
+        path::PathBuf,
+        str::FromStr,
+        sync::{mpsc, Arc},
+    };
 
+    #[cfg(feature = "test")]
+    use crate::coin_store::PaymentStatus;
     use crate::{
-        coin_store::PaymentStatus,
         config::ScannerConfig,
         label_store::LabelKey,
         notification::Notification,
         open,
-        profile::{DefaultBackend, RamProfile},
+        persistence::{test_support::CallerFactory, BackendIdentity, BackendKind},
+        profile::{DefaultBackend, OpenScanFromBackend, RamProfile},
         scanner::ElectrumScanner,
     };
+
+    #[test]
+    fn lost_statuses_reopen_the_injected_backend_and_retry_read_errors() {
+        let factory = Arc::new(CallerFactory::new(true));
+        let mut config = label_test_config(std::env::temp_dir().join("unused-status-recovery"));
+        config.backend_factory = Some(factory.clone());
+        config.backend_kind = BackendKind::SubAccount(3);
+        let decoded: ScannerConfig =
+            serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+        assert_eq!(decoded.backend_kind, BackendKind::SubAccount(3));
+        assert!(decoded.backend_factory.is_none());
+        let backend = factory.backend(BackendIdentity {
+            account: config.account.clone(),
+            network: config.network,
+            kind: BackendKind::SubAccount(3),
+        });
+        let mut scanner: ElectrumScanner = ElectrumScanner::try_new(config).unwrap();
+        let script = scanner.recv_at(7).script_pubkey();
+        let mut statuses = RamProfile::<DefaultBackend>::open_statuses(backend.clone()).unwrap();
+        let value = (Some("caller status".into()), 0, 7);
+        statuses.insert(script.clone(), value.clone()).unwrap();
+        statuses.flush().unwrap();
+        scanner.statuses_store = None;
+        let (sender, receiver) = mpsc::channel();
+        drop(sender);
+        scanner.statuses_rx = Some(receiver);
+        *backend.fail_read.lock().unwrap() = Some(STATUSES_STORE_KEY.into());
+        assert_eq!(
+            scanner.try_persist(),
+            Err(PersistError::Io("read denied: statuses".into()))
+        );
+        *backend.fail_read.lock().unwrap() = None;
+        scanner.try_persist().unwrap();
+        assert_eq!(
+            scanner
+                .statuses_store
+                .as_ref()
+                .unwrap()
+                .get(&script)
+                .unwrap(),
+            Some(value)
+        );
+        assert_eq!(factory.requests.lock().unwrap().len(), 1);
+    }
 
     /// A descriptor the scan cannot derive from (single path, no `<0;1>`) must
     /// fail the open rather than panic once the coin store derives from it.

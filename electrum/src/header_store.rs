@@ -316,6 +316,29 @@ struct ProgressListeners {
 }
 
 impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>> {
+    /// Open caller-owned header rows without discarding read or decode failures.
+    pub fn try_from_backend(
+        network: Network,
+        backend: Arc<dyn PersistenceBackend>,
+        checkpoint: Option<Checkpoint>,
+    ) -> Result<Arc<Self>, PersistError> {
+        #[cfg(not(feature = "no-checkpoint"))]
+        if network == Network::Bitcoin && checkpoint.is_none() {
+            return Err(PersistError::Io(
+                "a mainnet header store needs a checkpoint".into(),
+            ));
+        }
+        let store = RamStore::open(
+            backend,
+            STORE_KEY,
+            encode_height,
+            decode_height,
+            encode_header,
+            decode_header,
+        )?;
+        Ok(Self::with_checkpoint(network, store, checkpoint))
+    }
+
     pub fn new_in_memory(network: Network) -> Arc<Self> {
         let backend: Arc<dyn PersistenceBackend> = Arc::new(NoopBackend);
         Self::from_store(
@@ -610,6 +633,11 @@ impl<S> HeaderStore<S>
 where
     S: Store<Key = u32, Value = [u8; Header::SIZE]> + Send + 'static,
 {
+    /// Retry pending header writes, without changing worker ownership.
+    pub fn try_persist(&self) -> Result<(), PersistError> {
+        self.inner.lock().expect("poisoned").store.flush()
+    }
+
     pub fn from_store(network: Network, store: S) -> Arc<Self> {
         Self::with_checkpoint(network, store, None)
     }
