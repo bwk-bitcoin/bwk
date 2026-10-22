@@ -19,6 +19,7 @@ use bwk_electrum::{
     history::{AccountHistory, TxContribution},
     notification::{Notification, SignerNotification},
     open,
+    persistence::{BackendFactory, BackendIdentity, BackendKind},
     profile::{
         DefaultBackend, OpenScanFromBackend, RamProfile, ReopenStatuses, ScanProfile, ScanStores,
     },
@@ -28,6 +29,7 @@ use bwk_electrum::{
 use bwk_persist::{
     backend::PersistenceBackend,
     config_store::{ConfigStore, NoopConfigStore},
+    PersistError,
 };
 use bwk_sign::{
     identity::{SignerId, SignerInfo, SignerState},
@@ -712,6 +714,22 @@ impl<P: OpenScanFromBackend> Account<P> {
         Ok(account)
     }
 
+    /// Open caller-owned wallet and header backends. `header_store` shares an
+    /// existing chain instead of requesting a header backend from `factory`.
+    /// Runtime config clones retain the factory; serialized metadata does not.
+    pub fn try_with_backend_factory(
+        mut config: Config,
+        factory: Arc<dyn BackendFactory>,
+        config_store: Arc<dyn ConfigStore<Config>>,
+        header_store: Option<Arc<HeaderStore<P::HeaderStore>>>,
+    ) -> Result<Self, open::Error> {
+        config.scanner.backend_factory = Some(factory);
+        let (sender, receiver) = mpsc::channel();
+        let mut account = Self::try_new_inner(config, header_store, sender, config_store)?;
+        account.receiver = Some(receiver);
+        Ok(account)
+    }
+
     /// Like [`Account::try_new`] but sharing an existing [`HeaderStore`]
     /// handle instead of building one. An account without a header scanner
     /// leaves it unused.
@@ -784,10 +802,27 @@ impl<P: OpenScanFromBackend> Account<P> {
             return Err(open::Error::EmptyAccount);
         }
         config.scanner.validate_descriptor()?;
-        let headers = match (config.scanner.header_scanner, header_store) {
-            (false, _) => None,
-            (true, Some(store)) => Some(HeaderFollower::borrowed(store, sender.clone())),
-            (true, None) => Some(HeaderFollower::open(
+        let headers = match (
+            config.scanner.header_scanner,
+            header_store,
+            &config.scanner.backend_factory,
+        ) {
+            (false, _, _) => None,
+            (true, Some(store), _) => Some(HeaderFollower::borrowed(store, sender.clone())),
+            (true, None, Some(factory)) => Some(HeaderFollower::from_factory(
+                (!config.scanner.stay_offline())
+                    .then(|| config.scanner.endpoint().configured().cloned())
+                    .flatten(),
+                factory.as_ref(),
+                BackendIdentity {
+                    account: config.scanner.account.clone(),
+                    network: config.scanner.network,
+                    kind: BackendKind::Headers,
+                },
+                config.scanner.header_checkpoint,
+                sender.clone(),
+            )?),
+            (true, None, None) => Some(HeaderFollower::open(
                 // An account asked to stay offline opens its store idle; the
                 // first start points it at the configured endpoint.
                 (!config.scanner.stay_offline())
@@ -805,14 +840,14 @@ impl<P: OpenScanFromBackend> Account<P> {
         let reopen_statuses: ReopenStatuses<P> =
             Arc::new(move || P::open_statuses(reopen_backend.clone()));
         let stores = <P as OpenScanFromBackend>::open(backend)?;
-        Ok(Self::from_stores(
+        Self::from_stores(
             config,
             headers,
             sender,
             config_store,
             stores,
             Some(reopen_statuses),
-        ))
+        )
     }
 
     fn from_stores(
@@ -822,14 +857,15 @@ impl<P: OpenScanFromBackend> Account<P> {
         config_store: Arc<dyn ConfigStore<Config>>,
         stores: ScanStores<P>,
         reopen_statuses: Option<ReopenStatuses<P>>,
-    ) -> Self {
+    ) -> Result<Self, open::Error> {
         let Config {
             scanner: scanner_config,
             mnemonic,
         } = config;
         let stay_offline = scanner_config.stay_offline();
-        let scanner =
+        let mut scanner =
             ElectrumScanner::from_stores(scanner_config, sender.clone(), stores, reopen_statuses);
+        scanner.try_persist()?;
         let header_scanner = headers.map(|headers| {
             // Once per account, not per reconciler: a store shared by several
             // accounts would otherwise report the same event to this channel as
@@ -868,7 +904,7 @@ impl<P: OpenScanFromBackend> Account<P> {
         if !stay_offline {
             account.start_electrum();
         }
-        account
+        Ok(account)
     }
 
     /// Reconnect every Electrum connection in place, keeping the `Account` and
@@ -892,6 +928,16 @@ impl<P: OpenScanFromBackend> Account<P> {
 }
 
 impl<P: ScanProfile> Account<P> {
+    /// Flush wallet data and metadata, returning the first failure. This is not
+    /// a shutdown operation; stop workers before using it as a durability check.
+    pub fn try_persist(&mut self) -> Result<(), PersistError> {
+        self.scanner.try_persist()?;
+        if let Some(headers) = &self.header_scanner {
+            headers.headers.store().try_persist()?;
+        }
+        self.config_store.save(&self.get_config().for_persistence())
+    }
+
     /// Push the current config to the configured [`ConfigStore`].
     ///
     /// Under [`bwk_persist::PersistenceKind::Sqlite`] the saved view has

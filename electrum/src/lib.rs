@@ -14,6 +14,7 @@ pub mod label_store;
 pub mod listener;
 pub mod notification;
 pub mod open;
+pub mod persistence;
 pub mod profile;
 pub mod raw_client;
 pub mod reconcile;

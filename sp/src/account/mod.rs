@@ -23,7 +23,7 @@ use {
     crate::{
         account::{
             coin_store::{CoinState, MergedCoinSource, SpCoinEntry, SpCoinSource, SpCoinStore},
-            config::Config,
+            config::{Config, SubAccountConfig},
             recipient::SpChangeRecipientProvider,
             tx_store::{header_time, SpTxEntry, SpTxStore},
             updater::SpInputUpdater,
@@ -43,13 +43,14 @@ use {
         bwk_electrum::{
             address_store::AddressEntry,
             coin_store::SpendRecorder,
-            config::{Endpoint, ScannerConfig},
+            config::Endpoint,
             header_follower::HeaderFollower,
             header_store::HeaderStore,
             label_store::{LabelKey, LabelStore},
             notification::{
                 CoinOrigin, Notification, SignerNotification, SpNotification, SubAccountKind,
             },
+            persistence::{BackendFactory, BackendIdentity, BackendKind},
             profile::{DefaultBackend, RamProfile},
             raw_client::CertificateCheck,
             reconcile::Reconciler,
@@ -132,6 +133,8 @@ pub enum AccountError {
     InputNotOwned(OutPoint),
     #[error("the sub-account header scanner setting differs from the account's")]
     HeaderScannerMismatch,
+    #[error("externally added scanners have no saved sub-account metadata")]
+    UntrackedSubAccounts,
     #[error("silent payment derivation failed: {0}")]
     SilentPayment(#[from] crate::core::error::Error),
     #[error("psbtv2 error")]
@@ -551,8 +554,7 @@ struct SubAccount {
     reconciler: Option<Reconciler<RamProfile<DefaultBackend>>>,
 }
 
-// Constructors are tied to the default SpRamProfile because they open
-// concrete on-disk RamStore instances.
+// Constructors open the default RAM profile over native or caller-owned backends.
 #[cfg(feature = "mnemonic")]
 impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBackend>> {
     // Constructors
@@ -567,6 +569,20 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
     /// Returns [`AccountError::MissingBlindbitUrl`] if `blindbit_url` is empty.
     pub fn new(config: Config) -> Result<Self, AccountError> {
         Self::with_runtime_config(config, ScanRuntimeConfig::default())
+    }
+
+    /// Open all wallet stores through `factory`, including configured and later
+    /// sub-accounts. A shared header store bypasses only the header request.
+    /// Reattach the factory after deserializing metadata; runtime clones keep it.
+    pub fn with_backend_factory(
+        mut config: Config,
+        factory: Arc<dyn BackendFactory>,
+        config_store: Arc<dyn ConfigStore<Config>>,
+        header_store: Option<Arc<HeaderStore>>,
+        scan_runtime: ScanRuntimeConfig,
+    ) -> Result<Self, AccountError> {
+        config.backend_factory = Some(factory);
+        Self::with_config_store_and_header_store(config, config_store, header_store, scan_runtime)
     }
 
     pub fn with_runtime_config(
@@ -670,22 +686,7 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
         }
         let mut scanners = Vec::with_capacity(config.descriptors.len());
         for (i, sub_cfg) in config.descriptors.iter().enumerate() {
-            let name = format!("{}-sub-{}", config.account_name, i);
-            let mut scanner_config = ScannerConfig::new(
-                sub_cfg.descriptor.clone(),
-                config.account_dir(),
-                name.clone(),
-                name,
-                config.network,
-                config.persistence,
-            );
-            // The account's certificate policy only reaches a sub-account
-            // pointed at the same server as the account itself.
-            let mut endpoint = sub_cfg.endpoint.clone();
-            endpoint.adopt_certificate_check(config.endpoint());
-            scanner_config.set_stay_offline(endpoint.url().is_none());
-            scanner_config.set_endpoint(endpoint);
-            scanner_config.header_scanner = config.header_scanner;
+            let scanner_config = config.scanner_config(i, sub_cfg);
             let scanner = ElectrumScanner::try_new_with_sender(scanner_config, sender.clone())?;
             scanner.set_origin(CoinOrigin::SubAccount {
                 index: i,
@@ -705,10 +706,21 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
         // Opened against the same target the scanners are followed at, so an
         // account with no endpoint of its own still validates against the one
         // its sub-accounts watch.
-        let headers = match (config.header_scanner, header_store) {
-            (false, _) => None,
-            (true, Some(store)) => Some(HeaderFollower::borrowed(store, sender.clone())),
-            (true, None) => Some(HeaderFollower::open(
+        let headers = match (config.header_scanner, header_store, &config.backend_factory) {
+            (false, _, _) => None,
+            (true, Some(store), _) => Some(HeaderFollower::borrowed(store, sender.clone())),
+            (true, None, Some(factory)) => Some(HeaderFollower::from_factory(
+                header_store_target(&config, &scanners),
+                factory.as_ref(),
+                BackendIdentity {
+                    account: config.account_name.clone(),
+                    network: config.network,
+                    kind: BackendKind::Headers,
+                },
+                config.header_checkpoint,
+                sender.clone(),
+            )?),
+            (true, None, None) => Some(HeaderFollower::open(
                 header_store_target(&config, &scanners),
                 config.network,
                 config.persistence,
@@ -825,22 +837,20 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
         SpReceiver::new(scan_sk, spend_pk, config.network).map_err(AccountError::SpReceiver)
     }
 
-    // (see the free `create_backend` helper below for the backend
-    // constructor: it's pure w.r.t. `P`.)
-
-    /// Create or load stores based on `config.persistence`.
-    ///
-    /// Builds a single backend ([`bwk::persist::backend::json::JsonBackend`] or
-    /// [`bwk::persist::backend::sqlite::SqliteBackend`]) from the config and
-    /// threads it into every store. JSON layout is byte-for-byte equivalent to the
-    /// pre-backend layout (one `{store}.json` file per store name).
+    /// Open every SP store against the same caller-owned or native backend.
     fn create_or_load_stores(config: &Config) -> Result<Stores, AccountError> {
         let birthday = config
             .birthday_height
             .unwrap_or_else(|| config.min_birthday_height());
 
-        let backend: Arc<dyn bwk::persist::backend::PersistenceBackend> =
-            bwk::persist::build_backend(config.persistence, config.account_dir())?;
+        let backend = match &config.backend_factory {
+            Some(factory) => factory.open(&BackendIdentity {
+                account: config.account_name.clone(),
+                network: config.network,
+                kind: BackendKind::SilentPayment,
+            })?,
+            None => bwk::persist::build_backend(config.persistence, config.account_dir())?,
+        };
 
         let coin_store =
             SpCoinStore::load_from_backend(backend.clone(), crate::account::coin_store::STORE_KEY)?;
@@ -1027,7 +1037,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     /// Update the Blindbit server URL.
     pub fn set_blindbit_url(&mut self, url: String) {
         self.config.blindbit_url = url;
-        if self.config.persistence.is_some() {
+        if self.config.persistence.is_some() || self.config.backend_factory.is_some() {
             self.persist_config();
         }
     }
@@ -1043,6 +1053,27 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     }
 
     // Sub-accounts
+
+    /// Open and remember another descriptor using this account's persistence
+    /// factory. Backend failures leave the descriptor list unchanged. A config
+    /// save failure leaves the new sub-account in memory; retry `try_persist`,
+    /// not creation. Use this rather than `add_sub_account` for managed reopen.
+    pub fn create_sub_account(&mut self, sub_config: SubAccountConfig) -> Result<(), AccountError> {
+        if self.config.descriptors.len() != self.sub_accounts.len() {
+            return Err(AccountError::UntrackedSubAccounts);
+        }
+        let index = self.config.descriptors.len();
+        let config = self.config.scanner_config(index, &sub_config);
+        let scanner = ElectrumScanner::try_new_with_sender(config, self.sender.clone())?;
+        let mnemonic = sub_config
+            .mnemonic
+            .clone()
+            .or_else(|| self.config.mnemonic.clone());
+        self.add_sub_account(scanner, mnemonic)?;
+        self.config.descriptors.push(sub_config);
+        self.config_store.save(&self.config)?;
+        Ok(())
+    }
 
     /// Watch one more standard descriptor (segwit, taproot, etc.) as a
     /// sub-account, reconciled against this account's header chain. The
@@ -1833,6 +1864,23 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
 
     // Persistence
 
+    /// Flush every wallet store and config callback, returning the first error.
+    /// Stop account workers first when using this as a durability check.
+    pub fn try_persist(&mut self) -> Result<(), AccountError> {
+        self.coin_store.lock().expect("poisoned").try_persist()?;
+        self.label_store.lock().expect("poisoned").try_persist()?;
+        self.tx_store.lock().expect("poisoned").try_persist()?;
+        self.scan_state.lock().expect("poisoned").try_persist()?;
+        for sub in &mut self.sub_accounts {
+            sub.scanner.try_persist()?;
+        }
+        if let Some(headers) = &self.headers {
+            headers.store().try_persist()?;
+        }
+        self.config_store.save(&self.config)?;
+        Ok(())
+    }
+
     /// Persist all stores to disk.
     ///
     /// This runs from `Drop`; a poisoned lock here would otherwise
@@ -2148,7 +2196,10 @@ mod tests {
         sighash::SighashCache,
         transaction, TxIn, Witness,
     };
-    use bwk::{account::test_support::StubManager, bwk_electrum::raw_client::CertificateCheck};
+    use bwk::{
+        account::test_support::StubManager,
+        bwk_electrum::{config::ScannerConfig, raw_client::CertificateCheck},
+    };
     use bwk_sign::{identity::SignerState, protocol::Response};
     use std::{path::PathBuf, str::FromStr};
 

@@ -14,10 +14,15 @@ use bwk_descriptor::{
 };
 use bwk_persist::{backend::PersistenceBackend, PersistError, PersistenceKind};
 
-use crate::{checkpoint::Checkpoint, open, raw_client::CertificateCheck};
+use crate::{
+    checkpoint::Checkpoint,
+    open,
+    persistence::{BackendFactory, BackendIdentity, BackendKind},
+    raw_client::CertificateCheck,
+};
 
 /// Filename for the binary header cache under [`ScannerConfig::account_dir`].
-/// Headers are always binary-backed, independent of `persistence`.
+/// Used by native persistence; caller-owned backends choose their own layout.
 pub const HEADERS_FILENAME: &str = "headers.bin";
 
 /// Unused addresses watched past the generated tip, for a caller with no
@@ -150,6 +155,11 @@ pub struct ScannerConfig {
     pub descriptor: Descriptor,
     /// Which backend keeps this account's data, `None` for in-memory only.
     pub persistence: Option<PersistenceKind>,
+    /// Overrides native persistence, even when `persistence` is `None`.
+    #[serde(skip)]
+    pub backend_factory: Option<Arc<dyn BackendFactory>>,
+    #[serde(default, skip_serializing_if = "BackendKind::is_wallet")]
+    pub backend_kind: BackendKind,
 }
 
 impl ScannerConfig {
@@ -176,6 +186,8 @@ impl ScannerConfig {
             look_ahead: DEFAULT_LOOK_AHEAD,
             descriptor,
             persistence,
+            backend_factory: None,
+            backend_kind: BackendKind::Wallet,
         }
     }
 
@@ -197,11 +209,18 @@ impl ScannerConfig {
         Ok(())
     }
 
-    /// Open the persistence backend this config selects, rooted at
-    /// [`ScannerConfig::account_dir`]. `NoopBackend` when `persistence` is
-    /// `None`.
+    /// Open caller-owned persistence when a factory is supplied. Otherwise use
+    /// the native backend at [`ScannerConfig::account_dir`], or `NoopBackend`
+    /// when `persistence` is `None`.
     pub fn build_backend(&self) -> Result<Arc<dyn PersistenceBackend>, PersistError> {
-        bwk_persist::build_backend(self.persistence, self.account_dir())
+        match &self.backend_factory {
+            Some(factory) => factory.open(&BackendIdentity {
+                account: self.account.clone(),
+                network: self.network,
+                kind: self.backend_kind,
+            }),
+            None => bwk_persist::build_backend(self.persistence, self.account_dir()),
+        }
     }
 
     pub fn set_stay_offline(&mut self, stay_offline: bool) {

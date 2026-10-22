@@ -6,11 +6,15 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use bitcoin::{bip32::ChildNumber, secp256k1::Secp256k1, Network, NetworkKind};
 use bwk::bwk_electrum::{
-    checkpoint::Checkpoint, config::Endpoint, notification::SubAccountKind,
+    checkpoint::Checkpoint,
+    config::{Endpoint, ScannerConfig},
+    notification::SubAccountKind,
+    persistence::{BackendFactory, BackendKind},
     raw_client::CertificateCheck,
 };
 use bwk_sign::{
@@ -85,6 +89,9 @@ pub struct Config {
     /// `Json`: byte-for-byte compatible with the pre-backend layout.
     /// `Sqlite`: single `account.sqlite` file per account.
     pub persistence: Option<bwk::persist::PersistenceKind>,
+    /// Runtime-only override for every wallet and owned header backend.
+    #[serde(skip)]
+    pub backend_factory: Option<Arc<dyn BackendFactory>>,
 
     // Scanning
     /// Minimum output value in satoshis to consider (dust filter)
@@ -134,6 +141,26 @@ pub struct SubAccountConfig {
 }
 
 impl Config {
+    pub(crate) fn scanner_config(&self, index: usize, sub: &SubAccountConfig) -> ScannerConfig {
+        let name = format!("{}-sub-{}", self.account_name, index);
+        let mut config = ScannerConfig::new(
+            sub.descriptor.clone(),
+            self.account_dir(),
+            name.clone(),
+            name,
+            self.network,
+            self.persistence,
+        );
+        let mut endpoint = sub.endpoint.clone();
+        endpoint.adopt_certificate_check(self.endpoint());
+        config.set_stay_offline(endpoint.url().is_none());
+        config.set_endpoint(endpoint);
+        config.header_scanner = self.header_scanner;
+        config.backend_factory = self.backend_factory.clone();
+        config.backend_kind = BackendKind::SubAccount(index);
+        config
+    }
+
     // Constructors
 
     /// Create a new Config from a mnemonic phrase.
@@ -162,6 +189,7 @@ impl Config {
             endpoint: Endpoint::default(),
             data_dir,
             persistence: Some(bwk::persist::PersistenceKind::default()),
+            backend_factory: None,
             dust_limit: None,
             birthday_height: None,
             header_scanner: true,
@@ -192,6 +220,7 @@ impl Config {
             endpoint: Endpoint::default(),
             data_dir,
             persistence: Some(bwk::persist::PersistenceKind::default()),
+            backend_factory: None,
             dust_limit: None,
             birthday_height: None,
             header_scanner: true,
