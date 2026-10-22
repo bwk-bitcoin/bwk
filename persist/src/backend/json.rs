@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::Value;
 
 use super::{lock::DirLock, PersistenceBackend};
-use crate::{PersistError, DB_VERSION};
+use crate::{cipher, PersistError, DB_VERSION};
 
 const VERSION_FILENAME: &str = "version";
 
@@ -74,7 +74,7 @@ impl JsonBackend {
 
     /// Internal: filesystem path of `store`'s rows file.
     fn store_path(&self, store: &str) -> PathBuf {
-        self.dir.join(format!("{store}.json"))
+        cipher::sealed_path(&self.dir.join(format!("{store}.json")))
     }
 
     /// Path to the file that holds `store`'s rows.
@@ -88,7 +88,7 @@ impl JsonBackend {
     }
 
     fn version_path(&self) -> PathBuf {
-        self.dir.join(VERSION_FILENAME)
+        version_path(&self.dir)
     }
 
     /// Write [`DB_VERSION`] into the version file if this backend
@@ -102,7 +102,8 @@ impl JsonBackend {
         if self.stamped.load(Ordering::Acquire) {
             return Ok(());
         }
-        Self::atomic_write(&self.version_path(), format!("{DB_VERSION}\n").as_bytes())?;
+        let version = cipher::seal(format!("{DB_VERSION}\n").as_bytes())?;
+        Self::atomic_write(&self.version_path(), &version)?;
         self.stamped.store(true, Ordering::Release);
         Ok(())
     }
@@ -147,8 +148,17 @@ impl JsonBackend {
     /// the file is absent.
     fn read_store(&self, store: &str) -> Result<BTreeMap<String, Value>, PersistError> {
         let path = self.store_path(store);
+        // A store left in clear is refused rather than read as empty: the wallet would
+        // start over beside it.
+        let clear = self.dir.join(format!("{store}.json"));
+        if path != clear && !path.exists() && clear.exists() {
+            return Err(PersistError::Cipher(format!(
+                "{} is not encrypted",
+                clear.display()
+            )));
+        }
         match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice::<BTreeMap<String, Value>>(&bytes)
+            Ok(bytes) => serde_json::from_slice::<BTreeMap<String, Value>>(&cipher::open(&bytes)?)
                 .map_err(|e| PersistError::Serde(format!("parse {}: {e}", path.display()))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
             Err(e) => Err(PersistError::Io(format!("read {}: {e}", path.display()))),
@@ -158,7 +168,7 @@ impl JsonBackend {
     fn write_store(&self, store: &str, rows: &BTreeMap<String, Value>) -> Result<(), PersistError> {
         let bytes = serde_json::to_vec_pretty(rows)
             .map_err(|e| PersistError::Serde(format!("serialize {store}: {e}")))?;
-        Self::atomic_write(&self.store_path(store), &bytes)
+        Self::atomic_write(&self.store_path(store), &cipher::seal(&bytes)?)
     }
 }
 
@@ -168,10 +178,25 @@ impl JsonBackend {
 ///
 /// Never creates the file. Stamping is deferred to the first actual
 /// write; see [`JsonBackend::stamp_version_if_needed`].
+/// The version file: sealed like the stores while a cipher is installed, so it cannot
+/// be changed under the wallet.
+fn version_path(dir: &std::path::Path) -> PathBuf {
+    cipher::sealed_path(&dir.join(VERSION_FILENAME))
+}
+
 fn check_version(dir: &std::path::Path) -> Result<Option<u32>, PersistError> {
-    let vp = dir.join(VERSION_FILENAME);
-    match fs::read_to_string(&vp) {
-        Ok(s) => {
+    let vp = version_path(dir);
+    let clear = dir.join(VERSION_FILENAME);
+    if vp != clear && !vp.exists() && clear.exists() {
+        return Err(PersistError::Cipher(format!(
+            "{} is not encrypted",
+            clear.display()
+        )));
+    }
+    match fs::read(&vp) {
+        Ok(bytes) => {
+            let bytes = cipher::open(&bytes)?;
+            let s = String::from_utf8_lossy(&bytes);
             let v: u32 = s.trim().parse().map_err(|e| {
                 PersistError::Serde(format!("parse version file {}: {e}", vp.display()))
             })?;

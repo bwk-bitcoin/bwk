@@ -16,13 +16,15 @@ doctest = false
 crossbeam.workspace = true
 bwk-keys.workspace = true
 bwk-descriptor.workspace = true
-bwk-persist.workspace = true
-bwk-utils.workspace = true
+bwk-psbt.workspace = true
+bwk-musig = { workspace = true, optional = true, features = ["rust-bitcoin"] }
+getrandom = { workspace = true, optional = true }
 bip39 = { workspace = true, features = ["rand"] }
 serde.workspace = true
 serde_json.workspace = true
 miniscript.workspace = true
 log.workspace = true
+thiserror.workspace = true
 
 # `bwk-hwi` pulls in the USB/HID hardware-wallet stack (coldcard -> hidapi ->
 # libudev), which cannot cross-compile to Android. Gate it off Android targets;
@@ -30,9 +32,13 @@ log.workspace = true
 [target.'cfg(not(target_os = "android"))'.dependencies]
 bwk-hwi = { workspace = true, features = ["service"], optional = true }
 
+[dev-dependencies]
+bwk-utils = { workspace = true, features = ["test"] }
+bwk-bup.workspace = true
+
 [features]
 default = ["hwi", "sp"]
-test = ["bwk-utils/test"]
+test = []
 sp = []
 # Marker feature only. The actual `bwk-hwi` optional dependency is auto-enabled
 # by the `hwi` feature on non-Android targets (see the target table above). It is
@@ -40,3 +46,4 @@ sp = []
 # dependency does not exist) resolves cleanly. Code paths that touch `bwk_hwi`
 # are additionally gated with `not(target_os = "android")`.
 hwi = ["dep:bwk-hwi"]
+musig = ["bwk-descriptor/musig", "bwk-psbt/musig", "bwk-keys/musig", "dep:bwk-musig", "dep:getrandom", "bwk-bup/musig", "bwk-hwi?/musig"]

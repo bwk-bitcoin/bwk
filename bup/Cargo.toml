@@ -1,0 +1,15 @@
+[package]
+name = "bwk-bup"
+version = "0.1.0"
+edition = "2021"
+license-file = "LICENCE"
+description = "Bitcoin user policy: role-tagged Taproot multipath descriptors"
+
+[dependencies]
+miniscript = { workspace = true, features = ["serde", "compiler"] }
+serde.workspace = true
+bwk-descriptor.workspace = true
+bwk-keys.workspace = true
+
+[features]
+musig = ["bwk-keys/musig", "bwk-descriptor/musig"]

@@ -1,16 +1,14 @@
 use miniscript::{
     bitcoin::{
-        self, absolute,
-        address::NetworkUnchecked,
-        secp256k1::{PublicKey, SecretKey},
-        Address, Network, ScriptBuf, TxOut, Weight,
+        self, absolute, address::NetworkUnchecked, secp256k1::PublicKey, Address, Network,
+        ScriptBuf, TxOut, Weight,
     },
-    psbt::PsbtExt,
-    Descriptor, DescriptorPublicKey,
+    DescriptorPublicKey,
 };
 use serde::{Deserialize, Serialize};
 
 use bwk_coin::{derive_descriptor, ChangeTip, Coin, KeyChain};
+use bwk_descriptor::wallet::{WalletDescriptor, WalletDescriptorExt};
 
 use crate::{error::Error, transaction::Amount};
 
@@ -19,29 +17,16 @@ use crate::{error::Error, transaction::Amount};
 pub struct FinalizationContext<'a> {
     /// Selected input coins
     pub inputs: &'a [Coin],
-    /// Partial secret for SP outputs (computed by SpPartialSecretProvider if any SP outputs exist)
-    pub partial_secret: Option<SecretKey>,
     /// Bitcoin network
     pub network: Network,
 }
 
-/// Trait for computing SP partial secret from inputs.
-/// Implemented by SpReceiver/Account in bwk-sp.
-pub trait SpPartialSecretProvider {
-    /// Compute the partial secret needed for SP output derivation.
-    /// This combines the spend key with tweaks from all selected inputs.
-    fn compute_partial_secret(&self, inputs: &[Coin]) -> Result<SecretKey, Error>;
-
-    /// Batch-derive scripts for all Silent Payment outputs in a transaction.
-    ///
-    /// BIP352 requires all SP outputs sharing the same scan key to be derived
-    /// together with incrementing `k` values. This method is called during
-    /// `finalize()` after computing `partial_secret` but before `build_psbt()`.
-    fn derive_sp_scripts(
-        &self,
-        _outputs: &mut [Box<dyn RecipientProvider>],
-        _partial_secret: SecretKey,
-    ) {
+/// Trait for updating BIP375 fields on a PSBTv2's silent-payment inputs.
+/// Implemented by signers in bwk-sp; the wallet never needs a private key to
+/// build a template, so the default body is a no-op.
+pub trait SpUpdater {
+    fn update_sp_inputs(&self, _psbt: &mut bwk_psbt::PsbtV2, _coins: &[Coin]) -> Result<(), Error> {
+        Ok(())
     }
 }
 
@@ -53,7 +38,7 @@ pub trait RecipientProvider: RecipientProviderClone {
 
     /// Create output script using finalization context.
     /// - For regular addresses: ignores context
-    /// - For SP: uses partial_secret from context to derive output key
+    /// - For SP: left unset here; a signer derives it from the input hash
     fn create_script(&mut self, ctx: &FinalizationContext) -> ScriptBuf;
 
     /// PSBT output metadata for signers (BIP32 derivation or BIP375 SP info)
@@ -74,9 +59,6 @@ pub trait RecipientProvider: RecipientProviderClone {
 
     /// Set the amount (used for Max output resolution)
     fn set_amount(&mut self, amount: Amount);
-
-    /// Store a pre-computed output script (used by SP batch derivation).
-    fn set_precomputed_script(&mut self, _script: ScriptBuf) {}
 
     /// Convert to PSBT output metadata
     fn to_psbt_output(&self) -> Result<bitcoin::psbt::Output, Error> {
@@ -114,7 +96,7 @@ pub enum PsbtOutputInfo {
     /// Descriptor-based wallets (BIP32 derivation paths)
     Bip32 {
         origin: (KeyChain, u32),
-        descriptor: Descriptor<DescriptorPublicKey>,
+        descriptor: WalletDescriptor,
     },
     /// Silent Payment outputs (BIP375)
     /// Contains PSBT_OUT_SP_V0_INFO (scan + spend pubkeys) and optional PSBT_OUT_SP_V0_LABEL
@@ -133,7 +115,7 @@ pub struct Recipient {
     pub amount: Amount,
     pub label: Option<String>,
     pub origin: Option<(KeyChain, u32 /* index */)>,
-    pub descriptor: Option<Descriptor<DescriptorPublicKey>>,
+    pub descriptor: Option<WalletDescriptor>,
 }
 
 impl From<&Recipient> for TxOut {
@@ -197,7 +179,7 @@ impl Recipient {
             outputs: vec![bitcoin::psbt::Output::default()],
         };
 
-        PsbtExt::update_output_with_descriptor(&mut dummy_psbt, 0, &descr)
+        bwk_descriptor::updater::update_output(&mut dummy_psbt, 0, &descr)
             .map_err(|_| Error::Update)?;
 
         Ok(dummy_psbt.outputs[0].clone())
@@ -245,18 +227,14 @@ impl RecipientProvider for Recipient {
     }
 
     fn network(&self) -> Network {
-        use miniscript::ForEachKey;
-
         if let Some(descriptor) = &self.descriptor {
             let is_mainnet = descriptor
-                .clone()
-                .into_single_descriptors()
+                .single_paths()
                 .ok()
                 .and_then(|d| d.first().cloned())
                 .map(|d| {
-                    d.for_any_key(|k| match k {
-                        DescriptorPublicKey::XPub(k) => k.xkey.network.is_mainnet(),
-                        _ => false,
+                    d.plain_keys().iter().any(|k| {
+                        matches!(k, DescriptorPublicKey::XPub(x) if x.xkey.network.is_mainnet())
                     })
                 })
                 .unwrap_or(false);
@@ -293,14 +271,14 @@ impl ChangeTip for LocalTipUpdater {
 /// The type parameter is erased when boxed into `Box<dyn RecipientProvider>`.
 pub struct ChangeRecipientProvider<T: ChangeTip> {
     tip_updater: T,
-    descriptor: Descriptor<DescriptorPublicKey>,
+    descriptor: WalletDescriptor,
     network: Network,
     amount: Amount,
     current_index: Option<u32>,
 }
 
 impl ChangeRecipientProvider<LocalTipUpdater> {
-    pub fn new(descriptor: Descriptor<DescriptorPublicKey>, network: Network) -> Self {
+    pub fn new(descriptor: WalletDescriptor, network: Network) -> Self {
         Self {
             tip_updater: LocalTipUpdater::new(0),
             descriptor,
@@ -319,7 +297,7 @@ impl ChangeRecipientProvider<LocalTipUpdater> {
 impl<T: ChangeTip> ChangeRecipientProvider<T> {
     pub fn new_with_updater(
         tip_updater: T,
-        descriptor: Descriptor<DescriptorPublicKey>,
+        descriptor: WalletDescriptor,
         network: Network,
     ) -> Self {
         Self {
@@ -348,12 +326,11 @@ impl<T: ChangeTip + Clone + 'static> RecipientProvider for ChangeRecipientProvid
     fn output_weight(&self) -> Weight {
         let script = self
             .descriptor
-            .clone()
-            .into_single_descriptors()
+            .single_paths()
             .expect("multipath")
             .get(1)
             .expect("change descriptor")
-            .at_derivation_index(0)
+            .derive_at(0)
             .expect("derivation")
             .address(self.network)
             .expect("address")
@@ -370,12 +347,11 @@ impl<T: ChangeTip + Clone + 'static> RecipientProvider for ChangeRecipientProvid
         self.current_index = Some(index);
 
         self.descriptor
-            .clone()
-            .into_single_descriptors()
+            .single_paths()
             .expect("multipath")
             .get(1)
             .expect("change descriptor")
-            .at_derivation_index(index)
+            .derive_at(index)
             .expect("derivation")
             .address(self.network)
             .expect("address")

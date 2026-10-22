@@ -2,6 +2,7 @@
 resolver = "3"
 
 members = [
+    "bbqr",
     "bwk",
     "sp",
     "electrum",
@@ -9,10 +10,15 @@ members = [
     "error",
     "coin",
     "keys", "utils", "sign", "descriptor", "tx",
+    "qr", "qr-protocol",
     "persist",
     "p2p",
     "mitm",
+    "psbt",
+    "musig",
+    "bup",
     "hwi", "hwi/cli",
+    "hwi/coldcard",
     "secp256k1_spscan-sys",
 ]
 
@@ -55,6 +61,9 @@ corepc-node = { version = "0.10", features = ["download", "29_0"] }
 electrsd = { git = "https://github.com/pythcoiner/electrsd.git", branch = "buffered_logs" }
 dns-lookup = "2.0"
 trybuild = "1.0"
+qrcodegen = "=1.8.0"
+quircs = "=0.10.3"
+bbqr = { path = "bbqr" }
 
 # spdk dependencies
 secp256k1_spscan-sys = { path = "secp256k1_spscan-sys" }
@@ -63,8 +72,11 @@ bdk_coin_select = "0.4.0"
 secp256k1 = { version = "0.29.1", features = ["rand", "global-context"] }
 bitcoin_hashes = "0.13.0"
 bech32 = "0.9"
-bimap = "0.6"
 ureq = { version = "3.3", default-features = false }
+# rust-secp256k1 with the musig module, as bark/ark-lib uses it; bitcoin 0.32 stays on
+# secp256k1 0.29, conversions go through bytes. 0.33's musig API runs on its internal
+# context, so only `std` is enabled.
+secp256k1-musig = { package = "secp256k1", version = "0.33", default-features = false, features = ["std"] }
 
 # bwk crates
 bwk-electrum = { path = "electrum" }
@@ -77,6 +89,11 @@ bwk-descriptor = { path = "descriptor" }
 bwk-persist = { path = "persist" }
 bwk-utils = { path = "utils" }
 bwk-p2p = { path = "p2p" }
+bwk-qr = { path = "qr" }
+bwk-qr-protocol = { path = "qr-protocol" }
+bwk-psbt = { path = "psbt" }
+bwk-musig = { path = "musig", default-features = false }
+bwk-bup = { path = "bup" }
 bwk = { path = "bwk" }
 # bwk-error is the in-house derive. Aliasing the package as `thiserror` is deliberate,
 # not an oversight: error definitions across the tree keep reading `thiserror::Error`,

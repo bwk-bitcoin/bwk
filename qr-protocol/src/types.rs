@@ -1,0 +1,191 @@
+use alloc::vec::Vec;
+
+pub const EXTENDED_KEY_LEN: usize = 78;
+pub const FINGERPRINT_LEN: usize = 4;
+pub const PUBLIC_KEY_LEN: usize = 33;
+pub const MUSIG_PUB_NONCE_LEN: usize = 66;
+pub const MUSIG_PARTIAL_SIG_LEN: usize = 32;
+pub const TAP_LEAF_HASH_LEN: usize = 32;
+
+/// BIP-32 child numbers with the hardened bit set, exactly as they sit on the wire.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DerivationPath(pub Vec<u32>);
+
+/// The 78-byte BIP-32 serialization of an extended public or private key, the form
+/// BIP-32 base58-encodes. A private one carries `0x00 || 32-byte key` in place of the
+/// 33-byte public key, and its own version bytes, so both have the same length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtendedKey(pub [u8; EXTENDED_KEY_LEN]);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fingerprint(pub [u8; FINGERPRINT_LEN]);
+
+/// A compressed secp256k1 public key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicKey(pub [u8; PUBLIC_KEY_LEN]);
+
+#[cfg(feature = "bitcoin")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Error {
+    ExtendedKey(bitcoin::bip32::Error),
+    PublicKey(bitcoin::key::FromSliceError),
+    UncompressedPublicKey,
+    /// A silent payment keys string that is not `<fingerprint>|<spend_path>|<scan_path>`.
+    SpKeys,
+}
+
+#[cfg(feature = "bitcoin")]
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::ExtendedKey(e) => write!(f, "invalid extended key: {e}"),
+            Self::PublicKey(e) => write!(f, "invalid public key: {e}"),
+            Self::UncompressedPublicKey => f.write_str("public key is not compressed"),
+            Self::SpKeys => {
+                f.write_str("silent payment keys are not <fingerprint>|<spend_path>|<scan_path>")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "bitcoin")]
+impl core::error::Error for Error {}
+
+#[cfg(feature = "bitcoin")]
+impl From<&bitcoin::bip32::DerivationPath> for DerivationPath {
+    fn from(path: &bitcoin::bip32::DerivationPath) -> Self {
+        Self(path.as_ref().iter().copied().map(u32::from).collect())
+    }
+}
+
+#[cfg(feature = "bitcoin")]
+impl From<&DerivationPath> for bitcoin::bip32::DerivationPath {
+    fn from(path: &DerivationPath) -> Self {
+        path.0
+            .iter()
+            .copied()
+            .map(bitcoin::bip32::ChildNumber::from)
+            .collect()
+    }
+}
+
+#[cfg(feature = "bitcoin")]
+impl From<&bitcoin::bip32::Xpub> for ExtendedKey {
+    fn from(xpub: &bitcoin::bip32::Xpub) -> Self {
+        Self(xpub.encode())
+    }
+}
+
+#[cfg(feature = "bitcoin")]
+impl From<&bitcoin::bip32::Xpriv> for ExtendedKey {
+    fn from(xpriv: &bitcoin::bip32::Xpriv) -> Self {
+        Self(xpriv.encode())
+    }
+}
+
+#[cfg(feature = "bitcoin")]
+impl TryFrom<&ExtendedKey> for bitcoin::bip32::Xpub {
+    type Error = Error;
+
+    fn try_from(key: &ExtendedKey) -> Result<Self, Error> {
+        Self::decode(&key.0).map_err(Error::ExtendedKey)
+    }
+}
+
+#[cfg(feature = "bitcoin")]
+impl TryFrom<&ExtendedKey> for bitcoin::bip32::Xpriv {
+    type Error = Error;
+
+    fn try_from(key: &ExtendedKey) -> Result<Self, Error> {
+        Self::decode(&key.0).map_err(Error::ExtendedKey)
+    }
+}
+
+#[cfg(feature = "bitcoin")]
+impl From<&bitcoin::bip32::Fingerprint> for Fingerprint {
+    fn from(fingerprint: &bitcoin::bip32::Fingerprint) -> Self {
+        Self(fingerprint.to_bytes())
+    }
+}
+
+#[cfg(feature = "bitcoin")]
+impl From<&Fingerprint> for bitcoin::bip32::Fingerprint {
+    fn from(fingerprint: &Fingerprint) -> Self {
+        Self::from(fingerprint.0)
+    }
+}
+
+#[cfg(feature = "bitcoin")]
+impl TryFrom<&bitcoin::PublicKey> for PublicKey {
+    type Error = Error;
+
+    fn try_from(key: &bitcoin::PublicKey) -> Result<Self, Error> {
+        if !key.compressed {
+            return Err(Error::UncompressedPublicKey);
+        }
+        Ok(Self(key.inner.serialize()))
+    }
+}
+
+#[cfg(feature = "bitcoin")]
+impl TryFrom<&PublicKey> for bitcoin::PublicKey {
+    type Error = Error;
+
+    fn try_from(key: &PublicKey) -> Result<Self, Error> {
+        Self::from_slice(&key.0).map_err(Error::PublicKey)
+    }
+}
+
+/// The keys a [`DescriptorBody::SpKeys`](crate::request::DescriptorBody::SpKeys) names:
+/// a silent payment account's master fingerprint and the BIP-32 paths of its BIP-352
+/// spend and scan keys, written `<fingerprint>|<spend_path>|<scan_path>`.
+#[cfg(feature = "bitcoin")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpKeys {
+    pub fingerprint: bitcoin::bip32::Fingerprint,
+    pub spend_path: bitcoin::bip32::DerivationPath,
+    pub scan_path: bitcoin::bip32::DerivationPath,
+}
+
+#[cfg(feature = "bitcoin")]
+impl core::fmt::Display for SpKeys {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{}|m/{}|m/{}",
+            self.fingerprint, self.spend_path, self.scan_path
+        )
+    }
+}
+
+#[cfg(feature = "bitcoin")]
+impl core::str::FromStr for SpKeys {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut parts = s.split('|');
+        let (Some(fingerprint), Some(spend_path), Some(scan_path), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(Error::SpKeys);
+        };
+        // both paths start at the master key: "m/..."
+        let path = |text: &str| {
+            text.strip_prefix("m/")
+                .and_then(|_| text.parse::<bitcoin::bip32::DerivationPath>().ok())
+                .ok_or(Error::SpKeys)
+        };
+        Ok(Self {
+            fingerprint: fingerprint.parse().map_err(|_| Error::SpKeys)?,
+            spend_path: path(spend_path)?,
+            scan_path: path(scan_path)?,
+        })
+    }
+}
+
+#[cfg(feature = "bitcoin")]
+impl From<&SpKeys> for crate::request::DescriptorBody {
+    fn from(keys: &SpKeys) -> Self {
+        Self::SpKeys(alloc::string::ToString::to_string(keys))
+    }
+}

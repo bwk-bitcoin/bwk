@@ -1,8 +1,15 @@
 use std::{
     collections::BTreeMap,
     slice,
-    sync::{mpsc, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
 };
+
+use bwk_descriptor::descriptor::Descriptor;
 
 use bwk_electrum::{
     coin_store::{ChangeTipUpdater, SpendRecorder},
@@ -10,25 +17,582 @@ use bwk_electrum::{
     header_follower::HeaderFollower,
     header_store::HeaderStore,
     history::{AccountHistory, TxContribution},
-    notification::Notification,
+    notification::{Notification, SignerNotification},
     open,
-    profile::{DefaultBackend, RamProfile, ReopenStatuses},
+    persistence::{BackendFactory, BackendIdentity, BackendKind},
+    profile::{
+        DefaultBackend, OpenScanFromBackend, RamProfile, ReopenStatuses, ScanProfile, ScanStores,
+    },
     reconcile::Reconciler,
     scanner::ElectrumScanner,
 };
 use bwk_persist::{
     backend::PersistenceBackend,
     config_store::{ConfigStore, NoopConfigStore},
+    PersistError,
 };
-use bwk_sign::signing_manager::SigningManager;
+use bwk_sign::{
+    identity::{SignerId, SignerInfo, SignerState},
+    manager::{self, SigningManager},
+    protocol::{RequestId, Response},
+    signing_manager::HotManager,
+};
 use bwk_tx::{recipient::ChangeRecipientProvider, tx_builder::TxBuilder};
+use crossbeam::channel;
 
-use miniscript::bitcoin::{self, Txid};
-
-use crate::{
-    config::Config,
-    profile::{OpenFromBackend, StorageProfile, Stores},
+#[cfg(feature = "musig")]
+use bwk_coin::{
+    derive_descriptor, max_input_satisfaction_size, Coin, CoinSpendInfo, KeyChain,
+    TAPROOT_KEYSPEND_SATISFACTION_WU,
 };
+#[cfg(feature = "musig")]
+use bwk_descriptor::{
+    restrict::{restrict_input_to_key_path, restrict_input_to_leaf},
+    wallet::{WalletDefiniteKey, WalletDescriptorExt, WalletKey},
+};
+#[cfg(feature = "musig")]
+use bwk_keys::{musig::MusigKey, nums};
+use miniscript::{
+    bitcoin::{self, secp256k1::Secp256k1, Txid},
+    psbt::PsbtExt,
+};
+#[cfg(feature = "musig")]
+use miniscript::{
+    bitcoin::{
+        absolute,
+        bip32::Fingerprint,
+        relative,
+        taproot::{LeafVersion, TapLeafHash, TAPROOT_CONTROL_BASE_SIZE, TAPROOT_CONTROL_NODE_SIZE},
+        OutPoint, Sequence, VarInt,
+    },
+    descriptor::{SinglePubKey, Tr},
+    DescriptorPublicKey, Miniscript, MiniscriptKey, Tap, Terminal,
+};
+
+use crate::config::Config;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("a signing manager is already attached under this name")]
+    ManagerAlreadyAttached,
+    #[error("no signer with that id")]
+    UnknownSigner,
+    #[error("signer is not ready")]
+    SignerNotReady,
+    #[error("signing error: {0}")]
+    Signing(#[from] manager::Error),
+    #[error("finalize failed: {0}")]
+    Finalize(String),
+    #[cfg(feature = "musig")]
+    #[error("musig: {0}")]
+    Musig(String),
+    #[cfg(feature = "musig")]
+    #[error("no such spend path")]
+    UnknownSpendPath,
+    #[cfg(feature = "musig")]
+    #[error("the key path is unspendable: the internal key is the BIP-341 NUMS point")]
+    UnspendableKeyPath,
+    #[cfg(feature = "musig")]
+    #[error("the leaf is unspendable: every key in it is the BIP-341 NUMS point")]
+    UnspendableLeaf,
+}
+
+/// How an input is spent: the key path or one tap leaf.
+#[cfg(feature = "musig")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SpendPath {
+    KeyPath,
+    Leaf(bitcoin::taproot::TapLeafHash),
+}
+
+/// One spend path of the account descriptor, as the leaf picker shows it.
+#[cfg(feature = "musig")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpendLeaf {
+    pub path: SpendPath,
+    /// Master fingerprints of the keys that sign it (the musig subset, or the one key).
+    pub signers: Vec<bitcoin::bip32::Fingerprint>,
+    /// `older()` blocks on the leaf.
+    pub relative: Option<u16>,
+    /// `after()` height on the leaf.
+    pub absolute: Option<u32>,
+    /// Every given coin's timelock on this path is met at the current tip; an
+    /// `older()` path with no given coin is not spendable.
+    pub spendable: bool,
+    /// Witness weight of one input spent this way, control block included.
+    pub satisfaction_wu: u64,
+}
+
+/// Well-known name of the hot manager an `Account` attaches at construction
+/// when the config carries a mnemonic.
+const HOT_MANAGER_NAME: &str = "hot";
+
+/// One runtime-attached signing manager plus the pump thread forwarding its
+/// responses into the account's notification sender.
+pub struct AttachedManager {
+    pub manager: Box<dyn SigningManager>,
+    pub stop: Arc<AtomicBool>,
+    pub pump: Option<JoinHandle<()>>,
+}
+
+/// One cached signer identity plus the name of the manager it came from, so
+/// [`Account::detach_signing_manager`] can drop exactly that manager's
+/// entries.
+pub struct CachedSigner {
+    pub manager: String,
+    pub info: SignerInfo,
+}
+
+/// Replaces every cached entry owned by `manager` with `list`: a signer whose
+/// state changes is dropped and re-registered rather than mutated, so a roster
+/// update is a wholesale replacement, not a merge.
+pub fn replace_manager_signers(
+    cache: &Mutex<BTreeMap<SignerId, CachedSigner>>,
+    manager: &str,
+    list: Vec<SignerInfo>,
+) {
+    let mut cache = cache.lock().expect("poisoned");
+    cache.retain(|_, entry| entry.manager != manager);
+    for info in list {
+        cache.insert(
+            info.id.clone(),
+            CachedSigner {
+                manager: manager.to_string(),
+                info,
+            },
+        );
+    }
+}
+
+/// Every currently cached signer, across every attached manager. Used to
+/// emit `SignerNotification::Signers` with the account-wide list rather than
+/// one manager's slice.
+pub fn signers_snapshot(cache: &Mutex<BTreeMap<SignerId, CachedSigner>>) -> Vec<SignerInfo> {
+    cache
+        .lock()
+        .expect("poisoned")
+        .values()
+        .map(|cached| cached.info.clone())
+        .collect()
+}
+
+/// Resolves `signer_id` to the name of the manager that owns it, rejecting an
+/// unknown id or a signer that is not [`SignerState::Ready`] before any
+/// manager is touched. Shared by [`dispatch`] and [`dispatch_mut`] so the
+/// lookup exists once in the workspace, not once per account type.
+pub fn resolve_manager(
+    cache: &Mutex<BTreeMap<SignerId, CachedSigner>>,
+    signer_id: &SignerId,
+) -> Result<String, Error> {
+    let cache = cache.lock().expect("poisoned");
+    let entry = cache.get(signer_id).ok_or(Error::UnknownSigner)?;
+    if !matches!(entry.info.state, SignerState::Ready) {
+        return Err(Error::SignerNotReady);
+    }
+    Ok(entry.manager.clone())
+}
+
+/// Routes a `&self` [`SigningManager`] operation to the manager owning
+/// `signer_id`, the id-to-manager resolution every account type shares.
+pub fn dispatch<F>(
+    managers: &BTreeMap<String, AttachedManager>,
+    signers: &Mutex<BTreeMap<SignerId, CachedSigner>>,
+    signer_id: &SignerId,
+    f: F,
+) -> Result<RequestId, Error>
+where
+    F: FnOnce(&dyn SigningManager) -> Result<RequestId, manager::Error>,
+{
+    let name = resolve_manager(signers, signer_id)?;
+    let attached = managers.get(&name).ok_or(Error::UnknownSigner)?;
+    f(attached.manager.as_ref()).map_err(Error::from)
+}
+
+/// Routes a `&mut self` [`SigningManager`] operation (`init`,
+/// `register_descriptor`) to the manager owning `signer_id`. See
+/// [`dispatch`].
+pub fn dispatch_mut<F>(
+    managers: &mut BTreeMap<String, AttachedManager>,
+    signers: &Mutex<BTreeMap<SignerId, CachedSigner>>,
+    signer_id: &SignerId,
+    f: F,
+) -> Result<RequestId, Error>
+where
+    F: FnOnce(&mut dyn SigningManager) -> Result<RequestId, manager::Error>,
+{
+    let name = resolve_manager(signers, signer_id)?;
+    let attached = managers.get_mut(&name).ok_or(Error::UnknownSigner)?;
+    f(attached.manager.as_mut()).map_err(Error::from)
+}
+
+/// Adapts a shared [`HotManager`] to [`SigningManager`] so it can sit in
+/// [`Account::managers`] like any other attached manager.
+pub struct HotManagerHandle(pub Arc<Mutex<HotManager>>);
+
+impl SigningManager for HotManagerHandle {
+    fn signers(&self) -> Vec<SignerInfo> {
+        self.0.lock().expect("poisoned").signers()
+    }
+
+    fn subscribe(&mut self, sender: channel::Sender<Response>) {
+        self.0.lock().expect("poisoned").subscribe(sender);
+    }
+
+    fn set_polling(&mut self, enabled: bool) {
+        self.0.lock().expect("poisoned").set_polling(enabled);
+    }
+
+    fn init(&mut self, signer: &SignerId) -> Result<RequestId, manager::Error> {
+        self.0.lock().expect("poisoned").init(signer)
+    }
+
+    fn info(&self, signer: &SignerId) -> Result<RequestId, manager::Error> {
+        self.0.lock().expect("poisoned").info(signer)
+    }
+
+    fn get_xpub(
+        &self,
+        signer: &SignerId,
+        path: bitcoin::bip32::DerivationPath,
+        display: bool,
+    ) -> Result<RequestId, manager::Error> {
+        self.0
+            .lock()
+            .expect("poisoned")
+            .get_xpub(signer, path, display)
+    }
+
+    fn is_descriptor_registered(
+        &self,
+        signer: &SignerId,
+        descriptor: Descriptor,
+    ) -> Result<RequestId, manager::Error> {
+        self.0
+            .lock()
+            .expect("poisoned")
+            .is_descriptor_registered(signer, descriptor)
+    }
+
+    fn register_descriptor(
+        &mut self,
+        signer: &SignerId,
+        descriptor: Descriptor,
+    ) -> Result<RequestId, manager::Error> {
+        self.0
+            .lock()
+            .expect("poisoned")
+            .register_descriptor(signer, descriptor)
+    }
+
+    fn sign(
+        &self,
+        signer: &SignerId,
+        descriptor: Descriptor,
+        psbt: Vec<u8>,
+    ) -> Result<RequestId, manager::Error> {
+        self.0
+            .lock()
+            .expect("poisoned")
+            .sign(signer, descriptor, psbt)
+    }
+
+    fn raw(&self, signer: &SignerId, request: Vec<u8>) -> Result<RequestId, manager::Error> {
+        self.0.lock().expect("poisoned").raw(signer, request)
+    }
+}
+
+/// Checks a signed PSBT's bytes on receipt, returning the failure reason on
+/// rejection. Installed on [`spawn_pump`] by account types that know how to
+/// verify their own signed PSBTs (e.g. `bwk_sp::account::Account`'s BIP375
+/// check); [`Account`] installs none.
+pub type PsbtVerifier = Arc<dyn Fn(&[u8]) -> Result<(), String> + Send + Sync>;
+
+/// Bridges an attached manager's `crossbeam` response channel onto the
+/// account's `std::sync::mpsc` notification sender. Polls on a timeout so a
+/// `stop` request is picked up promptly even when the manager never answers.
+///
+/// Also keeps `signers` current: `Response::Signers` and
+/// `Response::SignersChanged` both carry a full roster for `manager_name`, so
+/// either one replaces that manager's cached entries wholesale before the
+/// account-wide snapshot is emitted.
+///
+/// `verifier`, when installed, is applied to every `Response::Signed`'s bytes:
+/// `Ok` emits `PsbtVerified`, `Err` emits `PsbtVerificationFailed` and drops
+/// the bytes. With no verifier the plain `PsbtUpdated` is emitted.
+pub fn spawn_pump(
+    manager_name: String,
+    rx: channel::Receiver<Response>,
+    sender: mpsc::Sender<Notification>,
+    stop: Arc<AtomicBool>,
+    signers: Arc<Mutex<BTreeMap<SignerId, CachedSigner>>>,
+    verifier: Option<PsbtVerifier>,
+) -> JoinHandle<()> {
+    thread::spawn(move || loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(response) => {
+                let notif = match response {
+                    Response::Signers { signers: list, .. }
+                    | Response::SignersChanged { signers: list } => {
+                        replace_manager_signers(&signers, &manager_name, list);
+                        SignerNotification::Signers(signers_snapshot(&signers))
+                    }
+                    Response::Initialized { request, signer } => {
+                        SignerNotification::Initialized { request, signer }
+                    }
+                    Response::Info {
+                        request,
+                        signer,
+                        info,
+                    } => SignerNotification::Info {
+                        request,
+                        signer,
+                        info,
+                    },
+                    Response::Xpub {
+                        request,
+                        signer,
+                        xpub,
+                    } => SignerNotification::Xpub {
+                        request,
+                        signer,
+                        xpub,
+                    },
+                    Response::DescriptorIsRegistered {
+                        request,
+                        signer,
+                        registered,
+                    } => SignerNotification::DescriptorIsRegistered {
+                        request,
+                        signer,
+                        registered,
+                    },
+                    Response::DescriptorRegistered {
+                        request,
+                        signer,
+                        registered,
+                    } => SignerNotification::DescriptorRegistered {
+                        request,
+                        signer,
+                        registered,
+                    },
+                    Response::Signed {
+                        request,
+                        signer,
+                        psbt,
+                    } => match &verifier {
+                        None => SignerNotification::PsbtUpdated {
+                            request,
+                            signer,
+                            psbt,
+                        },
+                        Some(verify) => match verify(&psbt) {
+                            Ok(()) => SignerNotification::PsbtVerified {
+                                request,
+                                signer,
+                                psbt,
+                            },
+                            // Bytes are withheld: a tampered PSBT must not be routable
+                            // into finalize by a consumer that missed the reason.
+                            Err(reason) => SignerNotification::PsbtVerificationFailed {
+                                request,
+                                signer,
+                                reason,
+                            },
+                        },
+                    },
+                    Response::Raw {
+                        request,
+                        signer,
+                        payload,
+                    } => SignerNotification::Raw {
+                        request,
+                        signer,
+                        payload,
+                    },
+                    Response::Error {
+                        request,
+                        signer,
+                        message,
+                    } => SignerNotification::Error {
+                        request,
+                        signer,
+                        message,
+                    },
+                };
+                if sender.send(notif.into()).is_err() {
+                    log::debug!("signer pump: consumer receiver dropped");
+                }
+            }
+            Err(channel::RecvTimeoutError::Timeout) => {}
+            Err(channel::RecvTimeoutError::Disconnected) => return,
+        }
+    })
+}
+
+/// Test doubles for the signing-manager machinery, exposed so other account
+/// types (e.g. `bwk_sp::account::Account`) can exercise it in their own tests
+/// without duplicating a stub.
+#[cfg(feature = "test")]
+pub mod test_support {
+    use std::sync::{Arc, Mutex};
+
+    use bwk_descriptor::descriptor::Descriptor;
+    use bwk_sign::{
+        identity::{SignerId, SignerInfo},
+        manager::{self, SigningManager},
+        protocol::{RequestId, RequestIdSource, Response},
+    };
+    use crossbeam::channel;
+    use miniscript::bitcoin::bip32::DerivationPath;
+
+    /// The signer, descriptor and PSBT bytes of the last `sign` call a
+    /// [`StubManager`] received.
+    pub type LastSign = Arc<Mutex<Option<(SignerId, Descriptor, Vec<u8>)>>>;
+
+    /// Shared stub for signing-manager attach/detach tests.
+    /// Records every call it receives and keeps the sender handed to it by
+    /// `subscribe` in a shared slot, so a test can push a `Response` on it
+    /// after attaching.
+    pub struct StubManager {
+        calls: Arc<Mutex<Vec<String>>>,
+        captured_sender: Arc<Mutex<Option<channel::Sender<Response>>>>,
+        requests: RequestIdSource,
+        initial_signers: Vec<SignerInfo>,
+        /// When set, every request method panics instead of recording and
+        /// answering, so a test can assert that a non-blocking call never
+        /// reaches one.
+        panic_on_request: bool,
+        last_sign: LastSign,
+        last_register_descriptor: Arc<Mutex<Option<(SignerId, Descriptor)>>>,
+    }
+
+    impl StubManager {
+        pub fn new(
+            calls: Arc<Mutex<Vec<String>>>,
+            captured_sender: Arc<Mutex<Option<channel::Sender<Response>>>>,
+        ) -> Self {
+            Self {
+                calls,
+                captured_sender,
+                requests: RequestIdSource::new(),
+                initial_signers: Vec::new(),
+                panic_on_request: false,
+                last_sign: Arc::new(Mutex::new(None)),
+                last_register_descriptor: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        pub fn with_signers(mut self, signers: Vec<SignerInfo>) -> Self {
+            self.initial_signers = signers;
+            self
+        }
+
+        pub fn panicking(mut self) -> Self {
+            self.panic_on_request = true;
+            self
+        }
+
+        fn record(&self, call: &str) {
+            self.calls.lock().expect("poisoned").push(call.to_string());
+        }
+
+        fn deny_request(&self, call: &str) {
+            if self.panic_on_request {
+                panic!("request method {call} reached on a non-blocking call");
+            }
+        }
+
+        pub fn last_sign(&self) -> LastSign {
+            self.last_sign.clone()
+        }
+
+        pub fn last_register_descriptor(&self) -> Arc<Mutex<Option<(SignerId, Descriptor)>>> {
+            self.last_register_descriptor.clone()
+        }
+    }
+
+    impl SigningManager for StubManager {
+        fn signers(&self) -> Vec<SignerInfo> {
+            self.record("signers");
+            self.initial_signers.clone()
+        }
+
+        fn subscribe(&mut self, sender: channel::Sender<Response>) {
+            self.record("subscribe");
+            *self.captured_sender.lock().expect("poisoned") = Some(sender);
+        }
+
+        fn set_polling(&mut self, _enabled: bool) {
+            self.record("set_polling");
+        }
+
+        fn init(&mut self, _signer: &SignerId) -> Result<RequestId, manager::Error> {
+            self.deny_request("init");
+            self.record("init");
+            Ok(self.requests.next())
+        }
+
+        fn info(&self, _signer: &SignerId) -> Result<RequestId, manager::Error> {
+            self.deny_request("info");
+            self.record("info");
+            Ok(self.requests.next())
+        }
+
+        fn get_xpub(
+            &self,
+            _signer: &SignerId,
+            _path: DerivationPath,
+            _display: bool,
+        ) -> Result<RequestId, manager::Error> {
+            self.deny_request("get_xpub");
+            self.record("get_xpub");
+            Ok(self.requests.next())
+        }
+
+        fn is_descriptor_registered(
+            &self,
+            _signer: &SignerId,
+            _descriptor: Descriptor,
+        ) -> Result<RequestId, manager::Error> {
+            self.deny_request("is_descriptor_registered");
+            self.record("is_descriptor_registered");
+            Ok(self.requests.next())
+        }
+
+        fn register_descriptor(
+            &mut self,
+            signer: &SignerId,
+            descriptor: Descriptor,
+        ) -> Result<RequestId, manager::Error> {
+            self.deny_request("register_descriptor");
+            self.record("register_descriptor");
+            *self.last_register_descriptor.lock().expect("poisoned") =
+                Some((signer.clone(), descriptor));
+            Ok(self.requests.next())
+        }
+
+        fn sign(
+            &self,
+            signer: &SignerId,
+            descriptor: Descriptor,
+            psbt: Vec<u8>,
+        ) -> Result<RequestId, manager::Error> {
+            self.deny_request("sign");
+            self.record("sign");
+            *self.last_sign.lock().expect("poisoned") = Some((signer.clone(), descriptor, psbt));
+            Ok(self.requests.next())
+        }
+
+        fn raw(&self, _signer: &SignerId, _request: Vec<u8>) -> Result<RequestId, manager::Error> {
+            self.deny_request("raw");
+            self.record("raw");
+            Ok(self.requests.next())
+        }
+    }
+}
 
 /// A descriptor wallet: one [`ElectrumScanner`] watching the descriptor, one
 /// [`HeaderStore`] validating the chain, and the reconciliation between them.
@@ -41,9 +605,14 @@ use crate::{
 /// With [`ScannerConfig::header_scanner`](bwk_electrum::config::ScannerConfig::header_scanner)
 /// off there is no header store and no reconcile pass: the scanner takes the
 /// confirmations the server reports as is.
-pub struct Account<P: StorageProfile = RamProfile<DefaultBackend>> {
+pub struct Account<P: ScanProfile = RamProfile<DefaultBackend>> {
     scanner: ElectrumScanner<P>,
-    signing_manager: SigningManager<P::SignerStore>,
+    managers: BTreeMap<String, AttachedManager>,
+    /// Cache of every signer reachable through `managers`, keyed by its
+    /// unique [`SignerId`] (never by fingerprint: several signers can share
+    /// one). Seeded from a manager's `signers()` on attach, dropped on
+    /// detach, and kept current by each manager's pump thread.
+    signers: Arc<Mutex<BTreeMap<SignerId, CachedSigner>>>,
     /// Wallet-level half of [`Config`]; the scanner owns the rest.
     mnemonic: Option<String>,
     sender: mpsc::Sender<Notification>,
@@ -63,7 +632,7 @@ pub struct Account<P: StorageProfile = RamProfile<DefaultBackend>> {
 
 /// The validated header chain an account promotes its scan against, and the
 /// pass doing it.
-struct HeaderScanner<P: StorageProfile> {
+struct HeaderScanner<P: ScanProfile> {
     /// This account's own chain or one shared across accounts. The reconcile
     /// thread reads it on every chain-tip advance and fetches its merkle
     /// proofs through it.
@@ -71,7 +640,7 @@ struct HeaderScanner<P: StorageProfile> {
     reconciler: Reconciler<P>,
 }
 
-impl<P: OpenFromBackend> HeaderScanner<P> {
+impl<P: OpenScanFromBackend> HeaderScanner<P> {
     /// Follow `target` and run the reconcile pass. A store already running
     /// against `target` (the usual case at open) is left alone.
     fn start(&mut self, target: Endpoint) {
@@ -94,9 +663,18 @@ impl<P: OpenFromBackend> HeaderScanner<P> {
     }
 }
 
-impl<P: StorageProfile> std::fmt::Debug for Account<P> {
+impl<P: ScanProfile> std::fmt::Debug for Account<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Account").finish()
+    }
+}
+
+impl<P: ScanProfile> Drop for Account<P> {
+    fn drop(&mut self) {
+        let names: Vec<String> = self.managers.keys().cloned().collect();
+        for name in names {
+            self.detach_signing_manager(&name);
+        }
     }
 }
 
@@ -106,7 +684,7 @@ fn default_config_store() -> Arc<dyn ConfigStore<Config>> {
 
 // Generic constructors over any profile that knows how to open its
 // store bundle from a single `Arc<dyn PersistenceBackend>`.
-impl<P: OpenFromBackend> Account<P> {
+impl<P: OpenScanFromBackend> Account<P> {
     /// Creates a new `Account` instance with the given configuration.
     ///
     /// Opens the profile's stores against whatever backend the config
@@ -132,6 +710,22 @@ impl<P: OpenFromBackend> Account<P> {
     pub fn try_new(config: Config) -> Result<Self, open::Error> {
         let (sender, receiver) = mpsc::channel();
         let mut account = Self::try_new_inner(config, None, sender, default_config_store())?;
+        account.receiver = Some(receiver);
+        Ok(account)
+    }
+
+    /// Open caller-owned wallet and header backends. `header_store` shares an
+    /// existing chain instead of requesting a header backend from `factory`.
+    /// Runtime config clones retain the factory; serialized metadata does not.
+    pub fn try_with_backend_factory(
+        mut config: Config,
+        factory: Arc<dyn BackendFactory>,
+        config_store: Arc<dyn ConfigStore<Config>>,
+        header_store: Option<Arc<HeaderStore<P::HeaderStore>>>,
+    ) -> Result<Self, open::Error> {
+        config.scanner.backend_factory = Some(factory);
+        let (sender, receiver) = mpsc::channel();
+        let mut account = Self::try_new_inner(config, header_store, sender, config_store)?;
         account.receiver = Some(receiver);
         Ok(account)
     }
@@ -208,10 +802,27 @@ impl<P: OpenFromBackend> Account<P> {
             return Err(open::Error::EmptyAccount);
         }
         config.scanner.validate_descriptor()?;
-        let headers = match (config.scanner.header_scanner, header_store) {
-            (false, _) => None,
-            (true, Some(store)) => Some(HeaderFollower::borrowed(store, sender.clone())),
-            (true, None) => Some(HeaderFollower::open(
+        let headers = match (
+            config.scanner.header_scanner,
+            header_store,
+            &config.scanner.backend_factory,
+        ) {
+            (false, _, _) => None,
+            (true, Some(store), _) => Some(HeaderFollower::borrowed(store, sender.clone())),
+            (true, None, Some(factory)) => Some(HeaderFollower::from_factory(
+                (!config.scanner.stay_offline())
+                    .then(|| config.scanner.endpoint().configured().cloned())
+                    .flatten(),
+                factory.as_ref(),
+                BackendIdentity {
+                    account: config.scanner.account.clone(),
+                    network: config.scanner.network,
+                    kind: BackendKind::Headers,
+                },
+                config.scanner.header_checkpoint,
+                sender.clone(),
+            )?),
+            (true, None, None) => Some(HeaderFollower::open(
                 // An account asked to stay offline opens its store idle; the
                 // first start points it at the configured endpoint.
                 (!config.scanner.stay_offline())
@@ -225,28 +836,18 @@ impl<P: OpenFromBackend> Account<P> {
             )?),
         };
         let backend: Arc<dyn PersistenceBackend> = config.scanner.build_backend()?;
-        // Hot-signer material must not land on the SQLite DB; route the
-        // SignerStore slot through a NoopBackend in that case.
-        let secrets_backend: Arc<dyn PersistenceBackend> = if matches!(
-            config.scanner.persistence,
-            Some(bwk_persist::PersistenceKind::Sqlite)
-        ) {
-            Arc::new(bwk_persist::backend::noop::NoopBackend)
-        } else {
-            backend.clone()
-        };
         let reopen_backend = backend.clone();
         let reopen_statuses: ReopenStatuses<P> =
             Arc::new(move || P::open_statuses(reopen_backend.clone()));
-        let stores = <P as OpenFromBackend>::open(backend, secrets_backend)?;
-        Ok(Self::from_stores(
+        let stores = <P as OpenScanFromBackend>::open(backend)?;
+        Self::from_stores(
             config,
             headers,
             sender,
             config_store,
             stores,
             Some(reopen_statuses),
-        ))
+        )
     }
 
     fn from_stores(
@@ -254,25 +855,17 @@ impl<P: OpenFromBackend> Account<P> {
         headers: Option<HeaderFollower<P>>,
         sender: mpsc::Sender<Notification>,
         config_store: Arc<dyn ConfigStore<Config>>,
-        stores: Stores<P>,
+        stores: ScanStores<P>,
         reopen_statuses: Option<ReopenStatuses<P>>,
-    ) -> Self {
+    ) -> Result<Self, open::Error> {
         let Config {
             scanner: scanner_config,
             mnemonic,
         } = config;
-        let mut signing_manager = SigningManager::from_store(stores.signers);
-        if let Some(mnemo) = mnemonic.clone() {
-            signing_manager.new_bip32_signer_from_mnemonic(scanner_config.network, mnemo);
-            signing_manager.register_bip32_descriptor(scanner_config.descriptor.clone());
-        }
         let stay_offline = scanner_config.stay_offline();
-        let scanner = ElectrumScanner::from_stores(
-            scanner_config,
-            sender.clone(),
-            stores.scan,
-            reopen_statuses,
-        );
+        let mut scanner =
+            ElectrumScanner::from_stores(scanner_config, sender.clone(), stores, reopen_statuses);
+        scanner.try_persist()?;
         let header_scanner = headers.map(|headers| {
             // Once per account, not per reconciler: a store shared by several
             // accounts would otherwise report the same event to this channel as
@@ -286,17 +879,32 @@ impl<P: OpenFromBackend> Account<P> {
         });
         let mut account = Account {
             scanner,
-            signing_manager,
+            managers: BTreeMap::new(),
+            signers: Arc::new(Mutex::new(BTreeMap::new())),
             mnemonic,
             sender,
             receiver: None,
             config_store,
             header_scanner,
         };
+        // A hot manager is seeded from the config mnemonic and attached like
+        // any other manager; registration stays consumer-driven, so no
+        // descriptor is pushed here.
+        if let Some(mnemo) = account.mnemonic.clone() {
+            let mut hot_manager = HotManager::new();
+            hot_manager.new_bip32_signer_from_mnemonic(account.scanner.network(), mnemo);
+            let hot = Arc::new(Mutex::new(hot_manager));
+            if account
+                .attach_signing_manager(HOT_MANAGER_NAME, Box::new(HotManagerHandle(hot)))
+                .is_err()
+            {
+                log::error!("from_stores(): hot manager name unexpectedly already attached");
+            }
+        }
         if !stay_offline {
             account.start_electrum();
         }
-        account
+        Ok(account)
     }
 
     /// Reconnect every Electrum connection in place, keeping the `Account` and
@@ -319,7 +927,17 @@ impl<P: OpenFromBackend> Account<P> {
     }
 }
 
-impl<P: StorageProfile> Account<P> {
+impl<P: ScanProfile> Account<P> {
+    /// Flush wallet data and metadata, returning the first failure. This is not
+    /// a shutdown operation; stop workers before using it as a durability check.
+    pub fn try_persist(&mut self) -> Result<(), PersistError> {
+        self.scanner.try_persist()?;
+        if let Some(headers) = &self.header_scanner {
+            headers.headers.store().try_persist()?;
+        }
+        self.config_store.save(&self.get_config().for_persistence())
+    }
+
     /// Push the current config to the configured [`ConfigStore`].
     ///
     /// Under [`bwk_persist::PersistenceKind::Sqlite`] the saved view has
@@ -330,14 +948,10 @@ impl<P: StorageProfile> Account<P> {
             log::warn!("config save failed: {e}");
         }
     }
-
-    fn signing_manager(&self) -> &SigningManager<P::SignerStore> {
-        &self.signing_manager
-    }
 }
 
 // Non (b)locking API
-impl<P: StorageProfile> Account<P> {
+impl<P: ScanProfile> Account<P> {
     /// The scanner this account watches its descriptor with.
     pub fn scanner(&self) -> &ElectrumScanner<P> {
         &self.scanner
@@ -362,22 +976,220 @@ impl<P: StorageProfile> Account<P> {
         }
     }
 
-    pub fn sign(&self, psbt: String) {
-        self.signing_manager().sign(psbt);
+    /// Attaches a runtime signing manager under `name`. Non-blocking: this
+    /// only subscribes to the manager's response channel and spawns its pump
+    /// thread, it never registers a descriptor, requests an xpub, or polls
+    /// for devices.
+    ///
+    /// Refuses a duplicate `name` rather than replacing the existing
+    /// manager.
+    pub fn attach_signing_manager(
+        &mut self,
+        name: &str,
+        mut manager: Box<dyn SigningManager>,
+    ) -> Result<(), Error> {
+        if self.managers.contains_key(name) {
+            return Err(Error::ManagerAlreadyAttached);
+        }
+        let (tx, rx) = channel::unbounded();
+        manager.subscribe(tx);
+        let stop = Arc::new(AtomicBool::new(false));
+        let pump = spawn_pump(
+            name.to_string(),
+            rx,
+            self.sender.clone(),
+            stop.clone(),
+            self.signers.clone(),
+            None,
+        );
+        // A synchronous read of what the manager already knows, not a
+        // request, so it does not violate the non-blocking rule.
+        let initial = manager.signers();
+        replace_manager_signers(&self.signers, name, initial);
+        self.managers.insert(
+            name.to_string(),
+            AttachedManager {
+                manager,
+                stop,
+                pump: Some(pump),
+            },
+        );
+        let _ = self.sender.send(
+            SignerNotification::ManagerAttached {
+                manager: name.to_string(),
+            }
+            .into(),
+        );
+        let _ = self
+            .sender
+            .send(SignerNotification::Signers(signers_snapshot(&self.signers)).into());
+        Ok(())
     }
 
-    pub fn sign_psbt(&self, psbt: &mut bitcoin::Psbt) {
-        self.signing_manager().sign_psbt(psbt);
+    /// Detaches the manager registered under `name`, stopping its pump
+    /// thread and dropping its signers from the cache. Returns whether a
+    /// manager was actually removed.
+    pub fn detach_signing_manager(&mut self, name: &str) -> bool {
+        let Some(mut attached) = self.managers.remove(name) else {
+            return false;
+        };
+        attached.stop.store(true, Ordering::Relaxed);
+        drop(attached.manager);
+        if let Some(pump) = attached.pump.take() {
+            let _ = pump.join();
+        }
+        self.signers
+            .lock()
+            .expect("poisoned")
+            .retain(|_, entry| entry.manager != name);
+        let _ = self.sender.send(
+            SignerNotification::ManagerDetached {
+                manager: name.to_string(),
+            }
+            .into(),
+        );
+        let _ = self
+            .sender
+            .send(SignerNotification::Signers(signers_snapshot(&self.signers)).into());
+        true
     }
 
-    /// Returns master xprivs from all BIP32 hot signers, keyed by fingerprint.
-    pub fn master_xprivs(&self) -> BTreeMap<bitcoin::bip32::Fingerprint, bitcoin::bip32::Xpriv> {
-        self.signing_manager().master_xprivs()
+    /// Names of every currently attached signing manager.
+    pub fn signing_manager_names(&self) -> Vec<String> {
+        self.managers.keys().cloned().collect()
+    }
+
+    /// Every signer reachable through an attached manager, from the local
+    /// cache. Keyed by unique id, never by fingerprint: two signers sharing a
+    /// fingerprint both appear. Synchronous and never touches a device.
+    pub fn signers(&self) -> Vec<SignerInfo> {
+        self.signers
+            .lock()
+            .expect("poisoned")
+            .values()
+            .map(|cached| cached.info.clone())
+            .collect()
+    }
+
+    /// The cached identity of one signer, if it is currently known.
+    pub fn signer(&self, id: &SignerId) -> Option<SignerInfo> {
+        self.signers
+            .lock()
+            .expect("poisoned")
+            .get(id)
+            .map(|cached| cached.info.clone())
+    }
+
+    /// Re-reads `signers()` from every attached manager and refreshes the
+    /// cache. Synchronous and cheap: it only reads what each manager already
+    /// holds, it never sends a request to a device.
+    pub fn refresh_signers(&self) {
+        for (name, attached) in self.managers.iter() {
+            let list = attached.manager.signers();
+            replace_manager_signers(&self.signers, name, list);
+        }
+    }
+
+    /// Turns device discovery on and off on every attached manager, mirroring
+    /// silent's `Host::requestSignerPolling`.
+    pub fn set_signer_polling(&mut self, enabled: bool) {
+        for attached in self.managers.values_mut() {
+            attached.manager.set_polling(enabled);
+        }
+    }
+
+    /// Routes a `&self` [`SigningManager`] operation to the manager owning
+    /// `signer_id`, through the free [`dispatch`].
+    fn dispatch<F>(&self, signer_id: &SignerId, f: F) -> Result<RequestId, Error>
+    where
+        F: FnOnce(&dyn SigningManager) -> Result<RequestId, manager::Error>,
+    {
+        dispatch(&self.managers, &self.signers, signer_id, f)
+    }
+
+    /// Routes a `&mut self` [`SigningManager`] operation (`init`,
+    /// `register_descriptor`) to the manager owning `signer_id`, through the
+    /// free [`dispatch_mut`].
+    fn dispatch_mut<F>(&mut self, signer_id: &SignerId, f: F) -> Result<RequestId, Error>
+    where
+        F: FnOnce(&mut dyn SigningManager) -> Result<RequestId, manager::Error>,
+    {
+        dispatch_mut(&mut self.managers, &self.signers, signer_id, f)
+    }
+
+    /// Initializes the signer, e.g. an unlock or pairing handshake. Returns
+    /// immediately; the result arrives later as a notification.
+    pub fn init_signer(&mut self, signer_id: &SignerId) -> Result<RequestId, Error> {
+        self.dispatch_mut(signer_id, |manager| manager.init(signer_id))
+    }
+
+    /// Requests the signer's info payload. Returns immediately; the result
+    /// arrives later as a notification.
+    pub fn signer_info(&self, signer_id: &SignerId) -> Result<RequestId, Error> {
+        self.dispatch(signer_id, |manager| manager.info(signer_id))
+    }
+
+    /// Requests an xpub at `path` from the signer. Returns immediately; the
+    /// result arrives later as a notification.
+    pub fn signer_xpub(
+        &self,
+        signer_id: &SignerId,
+        path: bitcoin::bip32::DerivationPath,
+        display: bool,
+    ) -> Result<RequestId, Error> {
+        self.dispatch(signer_id, |manager| {
+            manager.get_xpub(signer_id, path, display)
+        })
+    }
+
+    /// Asks the signer whether `descriptor` is already registered. Returns
+    /// immediately; the result arrives later as a notification.
+    pub fn is_descriptor_registered(
+        &self,
+        signer_id: &SignerId,
+        descriptor: Descriptor,
+    ) -> Result<RequestId, Error> {
+        self.dispatch(signer_id, |manager| {
+            manager.is_descriptor_registered(signer_id, descriptor)
+        })
+    }
+
+    /// Registers `descriptor` with the signer. Consumer-driven: nothing in
+    /// `bwk` calls this on the consumer's behalf. Returns immediately; the
+    /// result arrives later as a notification.
+    pub fn register_descriptor(
+        &mut self,
+        signer_id: &SignerId,
+        descriptor: Descriptor,
+    ) -> Result<RequestId, Error> {
+        self.dispatch_mut(signer_id, |manager| {
+            manager.register_descriptor(signer_id, descriptor)
+        })
+    }
+
+    /// Asks the signer to sign `psbt` against `descriptor`. Non-blocking: the
+    /// bytes cross untouched, never parsed, never stored, and the result
+    /// arrives later as a notification.
+    pub fn sign(
+        &self,
+        signer_id: &SignerId,
+        descriptor: Descriptor,
+        psbt: Vec<u8>,
+    ) -> Result<RequestId, Error> {
+        self.dispatch(signer_id, |manager| {
+            manager.sign(signer_id, descriptor, psbt)
+        })
+    }
+
+    /// Sends an opaque, manager-defined request to the signer. Returns
+    /// immediately; the result arrives later as a notification.
+    pub fn signer_raw(&self, signer_id: &SignerId, request: Vec<u8>) -> Result<RequestId, Error> {
+        self.dispatch(signer_id, |manager| manager.raw(signer_id, request))
     }
 }
 
 // Locking API
-impl<P: StorageProfile> Account<P> {
+impl<P: ScanProfile> Account<P> {
     pub fn tx_builder(&self) -> TxBuilder {
         let tip_updater = ChangeTipUpdater::new(self.scanner.coin_store().clone());
         let change_provider = Box::new(ChangeRecipientProvider::new_with_updater(
@@ -394,15 +1206,417 @@ impl<P: StorageProfile> Account<P> {
     }
 }
 
-impl<P: StorageProfile> AccountHistory for Account<P> {
+// Spend paths, MuSig2 status and finalize
+impl<P: ScanProfile> Account<P> {
+    /// Complete transaction-independent alternatives for one coin. Maturity is
+    /// evaluated separately with an explicit chain snapshot, never device state.
+    #[cfg(feature = "musig")]
+    pub fn spend_variants(
+        &self,
+        outpoint: &OutPoint,
+    ) -> Result<bwk_descriptor::spend::SpendVariants, Error> {
+        let (_, (keychain, index)) = self
+            .bip32_coin(outpoint)
+            .ok_or_else(|| Error::Musig(format!("unknown coin {outpoint}")))?;
+        let keychain = match keychain {
+            KeyChain::Receive => 0,
+            KeyChain::Change => 1,
+            KeyChain::Custom(_) => return Err(Error::Musig("unsupported keychain".into())),
+        };
+        bwk_descriptor::spend::spend_variants(&self.scanner.descriptor(), keychain, index)
+            .map_err(to_musig)
+    }
+
+    /// Every spend path of the descriptor, key path first then leaves in DFS order,
+    /// `spendable` evaluated for `outpoints` against the current tip.
+    ///
+    /// A tr() whose internal key is the BIP-341 NUMS point has no key path: it is
+    /// left out rather than listed as not spendable, as no signer can ever spend it.
+    /// So is a leaf whose keys are all that point, like bwk-bup's padding leaf.
+    ///
+    /// A leaf hash depends on the derivation index, so each leaf's hash is computed
+    /// at the derivation of the first outpoint (receive index 0 when `outpoints` is
+    /// empty); [`Account::restrict_spend_path`] resolves it by its position.
+    #[cfg(feature = "musig")]
+    pub fn spend_leaves(&self, outpoints: &[OutPoint]) -> Result<Vec<SpendLeaf>, Error> {
+        let descriptor = self.scanner.descriptor();
+        let coins = outpoints
+            .iter()
+            .map(|outpoint| {
+                self.bip32_coin(outpoint)
+                    .ok_or_else(|| Error::Musig(format!("unknown coin {outpoint}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let miniscript::Descriptor::Tr(template) = &descriptor else {
+            return Ok(vec![SpendLeaf {
+                path: SpendPath::KeyPath,
+                signers: descriptor
+                    .plain_keys()
+                    .iter()
+                    .map(DescriptorPublicKey::master_fingerprint)
+                    .collect(),
+                relative: None,
+                absolute: None,
+                spendable: true,
+                satisfaction_wu: max_input_satisfaction_size(&descriptor) as u64,
+            }]);
+        };
+        let (keychain, index) = coins
+            .first()
+            .map_or((KeyChain::Receive, 0), |(_, coin_path)| *coin_path);
+        let miniscript::Descriptor::Tr(definite) =
+            derive_descriptor(&descriptor, keychain, index).map_err(to_musig)?
+        else {
+            return Err(Error::Musig("derived descriptor is not tr()".into()));
+        };
+        let heights: Vec<Option<u64>> = coins.iter().map(|(coin, _)| coin.height).collect();
+        // Without a header scanner there is no validated tip: a timelocked leaf is
+        // then reported unspendable.
+        let tip = self
+            .header_scanner
+            .as_ref()
+            .and_then(|header_scanner| header_scanner.headers.store().tip());
+        let mut leaves = Vec::new();
+        if !is_nums(template.internal_key()) {
+            leaves.push(SpendLeaf {
+                path: SpendPath::KeyPath,
+                signers: template.internal_key().master_fingerprints(),
+                relative: None,
+                absolute: None,
+                spendable: true,
+                satisfaction_wu: TAPROOT_KEYSPEND_SATISFACTION_WU,
+            });
+        }
+        for ((_, template_ms), (depth, definite_ms)) in
+            template.iter_scripts().zip(definite.iter_scripts())
+        {
+            if is_unspendable_leaf(template_ms) {
+                continue;
+            }
+            let locks = LeafLocks::of(template_ms);
+            leaves.push(SpendLeaf {
+                path: SpendPath::Leaf(leaf_hash(definite_ms)),
+                signers: leaf_signers(template_ms),
+                relative: locks.relative,
+                absolute: locks.absolute,
+                spendable: locks.met(tip, &heights),
+                satisfaction_wu: leaf_satisfaction_wu(definite_ms, depth)?,
+            });
+        }
+        Ok(leaves)
+    }
+
+    /// Keeps only `path` in every input: drops the other leaves' `tap_scripts`, their
+    /// leaf hashes in `tap_key_origins`, and the 0x1a entries of aggregates `path`
+    /// does not use. Called on the prepared PSBT before round 1.
+    ///
+    /// Every `tap_key_origins` entry stays, with no leaf hash on the key path and
+    /// for a key outside the leaf: a Coldcard skips an input whose origins do not
+    /// list every key of its enrolled wallet (`bwk_descriptor::restrict`).
+    ///
+    /// Only inputs spending a coin of this account are touched. A `Leaf` hash is
+    /// resolved to its depth-first position through any owned input holding it,
+    /// then every owned input keeps its own leaf at that position: inputs at
+    /// different indexes share one tree shape but not the leaf hashes.
+    /// `Error::UnknownSpendPath` when no owned input holds it, the PSBT unchanged.
+    /// `KeyPath` on a tr() whose internal key is the BIP-341 NUMS point is
+    /// `Error::UnspendableKeyPath`, the PSBT unchanged. A `Leaf` whose keys are all
+    /// that point is `Error::UnspendableLeaf`, the PSBT unchanged.
+    ///
+    /// A `Leaf` also writes its timelocks, which the signature covers: the leaf's
+    /// `older()` as each owned input's sequence, its `after()` as the locktime.
+    ///
+    /// Signers skip the key path of a PSBT restricted to a leaf, except on a
+    /// single-leaf tree: restricted to its leaf it is the unrestricted PSBT, so a
+    /// holder of a plain internal key may still sign the key path.
+    #[cfg(feature = "musig")]
+    pub fn restrict_spend_path(
+        &self,
+        psbt: &mut bitcoin::Psbt,
+        path: SpendPath,
+    ) -> Result<(), Error> {
+        let descriptor = self.scanner.descriptor();
+        if let miniscript::Descriptor::Tr(tr) = &descriptor {
+            if path == SpendPath::KeyPath && is_nums(tr.internal_key()) {
+                return Err(Error::UnspendableKeyPath);
+            }
+        }
+        let mut owned: BTreeMap<usize, Tr<WalletDefiniteKey>> = BTreeMap::new();
+        for (input_index, txin) in psbt.unsigned_tx.input.iter().enumerate() {
+            let Some((_, (keychain, index))) = self.bip32_coin(&txin.previous_output) else {
+                continue;
+            };
+            match derive_descriptor(&descriptor, keychain, index).map_err(to_musig)? {
+                miniscript::Descriptor::Tr(tr) => {
+                    owned.insert(input_index, tr);
+                }
+                _ if path == SpendPath::KeyPath => {}
+                _ => return Err(Error::UnknownSpendPath),
+            }
+        }
+        match path {
+            SpendPath::KeyPath => {
+                for (input_index, input) in psbt.inputs.iter_mut().enumerate() {
+                    if let Some(tr) = owned.get(&input_index) {
+                        restrict_input_to_key_path(input, tr);
+                    }
+                }
+            }
+            SpendPath::Leaf(hash) => {
+                let position = owned
+                    .values()
+                    .find_map(|tr| tr.iter_scripts().position(|(_, ms)| leaf_hash(ms) == hash))
+                    .ok_or(Error::UnknownSpendPath)?;
+                if let miniscript::Descriptor::Tr(template) = &descriptor {
+                    if template
+                        .iter_scripts()
+                        .nth(position)
+                        .is_some_and(|(_, ms)| is_unspendable_leaf(ms))
+                    {
+                        return Err(Error::UnspendableLeaf);
+                    }
+                }
+                let leaves = owned
+                    .iter()
+                    .map(|(input_index, tr)| {
+                        tr.iter_scripts()
+                            .nth(position)
+                            .map(|(_, ms)| (*input_index, ms))
+                            .ok_or(Error::UnknownSpendPath)
+                    })
+                    .collect::<Result<BTreeMap<_, _>, _>>()?;
+                for (input_index, input) in psbt.inputs.iter_mut().enumerate() {
+                    if let Some(ms) = leaves.get(&input_index) {
+                        restrict_input_to_leaf(input, ms);
+                    }
+                }
+                set_leaf_locks(&mut psbt.unsigned_tx, &leaves);
+            }
+        }
+        Ok(())
+    }
+
+    /// The coin at `outpoint` and its (keychain, index), when it is a descriptor
+    /// coin of this account.
+    #[cfg(feature = "musig")]
+    fn bip32_coin(&self, outpoint: &OutPoint) -> Option<(Coin, (KeyChain, u32))> {
+        let coin = self.scanner.get_coin(outpoint)?;
+        match coin.spend_info {
+            CoinSpendInfo::Bip32 { coin_path, .. } => Some((coin, coin_path)),
+            CoinSpendInfo::Sp { .. } => None,
+        }
+    }
+
+    /// The account's descriptor (standard text through Display).
+    pub fn descriptor(&self) -> Descriptor {
+        self.scanner.wallet_descriptor()
+    }
+
+    /// Signing progress of `psbt` per cosigner, cosigners from the account descriptor.
+    #[cfg(feature = "musig")]
+    pub fn musig_status(
+        &self,
+        psbt: &bitcoin::Psbt,
+    ) -> Result<bwk_sign::musig::MusigStatus, Error> {
+        bwk_sign::musig::musig_status(psbt, &self.scanner.descriptor()).map_err(to_musig)
+    }
+
+    /// Aggregates complete partial signatures; the count aggregated.
+    #[cfg(feature = "musig")]
+    pub fn aggregate_musig(&self, psbt: &mut bitcoin::Psbt) -> Result<usize, Error> {
+        bwk_sign::musig::aggregate_partial_sigs(psbt, &self.scanner.descriptor()).map_err(to_musig)
+    }
+
+    /// Aggregates musig partial signatures (under `musig`), then miniscript finalize,
+    /// then extracts.
+    pub fn finalize(&self, psbt: &mut bitcoin::Psbt) -> Result<bitcoin::Transaction, Error> {
+        #[cfg(feature = "musig")]
+        self.aggregate_musig(psbt)?;
+        PsbtExt::finalize_mut(psbt, &Secp256k1::verification_only()).map_err(|errors| {
+            let errors: Vec<String> = errors.iter().map(ToString::to_string).collect();
+            Error::Finalize(errors.join("; "))
+        })?;
+        Ok(psbt.clone().extract_tx_unchecked_fee_rate())
+    }
+}
+
+#[cfg(feature = "musig")]
+fn to_musig<E: std::fmt::Display>(error: E) -> Error {
+    Error::Musig(error.to_string())
+}
+
+/// `key` is the BIP-341 NUMS point before any derivation: a plain key or an xpub
+/// whose own public key has H's x coordinate, either y parity, since taproot keys
+/// are x-only. Its derived children are not H, so this is checked on the descriptor
+/// template, not on a derived descriptor.
+#[cfg(feature = "musig")]
+fn is_nums(key: &WalletKey) -> bool {
+    let MusigKey::Plain(key) = key else {
+        return false;
+    };
+    match key {
+        DescriptorPublicKey::Single(single) => match single.key {
+            SinglePubKey::FullKey(key) => nums::is_nums(&key.inner),
+            SinglePubKey::XOnly(key) => nums::is_nums_x_only(&key),
+        },
+        DescriptorPublicKey::XPub(xpub) => nums::is_nums(&xpub.xkey.public_key),
+        DescriptorPublicKey::MultiXPub(xpub) => nums::is_nums(&xpub.xkey.public_key),
+    }
+}
+
+/// No signer can ever spend the leaf: every key of `ms` is the BIP-341 NUMS point
+/// and every satisfaction needs a signature (miniscript's `s` property), so a
+/// branch without a signature like `or_d(pk(NUMS),older(N))` stays spendable.
+#[cfg(feature = "musig")]
+fn is_unspendable_leaf(ms: &Miniscript<WalletKey, Tap>) -> bool {
+    let mut keys = ms.iter_pk().peekable();
+    keys.peek().is_some() && keys.all(|key| is_nums(&key)) && ms.requires_sig()
+}
+
+#[cfg(feature = "musig")]
+fn leaf_hash(ms: &Miniscript<WalletDefiniteKey, Tap>) -> TapLeafHash {
+    TapLeafHash::from_script(&ms.encode(), LeafVersion::TapScript)
+}
+
+/// Fingerprints of every key of the leaf, cosigners included, in first-seen order.
+#[cfg(feature = "musig")]
+fn leaf_signers(ms: &Miniscript<WalletKey, Tap>) -> Vec<Fingerprint> {
+    let mut signers = Vec::new();
+    for fingerprint in ms.iter_pk().flat_map(|key| key.master_fingerprints()) {
+        if !signers.contains(&fingerprint) {
+            signers.push(fingerprint);
+        }
+    }
+    signers
+}
+
+#[cfg(feature = "musig")]
+fn compact_size_len(n: usize) -> usize {
+    VarInt(n as u64).size()
+}
+
+/// Witness weight of spending through one leaf at `depth`, the per-leaf term of
+/// miniscript's `Tr::max_weight_to_satisfy`.
+#[cfg(feature = "musig")]
+fn leaf_satisfaction_wu(ms: &Miniscript<WalletDefiniteKey, Tap>, depth: u8) -> Result<u64, Error> {
+    let script_size = ms.script_size();
+    let elems = ms.max_satisfaction_witness_elements().map_err(to_musig)?;
+    let sat = ms.max_satisfaction_size().map_err(to_musig)?;
+    let control_block = TAPROOT_CONTROL_BASE_SIZE + TAPROOT_CONTROL_NODE_SIZE * depth as usize;
+    // +1 stack element for the control block, the script is counted in `elems`.
+    let wu = compact_size_len(elems + 1) - compact_size_len(0)
+        + sat
+        + compact_size_len(script_size)
+        + script_size
+        + compact_size_len(control_block)
+        + control_block;
+    Ok(wu as u64)
+}
+
+/// The height-based timelocks of one leaf.
+#[cfg(feature = "musig")]
+#[derive(Default)]
+struct LeafLocks {
+    /// Largest `older()` in blocks.
+    relative: Option<u16>,
+    /// Largest `after()` height.
+    absolute: Option<u32>,
+    /// The leaf holds a time-based lock, never reported as spendable.
+    time_based: bool,
+    /// Largest `older()` (heights and times), the input sequence it requires.
+    sequence: Option<Sequence>,
+    /// Largest `after()` (heights and times), the transaction locktime it requires.
+    lock_time: Option<u32>,
+}
+
+#[cfg(feature = "musig")]
+impl LeafLocks {
+    fn of<Pk: MiniscriptKey>(ms: &Miniscript<Pk, Tap>) -> Self {
+        let mut locks = LeafLocks::default();
+        for node in ms.iter() {
+            match &node.node {
+                Terminal::Older(lock) => {
+                    locks.sequence = locks.sequence.max(Some(Sequence::from(*lock)));
+                    match relative::LockTime::from(*lock) {
+                        relative::LockTime::Blocks(height) => {
+                            locks.relative = locks.relative.max(Some(height.value()));
+                        }
+                        relative::LockTime::Time(_) => locks.time_based = true,
+                    }
+                }
+                Terminal::After(lock) => {
+                    locks.lock_time = locks.lock_time.max(Some(lock.to_consensus_u32()));
+                    match absolute::LockTime::from(*lock) {
+                        absolute::LockTime::Blocks(height) => {
+                            locks.absolute = locks.absolute.max(Some(height.to_consensus_u32()));
+                        }
+                        absolute::LockTime::Seconds(_) => locks.time_based = true,
+                    }
+                }
+                _ => {}
+            }
+        }
+        locks
+    }
+
+    /// A transaction mined in the block after `tip` meets every lock, spending
+    /// coins confirmed at `heights`: a locktime `a` tx is final at `tip + 1` when
+    /// `tip >= a`, and an `older(r)` input when `tip + 1 >= height + r`.
+    fn met(&self, tip: Option<u32>, heights: &[Option<u64>]) -> bool {
+        if self.time_based {
+            return false;
+        }
+        if self.relative.is_none() && self.absolute.is_none() {
+            return true;
+        }
+        let Some(tip) = tip else {
+            return false;
+        };
+        let next = u64::from(tip) + 1;
+        let absolute = self.absolute.is_none_or(|absolute| tip >= absolute);
+        // No coin to measure the delay from: an `older()` leaf is not spendable.
+        let relative = self.relative.is_none_or(|relative| {
+            !heights.is_empty()
+                && heights
+                    .iter()
+                    .all(|height| height.is_some_and(|height| next >= height + u64::from(relative)))
+        });
+        absolute && relative
+    }
+}
+
+/// Writes the timelocks of each owned input's leaf, covered by the signature, so the
+/// spend can be finalized: `older()` as that input's sequence, `after()` as the
+/// transaction locktime with the input's sequence kept non-final.
+#[cfg(feature = "musig")]
+fn set_leaf_locks(
+    tx: &mut bitcoin::Transaction,
+    leaves: &BTreeMap<usize, &Miniscript<WalletDefiniteKey, Tap>>,
+) {
+    for (input_index, ms) in leaves {
+        let locks = LeafLocks::of(*ms);
+        let txin = &mut tx.input[*input_index];
+        if let Some(sequence) = locks.sequence {
+            txin.sequence = sequence;
+        }
+        if let Some(lock_time) = locks.lock_time {
+            if txin.sequence.is_final() {
+                txin.sequence = Sequence::ENABLE_RBF_NO_LOCKTIME;
+            }
+            tx.lock_time = absolute::LockTime::from_consensus(lock_time);
+        }
+    }
+}
+
+impl<P: ScanProfile> AccountHistory for Account<P> {
     fn tx_contributions(&self) -> BTreeMap<Txid, TxContribution> {
         self.scanner.tx_contributions()
     }
 }
 
-// Electrum specific implementation. Bound to `OpenFromBackend`, which pins the
+// Electrum specific implementation. Bound to `OpenScanFromBackend`, which pins the
 // header store to the concrete backend-backed one the worker drives.
-impl<P: OpenFromBackend> Account<P> {
+impl<P: OpenScanFromBackend> Account<P> {
     /// Sets the Electrum server URL and port for the account.
     pub fn set_electrum(&mut self, url: String, port: String) {
         if let Ok(port) = port.parse::<u16>() {
@@ -483,18 +1697,20 @@ impl<P: OpenFromBackend> Account<P> {
 mod tests {
     use super::*;
     use bip39::Mnemonic;
-    use bwk_descriptor::descriptor::ScriptType;
-    use bwk_persist::{storage::Store, PersistenceKind};
-    use bwk_sign::hot_signer::HotSigner;
+    use bwk_descriptor::{descriptor::ScriptType, wallet::to_wallet};
+    use bwk_persist::{config_store::FileConfigStore, storage::Store, PersistenceKind};
+    use bwk_sign::{hot_signer::HotSigner, identity::SignerState};
     use miniscript::{
         bitcoin::{
-            bip32::{ChildNumber, DerivationPath},
+            bip32::{self, ChildNumber, DerivationPath},
             Network, ScriptBuf,
         },
         Descriptor, DescriptorPublicKey,
     };
     use std::{path::PathBuf, str::FromStr};
     use temp_dir::TempDir;
+
+    use crate::{account::test_support::StubManager, config::CONFIG_FILENAME};
 
     fn persisted_offline_config(dir: &TempDir, look_ahead: u32) -> Config {
         let mnemonic = Mnemonic::generate(12).unwrap();
@@ -531,7 +1747,7 @@ mod tests {
             Some(mnemonic.to_string()),
             "acct".to_string(),
             Network::Regtest,
-            ScriptType::Descriptor(Box::new(single_path)),
+            ScriptType::Descriptor(Box::new(to_wallet(single_path))),
             PathBuf::default(),
             ".bwk".to_string(),
             None,
@@ -688,6 +1904,771 @@ mod tests {
         );
         drop(account);
     }
+
+    #[test]
+    fn account_rejects_sp_descriptor() {
+        let sp_str = "sp(L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1,\
+                       0260b2003c386519fc9eadf2b5cf124dd8eea4c4e68d5e154050a9346ea98ce600)";
+        let dir = TempDir::new().unwrap();
+        let mut config = persisted_offline_config(&dir, 20);
+        config.scanner.descriptor =
+            bwk_descriptor::descriptor::Descriptor::from_str(sp_str).unwrap();
+        let account_dir = config.scanner.account_dir();
+        let header_store = HeaderStore::new_in_memory(config.scanner.network);
+
+        let result: Result<Account, open::Error> =
+            Account::try_new_with_header_store(config, header_store);
+
+        assert!(matches!(result, Err(open::Error::SpDescriptor)));
+        assert!(
+            !account_dir.exists(),
+            "account directory must not be created for a rejected config"
+        );
+    }
+
+    #[test]
+    fn wallet_descriptor_returns_the_enum() {
+        let dir = TempDir::new().unwrap();
+        let config = persisted_offline_config(&dir, 20);
+        let account: Account = Account::new(config);
+
+        let wallet_descriptor = account.scanner().wallet_descriptor();
+
+        assert!(matches!(
+            wallet_descriptor,
+            bwk_descriptor::descriptor::Descriptor::Miniscript(_)
+        ));
+        assert_eq!(
+            wallet_descriptor.to_string(),
+            account.scanner().descriptor_str()
+        );
+    }
+
+    #[test]
+    fn no_signer_file_is_written() {
+        let temp = TempDir::new().unwrap();
+        let mnemonic = Mnemonic::generate(12).unwrap().to_string();
+
+        let cfg = Config::new(
+            Some(mnemonic),
+            "alice".to_string(),
+            Network::Regtest,
+            ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
+            temp.path().to_path_buf(),
+            "wallet".to_string(),
+            Some(PersistenceKind::Json),
+        )
+        .unwrap();
+
+        let account_dir = cfg.scanner.account_dir();
+        let config_store: Arc<dyn ConfigStore<Config>> = Arc::new(FileConfigStore::<Config>::new(
+            account_dir.join(CONFIG_FILENAME),
+        ));
+        let account: Account = Account::with_config_store(cfg.clone(), config_store);
+        account.persist_config();
+        drop(account);
+
+        assert!(
+            !account_dir.join("signers.json").exists(),
+            "no signer file should ever be written, hot signers are in-memory only"
+        );
+    }
+
+    #[test]
+    fn mnemonic_still_yields_a_hot_signer() {
+        // bwk has no persistence path for signer material; the config's
+        // mnemonic must still yield a derived, in-memory hot signer.
+        let mnemonic = Mnemonic::generate(12).unwrap();
+        let dir = TempDir::new().unwrap();
+        let mut config = Config::new(
+            Some(mnemonic.to_string()),
+            "acct".to_string(),
+            Network::Regtest,
+            ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
+            dir.path().to_path_buf(),
+            ".bwk".to_string(),
+            Some(PersistenceKind::Json),
+        )
+        .unwrap();
+        config.scanner.set_stay_offline(true);
+        let account: Account = Account::new(config);
+
+        let expected_fingerprint =
+            HotSigner::new_from_mnemonics(Network::Regtest, &mnemonic.to_string())
+                .unwrap()
+                .fingerprint();
+        let signers = account.signers();
+        assert_eq!(signers.len(), 1);
+        assert_eq!(signers[0].fingerprint, expected_fingerprint);
+    }
+
+    fn account_for_signing_tests() -> (Account, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let config = persisted_offline_config(&dir, 20);
+        (Account::new(config), dir)
+    }
+
+    /// Like [`account_for_signing_tests`] but watch-only: no mnemonic, so no
+    /// hot manager is attached at construction and the signer cache starts
+    /// empty.
+    fn watch_only_account_for_signing_tests() -> (Account, TempDir) {
+        let mnemonic = Mnemonic::generate(12).unwrap();
+        let signer =
+            HotSigner::new_from_mnemonics(Network::Regtest, &mnemonic.to_string()).unwrap();
+        let xpub = signer.xpub(&DerivationPath::from_str("m/84'/0'/0'/1").unwrap());
+        let descriptor = to_wallet(bwk_descriptor::descriptor::wpkh(xpub));
+        let dir = TempDir::new().unwrap();
+        let mut config = Config::new(
+            None,
+            "watch-only".to_string(),
+            Network::Regtest,
+            ScriptType::Descriptor(Box::new(descriptor)),
+            dir.path().to_path_buf(),
+            "wallet".to_string(),
+            Some(PersistenceKind::Json),
+        )
+        .unwrap();
+        config.scanner.set_stay_offline(true);
+        (Account::new(config), dir)
+    }
+
+    #[test]
+    fn attach_then_detach_stops_the_pump() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(calls, captured_sender);
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+        assert!(account
+            .signing_manager_names()
+            .contains(&"stub".to_string()));
+
+        assert!(account.detach_signing_manager("stub"));
+        assert!(!account
+            .signing_manager_names()
+            .contains(&"stub".to_string()));
+        assert!(!account.detach_signing_manager("stub"));
+    }
+
+    #[test]
+    fn duplicate_manager_name_is_refused() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let calls_a = Arc::new(Mutex::new(Vec::new()));
+        let calls_b = Arc::new(Mutex::new(Vec::new()));
+        account
+            .attach_signing_manager(
+                "stub",
+                Box::new(StubManager::new(calls_a, Arc::new(Mutex::new(None)))),
+            )
+            .unwrap();
+
+        let result = account.attach_signing_manager(
+            "stub",
+            Box::new(StubManager::new(calls_b, Arc::new(Mutex::new(None)))),
+        );
+        assert!(matches!(result, Err(Error::ManagerAlreadyAttached)));
+        assert!(account
+            .signing_manager_names()
+            .contains(&"stub".to_string()));
+    }
+
+    /// Blocks until a `Notification` matching `pred` arrives, or panics after
+    /// a short timeout. Used by the signer notification tests below, which
+    /// race the pump thread.
+    fn recv_signer_notif_matching(
+        receiver: &mpsc::Receiver<Notification>,
+        mut pred: impl FnMut(&SignerNotification) -> bool,
+    ) -> SignerNotification {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match receiver.recv_timeout(Duration::from_millis(50)) {
+                Ok(Notification::Signer(n)) if pred(&n) => return n,
+                _ => {}
+            }
+        }
+        panic!("expected matching Notification::Signer within timeout");
+    }
+
+    #[test]
+    fn manager_responses_reach_the_account_channel() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let receiver = account.receiver().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(calls, captured_sender.clone());
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let sender = captured_sender.lock().unwrap().clone().unwrap();
+        sender
+            .send(Response::SignersChanged { signers: vec![] })
+            .unwrap();
+
+        recv_signer_notif_matching(&receiver, |n| matches!(n, SignerNotification::Signers(_)));
+
+        // The pump thread is still alive: it accepts a second send.
+        sender
+            .send(Response::SignersChanged { signers: vec![] })
+            .unwrap();
+
+        assert!(account.detach_signing_manager("stub"));
+    }
+
+    #[test]
+    fn signed_response_arrives_as_psbt_updated() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let receiver = account.receiver().unwrap();
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), captured_sender.clone());
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+        let sender = captured_sender.lock().unwrap().clone().unwrap();
+
+        let request = RequestId::new(7);
+        let signer = SignerId::new("s1");
+        sender
+            .send(Response::Signed {
+                request,
+                signer: signer.clone(),
+                psbt: vec![1, 2, 3],
+            })
+            .unwrap();
+
+        let notif = recv_signer_notif_matching(&receiver, |n| {
+            matches!(n, SignerNotification::PsbtUpdated { .. })
+        });
+        match notif {
+            SignerNotification::PsbtUpdated {
+                request: req,
+                signer: sid,
+                psbt,
+            } => {
+                assert_eq!(req, request);
+                assert_eq!(sid, signer);
+                assert_eq!(psbt, vec![1, 2, 3]);
+            }
+            other => panic!("expected PsbtUpdated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_response_keeps_optional_ids() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let receiver = account.receiver().unwrap();
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), captured_sender.clone());
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+        let sender = captured_sender.lock().unwrap().clone().unwrap();
+
+        sender
+            .send(Response::Error {
+                request: None,
+                signer: None,
+                message: "device gone".to_string(),
+            })
+            .unwrap();
+
+        let notif = recv_signer_notif_matching(&receiver, |n| {
+            matches!(n, SignerNotification::Error { .. })
+        });
+        match notif {
+            SignerNotification::Error {
+                request,
+                signer,
+                message,
+            } => {
+                assert!(request.is_none());
+                assert!(signer.is_none());
+                assert_eq!(message, "device gone");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roster_response_emits_full_list() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let receiver = account.receiver().unwrap();
+        let a = signer_info("roster-full-a", [1, 1, 1, 1], SignerState::Ready);
+        let b = signer_info("roster-full-b", [2, 2, 2, 2], SignerState::Ready);
+        let captured_sender_b = Arc::new(Mutex::new(None));
+        let stub_a = StubManager::new(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)))
+            .with_signers(vec![a.clone()]);
+        let stub_b = StubManager::new(Arc::new(Mutex::new(Vec::new())), captured_sender_b.clone())
+            .with_signers(vec![b.clone()]);
+        account
+            .attach_signing_manager("stub-a", Box::new(stub_a))
+            .unwrap();
+        account
+            .attach_signing_manager("stub-b", Box::new(stub_b))
+            .unwrap();
+        let sender_b = captured_sender_b.lock().unwrap().clone().unwrap();
+
+        let b_locked = SignerInfo::new(
+            b.id.clone(),
+            b.fingerprint,
+            b.wallet_name.clone(),
+            SignerState::Locked,
+        )
+        .with_detail("locked");
+        sender_b
+            .send(Response::Signers {
+                request: RequestId::new(1),
+                signers: vec![b_locked.clone()],
+            })
+            .unwrap();
+
+        let notif = recv_signer_notif_matching(&receiver, |n| match n {
+            SignerNotification::Signers(list) => list.contains(&a) && list.contains(&b_locked),
+            _ => false,
+        });
+        match notif {
+            SignerNotification::Signers(list) => {
+                assert!(list.contains(&a));
+                assert!(list.contains(&b_locked));
+                assert!(!list.contains(&b));
+            }
+            other => panic!("expected Signers, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_and_detach_are_announced() {
+        let (mut account, _dir) = watch_only_account_for_signing_tests();
+        let receiver = account.receiver().unwrap();
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)));
+        account
+            .attach_signing_manager("announced", Box::new(stub))
+            .unwrap();
+
+        recv_signer_notif_matching(
+            &receiver,
+            |n| matches!(n, SignerNotification::ManagerAttached { manager } if manager == "announced"),
+        );
+        recv_signer_notif_matching(&receiver, |n| matches!(n, SignerNotification::Signers(_)));
+
+        assert!(account.detach_signing_manager("announced"));
+
+        recv_signer_notif_matching(
+            &receiver,
+            |n| matches!(n, SignerNotification::ManagerDetached { manager } if manager == "announced"),
+        );
+        let notif =
+            recv_signer_notif_matching(&receiver, |n| matches!(n, SignerNotification::Signers(_)));
+        match notif {
+            SignerNotification::Signers(list) => assert!(list.is_empty()),
+            other => panic!("expected Signers, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pump_survives_a_dropped_receiver() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let receiver = account.receiver().unwrap();
+        drop(receiver);
+
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), captured_sender.clone());
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+        let sender = captured_sender.lock().unwrap().clone().unwrap();
+
+        sender
+            .send(Response::Signed {
+                request: RequestId::new(1),
+                signer: SignerId::new("s1"),
+                psbt: vec![1],
+            })
+            .unwrap();
+        sender
+            .send(Response::Error {
+                request: None,
+                signer: None,
+                message: "boom".to_string(),
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        // The pump thread is still alive and joinable: detach completes.
+        assert!(account.detach_signing_manager("stub"));
+    }
+
+    // The account keeps no in-flight PSBT registry, so there is no accessor
+    // returning a stored PSBT to assert against: this only proves a signed
+    // response is consumed and the manager still detaches.
+    #[test]
+    fn account_stores_no_returned_psbt() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), captured_sender.clone());
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+        let sender = captured_sender.lock().unwrap().clone().unwrap();
+        sender
+            .send(Response::Signed {
+                request: RequestId::new(1),
+                signer: SignerId::new("s1"),
+                psbt: vec![1, 2, 3],
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(account.detach_signing_manager("stub"));
+    }
+
+    #[test]
+    fn watch_only_account_attaches_no_manager() {
+        let (account, _dir) = watch_only_account_for_signing_tests();
+        assert!(account.signing_manager_names().is_empty());
+    }
+
+    #[test]
+    fn attach_does_not_register_descriptors() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let stub = StubManager::new(calls.clone(), Arc::new(Mutex::new(None)));
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let seen = calls.lock().unwrap().clone();
+        assert_eq!(seen, vec!["subscribe".to_string(), "signers".to_string()]);
+    }
+
+    fn signer_info(id: &str, fingerprint: [u8; 4], state: SignerState) -> SignerInfo {
+        SignerInfo::new(
+            SignerId::new(id),
+            bip32::Fingerprint::from(fingerprint),
+            "wallet".to_string(),
+            state,
+        )
+    }
+
+    #[test]
+    fn attach_seeds_the_signer_list() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let a = signer_info("seed-a", [1, 1, 1, 1], SignerState::Ready);
+        let b = signer_info("seed-b", [2, 2, 2, 2], SignerState::Ready);
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)))
+            .with_signers(vec![a.clone(), b.clone()]);
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let ids: Vec<SignerId> = account
+            .signers()
+            .into_iter()
+            .map(|info| info.id)
+            .filter(|id| *id == a.id || *id == b.id)
+            .collect();
+        assert_eq!(ids, vec![a.id.clone(), b.id.clone()]);
+    }
+
+    #[test]
+    fn two_signers_share_a_fingerprint() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let fingerprint = [9, 9, 9, 9];
+        let a = signer_info("dup-a", fingerprint, SignerState::Ready);
+        let b = signer_info("dup-b", fingerprint, SignerState::Ready);
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)))
+            .with_signers(vec![a.clone(), b.clone()]);
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let signers = account.signers();
+        assert!(signers.contains(&a));
+        assert!(signers.contains(&b));
+    }
+
+    #[test]
+    fn detach_removes_only_that_managers_signers() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let a = signer_info("mgr-a-signer", [1, 1, 1, 1], SignerState::Ready);
+        let b = signer_info("mgr-b-signer", [2, 2, 2, 2], SignerState::Ready);
+        let stub_a = StubManager::new(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)))
+            .with_signers(vec![a.clone()]);
+        let stub_b = StubManager::new(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)))
+            .with_signers(vec![b.clone()]);
+        account
+            .attach_signing_manager("stub-a", Box::new(stub_a))
+            .unwrap();
+        account
+            .attach_signing_manager("stub-b", Box::new(stub_b))
+            .unwrap();
+
+        assert!(account.detach_signing_manager("stub-a"));
+
+        let signers = account.signers();
+        assert!(!signers.contains(&a));
+        assert!(signers.contains(&b));
+    }
+
+    #[test]
+    fn roster_update_replaces_wholesale() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let a = signer_info("roster-a", [3, 3, 3, 3], SignerState::Ready);
+        let b = signer_info("roster-b", [4, 4, 4, 4], SignerState::Ready);
+        let captured_sender = Arc::new(Mutex::new(None));
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), captured_sender.clone())
+            .with_signers(vec![a.clone(), b.clone()]);
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let a_locked = SignerInfo::new(
+            a.id.clone(),
+            a.fingerprint,
+            a.wallet_name.clone(),
+            SignerState::Locked,
+        )
+        .with_detail("locked");
+
+        let sender = captured_sender.lock().unwrap().clone().unwrap();
+        sender
+            .send(Response::SignersChanged {
+                signers: vec![a_locked.clone()],
+            })
+            .unwrap();
+
+        let mut updated = false;
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(20));
+            let signers = account.signers();
+            if signers.contains(&a_locked) && !signers.contains(&a) && !signers.contains(&b) {
+                updated = true;
+                break;
+            }
+        }
+        assert!(updated, "roster update was not replaced wholesale in time");
+    }
+
+    #[test]
+    fn signers_is_non_blocking() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)))
+            .panicking();
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let _ = account.signers();
+        account.refresh_signers();
+    }
+
+    #[test]
+    fn polling_flag_reaches_every_manager() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let calls_a = Arc::new(Mutex::new(Vec::new()));
+        let calls_b = Arc::new(Mutex::new(Vec::new()));
+        account
+            .attach_signing_manager(
+                "stub-a",
+                Box::new(StubManager::new(
+                    calls_a.clone(),
+                    Arc::new(Mutex::new(None)),
+                )),
+            )
+            .unwrap();
+        account
+            .attach_signing_manager(
+                "stub-b",
+                Box::new(StubManager::new(
+                    calls_b.clone(),
+                    Arc::new(Mutex::new(None)),
+                )),
+            )
+            .unwrap();
+
+        account.set_signer_polling(true);
+        account.set_signer_polling(false);
+
+        let expected = vec![
+            "subscribe".to_string(),
+            "signers".to_string(),
+            "set_polling".to_string(),
+            "set_polling".to_string(),
+        ];
+        assert_eq!(calls_a.lock().unwrap().clone(), expected);
+        assert_eq!(calls_b.lock().unwrap().clone(), expected);
+    }
+
+    fn test_miniscript_descriptor() -> bwk_descriptor::descriptor::Descriptor {
+        let mnemonic = Mnemonic::generate(12).unwrap();
+        let signer =
+            HotSigner::new_from_mnemonics(Network::Regtest, &mnemonic.to_string()).unwrap();
+        let xpub = signer.xpub(&DerivationPath::from_str("m/84'/0'/0'/1").unwrap());
+        bwk_descriptor::descriptor::wpkh(xpub).into()
+    }
+
+    fn test_sp_descriptor() -> bwk_descriptor::descriptor::Descriptor {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let scan = bip32::Xpriv::new_master(Network::Regtest, &[0x09; 64]).unwrap();
+        let spend = bip32::Xpriv::new_master(Network::Regtest, &[0x0a; 64]).unwrap();
+        let spend_xpub = bip32::Xpub::from_priv(&secp, &spend);
+        bwk_descriptor::sp_descriptor::SpDescriptor::from_str(&format!(
+            "sp([deadbeef/352h/1h/0h]{scan}/0h,{spend_xpub}/0h)"
+        ))
+        .unwrap()
+        .into()
+    }
+
+    #[test]
+    fn sign_forwards_bytes_untouched() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let a = signer_info("signer-1", [1, 1, 1, 1], SignerState::Ready);
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)))
+            .with_signers(vec![a.clone()]);
+        let last_sign = stub.last_sign();
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let descriptor = test_miniscript_descriptor();
+        account
+            .sign(&a.id, descriptor.clone(), vec![0xde, 0xad, 0xbe, 0xef])
+            .unwrap();
+
+        let (signer, sent_descriptor, bytes) = last_sign.lock().unwrap().clone().unwrap();
+        assert_eq!(signer, a.id);
+        assert_eq!(sent_descriptor, descriptor);
+        assert_eq!(bytes, vec![0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn sign_returns_immediately() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let a = signer_info("signer-1", [1, 1, 1, 1], SignerState::Ready);
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)))
+            .with_signers(vec![a.clone()]);
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        // The stub records the call and never sends a `Response` on its
+        // channel; if `sign` waited for one instead of returning the queued
+        // `RequestId` straight away, this call would hang.
+        account
+            .sign(&a.id, test_miniscript_descriptor(), vec![1, 2, 3])
+            .unwrap();
+    }
+
+    #[test]
+    fn sign_rejects_unknown_signer() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let stub = StubManager::new(calls.clone(), Arc::new(Mutex::new(None)));
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let unknown = SignerId::new("does-not-exist");
+        let result = account.sign(&unknown, test_miniscript_descriptor(), vec![1]);
+        assert!(matches!(result, Err(Error::UnknownSigner)));
+        assert!(!calls.lock().unwrap().contains(&"sign".to_string()));
+    }
+
+    #[test]
+    fn sign_rejects_locked_signer() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let locked = signer_info("locked-1", [2, 2, 2, 2], SignerState::Locked);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let stub = StubManager::new(calls.clone(), Arc::new(Mutex::new(None)))
+            .with_signers(vec![locked.clone()]);
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let result = account.sign(&locked.id, test_miniscript_descriptor(), vec![1]);
+        assert!(matches!(result, Err(Error::SignerNotReady)));
+        assert!(!calls.lock().unwrap().contains(&"sign".to_string()));
+    }
+
+    #[test]
+    fn register_descriptor_is_consumer_driven() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let a = signer_info("signer-1", [3, 3, 3, 3], SignerState::Ready);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let stub = StubManager::new(calls.clone(), Arc::new(Mutex::new(None)))
+            .with_signers(vec![a.clone()]);
+        let last_register = stub.last_register_descriptor();
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        assert!(!calls
+            .lock()
+            .unwrap()
+            .contains(&"register_descriptor".to_string()));
+
+        let descriptor = test_miniscript_descriptor();
+        account
+            .register_descriptor(&a.id, descriptor.clone())
+            .unwrap();
+
+        let seen = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| *c == "register_descriptor")
+            .count();
+        assert_eq!(seen, 1);
+        let (signer, sent) = last_register.lock().unwrap().clone().unwrap();
+        assert_eq!(signer, a.id);
+        assert_eq!(sent, descriptor);
+    }
+
+    #[test]
+    fn sign_routes_to_the_owning_manager() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let a = signer_info("mgr-a-signer", [4, 4, 4, 4], SignerState::Ready);
+        let b = signer_info("mgr-b-signer", [5, 5, 5, 5], SignerState::Ready);
+        let calls_a = Arc::new(Mutex::new(Vec::new()));
+        let calls_b = Arc::new(Mutex::new(Vec::new()));
+        let stub_a = StubManager::new(calls_a.clone(), Arc::new(Mutex::new(None)))
+            .with_signers(vec![a.clone()]);
+        let stub_b = StubManager::new(calls_b.clone(), Arc::new(Mutex::new(None)))
+            .with_signers(vec![b.clone()]);
+        account
+            .attach_signing_manager("stub-a", Box::new(stub_a))
+            .unwrap();
+        account
+            .attach_signing_manager("stub-b", Box::new(stub_b))
+            .unwrap();
+
+        account
+            .sign(&b.id, test_miniscript_descriptor(), vec![9])
+            .unwrap();
+
+        assert!(!calls_a.lock().unwrap().contains(&"sign".to_string()));
+        assert!(calls_b.lock().unwrap().contains(&"sign".to_string()));
+    }
+
+    #[test]
+    fn sp_descriptor_reaches_the_manager() {
+        let (mut account, _dir) = account_for_signing_tests();
+        let a = signer_info("signer-1", [6, 6, 6, 6], SignerState::Ready);
+        let stub = StubManager::new(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)))
+            .with_signers(vec![a.clone()]);
+        let last_sign = stub.last_sign();
+        account
+            .attach_signing_manager("stub", Box::new(stub))
+            .unwrap();
+
+        let descriptor = test_sp_descriptor();
+        account.sign(&a.id, descriptor.clone(), vec![7]).unwrap();
+
+        let (_, sent, _) = last_sign.lock().unwrap().clone().unwrap();
+        assert!(sent.is_sp());
+        assert_eq!(sent, descriptor);
+    }
 }
 
 #[cfg(test)]
@@ -707,7 +2688,7 @@ mod integration_tests {
     };
     use bip39::Mnemonic;
     use bwk_coin::CoinStatus;
-    use bwk_descriptor::descriptor::ScriptType;
+    use bwk_descriptor::descriptor::{Descriptor, ScriptType};
     use bwk_electrum::{
         client::Client,
         coin_store::{Payment, PaymentStatus},
@@ -716,6 +2697,7 @@ mod integration_tests {
         tx_store::Inclusion,
     };
     use bwk_persist::PersistenceKind;
+    use bwk_sign::hot_signer::HotSigner;
     use bwk_utils::test::{
         electrsd,
         regtest::{
@@ -727,7 +2709,32 @@ mod integration_tests {
     use miniscript::bitcoin::{
         self, bip32::ChildNumber, Address, Amount, Network, Transaction, Txid,
     };
-    use miniscript::psbt::PsbtExt;
+    #[cfg(feature = "musig")]
+    use std::str::FromStr;
+
+    #[cfg(feature = "musig")]
+    use crate::account::{is_unspendable_leaf, Error, SpendPath};
+    #[cfg(feature = "musig")]
+    use bwk_bup::{Locktime, OXpub, Path, Policy, PolicyType, Semantic, TapPosition};
+    #[cfg(feature = "musig")]
+    use bwk_descriptor::{musig::musig_descriptor_to_string, wallet::WalletKey};
+    #[cfg(feature = "musig")]
+    use bwk_keys::nums::bip341_nums;
+    #[cfg(feature = "musig")]
+    use bwk_sign::musig::MusigRound;
+    #[cfg(feature = "musig")]
+    use bwk_tx::bwk_psbt::musig::musig_input_participants_all;
+    #[cfg(feature = "musig")]
+    use miniscript::{
+        bitcoin::{
+            absolute,
+            bip32::{ChainCode, DerivationPath, Fingerprint, Xpub},
+            hashes::Hash,
+            taproot::TapLeafHash,
+            NetworkKind, OutPoint, Psbt, Sequence,
+        },
+        Miniscript, Tap,
+    };
 
     use electrsd::{
         bitcoind::{bitcoincore_rpc::RpcApi, BitcoinD},
@@ -1160,12 +3167,26 @@ mod integration_tests {
     #[cfg(feature = "test")]
     use bwk_tx::tx_builder::TxBuilder;
 
+    /// Signs `psbt` with a fresh [`HotSigner`] built from `mnemonic`,
+    /// registering `descriptor` on it first.
+    fn sign_with_mnemonic(
+        psbt: &mut bitcoin::Psbt,
+        network: Network,
+        mnemonic: &str,
+        descriptor: Descriptor,
+    ) {
+        let mut signer = HotSigner::new_from_mnemonics(network, mnemonic).unwrap();
+        signer.inner_register_descriptor(descriptor);
+        signer.sign(psbt);
+    }
+
     #[cfg(feature = "test")]
     fn spend(
         account: &mut Account,
         builder: &mut TxBuilder,
         bitcoind: &BitcoinD,
         amount: u64,
+        mnemonic: &str,
     ) -> (bitcoin::Txid, u32) {
         let coins = account
             .scanner()
@@ -1177,9 +3198,13 @@ mod integration_tests {
         builder.tx_template.inputs = coins;
         builder.dummy_external_output(amount);
         let mut psbt = builder.generate().unwrap();
-        account.sign_psbt(&mut psbt);
-        PsbtExt::finalize_mut(&mut psbt, &bitcoin::secp256k1::Secp256k1::new()).unwrap();
-        let tx = psbt.extract_tx_unchecked_fee_rate();
+        sign_with_mnemonic(
+            &mut psbt,
+            account.scanner().network(),
+            mnemonic,
+            account.scanner().wallet_descriptor(),
+        );
+        let tx = account.finalize(&mut psbt).unwrap();
         let txid = bitcoind.client.send_raw_transaction(&tx).unwrap();
         let blocks: u32 = random_range(2..15);
         generate(bitcoind, blocks);
@@ -1283,7 +3308,13 @@ mod integration_tests {
             },
             block_wait(blocks),
         );
-        let (_, blocks) = spend(&mut account, &mut builder, &bitcoind, 100_000);
+        let (_, blocks) = spend(
+            &mut account,
+            &mut builder,
+            &bitcoind,
+            100_000,
+            &mnemonic.to_string(),
+        );
         wait_until_timeout(
             || {
                 let payments = account.scanner().payment_history();
@@ -1490,10 +3521,13 @@ mod integration_tests {
                     let mut attempt = 0;
                     loop {
                         let mut psbt = builder.pay(amount, addr.clone(), 1000).unwrap();
-                        account.sign_psbt(&mut psbt);
-                        PsbtExt::finalize_mut(&mut psbt, &bitcoin::secp256k1::Secp256k1::new())
-                            .unwrap();
-                        let tx = psbt.extract_tx_unchecked_fee_rate();
+                        sign_with_mnemonic(
+                            &mut psbt,
+                            account.scanner().network(),
+                            &mnemonic.to_string(),
+                            account.scanner().wallet_descriptor(),
+                        );
+                        let tx = account.finalize(&mut psbt).unwrap();
                         match bitcoind.client.send_raw_transaction(&tx) {
                             Ok(_) => break,
                             Err(_) if attempt < 30 => {
@@ -1526,6 +3560,716 @@ mod integration_tests {
         sleep(Duration::from_millis(300));
         let payments = account.scanner().payment_history();
         assert_eq!(payments.len(), 16);
+    }
+
+    #[cfg(feature = "musig")]
+    const COSIGNER_PATH: &str = "m/87'/1'/0'/2";
+    #[cfg(feature = "musig")]
+    const MUSIG_TIMEOUT: u64 = 120;
+
+    /// A hot signer and its `[fp/87'/1'/0'/2]tpub` cosigner text.
+    #[cfg(feature = "musig")]
+    struct Cosigner {
+        signer: HotSigner,
+        text: String,
+    }
+
+    #[cfg(feature = "musig")]
+    fn musig_cosigners(n: usize) -> Vec<Cosigner> {
+        (0..n)
+            .map(|_| {
+                let mnemonic = Mnemonic::generate(12).unwrap().to_string();
+                let signer = HotSigner::new_from_mnemonics(Network::Regtest, &mnemonic).unwrap();
+                let text = signer
+                    .xpub(&DerivationPath::from_str(COSIGNER_PATH).unwrap())
+                    .to_string();
+                Cosigner { signer, text }
+            })
+            .collect()
+    }
+
+    /// A watch-only account of the descriptor `text`, under `dir`.
+    #[cfg(feature = "musig")]
+    fn musig_account(text: &str, url: &str, port: u16, dir: &TempDir) -> Account {
+        maybe_create_dir(&dir.path().join(".bwk"));
+        let mut config = Config::new_from_descriptor(
+            None,
+            "musig".to_string(),
+            Network::Regtest,
+            text,
+            dir.path().to_path_buf(),
+            ".bwk".to_string(),
+            Some(PersistenceKind::Json),
+        )
+        .unwrap();
+        config.scanner.look_ahead = 20;
+        config.set_electrum_url(url.to_string());
+        config.set_electrum_port(port.to_string());
+        Account::new(config)
+    }
+
+    /// Pays `sats` to a new receive address, mines it and waits for the coin.
+    #[cfg(feature = "musig")]
+    fn fund(account: &mut Account, bitcoind: &BitcoinD, sats: u64) -> OutPoint {
+        let address = account.scanner_mut().new_recv_addr();
+        let txid = send_to_address(bitcoind, &address, Amount::from_sat(sats));
+        generate(bitcoind, 1);
+        let confirmed = || {
+            account
+                .scanner()
+                .coins()
+                .values()
+                .find(|entry| entry.coin.outpoint.txid == txid && entry.coin.height.is_some())
+                .map(|entry| entry.coin.outpoint)
+        };
+        wait_until_timeout(|| confirmed().is_some(), MUSIG_TIMEOUT);
+        confirmed().unwrap()
+    }
+
+    /// Waits until the account's header chain reaches bitcoind's tip.
+    #[cfg(feature = "musig")]
+    fn wait_tip(account: &Account, bitcoind: &BitcoinD) {
+        let height = get_block_height(bitcoind);
+        wait_until_timeout(
+            || {
+                account
+                    .header_store()
+                    .is_some_and(|store| store.tip() == Some(height))
+            },
+            MUSIG_TIMEOUT,
+        );
+    }
+
+    /// A regtest musig account, its cosigners (each registered on the account
+    /// descriptor) and its funded coins. The account drops before its directory and
+    /// the daemons.
+    #[cfg(feature = "musig")]
+    struct MusigWallet {
+        account: Account,
+        cosigners: Vec<Cosigner>,
+        coins: Vec<OutPoint>,
+        _dir: TempDir,
+        _electrsd: ElectrsD,
+        bitcoind: TestBitcoinD,
+    }
+
+    #[cfg(feature = "musig")]
+    impl MusigWallet {
+        /// `n` cosigners, the account of `policy` over their texts, and one coin of
+        /// 100_000 sats per entry of `coins`, each at its own receive index.
+        fn new(n: usize, policy: fn(&[Cosigner]) -> String, coins: usize) -> Self {
+            let (url, port, electrsd, bitcoind) = bootstrap_electrs();
+            generate(&bitcoind, 100);
+            let mut cosigners = musig_cosigners(n);
+            let dir = TempDir::new().unwrap();
+            let mut account = musig_account(&policy(&cosigners), &url, port, &dir);
+            for cosigner in &mut cosigners {
+                cosigner
+                    .signer
+                    .inner_register_descriptor(account.descriptor());
+            }
+            let coins = (0..coins)
+                .map(|_| fund(&mut account, &bitcoind, 100_000))
+                .collect();
+            MusigWallet {
+                account,
+                cosigners,
+                coins,
+                _dir: dir,
+                _electrsd: electrsd,
+                bitcoind,
+            }
+        }
+
+        /// Spends every coin to an external address, change back to the account.
+        fn psbt(&self) -> Psbt {
+            let mut builder = self.account.tx_builder();
+            builder.new_template();
+            builder.tx_template.inputs = self
+                .coins
+                .iter()
+                .map(|outpoint| self.account.scanner().get_coin(outpoint).unwrap())
+                .collect();
+            builder.dummy_external_output(50_000);
+            builder.generate().unwrap()
+        }
+
+        /// One signing call by each of `signers`, in order.
+        fn round(&self, psbt: &mut Psbt, signers: &[usize]) {
+            let descriptor = self.account.descriptor();
+            for signer in signers {
+                self.cosigners[*signer]
+                    .signer
+                    .inner_sign(psbt, descriptor.as_miniscript().unwrap())
+                    .unwrap();
+            }
+        }
+
+        fn status(&self, psbt: &Psbt) -> MusigRound {
+            self.account.musig_status(psbt).unwrap().round
+        }
+
+        fn fingerprint(&self, cosigner: usize) -> bitcoin::bip32::Fingerprint {
+            self.cosigners[cosigner].signer.fingerprint()
+        }
+
+        /// Broadcasts `tx`, mines a block and checks the block holds it.
+        fn mine(&self, tx: &Transaction) {
+            let txid = self.bitcoind.client.send_raw_transaction(tx).unwrap();
+            generate(&self.bitcoind, 1);
+            let tip = self.bitcoind.client.get_best_block_hash().unwrap();
+            let block = self.bitcoind.client.get_block(&tip).unwrap();
+            assert!(block.txdata.iter().any(|tx| tx.compute_txid() == txid));
+        }
+    }
+
+    /// `tr(musig(A,B)/<0;1>/*)`.
+    #[cfg(feature = "musig")]
+    fn two_of_two(c: &[Cosigner]) -> String {
+        format!("tr(musig({},{})/<0;1>/*)", c[0].text, c[1].text)
+    }
+
+    /// `tr(D/<0;1>/*,{pk(musig(A,B)/<0;1>/*),{pk(musig(A,C)/<0;1>/*),pk(musig(B,C)/<0;1>/*)}})`.
+    #[cfg(feature = "musig")]
+    fn two_of_three(c: &[Cosigner]) -> String {
+        format!(
+            "tr({}/<0;1>/*,{{pk(musig({},{})/<0;1>/*),{{pk(musig({},{})/<0;1>/*),pk(musig({},{})/<0;1>/*)}}}})",
+            c[3].text, c[0].text, c[1].text, c[0].text, c[2].text, c[1].text, c[2].text
+        )
+    }
+
+    /// `tr(D/<0;1>/*,{pk(musig(A,B)/<0;1>/*),and_v(v:pk(C/<0;1>/*),older(10))})`.
+    #[cfg(feature = "musig")]
+    fn musig_or_timelocked(c: &[Cosigner]) -> String {
+        format!(
+            "tr({}/<0;1>/*,{{pk(musig({},{})/<0;1>/*),and_v(v:pk({}/<0;1>/*),older(10))}})",
+            c[3].text, c[0].text, c[1].text, c[2].text
+        )
+    }
+
+    /// An xpub whose public key is the BIP-341 NUMS point.
+    #[cfg(feature = "musig")]
+    fn nums_xpub() -> Xpub {
+        Xpub {
+            network: NetworkKind::Test,
+            depth: 0,
+            parent_fingerprint: Default::default(),
+            child_number: ChildNumber::from_normal_idx(0).unwrap(),
+            public_key: bip341_nums(),
+            chain_code: ChainCode::from([7; 32]),
+        }
+    }
+
+    /// bwk-bup's shape: `tr(NUMS/<2147483646;2147483647>/*,pk(A/<512;513>/*))`, the
+    /// internal key an xpub whose public key is the BIP-341 NUMS point.
+    #[cfg(feature = "musig")]
+    fn nums_internal_key(c: &[Cosigner]) -> String {
+        format!(
+            "tr({}/<2147483646;2147483647>/*,pk({}/<512;513>/*))",
+            nums_xpub(),
+            c[0].text
+        )
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn nums_leaf_with_a_branch_without_signature_is_spendable() {
+        let nums = nums_xpub();
+        let leaf = |text: String| Miniscript::<WalletKey, Tap>::from_str_insane(&text).unwrap();
+        assert!(is_unspendable_leaf(&leaf(format!("pk({nums}/<0;1>/*)"))));
+        assert!(!is_unspendable_leaf(&leaf(format!(
+            "or_d(pk({nums}/<0;1>/*),older(10))"
+        ))));
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn odd_y_nums_is_nums() {
+        let (x_only, _) = bip341_nums().x_only_public_key();
+        let odd = bitcoin::PublicKey::new(bitcoin::secp256k1::PublicKey::from_x_only_public_key(
+            x_only,
+            bitcoin::key::Parity::Odd,
+        ));
+        assert_eq!(odd.to_bytes()[0], 0x03);
+        let odd_xpub = Xpub {
+            public_key: odd.inner,
+            ..nums_xpub()
+        };
+        let leaf = |text: String| Miniscript::<WalletKey, Tap>::from_str_insane(&text).unwrap();
+        assert!(is_unspendable_leaf(&leaf(format!("pk({odd})"))));
+        assert!(is_unspendable_leaf(&leaf(format!(
+            "pk({odd_xpub}/<0;1>/*)"
+        ))));
+        assert!(is_unspendable_leaf(&leaf(format!("pk({odd_xpub}/0/*)"))));
+    }
+
+    /// bwk-bup's PrimaryOnly 2-of-3 over A, B, C: a NUMS internal key, the three
+    /// musig pair leaves and one `pk(NUMS)` padding leaf.
+    #[cfg(feature = "musig")]
+    fn bup_primary_only_two_of_three(c: &[Cosigner]) -> String {
+        let path = DerivationPath::from_str(COSIGNER_PATH).unwrap();
+        let keys = c
+            .iter()
+            .map(|cosigner| {
+                let xpub = cosigner.signer.xpub(&path);
+                OXpub::new(Some(xpub.origin), xpub.xkey)
+            })
+            .collect();
+        let mut policy = Policy::new(
+            vec![Path::new(
+                Semantic::Multi { keys, threshold: 2 },
+                Locktime::None,
+                TapPosition::TapTree(vec![]),
+            )],
+            PolicyType::PrimaryOnly,
+        )
+        .unwrap();
+        musig_descriptor_to_string(policy.compile().unwrap(), false)
+    }
+
+    /// `restricted` keeps every key origin of `before`, each with only the hash of
+    /// its input's one leaf left, or none for a key outside it: the keys of `inside`
+    /// all have the hash, the keys of `outside` none.
+    #[cfg(feature = "musig")]
+    fn assert_leaf_origins(
+        before: &Psbt,
+        restricted: &Psbt,
+        inside: &[Fingerprint],
+        outside: &[Fingerprint],
+    ) {
+        for (before, after) in before.inputs.iter().zip(&restricted.inputs) {
+            let kept: Vec<TapLeafHash> = after
+                .tap_scripts
+                .values()
+                .map(|(script, version)| TapLeafHash::from_script(script, *version))
+                .collect();
+            assert_eq!(kept.len(), 1);
+            assert_eq!(
+                after.tap_key_origins.keys().collect::<Vec<_>>(),
+                before.tap_key_origins.keys().collect::<Vec<_>>()
+            );
+            for (key, (leaf_hashes, (fingerprint, path))) in &after.tap_key_origins {
+                let (before_hashes, before_source) = &before.tap_key_origins[key];
+                assert_eq!(&(*fingerprint, path.clone()), before_source);
+                if inside.contains(fingerprint) {
+                    assert_eq!(leaf_hashes, &kept);
+                }
+                if outside.contains(fingerprint) {
+                    assert!(leaf_hashes.is_empty());
+                    assert!(!before_hashes.is_empty());
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn spend_leaves_lists_musig_key_path() {
+        let wallet = MusigWallet::new(2, two_of_two, 1);
+        let leaves = wallet.account.spend_leaves(&wallet.coins).unwrap();
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(leaves[0].path, SpendPath::KeyPath);
+        assert!(leaves[0].spendable);
+        assert_eq!(
+            leaves[0].signers,
+            vec![wallet.fingerprint(0), wallet.fingerprint(1)]
+        );
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn spend_variants_funded_witness_bounds() {
+        for leaf in [false, true] {
+            let wallet = MusigWallet::new(4, two_of_three, 1);
+            let exported = wallet.account.spend_variants(&wallet.coins[0]).unwrap();
+            let variant = &exported.variants[usize::from(leaf)];
+            let mut psbt = wallet.psbt();
+            let (_, (_, index)) = wallet.account.bip32_coin(&wallet.coins[0]).unwrap();
+            bwk_descriptor::spend::restrict_variant(
+                &exported.descriptor,
+                0,
+                index,
+                &variant.id,
+                &mut psbt,
+                0,
+            )
+            .unwrap();
+            if leaf {
+                wallet.round(&mut psbt, &[0, 1]);
+                wallet.round(&mut psbt, &[0, 1]);
+            } else {
+                wallet.round(&mut psbt, &[3]);
+            }
+            let tx = wallet.account.finalize(&mut psbt).unwrap();
+            assert!(tx.input[0].witness.size() as u64 <= variant.satisfaction_wu);
+            assert!(!tx.input[0].witness.is_empty());
+            wallet.mine(&tx);
+        }
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn nums_internal_key_has_no_key_path() {
+        let wallet = MusigWallet::new(1, nums_internal_key, 1);
+        let leaves = wallet.account.spend_leaves(&wallet.coins).unwrap();
+        assert_eq!(leaves.len(), 1);
+        assert!(matches!(leaves[0].path, SpendPath::Leaf(_)));
+        assert_eq!(leaves[0].signers, vec![wallet.fingerprint(0)]);
+        assert!(leaves[0].spendable);
+
+        let mut psbt = wallet.psbt();
+        let before = psbt.clone();
+        assert!(matches!(
+            wallet
+                .account
+                .restrict_spend_path(&mut psbt, SpendPath::KeyPath),
+            Err(Error::UnspendableKeyPath)
+        ));
+        assert_eq!(psbt, before);
+
+        wallet
+            .account
+            .restrict_spend_path(&mut psbt, leaves[0].path)
+            .unwrap();
+        wallet.round(&mut psbt, &[0]);
+        let tx = wallet.account.finalize(&mut psbt).unwrap();
+        wallet.mine(&tx);
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn padding_leaf_is_not_a_spend_path() {
+        let wallet = MusigWallet::new(3, bup_primary_only_two_of_three, 1);
+        let leaves = wallet.account.spend_leaves(&wallet.coins).unwrap();
+        let signers: Vec<_> = leaves.iter().map(|leaf| leaf.signers.clone()).collect();
+        let (a, b, c) = (
+            wallet.fingerprint(0),
+            wallet.fingerprint(1),
+            wallet.fingerprint(2),
+        );
+        assert_eq!(signers, vec![vec![a, b], vec![a, c], vec![b, c]]);
+        assert!(leaves
+            .iter()
+            .all(|leaf| matches!(leaf.path, SpendPath::Leaf(_)) && leaf.spendable));
+
+        let mut psbt = wallet.psbt();
+        let hashes: BTreeSet<TapLeafHash> = psbt.inputs[0]
+            .tap_scripts
+            .values()
+            .map(|(script, version)| TapLeafHash::from_script(script, *version))
+            .collect();
+        assert_eq!(hashes.len(), 4);
+        let listed: BTreeSet<TapLeafHash> = leaves
+            .iter()
+            .map(|leaf| match leaf.path {
+                SpendPath::Leaf(hash) => hash,
+                SpendPath::KeyPath => unreachable!(),
+            })
+            .collect();
+        let padding: Vec<_> = hashes.difference(&listed).collect();
+        assert_eq!(padding.len(), 1);
+
+        let before = psbt.clone();
+        assert!(matches!(
+            wallet
+                .account
+                .restrict_spend_path(&mut psbt, SpendPath::Leaf(*padding[0])),
+            Err(Error::UnspendableLeaf)
+        ));
+        assert_eq!(psbt, before);
+
+        // Each listed leaf still resolves to itself.
+        for leaf in &leaves {
+            let mut restricted = before.clone();
+            wallet
+                .account
+                .restrict_spend_path(&mut restricted, leaf.path)
+                .unwrap();
+            let kept: Vec<_> = restricted.inputs[0]
+                .tap_scripts
+                .values()
+                .map(|(script, version)| {
+                    SpendPath::Leaf(TapLeafHash::from_script(script, *version))
+                })
+                .collect();
+            assert_eq!(kept, vec![leaf.path]);
+        }
+
+        wallet
+            .account
+            .restrict_spend_path(&mut psbt, leaves[2].path)
+            .unwrap();
+        assert_leaf_origins(&before, &psbt, &[b, c], &[a]);
+        wallet.round(&mut psbt, &[1, 2]);
+        wallet.round(&mut psbt, &[1, 2]);
+        assert_eq!(wallet.status(&psbt), MusigRound::Ready);
+        let tx = wallet.account.finalize(&mut psbt).unwrap();
+        wallet.mine(&tx);
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_key_path_spend_two_of_two() {
+        let wallet = MusigWallet::new(2, two_of_two, 1);
+        let mut psbt = wallet.psbt();
+        wallet
+            .account
+            .restrict_spend_path(&mut psbt, SpendPath::KeyPath)
+            .unwrap();
+        for input in &psbt.inputs {
+            let cosigners = input
+                .tap_key_origins
+                .values()
+                .filter(|(_, (fingerprint, _))| {
+                    [wallet.fingerprint(0), wallet.fingerprint(1)].contains(fingerprint)
+                })
+                .count();
+            assert_eq!(cosigners, 2);
+            assert_eq!(musig_input_participants_all(input).unwrap().len(), 1);
+        }
+        assert_eq!(wallet.status(&psbt), MusigRound::Nonces);
+
+        wallet.round(&mut psbt, &[0, 1]);
+        assert_eq!(wallet.status(&psbt), MusigRound::PartialSigs);
+        wallet.round(&mut psbt, &[0, 1]);
+        assert_eq!(wallet.status(&psbt), MusigRound::Ready);
+
+        let tx = wallet.account.finalize(&mut psbt).unwrap();
+        wallet.mine(&tx);
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn musig_two_of_three_leaf_spend() {
+        let wallet = MusigWallet::new(4, two_of_three, 2);
+        let leaves = wallet.account.spend_leaves(&wallet.coins).unwrap();
+        assert_eq!(leaves.len(), 4);
+        assert_eq!(leaves[0].path, SpendPath::KeyPath);
+        assert_eq!(leaves[0].signers, vec![wallet.fingerprint(3)]);
+        let ab = vec![wallet.fingerprint(0), wallet.fingerprint(1)];
+        let ab_leaves: Vec<_> = leaves.iter().filter(|leaf| leaf.signers == ab).collect();
+        assert_eq!(ab_leaves.len(), 1);
+        assert!(ab_leaves[0].spendable);
+        assert!(matches!(ab_leaves[0].path, SpendPath::Leaf(_)));
+
+        let mut psbt = wallet.psbt();
+        let before = psbt.clone();
+        wallet
+            .account
+            .restrict_spend_path(&mut psbt, ab_leaves[0].path)
+            .unwrap();
+        for input in &psbt.inputs {
+            assert_eq!(input.tap_scripts.len(), 1);
+            assert_eq!(musig_input_participants_all(input).unwrap().len(), 1);
+        }
+        assert_leaf_origins(&before, &psbt, &ab, &[wallet.fingerprint(2)]);
+        // The two inputs sit at different indexes: same leaf, different hashes.
+        let hashes: BTreeSet<TapLeafHash> = psbt
+            .inputs
+            .iter()
+            .flat_map(|input| input.tap_scripts.values())
+            .map(|(script, version)| TapLeafHash::from_script(script, *version))
+            .collect();
+        assert_eq!(hashes.len(), 2);
+
+        assert_eq!(wallet.status(&psbt), MusigRound::Nonces);
+        wallet.round(&mut psbt, &[0, 1]);
+        assert_eq!(wallet.status(&psbt), MusigRound::PartialSigs);
+        wallet.round(&mut psbt, &[0, 1]);
+        assert_eq!(wallet.status(&psbt), MusigRound::Ready);
+
+        let tx = wallet.account.finalize(&mut psbt).unwrap();
+        wallet.mine(&tx);
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn spend_relative_timelocked_leaf_after_delay() {
+        let wallet = MusigWallet::new(4, musig_or_timelocked, 1);
+        let leaves = || {
+            wait_tip(&wallet.account, &wallet.bitcoind);
+            wallet.account.spend_leaves(&wallet.coins).unwrap()
+        };
+        let ab = vec![wallet.fingerprint(0), wallet.fingerprint(1)];
+        let check = |timelocked_spendable: bool| {
+            let leaves = leaves();
+            assert_eq!(leaves.len(), 3);
+            assert_eq!(leaves[0].path, SpendPath::KeyPath);
+            assert!(leaves[0].spendable);
+            assert_eq!(leaves[1].signers, ab);
+            assert_eq!(leaves[1].relative, None);
+            assert!(leaves[1].spendable);
+            assert_eq!(leaves[2].signers, vec![wallet.fingerprint(2)]);
+            assert_eq!(leaves[2].relative, Some(10));
+            assert_eq!(leaves[2].absolute, None);
+            assert_eq!(leaves[2].spendable, timelocked_spendable);
+        };
+
+        // Confirmed at height h: an older(10) spend can be mined at h + 10.
+        check(false);
+        generate(&wallet.bitcoind, 8);
+        check(false);
+
+        let timelocked = leaves()[2].path;
+        let mut psbt = wallet.psbt();
+        wallet
+            .account
+            .restrict_spend_path(&mut psbt, timelocked)
+            .unwrap();
+        assert_eq!(
+            psbt.unsigned_tx.input[0].sequence,
+            Sequence::from_height(10)
+        );
+        wallet.round(&mut psbt, &[2]);
+        let tx = wallet.account.finalize(&mut psbt).unwrap();
+        // One block early: not BIP-68 final yet.
+        let early = wallet
+            .bitcoind
+            .client
+            .send_raw_transaction(&tx)
+            .unwrap_err();
+        assert!(format!("{early:?}").contains("non-BIP68-final"));
+
+        generate(&wallet.bitcoind, 1);
+        check(true);
+        // No coin to measure the delay from: never spendable.
+        let without_coins = wallet.account.spend_leaves(&[]).unwrap();
+        assert_eq!(without_coins[2].relative, Some(10));
+        assert!(!without_coins[2].spendable);
+        assert!(without_coins[1].spendable);
+        wallet.mine(&tx);
+    }
+
+    /// The `after()` height of [`musig_or_after`], above the funded coin's.
+    #[cfg(feature = "musig")]
+    const AFTER_HEIGHT: u32 = 250;
+
+    /// `tr(D/<0;1>/*,{pk(musig(A,B)/<0;1>/*),and_v(v:pk(C/<0;1>/*),after(250))})`.
+    #[cfg(feature = "musig")]
+    fn musig_or_after(c: &[Cosigner]) -> String {
+        format!(
+            "tr({}/<0;1>/*,{{pk(musig({},{})/<0;1>/*),and_v(v:pk({}/<0;1>/*),after({AFTER_HEIGHT}))}})",
+            c[3].text, c[0].text, c[1].text, c[2].text
+        )
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn spend_absolute_timelocked_leaf_at_height() {
+        let wallet = MusigWallet::new(4, musig_or_after, 1);
+        let leaves = |outpoints: &[OutPoint]| {
+            wait_tip(&wallet.account, &wallet.bitcoind);
+            wallet.account.spend_leaves(outpoints).unwrap()
+        };
+        let check = |spendable: bool| {
+            for outpoints in [&wallet.coins[..], &[]] {
+                let leaves = leaves(outpoints);
+                assert_eq!(leaves.len(), 3);
+                assert_eq!(leaves[2].signers, vec![wallet.fingerprint(2)]);
+                assert_eq!(leaves[2].relative, None);
+                assert_eq!(leaves[2].absolute, Some(AFTER_HEIGHT));
+                assert_eq!(leaves[2].spendable, spendable);
+            }
+        };
+
+        let height = get_block_height(&wallet.bitcoind);
+        assert!(height < AFTER_HEIGHT - 1);
+        generate(&wallet.bitcoind, AFTER_HEIGHT - 1 - height);
+        check(false);
+
+        let timelocked = leaves(&wallet.coins)[2].path;
+        let mut psbt = wallet.psbt();
+        wallet
+            .account
+            .restrict_spend_path(&mut psbt, timelocked)
+            .unwrap();
+        assert_eq!(
+            psbt.unsigned_tx.lock_time,
+            absolute::LockTime::from_height(AFTER_HEIGHT).unwrap()
+        );
+        assert!(psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .all(|txin| !txin.sequence.is_final()));
+        wallet.round(&mut psbt, &[2]);
+        let tx = wallet.account.finalize(&mut psbt).unwrap();
+        // Tip at AFTER_HEIGHT - 1: the next block cannot hold it yet.
+        let early = wallet
+            .bitcoind
+            .client
+            .send_raw_transaction(&tx)
+            .unwrap_err();
+        assert!(format!("{early:?}").contains("non-final"));
+
+        generate(&wallet.bitcoind, 1);
+        check(true);
+        wallet.mine(&tx);
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn restrict_spend_path_refuses_unknown_leaf() {
+        let wallet = MusigWallet::new(4, two_of_three, 2);
+        let mut psbt = wallet.psbt();
+        let before = psbt.clone();
+        assert!(matches!(
+            wallet
+                .account
+                .restrict_spend_path(&mut psbt, SpendPath::Leaf(TapLeafHash::all_zeros())),
+            Err(Error::UnknownSpendPath)
+        ));
+        assert_eq!(psbt, before);
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn restrict_spend_path_key_path_drops_leaves() {
+        let wallet = MusigWallet::new(4, two_of_three, 2);
+        let mut psbt = wallet.psbt();
+        for input in &psbt.inputs {
+            assert_eq!(input.tap_scripts.len(), 3);
+            assert_eq!(musig_input_participants_all(input).unwrap().len(), 3);
+        }
+        let before = psbt.clone();
+        wallet
+            .account
+            .restrict_spend_path(&mut psbt, SpendPath::KeyPath)
+            .unwrap();
+        for (input, before) in psbt.inputs.iter().zip(&before.inputs) {
+            assert!(input.tap_scripts.is_empty());
+            // The internal key D is plain: no aggregate is left.
+            assert!(musig_input_participants_all(input).unwrap().is_empty());
+            // Every origin stays (a Coldcard needs them all), none with a leaf hash.
+            assert_eq!(
+                input.tap_key_origins.keys().collect::<Vec<_>>(),
+                before.tap_key_origins.keys().collect::<Vec<_>>()
+            );
+            let fingerprints: BTreeSet<Fingerprint> = input
+                .tap_key_origins
+                .values()
+                .map(|(leaf_hashes, (fingerprint, _))| {
+                    assert!(leaf_hashes.is_empty());
+                    *fingerprint
+                })
+                .collect();
+            for cosigner in 0..4 {
+                assert!(fingerprints.contains(&wallet.fingerprint(cosigner)));
+            }
+        }
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn finalize_without_musig_signatures_fails_cleanly() {
+        let wallet = MusigWallet::new(2, two_of_two, 1);
+        let mut psbt = wallet.psbt();
+        wallet.round(&mut psbt, &[0, 1]);
+        assert_eq!(wallet.status(&psbt), MusigRound::PartialSigs);
+        assert!(matches!(
+            wallet.account.finalize(&mut psbt),
+            Err(Error::Finalize(_))
+        ));
     }
 }
 
@@ -1634,5 +4378,34 @@ mod sqlite_signer_exclusion {
             on_disk.contains(&unique),
             "mnemonic must appear in config.json under JSON mode (default)"
         );
+    }
+
+    #[test]
+    fn sqlite_account_opens_without_a_secrets_backend() {
+        // With no signer store, the SQLite path needs no special case: opening
+        // must succeed and the mnemonic must still yield a derived hot signer.
+        let temp = TempDir::new().unwrap();
+        let mnemonic = Mnemonic::generate(12).unwrap().to_string();
+
+        let mut cfg = Config::new(
+            Some(mnemonic.clone()),
+            "alice".to_string(),
+            Network::Regtest,
+            ScriptType::Segwit(ChildNumber::from_hardened_idx(0).unwrap()),
+            temp.path().to_path_buf(),
+            "wallet".to_string(),
+            Some(PersistenceKind::Sqlite),
+        )
+        .unwrap();
+        cfg.scanner.set_stay_offline(true);
+
+        let account: Account = Account::new(cfg);
+        let expected_fingerprint =
+            bwk_sign::hot_signer::HotSigner::new_from_mnemonics(Network::Regtest, &mnemonic)
+                .unwrap()
+                .fingerprint();
+        let signers = account.signers();
+        assert_eq!(signers.len(), 1);
+        assert_eq!(signers[0].fingerprint, expected_fingerprint);
     }
 }

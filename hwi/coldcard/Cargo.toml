@@ -1,0 +1,25 @@
+[package]
+name = "coldcard"
+version = "0.13.0"
+edition = "2024"
+authors = ["Alfred Hodler <alfred_hodler@protonmail.com>"]
+license = "MIT"
+repository = "https://github.com/alfred-hodler/rust-coldcard/"
+description = "Fork of coldcard 0.13.0 (https://github.com/alfred-hodler/rust-coldcard) with a pluggable transport and the simulator socket"
+keywords = ["coldcard", "bitcoin", "wallet"]
+categories = ["command-line-utilities", "cryptography::cryptocurrencies", "hardware-support"]
+
+[features]
+default = ["linux-static-hidraw"]
+linux-static-hidraw = ["hidapi/linux-static-hidraw"]
+linux-static-libusb = ["hidapi/linux-static-libusb"]
+
+[dependencies]
+aes = "0.8.3"
+base58 = "0.2.0"
+bitcoin_hashes = "0.13.0"
+ctr = "0.9.2"
+hidapi = { version = "2.5.1", default-features = false }
+k256 = { version = "0.13.3", features = ["arithmetic"] }
+log = { version = "0.4.20", optional = true }
+rand = "0.8.5"

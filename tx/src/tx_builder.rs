@@ -1,6 +1,6 @@
 use crate::{
     coin_selection::{CoinSelector, DefaultCoinSelector},
-    recipient::{Recipient, RecipientProvider, SpPartialSecretProvider},
+    recipient::{Recipient, RecipientProvider, SpUpdater},
     transaction::{
         process_transaction, tx_estimated_weight, Amount, Error, Fees, TransactionResult,
         TxTemplate,
@@ -9,6 +9,7 @@ use crate::{
 };
 use bitcoin::Psbt;
 use bwk_coin::{Coin, CoinSource};
+use bwk_psbt::PsbtV2;
 
 #[cfg(feature = "test")]
 use {
@@ -22,6 +23,7 @@ use {
     bwk_descriptor::{
         derivator::SpkDerivator,
         descriptor::{tr_path, wpkh_path},
+        wallet::{to_wallet, WalletDescriptorExt},
     },
     bwk_sign::{hot_signer::HotSigner, signer::Signer},
     bwk_utils::test::{
@@ -40,7 +42,7 @@ pub struct TxBuilder {
     change_provider: Box<dyn RecipientProvider>,
     pub tx_template: TxTemplate,
     coin_source: Option<Box<dyn CoinSource>>,
-    sp_provider: Option<Box<dyn SpPartialSecretProvider>>,
+    sp_updater: Option<Box<dyn SpUpdater>>,
     coin_selector: Box<dyn CoinSelector>,
     max_fee_percent: u8,
     max_fee_amount: u64,
@@ -59,7 +61,7 @@ impl TxBuilder {
                 dust_threshold: DUST_AMOUNT,
             },
             coin_source: None,
-            sp_provider: None,
+            sp_updater: None,
             coin_selector: Box::new(DefaultCoinSelector::default()),
             max_fee_percent: 10,
             max_fee_amount: 2_000_000,
@@ -82,7 +84,7 @@ impl TxBuilder {
                 dust_threshold: DUST_AMOUNT,
             },
             coin_source: Some(Box::new(BTreeMap::new())),
-            sp_provider: None,
+            sp_updater: None,
             coin_selector: Box::new(DefaultCoinSelector::default()),
             max_fee_percent: 10,
             max_fee_amount: 2_000_000,
@@ -96,8 +98,8 @@ impl TxBuilder {
         self.coin_source = Some(coin_source);
         self
     }
-    pub fn sp_provider(mut self, provider: Box<dyn SpPartialSecretProvider>) -> Self {
-        self.sp_provider = Some(provider);
+    pub fn sp_updater(mut self, updater: Box<dyn SpUpdater>) -> Self {
+        self.sp_updater = Some(updater);
         self
     }
     pub fn coin_selector(mut self, coin_selector: Box<dyn CoinSelector>) -> Self {
@@ -209,8 +211,9 @@ impl TxBuilder {
         )
     }
 
-    /// Generate a signable PSBT from the current TxTemplate
-    pub fn generate(&mut self) -> Result<Psbt, Error> {
+    /// Run `process_transaction` and resolve the change recipient, without
+    /// finalizing. Shared by [`Self::generate`] and [`Self::generate_v2`].
+    fn final_template(&self) -> Result<(TxTemplate, Option<Box<dyn RecipientProvider>>), Error> {
         let res = process_transaction(
             self.tx_template.clone(),
             Some(self.change_provider.as_ref()),
@@ -230,10 +233,35 @@ impl TxBuilder {
                 None
             };
 
-        res.tx_template.finalize(
+        Ok((res.tx_template, change_recip))
+    }
+
+    /// Generate a signable PSBT from the current TxTemplate. Fails if any
+    /// output is a silent payment: a v0 PSBT has no field to carry the scan
+    /// and spend keys a signer would need, use [`Self::generate_v2`] instead.
+    pub fn generate(&mut self) -> Result<Psbt, Error> {
+        let (template, change_recip) = self.final_template()?;
+
+        template.finalize(
             change_recip,
             true,
-            self.sp_provider.as_deref(),
+            self.change_provider.network(),
+            self.max_fee_percent,
+            self.max_fee_amount,
+            false,
+        )
+    }
+
+    /// Generate a native PSBTv2 from the current TxTemplate. No private key
+    /// is involved: silent-payment outputs are left with no script for a
+    /// signer to derive, unless a registered [`SpUpdater`] fills them in.
+    pub fn generate_v2(&mut self) -> Result<PsbtV2, Error> {
+        let (template, change_recip) = self.final_template()?;
+
+        template.finalize_v2(
+            change_recip,
+            true,
+            self.sp_updater.as_deref(),
             self.change_provider.network(),
             self.max_fee_percent,
             self.max_fee_amount,
@@ -400,7 +428,6 @@ impl TxBuilder {
                             value,
                             script_pubkey: recipient.create_script(&FinalizationContext {
                                 inputs: &self.tx_template.inputs,
-                                partial_secret: None,
                                 network: bitcoin::Network::Bitcoin,
                             }),
                         };
@@ -524,17 +551,14 @@ pub mod test {
     pub fn builder_from_derivator(derivator: SpkDerivator) -> TxBuilder {
         let descriptor = derivator.descriptor();
         let network = {
-            use miniscript::ForEachKey;
             let is_mainnet = descriptor
-                .clone()
-                .into_single_descriptors()
+                .single_paths()
                 .expect("multipath")
                 .get(1)
                 .expect("multipath")
-                .for_any_key(|k| match k {
-                    DescriptorPublicKey::XPub(k) => k.xkey.network.is_mainnet(),
-                    _ => false,
-                });
+                .plain_keys()
+                .iter()
+                .any(|k| matches!(k, DescriptorPublicKey::XPub(x) if x.xkey.network.is_mainnet()));
             if is_mainnet {
                 Network::Bitcoin
             } else {
@@ -542,12 +566,11 @@ pub mod test {
             }
         };
         let address = descriptor
-            .clone()
-            .into_single_descriptors()
+            .single_paths()
             .expect("multipath")
             .get(1)
             .expect("multipath")
-            .at_derivation_index(0)
+            .derive_at(0)
             .expect("derivation")
             .address(network)
             .expect("address");
@@ -597,7 +620,7 @@ pub mod test {
         let path = tr_path(nw, ChildNumber::from_hardened_idx(0).unwrap()).unwrap();
         let xpub = signer.xpub(&path);
         let derivator = SpkDerivator::new_tr(xpub, nw).unwrap();
-        signer.register_descriptor(derivator.descriptor());
+        signer.register_descriptor(derivator.descriptor().into());
         (signer, derivator)
     }
 
@@ -622,8 +645,8 @@ pub mod test {
         );
         let desccriptor =
             Descriptor::<DescriptorPublicKey>::from_str(&descr_str).expect("hardcoded descriptor");
-        let derivator = SpkDerivator::new(desccriptor, nw).unwrap();
-        signer.register_descriptor(derivator.descriptor());
+        let derivator = SpkDerivator::new(to_wallet(desccriptor), nw).unwrap();
+        signer.register_descriptor(derivator.descriptor().into());
         (signer, derivator)
     }
 
@@ -633,7 +656,7 @@ pub mod test {
         let path = wpkh_path(nw, ChildNumber::from_hardened_idx(0).unwrap()).unwrap();
         let xpub = signer.xpub(&path);
         let derivator = SpkDerivator::new_wpkh(xpub, nw).unwrap();
-        signer.register_descriptor(derivator.descriptor());
+        signer.register_descriptor(derivator.descriptor().into());
         (signer, derivator)
     }
 
@@ -851,6 +874,34 @@ mod tests {
             !res.tx_template.inputs.is_empty(),
             "engine should have auto-selected inputs"
         );
+    }
+
+    fn assert_generate_v2_adds_change(mut builder: TxBuilder, derivator: &SpkDerivator) {
+        builder.receive_coin(test::receive_coin(100_000, derivator, 0));
+        builder.receive_coin(test::receive_coin(200_000, derivator, 1));
+        builder.dummy_external_output(50_000);
+
+        let psbt = builder.generate_v2().unwrap();
+        assert!(!psbt.inputs.is_empty());
+        assert_eq!(psbt.outputs.len(), 2);
+    }
+
+    #[test]
+    fn generate_v2_adds_change_output() {
+        let (_signer, derivator) = wpkh_signer();
+        let builder = test::builder_from_derivator(derivator.clone());
+        assert_generate_v2_adds_change(builder, &derivator);
+    }
+
+    #[test]
+    fn generate_v2_with_change_recipient_provider_does_not_panic() {
+        let (_signer, derivator) = wpkh_signer();
+        let change_provider = Box::new(crate::recipient::ChangeRecipientProvider::new(
+            derivator.descriptor(),
+            Network::Regtest,
+        ));
+        let builder = TxBuilder::new_with_derivator(change_provider, derivator.clone());
+        assert_generate_v2_adds_change(builder, &derivator);
     }
 
     #[test]

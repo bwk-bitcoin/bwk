@@ -1,4 +1,6 @@
 use bip39;
+#[cfg(feature = "musig")]
+use miniscript::bitcoin::secp256k1::PublicKey;
 use std::fmt::Display;
 
 #[derive(Debug, PartialEq)]
@@ -22,8 +24,25 @@ pub enum Error {
     InsanePrevouts,
     SigningInfo,
     InsaneTaptreeInfo,
+    MixedSigningInfo,
+    PsbtV2,
+    SpDescriptor,
     #[cfg(feature = "sp")]
     SpSigning,
+    #[cfg(feature = "musig")]
+    MusigSession,
+    #[cfg(feature = "musig")]
+    MusigNonces,
+    #[cfg(feature = "musig")]
+    /// Input index, and the participant whose partial signature fails to verify
+    /// (`None` when the shares verify but their aggregate does not).
+    MusigPartialSig(usize, Option<PublicKey>),
+    #[cfg(feature = "musig")]
+    Musig(bwk_musig::Error),
+    #[cfg(feature = "musig")]
+    MusigField,
+    #[cfg(feature = "musig")]
+    MusigParticipantReuse,
 }
 
 impl Display for Error {
@@ -48,8 +67,37 @@ impl Display for Error {
             Error::InsanePrevouts => write!(f, "Insane prevouts for taproot sighash"),
             Error::SigningInfo => write!(f, "Missing signing informations"),
             Error::InsaneTaptreeInfo => write!(f, "Wrong signing informations for taptree"),
+            Error::MixedSigningInfo => {
+                write!(
+                    f,
+                    "This input mixes segwit and taproot signing informations"
+                )
+            }
+            Error::PsbtV2 => write!(f, "PSBTv2 error"),
+            Error::SpDescriptor => write!(f, "silent payment descriptors are not signable yet"),
             #[cfg(feature = "sp")]
             Error::SpSigning => write!(f, "Failed to sign SP input"),
+            #[cfg(feature = "musig")]
+            Error::MusigSession => write!(f, "MuSig2 session missing or mismatch"),
+            #[cfg(feature = "musig")]
+            Error::MusigNonces => write!(f, "MuSig2 nonces missing from cosigners"),
+            #[cfg(feature = "musig")]
+            Error::MusigPartialSig(index, None) => {
+                write!(f, "invalid MuSig2 partial signature on input {index}")
+            }
+            #[cfg(feature = "musig")]
+            Error::MusigPartialSig(index, Some(participant)) => write!(
+                f,
+                "invalid MuSig2 partial signature on input {index} from participant {participant}"
+            ),
+            #[cfg(feature = "musig")]
+            Error::Musig(e) => write!(f, "MuSig2 error: {e}"),
+            #[cfg(feature = "musig")]
+            Error::MusigField => write!(f, "invalid MuSig2 PSBT field"),
+            #[cfg(feature = "musig")]
+            Error::MusigParticipantReuse => {
+                write!(f, "a MuSig2 participant key is also used as a plain key")
+            }
         }
     }
 }
@@ -57,5 +105,19 @@ impl Display for Error {
 impl From<bip39::Error> for Error {
     fn from(value: bip39::Error) -> Self {
         Error::Bip39(value)
+    }
+}
+
+#[cfg(feature = "musig")]
+impl From<bwk_musig::Error> for Error {
+    fn from(value: bwk_musig::Error) -> Self {
+        Error::Musig(value)
+    }
+}
+
+#[cfg(feature = "musig")]
+impl From<bwk_psbt::musig::Error> for Error {
+    fn from(_: bwk_psbt::musig::Error) -> Self {
+        Error::MusigField
     }
 }

@@ -10,6 +10,8 @@ pub mod core;
 pub mod profile;
 pub mod receiver;
 pub mod scan;
+#[cfg(feature = "mnemonic")]
+pub mod signer;
 mod thread_pool;
 
 pub use bwk;

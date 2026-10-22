@@ -9,9 +9,9 @@ generation, transaction history, and labels. Handles background sync with
 Electrum server and emits notifications on state changes.
 
 **Scope:** Account lifecycle, pairing an `ElectrumScanner` with a `HeaderStore`
-and reconciling them, signer management, change address management. The stores
-and the sync thread live in bwk-electrum. Does NOT handle signing itself (use
-bwk-sign) or transaction construction (use bwk-tx).
+and reconciling them, attaching signing managers, change address management.
+The stores and the sync thread live in bwk-electrum. Does NOT handle signing
+itself (use bwk-sign) or transaction construction (use bwk-tx).
 
 ## Usage
 
@@ -71,6 +71,31 @@ server needs, and it is unsafe against anything else. The account hands the
 same policy to its scanner connection and to both of the header store's
 connections. Pointing the config at another endpoint puts the check back, so
 the choice is made once per server.
+
+## Caller-owned persistence
+
+`Account::try_with_backend_factory(config, factory, config_store, header_store)`
+opens all wallet stores through a `bwk_electrum::persistence::BackendFactory`.
+It also opens owned headers there, unless given a shared `HeaderStore`. The
+existing constructors use the same factory if it is set on the runtime config.
+Without a factory they retain the configured JSON/SQLite/no-op behavior.
+
+Factory requests carry `BackendIdentity { account, network, kind }`, not native
+paths. `Wallet` and `Headers` are separate scopes. Backends still receive logical
+store names and byte rows through `PersistenceBackend`; typed stores use the
+existing `RamStore` layer. The caller owns identity separation, authorization,
+version checks, blob layout and storage limits. Account names used as identities
+must remain stable, or the caller must map them to its stable IDs.
+
+Runtime config clones retain the factory. Serialization skips it: reattach it
+after loading metadata using the constructor above. The config callback remains
+independent of wallet rows. Neither the factory nor these APIs provide a sandbox.
+
+`Account::try_persist` reports wallet, header and config callback failures instead
+of just logging them. Stop account work first: scanner flush joins stopped
+listeners and recovers their statuses through the supplied backend, but a flush
+is not backend destruction or permission to delete storage. RAM stores retain
+failed dirty writes for retry. Background/best-effort APIs still log failures.
 
 ## Architecture
 
@@ -151,10 +176,63 @@ Uses `ChangeTipUpdater` to increment change_generated_tip on each
 `create_script()` call. The index is stored in a `Cell` so `psbt_output_info()`
 can return correct BIP32 derivation path.
 
+## Signing
+
+An account does not sign, it routes. `attach_signing_manager(name, manager)`
+takes any `bwk_sign::manager::SigningManager` under a caller-chosen name and
+starts a thread forwarding that manager's answers into the account's
+notification channel. `detach_signing_manager(name)` stops that thread and
+drops the manager, and `signing_manager_names()` lists what is attached. A
+config carrying a mnemonic gets a hot manager attached at construction, under
+the name `hot`.
+
+`signers()` returns every signer cached across every attached manager and
+`signer(id)` one of them. `refresh_signers()` asks each manager for a fresh
+roster, and `set_signer_polling(enabled)` turns device discovery on and off on
+all of them at once.
+
+`init_signer`, `signer_info`, `signer_xpub`, `is_descriptor_registered`,
+`register_descriptor`, `sign` and `signer_raw` each take a `SignerId`, resolve
+which manager owns it and return the `RequestId` that manager minted. An
+unknown id, or a signer that is not ready, is refused before any manager is
+touched. None of them blocks or returns a result: the answer comes back as a
+notification.
+
+Those answers arrive as `Notification::Signer(SignerNotification)`: a manager
+attached or detached, the account-wide signer list, the result of each request
+tagged with its `RequestId` and `SignerId`, and errors no request asked for.
+
+## MuSig2
+
+Under the `musig` feature an account can watch a MuSig2 descriptor (BIP-390).
+`Config::new_from_descriptor(None, ...)` builds a watch-only config from the
+descriptor text, `musig()` keys included; `is_descriptor_valid` accepts the same
+texts. `Account::descriptor()` returns it, its `Display` is the standard text.
+
+A spend runs as follows:
+
+1. Build the PSBT with `tx_builder()` as for any account.
+2. `spend_leaves(&outpoints)` lists the spend paths: the key path first, then
+   each leaf in depth-first order, with its signers' fingerprints, its
+   `older()` / `after()` timelocks, whether those are met at the current tip for
+   the given coins, and its witness weight. A leaf hash depends on the derivation
+   index, so it is computed at the first coin's derivation.
+3. `restrict_spend_path(&mut psbt, path)` keeps only that path in every input of
+   the account, before round 1: an m-of-n path is one leaf (one subset of m
+   cosigners), and each cosigner then answers for that leaf only. The leaf is
+   matched by its position in the tree, so it is the same leaf in every input.
+4. Each cosigner signs once per round: the first call adds its nonces, the
+   second its partial signatures. `musig_status(&psbt)` tells the round reached
+   and what each cosigner contributed.
+5. `finalize(&mut psbt)` aggregates the partial signatures
+   (`aggregate_musig`), runs the miniscript finalizer and extracts the
+   transaction. Without `musig` it only finalizes and extracts.
+
 ## Features
 
 All off by default. `logger` installs `env_logger` as the global logger; leave
 it off if the consumer installs its own. `sp` adds the silent-payments
 notification variants `bwk-sp` needs, `hwi` adds hardware wallet signers,
-`sqlite` selects the SQLite persistence backend, and `test` exposes the
-test-only constructors the integration tests reach for.
+`sqlite` selects the SQLite persistence backend, `musig` the MuSig2 wallets
+above, and `test` exposes the test-only constructors the integration tests reach
+for.

@@ -258,9 +258,13 @@ impl<P: ScanProfile> TxStore<P> {
 
     /// Persists pending changes through the configured backend.
     pub fn persist(&mut self) {
-        if let Err(e) = self.store.flush() {
+        if let Err(e) = self.try_persist() {
             log::error!("TxStore::persist() flush: {e}");
         }
+    }
+
+    pub fn try_persist(&mut self) -> Result<(), PersistError> {
+        self.store.flush()
     }
 }
 
