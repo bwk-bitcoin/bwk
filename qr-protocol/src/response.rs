@@ -1,6 +1,7 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::{
+    musig, request,
     types::{ExtendedKey, Fingerprint, PublicKey, MUSIG_PARTIAL_SIG_LEN, MUSIG_PUB_NONCE_LEN},
     MessageType,
 };
@@ -11,6 +12,8 @@ pub enum Body {
     Registration(Registration),
     AddressUri(AddressUri),
     Signed(Signed),
+    MusigPrepared(MusigPrepared),
+    MusigSigned(MusigSigned),
     Error(ErrorBody),
 }
 
@@ -27,6 +30,8 @@ impl From<&Body> for MessageType {
             Body::Registration(_) => Self::RegisterDescriptor,
             Body::AddressUri(_) => Self::AddressVerification,
             Body::Signed(_) => Self::Signing,
+            Body::MusigPrepared(_) => Self::MusigPreparation,
+            Body::MusigSigned(_) => Self::MusigSigning,
             Body::Error(e) => e.message_type,
         }
     }
@@ -91,6 +96,47 @@ impl From<u8> for ReleaseFlag {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capabilities(pub u32);
+
+impl Capabilities {
+    pub const MUSIG_CACHE: u32 = 1 << 4;
+
+    pub fn supports_musig_cache(self) -> bool {
+        self.0 & Self::MUSIG_CACHE != 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MusigPrepared {
+    pub session_id: [u8; 32],
+    pub max_inputs: u8,
+    pub nonces: Vec<MusigNonce>,
+}
+
+impl MusigPrepared {
+    pub fn validate(&self) -> Result<(), musig::Error> {
+        musig::validate_input_coverage(self.max_inputs)?;
+        musig::validate_nonces(&self.nonces, self.max_inputs)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MusigNonce {
+    pub derivation: request::MusigDerivation,
+    pub input_index: u32,
+    pub expression_index: u32,
+    pub participant: PublicKey,
+    pub aggregate: PublicKey,
+    pub leaf_hash: Option<[u8; 32]>,
+    pub nonce: [u8; MUSIG_PUB_NONCE_LEN],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MusigSigned {
+    pub session_id: [u8; 32],
+    pub attempt_id: [u8; 32],
+    /// A serialized PSBT v0 or v2, carried without being parsed.
+    pub psbt: Vec<u8>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Registration {

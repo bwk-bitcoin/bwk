@@ -9,9 +9,9 @@ use core::ffi::{c_char, CStr};
 
 use crate::{
     ffi::{types, Error},
-    response,
+    musig, request, response,
     types::{ExtendedKey, Fingerprint, PublicKey, TAP_LEAF_HASH_LEN},
-    MessageType, RequestId, Response, SignResponseKind,
+    MessageType, RequestId, Response, SignResponseKind, MAX_VEC,
 };
 
 /// # Safety
@@ -30,11 +30,55 @@ pub unsafe fn response(view: &types::Response) -> Result<Response, Error> {
                 uri: optional_string(view.body.address_uri.uri)?,
             }),
             MessageType::Signing => response::Body::Signed(signed(&view.body.signed)?),
+            MessageType::MusigPreparation => {
+                response::Body::MusigPrepared(musig_prepared(&view.body.musig_prepared)?)
+            }
+            MessageType::MusigSigning => {
+                response::Body::MusigSigned(musig_signed(&view.body.musig_signed)?)
+            }
         }
     };
     Ok(Response {
         id: RequestId(view.id),
         body,
+    })
+}
+
+unsafe fn musig_prepared(view: &types::MusigPrepared) -> Result<response::MusigPrepared, Error> {
+    musig::validate_input_coverage(view.max_inputs).map_err(Error::Musig)?;
+    if view.nonces.len == 0 || view.nonces.len > MAX_VEC {
+        return Err(Error::Musig(musig::Error::NonceCount));
+    }
+    if view.nonces.is_absent() {
+        return Err(Error::NullPointer);
+    }
+    let mut nonces = Vec::new();
+    for nonce in view.nonces.as_slice() {
+        nonces.push(response::MusigNonce {
+            derivation: request::MusigDerivation {
+                keychain: nonce.derivation.keychain,
+                index: nonce.derivation.index,
+            },
+            input_index: nonce.input_index,
+            expression_index: nonce.expression_index,
+            participant: PublicKey(nonce.participant),
+            aggregate: PublicKey(nonce.aggregate),
+            leaf_hash: optional_leaf_hash(nonce.has_leaf_hash, nonce.leaf_hash)?,
+            nonce: nonce.nonce,
+        });
+    }
+    Ok(response::MusigPrepared {
+        session_id: view.session_id,
+        max_inputs: view.max_inputs,
+        nonces,
+    })
+}
+
+unsafe fn musig_signed(view: &types::MusigSigned) -> Result<response::MusigSigned, Error> {
+    Ok(response::MusigSigned {
+        session_id: view.session_id,
+        attempt_id: view.attempt_id,
+        psbt: bytes(view.psbt)?,
     })
 }
 

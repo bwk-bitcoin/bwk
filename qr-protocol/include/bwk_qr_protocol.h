@@ -32,6 +32,8 @@ extern "C" {
 #define BWK_QR_ERROR_MESSAGE_LEN 32
 #define BWK_QR_MAX_PATH 255
 #define BWK_QR_MAX_VEC 4096
+#define BWK_QR_MAX_MUSIG_INPUTS 8
+#define BWK_QR_MAX_MUSIG_DERIVATIONS 32
 #define BWK_QR_MAX_STRING (64 * 1024)
 #define BWK_QR_MAX_BYTES (512 * 1024)
 
@@ -48,7 +50,13 @@ enum bwk_qr_message_type {
     BWK_QR_MESSAGE_GET_KEYS = 0x01,
     BWK_QR_MESSAGE_REGISTER_DESCRIPTOR = 0x02,
     BWK_QR_MESSAGE_ADDRESS_VERIFICATION = 0x03,
-    BWK_QR_MESSAGE_SIGNING = 0x04
+    BWK_QR_MESSAGE_SIGNING = 0x04,
+    BWK_QR_MESSAGE_MUSIG_PREPARATION = 0x05,
+    BWK_QR_MESSAGE_MUSIG_SIGNING = 0x06
+};
+
+enum bwk_qr_capability {
+    BWK_QR_CAPABILITY_MUSIG_CACHE = 1u << 4
 };
 
 /* Closed: the decoder rejects any other value. */
@@ -113,7 +121,8 @@ enum bwk_qr_absent {
 };
 
 /* What the four functions return. 100..=199 come from the byte reader, 200..=299
- * from the decoder, 300..=399 from the encoder and 400..=499 from this binding. */
+ * from the decoder, 300..=399 from the encoder, 400..=499 from this binding,
+ * and 500..=599 from shared MuSig validation on encode and decode. */
 enum bwk_qr_status {
     BWK_QR_OK = 0,
 
@@ -156,7 +165,17 @@ enum bwk_qr_status {
     BWK_QR_ERR_FFI_INVALID_BOOL = 403,
     BWK_QR_ERR_UNKNOWN_TAG = 404,
     BWK_QR_ERR_UNTERMINATED_FIXED_STRING = 405,
-    BWK_QR_ERR_UNEXPECTED_RESPONSE = 406
+    BWK_QR_ERR_UNEXPECTED_RESPONSE = 406,
+
+    BWK_QR_ERR_MUSIG_INPUT_COVERAGE = 500,
+    BWK_QR_ERR_MUSIG_DERIVATION_COUNT = 501,
+    BWK_QR_ERR_MUSIG_DUPLICATE_DERIVATION = 502,
+    BWK_QR_ERR_MUSIG_HARDENED_INDEX = 503,
+    BWK_QR_ERR_MUSIG_MISSING_DESCRIPTOR = 504,
+    BWK_QR_ERR_MUSIG_NONCE_COUNT = 505,
+    BWK_QR_ERR_MUSIG_NONCE_INPUT_INDEX = 506,
+    BWK_QR_ERR_MUSIG_DUPLICATE_NONCE = 507,
+    BWK_QR_ERR_MUSIG_MISSING_INPUT = 508
 };
 
 /* A borrowed run of items. A NULL ptr means the field is absent, which is distinct
@@ -250,11 +269,36 @@ typedef struct {
     int16_t want_kind; /* BWK_QR_SIGN_RESPONSE_* or BWK_QR_ABSENT_KIND */
 } bwk_qr_sign;
 
+typedef struct {
+    uint32_t keychain;
+    uint32_t index; /* nonhardened */
+} bwk_qr_musig_derivation;
+
+typedef struct {
+    const bwk_qr_musig_derivation *ptr;
+    size_t len;
+} bwk_qr_musig_derivation_list;
+
+typedef struct {
+    bwk_qr_descriptor descriptor; /* body must be present */
+    uint8_t session_id[32];
+    uint8_t max_inputs;
+    bwk_qr_musig_derivation_list derivations;
+} bwk_qr_prepare_musig;
+
+typedef struct {
+    uint8_t session_id[32];
+    uint8_t attempt_id[32];
+    bwk_qr_bytes psbt;
+} bwk_qr_sign_musig;
+
 typedef union {
     bwk_qr_get_keys get_keys;
     bwk_qr_register_descriptor register_descriptor;
     bwk_qr_verify_address verify_address;
     bwk_qr_sign sign;
+    bwk_qr_prepare_musig prepare_musig;
+    bwk_qr_sign_musig sign_musig;
 } bwk_qr_request_body;
 
 typedef struct {
@@ -276,7 +320,7 @@ typedef struct {
     char vendor[BWK_QR_VENDOR_LEN + 1];
     char model[BWK_QR_MODEL_LEN + 1];
     bwk_qr_firmware_version version;
-    uint32_t capabilities; /* only the low four bits may be set */
+    uint32_t capabilities; /* only the low five bits may be set */
 } bwk_qr_keys;
 
 typedef struct {
@@ -321,6 +365,34 @@ typedef struct {
     uint8_t signature[BWK_QR_MUSIG_PARTIAL_SIG_LEN];
 } bwk_qr_musig_partial_sig;
 
+typedef struct {
+    bwk_qr_musig_derivation derivation;
+    uint32_t input_index;
+    uint32_t expression_index;
+    uint8_t participant[BWK_QR_PUBLIC_KEY_LEN];
+    uint8_t aggregate[BWK_QR_PUBLIC_KEY_LEN];
+    uint8_t has_leaf_hash; /* 0 or 1 */
+    uint8_t leaf_hash[BWK_QR_TAP_LEAF_HASH_LEN];
+    uint8_t nonce[BWK_QR_MUSIG_PUB_NONCE_LEN];
+} bwk_qr_musig_nonce;
+
+typedef struct {
+    const bwk_qr_musig_nonce *ptr;
+    size_t len;
+} bwk_qr_musig_nonce_list;
+
+typedef struct {
+    uint8_t session_id[32];
+    uint8_t max_inputs;
+    bwk_qr_musig_nonce_list nonces;
+} bwk_qr_musig_prepared;
+
+typedef struct {
+    uint8_t session_id[32];
+    uint8_t attempt_id[32];
+    bwk_qr_bytes psbt;
+} bwk_qr_musig_signed;
+
 typedef union {
     bwk_qr_ecdsa ecdsa;
     bwk_qr_tap_key tap_key;
@@ -360,6 +432,8 @@ typedef union {
     bwk_qr_registration registration;
     bwk_qr_address_uri address_uri;
     bwk_qr_signed signed_body;
+    bwk_qr_musig_prepared musig_prepared;
+    bwk_qr_musig_signed musig_signed;
     bwk_qr_error_body error;
 } bwk_qr_response_body;
 

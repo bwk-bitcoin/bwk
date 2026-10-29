@@ -1,16 +1,18 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::{
+    musig,
     reader::{self, Reader},
     request, response,
     types::{DerivationPath, ExtendedKey, Fingerprint, PublicKey},
     ErrorInfo, Message, MessageType, Request, RequestId, Response, SignResponseKind,
-    DIRECTION_RESPONSE, ERROR_MESSAGE_LEN, MAGIC, MAX_DESCRIPTOR_ALIAS, MODEL_LEN, STATUS_ERROR,
-    TYPE_MASK, VENDOR_LEN,
+    DIRECTION_RESPONSE, ERROR_MESSAGE_LEN, MAGIC, MAX_DESCRIPTOR_ALIAS, MAX_MUSIG_DERIVATIONS,
+    MAX_VEC, MODEL_LEN, STATUS_ERROR, TYPE_MASK, VENDOR_LEN,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
+    Musig(musig::Error),
     InvalidMagic,
     ReservedVersion,
     UnknownMessageType(u8),
@@ -25,6 +27,7 @@ pub enum Error {
 impl Error {
     pub fn info(&self) -> ErrorInfo {
         match self {
+            Self::Musig(error) => error.info(),
             Self::InvalidMagic => error_info!(200, "invalid magic"),
             Self::ReservedVersion => error_info!(201, "reserved protocol version"),
             Self::UnknownMessageType(_) => error_info!(202, "unknown message type"),
@@ -39,6 +42,12 @@ impl Error {
 }
 
 error_display!(Error);
+
+impl From<musig::Error> for Error {
+    fn from(error: musig::Error) -> Self {
+        Self::Musig(error)
+    }
+}
 
 impl From<reader::Error> for Error {
     fn from(error: reader::Error) -> Self {
@@ -79,6 +88,14 @@ pub fn decode(bytes: &[u8]) -> Result<Message, Error> {
             id,
             body: request::Body::Sign(read_sign_request(&mut reader)?),
         }),
+        (false, _, MessageType::MusigPreparation) => Message::Request(Request {
+            id,
+            body: request::Body::PrepareMusig(read_prepare_musig(&mut reader)?),
+        }),
+        (false, _, MessageType::MusigSigning) => Message::Request(Request {
+            id,
+            body: request::Body::SignMusig(read_sign_musig(&mut reader)?),
+        }),
         (true, true, _) => Message::Response(Response {
             id,
             body: response::Body::Error(read_error_response(&mut reader, message_type)?),
@@ -98,6 +115,14 @@ pub fn decode(bytes: &[u8]) -> Result<Message, Error> {
         (true, false, MessageType::Signing) => Message::Response(Response {
             id,
             body: response::Body::Signed(read_signed_response(&mut reader)?),
+        }),
+        (true, false, MessageType::MusigPreparation) => Message::Response(Response {
+            id,
+            body: response::Body::MusigPrepared(read_musig_prepared(&mut reader)?),
+        }),
+        (true, false, MessageType::MusigSigning) => Message::Response(Response {
+            id,
+            body: response::Body::MusigSigned(read_musig_signed(&mut reader)?),
         }),
     };
     Ok(decoded)
@@ -138,6 +163,85 @@ fn read_sign_request(reader: &mut Reader<'_>) -> Result<request::Sign, Error> {
         descriptors: reader.take_vec(read_descriptor)?,
         psbt: reader.take_bytes()?,
         want_kind: reader.take_option(read_sign_response_kind)?,
+    })
+}
+
+fn read_prepare_musig(reader: &mut Reader<'_>) -> Result<request::PrepareMusig, Error> {
+    let descriptor = read_descriptor(reader)?;
+    let session_id = reader.take_array()?;
+    let max_inputs = reader.take_u8()?;
+    musig::validate_input_coverage(max_inputs)?;
+    let count = reader.take_compact()?;
+    if count == 0 || count > MAX_MUSIG_DERIVATIONS {
+        return Err(musig::Error::DerivationCount.into());
+    }
+    let mut derivations = Vec::new();
+    for _ in 0..count {
+        derivations.push(read_musig_derivation(reader)?);
+    }
+    let request = request::PrepareMusig {
+        descriptor,
+        session_id,
+        max_inputs,
+        derivations,
+    };
+    request.validate()?;
+    Ok(request)
+}
+
+fn read_musig_derivation(reader: &mut Reader<'_>) -> Result<request::MusigDerivation, Error> {
+    Ok(request::MusigDerivation {
+        keychain: reader.take_u32_be()?,
+        index: reader.take_u32_be()?,
+    })
+}
+
+fn read_sign_musig(reader: &mut Reader<'_>) -> Result<request::SignMusig, Error> {
+    Ok(request::SignMusig {
+        session_id: reader.take_array()?,
+        attempt_id: reader.take_array()?,
+        psbt: reader.take_bytes()?,
+    })
+}
+
+fn read_musig_prepared(reader: &mut Reader<'_>) -> Result<response::MusigPrepared, Error> {
+    let session_id = reader.take_array()?;
+    let max_inputs = reader.take_u8()?;
+    musig::validate_input_coverage(max_inputs)?;
+    let count = reader.take_compact()?;
+    if count == 0 || count > MAX_VEC {
+        return Err(musig::Error::NonceCount.into());
+    }
+    let mut nonces = Vec::new();
+    for _ in 0..count {
+        nonces.push(read_cached_musig_nonce(reader)?);
+    }
+    let response = response::MusigPrepared {
+        session_id,
+        max_inputs,
+        nonces,
+    };
+    response.validate()?;
+    Ok(response)
+}
+
+fn read_cached_musig_nonce(reader: &mut Reader<'_>) -> Result<response::MusigNonce, Error> {
+    Ok(response::MusigNonce {
+        derivation: read_musig_derivation(reader)?,
+        input_index: reader.take_u32_be()?,
+        expression_index: reader.take_u32_be()?,
+        participant: read_pubkey(reader)?,
+        aggregate: read_pubkey(reader)?,
+        leaf_hash: reader.take_option(|r| r.take_array())?,
+        nonce: reader.take_array()?,
+    })
+}
+
+fn read_musig_signed(reader: &mut Reader<'_>) -> Result<response::MusigSigned, Error> {
+    Ok(response::MusigSigned {
+        session_id: reader.take_array()?,
+        attempt_id: reader.take_array()?,
+        psbt: reader.take_bytes()?,
     })
 }
 

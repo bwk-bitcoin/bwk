@@ -84,6 +84,8 @@ pub union RequestBody {
     pub register_descriptor: RegisterDescriptor,
     pub verify_address: VerifyAddress,
     pub sign: Sign,
+    pub prepare_musig: PrepareMusig,
+    pub sign_musig: SignMusig,
 }
 
 #[repr(C)]
@@ -135,6 +137,30 @@ pub struct Descriptor {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct MusigDerivation {
+    pub keychain: u32,
+    pub index: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PrepareMusig {
+    pub descriptor: Descriptor,
+    pub session_id: [u8; 32],
+    pub max_inputs: u8,
+    pub derivations: List<MusigDerivation>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SignMusig {
+    pub session_id: [u8; 32],
+    pub attempt_id: [u8; 32],
+    pub psbt: Bytes,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DescriptorBody {
     /// `DESCRIPTOR_BIP380`, `DESCRIPTOR_BIP388` or `DESCRIPTOR_SP_KEYS`, which selects
@@ -173,6 +199,8 @@ pub union ResponseBody {
     pub registration: Registration,
     pub address_uri: AddressUri,
     pub signed: Signed,
+    pub musig_prepared: MusigPrepared,
+    pub musig_signed: MusigSigned,
     pub error: ErrorBody,
 }
 
@@ -290,6 +318,36 @@ pub struct MusigPartialSig {
     pub has_leaf_hash: u8,
     pub leaf_hash: [u8; TAP_LEAF_HASH_LEN],
     pub signature: [u8; MUSIG_PARTIAL_SIG_LEN],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MusigPrepared {
+    pub session_id: [u8; 32],
+    pub max_inputs: u8,
+    pub nonces: List<MusigNonce>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MusigNonce {
+    pub derivation: MusigDerivation,
+    pub input_index: u32,
+    pub expression_index: u32,
+    pub participant: [u8; PUBLIC_KEY_LEN],
+    pub aggregate: [u8; PUBLIC_KEY_LEN],
+    /// 0 or 1.
+    pub has_leaf_hash: u8,
+    pub leaf_hash: [u8; TAP_LEAF_HASH_LEN],
+    pub nonce: [u8; MUSIG_PUB_NONCE_LEN],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MusigSigned {
+    pub session_id: [u8; 32],
+    pub attempt_id: [u8; 32],
+    pub psbt: Bytes,
 }
 
 #[repr(C)]

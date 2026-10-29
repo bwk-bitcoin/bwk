@@ -1,7 +1,7 @@
 use bip39;
 #[cfg(feature = "musig")]
 use miniscript::bitcoin::secp256k1::PublicKey;
-use std::fmt::Display;
+use std::{error::Error as StdError, fmt::Display};
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
@@ -121,3 +121,5 @@ impl From<bwk_psbt::musig::Error> for Error {
         Error::MusigField
     }
 }
+
+impl StdError for Error {}

@@ -11,6 +11,10 @@ pub mod manager;
 #[cfg(feature = "musig")]
 pub mod musig;
 pub mod protocol;
+#[cfg(feature = "musig")]
+pub mod qr_musig;
+#[cfg(feature = "musig")]
+pub mod qr_musig_host;
 pub mod remote_manager;
 pub mod signer;
 pub mod signing_manager;
