@@ -23,6 +23,11 @@ use std::{cmp::Ordering, fmt::Debug};
 #[cfg(feature = "regex")]
 use std::str::FromStr;
 
+/// The text of [`Error::MusigSession`]. The service forwards device errors as text
+/// (`SigningDeviceMsg::Error(_, String)`), so a consumer recognises this one by
+/// comparing with `MUSIG_SESSION_ERROR`.
+pub const MUSIG_SESSION_ERROR: &str = "MuSig2 session lost on the device, start again from round 1";
+
 #[derive(Debug, Clone)]
 pub enum Error {
     ParsingPolicy(bip389::ParseError),
@@ -39,6 +44,9 @@ pub enum Error {
     UserRefused,
     NetworkMismatch,
     Bip86ChangeIndex,
+    /// The device no longer holds the MuSig2 session of this PSBT (restarted, or a
+    /// round sent twice): every signer starts again from round 1.
+    MusigSession,
 }
 
 impl std::fmt::Display for Error {
@@ -60,6 +68,7 @@ impl std::fmt::Display for Error {
             Error::Bip86ChangeIndex => {
                 write!(f, "Ledger devices only accept 0 or 1 as`change` index value for BIP86 derivation path")
             }
+            Error::MusigSession => write!(f, "{MUSIG_SESSION_ERROR}"),
         }
     }
 }
@@ -71,6 +80,28 @@ impl From<bip389::ParseError> for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// A wallet policy as registered on a device, sent with each request that needs it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DeviceWallet {
+    /// Name given at registration (Ledger's HMAC covers it).
+    pub name: String,
+    /// Descriptor with keys inline, as given to `register_wallet`.
+    pub policy: String,
+    /// HMAC returned by `register_wallet` (Ledger), `None` otherwise.
+    pub hmac: Option<[u8; 32]>,
+}
+
+/// Shows whether an HMAC is set, never its bytes.
+impl Debug for DeviceWallet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceWallet")
+            .field("name", &self.name)
+            .field("policy", &self.policy)
+            .field("hmac", &self.hmac.map(|_| ".."))
+            .finish()
+    }
+}
 
 /// HWI is the common Hardware Wallet Interface.
 pub trait HWI: Debug {
@@ -92,6 +123,20 @@ pub trait HWI: Debug {
     fn display_address(&self, script: &AddressScript) -> Result<(), Error>;
     /// Sign a partially signed bitcoin transaction (PSBT).
     fn sign_tx(&self, tx: &mut Psbt) -> Result<(), Error>;
+    /// Sign `tx` for `wallet`. Devices that hold their policies ignore `wallet`.
+    fn sign_tx_with_wallet(&self, tx: &mut Psbt, wallet: &DeviceWallet) -> Result<(), Error> {
+        let _ = wallet;
+        self.sign_tx(tx)
+    }
+    /// Display an address of `wallet`. Devices that hold their policies ignore `wallet`.
+    fn display_address_with_wallet(
+        &self,
+        script: &AddressScript,
+        wallet: &DeviceWallet,
+    ) -> Result<(), Error> {
+        let _ = wallet;
+        self.display_address(script)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,6 +235,7 @@ impl std::fmt::Display for Version {
 pub enum DeviceKind {
     BitBox02,
     Coldcard,
+    ColdcardSimulator,
     Specter,
     SpecterSimulator,
     Ledger,
@@ -202,6 +248,7 @@ impl std::fmt::Display for DeviceKind {
         match self {
             DeviceKind::BitBox02 => write!(f, "bitbox02"),
             DeviceKind::Coldcard => write!(f, "coldcard"),
+            DeviceKind::ColdcardSimulator => write!(f, "coldcard-simulator"),
             DeviceKind::Specter => write!(f, "specter"),
             DeviceKind::SpecterSimulator => write!(f, "specter-simulator"),
             DeviceKind::Ledger => write!(f, "ledger"),
@@ -217,6 +264,7 @@ impl std::str::FromStr for DeviceKind {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "bitbox02" => Ok(DeviceKind::BitBox02),
+            "coldcard-simulator" => Ok(DeviceKind::ColdcardSimulator),
             "specter" => Ok(DeviceKind::Specter),
             "specter-simulator" => Ok(DeviceKind::SpecterSimulator),
             "ledger" => Ok(DeviceKind::Ledger),
@@ -231,6 +279,20 @@ impl std::str::FromStr for DeviceKind {
 mod tests {
     #[cfg(feature = "regex")]
     use super::*;
+
+    use crate::{DeviceKind, Error, MUSIG_SESSION_ERROR};
+
+    #[test]
+    fn musig_session_error_text() {
+        assert_eq!(Error::MusigSession.to_string(), MUSIG_SESSION_ERROR);
+    }
+
+    #[test]
+    fn coldcard_simulator_kind_round_trips() {
+        let kind = DeviceKind::ColdcardSimulator;
+        assert_eq!(kind.to_string(), "coldcard-simulator");
+        assert_eq!("coldcard-simulator".parse::<DeviceKind>(), Ok(kind));
+    }
 
     #[cfg(feature = "regex")]
     #[test]

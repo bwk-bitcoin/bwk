@@ -67,7 +67,8 @@ pub enum SigningDeviceMsg<Id = ()> {
     XPub(Id, Fingerprint, DerivationPath, Xpub),
     /// Device version retrieved
     Version(Id, Fingerprint, Version),
-    /// Wallet registered with optional HMAC
+    /// Wallet registered with optional HMAC (Ledger), to send back in
+    /// `DeviceWallet::hmac`
     WalletRegistered(Id, Fingerprint, String, Option<[u8; 32]>),
     /// Wallet registration check result
     WalletIsRegistered(Id, Fingerprint, String, bool),
@@ -198,9 +199,44 @@ for (id, device) in devices {
         // Sign a PSBT
         // Results arrive via SigningDeviceMsg::TransactionSigned
         // supported.sign_tx((), psbt);
+
+        // Sign a PSBT or display a miniscript address of a registered wallet: the
+        // name and policy given to register_wallet, and the HMAC it answered
+        use bwk_hwi::DeviceWallet;
+        // From SigningDeviceMsg::WalletRegistered(_, _, _, Some(hmac))
+        let hmac: [u8; 32] = registered_hmac;
+        let wallet = DeviceWallet {
+            name: "My Wallet".into(),
+            policy: "wsh(sortedmulti(2,[aabbccdd/48'/1'/0'/2']tpub.../**,...))".into(),
+            hmac: Some(hmac),
+        };
+        // Results arrive via SigningDeviceMsg::TransactionSigned
+        // supported.sign_tx_with_wallet((), psbt, wallet.clone());
+        // Results arrive via SigningDeviceMsg::AddressDisplayed
+        supported.display_address_with_wallet(
+            (),
+            &AddressScript::Miniscript { index: 0, change: false },
+            wallet,
+        );
     }
 }
 ```
+
+### Ledger
+
+The Ledger holds no wallet: every signing request and every miniscript address
+display needs the wallet policy and the HMAC `register_wallet` answered
+(`SigningDeviceMsg::WalletRegistered`). Send them with `sign_tx_with_wallet` and
+`display_address_with_wallet`; the HMAC covers the wallet name, so the name must be
+the one given at registration. Plain `sign_tx` answers `Error(Some(id), "Unimplemented
+method")` and a miniscript `display_address` `Error(Some(id), "Missing policy")`. A
+wrong HMAC is refused by the device (`Error(Some(id), ..)` with status
+`IncorrectData`). Other devices hold their registered policies and ignore the wallet
+sent with these two requests. The HMAC is never logged.
+
+`get_extended_pubkey` of a path the app refuses to export silently asks again with
+the xpub shown on the device: app 2.4.x exports BIP-87 account xpubs (`m/87'/..`)
+only after the user approves them, 2.5.0 and later without a screen.
 
 ### Using Request IDs
 
@@ -327,6 +363,22 @@ pub enum UnsupportedReason {
 }
 ```
 
+## Simulators
+
+The Ledger simulator (Speculos) is probed on `127.0.0.1:9999` every poll cycle and
+listed as `ledger-simulator`.
+
+The Coldcard simulator is probed only when `BWK_COLDCARD_SIMULATOR`
+(`service::COLDCARD_SIMULATOR_ENV`, Unix only) holds the path of its socket, for
+example `/tmp/ckcc-simulator.sock` or `/tmp/ckcc-simulator-<pid>.sock` with
+`--segregate`. The variable is read when the listener starts; when it is unset the
+service never touches a socket. The device is listed as `coldcard-simulator` with
+kind `ColdcardSimulator` and no firmware version gate, since the simulator only
+reports its bootloader version.
+
+It is dropped when its socket goes away or the path names another file (a
+restarted simulator), and found again once a simulator answers on the path.
+
 ## Taproot Miniscript Compatibility
 
 Check if a device supports Taproot Miniscript:
@@ -344,5 +396,40 @@ let compatible = is_compatible_with_tapminiscript(
 Minimum versions for Taproot Miniscript support:
 - Ledger: v2.2.0
 - Coldcard: v6.3.3
+- Coldcard simulator: All versions
 - BitBox02: v9.21.0
 - Specter: All versions
+
+## MuSig2 Session Errors
+
+`SigningDeviceMsg::Error` carries the error as text. A device that no longer holds
+the MuSig2 session of a PSBT answers `Error::MusigSession`, whose text is
+`bwk_hwi::MUSIG_SESSION_ERROR`; compare with it to tell this case apart, then start
+again from round 1 with every signer.
+
+```
++----------+--------------------------------------------------------------------+
+| Device   | When                                                               |
++----------+--------------------------------------------------------------------+
+| Ledger   | SW_BAD_STATE (0xB007) on a PSBT carrying a pubnonce (0x1b): round  |
+|          | 2 without the session round 1 stored (restart, round 2 sent twice) |
+| Coldcard | "musig needs restart" or "resign" as a line of the error, or       |
+|          | "Signing failed late" on a PSBT where the device is a MuSig2       |
+|          | participant (round 1 holding its own pubnonce after a restart,     |
+|          | round 1 sent twice)                                                |
++----------+--------------------------------------------------------------------+
+```
+
+The same SW_BAD_STATE without a pubnonce, and "Signing failed late" on a PSBT the
+Coldcard is no MuSig2 participant of, stay `Error::Device`.
+
+"Signing failed late" is all the Coldcard answers for any failure after the user
+approved: on a participant PSBT it is read as a lost session, but it may hide another
+late failure, whose reason is only shown on the device screen.
+
+A Coldcard answer keeps its own BIP-373 entries: the pubnonces (0x1b) and partial
+signatures (0x1c) whose participant key has a `tap_key_origins` entry with the
+device's fingerprint are copied into the PSBT next to the signatures; another
+cosigner's entry is never written. The Coldcard only signs an input whose
+`tap_key_origins` list every key of the enrolled wallet: a PSBT restricted to one leaf
+or to the key path must keep them all, as `bwk::Account::restrict_spend_path` does.

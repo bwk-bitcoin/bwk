@@ -26,6 +26,7 @@ use crate::{
     config::{Endpoint, HEADERS_FILENAME},
     header_store::{HeaderStore, StartError},
     notification::Notification,
+    persistence::{BackendFactory, BackendIdentity},
     profile::{OpenScanFromBackend, ScanProfile},
     raw_client::CertificateCheck,
     reconcile::Reconciler,
@@ -63,6 +64,29 @@ impl<P: ScanProfile> HeaderFollower<P> {
 }
 
 impl<P: OpenScanFromBackend> HeaderFollower<P> {
+    /// Own a caller-backed header store, without opening native files.
+    pub fn from_factory(
+        endpoint: Option<Endpoint>,
+        factory: &dyn BackendFactory,
+        identity: BackendIdentity,
+        checkpoint: Option<Checkpoint>,
+        notification: mpsc::Sender<Notification>,
+    ) -> Result<Self, StartError> {
+        let backend = factory.open(&identity)?;
+        let store = HeaderStore::try_from_backend(identity.network, backend, checkpoint)?;
+        if let Some(endpoint) = &endpoint {
+            if let Some((url, port)) = endpoint.server() {
+                store.restart(url.to_string(), port, endpoint.certificate_check())?;
+            }
+        }
+        Ok(Self {
+            store,
+            owned: true,
+            target: endpoint,
+            notification,
+        })
+    }
+
     /// Open this wallet's own store: online against `endpoint` when there is
     /// one, idle otherwise. Headers are always binary-backed, at
     /// [`HEADERS_FILENAME`] under `account_dir`, whenever the wallet persists

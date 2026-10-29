@@ -55,6 +55,7 @@ use crate::backend::sqlite::SqliteBackend;
 use crate::backend::{json::JsonBackend, noop::NoopBackend, PersistenceBackend};
 
 pub mod backend;
+pub mod cipher;
 pub mod config_store;
 pub mod storage;
 
@@ -98,15 +99,6 @@ pub const TXS_STORE_KEY: &str = "txs";
 /// by height, kept for reorg detection.
 pub const BLOCK_HASHES_STORE_KEY: &str = "block_hashes";
 
-/// Logical store name for hot-signer material (BIP32 mnemonics +
-/// per-signer descriptor sets), keyed by signer fingerprint.
-///
-/// Under [`PersistenceKind::Sqlite`] the `Account` constructor opens
-/// this store against [`NoopBackend`] so secrets never reach the
-/// SQLite DB; under JSON the store is a sibling of `transactions.json`,
-/// `labels.json`, etc.
-pub const SIGNERS_STORE_KEY: &str = "signers";
-
 /// Logical store name for the bwk validated header chain.
 ///
 /// The header chain uses a binary fixed-record cache keyed by block height.
@@ -128,7 +120,6 @@ pub const KNOWN_STORES: &[&str] = &[
     COINS_STORE_KEY,
     TXS_STORE_KEY,
     BLOCK_HASHES_STORE_KEY,
-    SIGNERS_STORE_KEY,
     HEADERS_STORE_KEY,
 ];
 
@@ -146,6 +137,9 @@ pub enum PersistError {
     Sqlite(String),
     #[error("sqlite support disabled: rebuild with feature `sqlite`")]
     SqliteDisabled,
+    /// The installed [`cipher::Cipher`] refused to seal or open the bytes.
+    #[error("encryption error: {0}")]
+    Cipher(String),
     /// Caller passed a `store` name that isn't in [`KNOWN_STORES`].
     #[error("unknown store {found:?} (expected one of {:?})", KNOWN_STORES)]
     UnknownStore { found: String },
@@ -221,5 +215,18 @@ mod tests {
         assert_eq!(sqlite, "\"sqlite\"");
         let back: PersistenceKind = serde_json::from_str(&json).unwrap();
         assert_eq!(back, PersistenceKind::Json);
+    }
+
+    #[test]
+    fn signers_store_name_is_rejected() {
+        // bwk has no persistence path for signer material; "signers" must
+        // be genuinely gone from KNOWN_STORES, not merely unused.
+        let backend = NoopBackend;
+        assert_eq!(
+            backend.validate_store_name("signers"),
+            Err(PersistError::UnknownStore {
+                found: "signers".to_string()
+            })
+        );
     }
 }

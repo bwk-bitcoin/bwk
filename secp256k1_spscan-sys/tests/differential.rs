@@ -248,3 +248,19 @@ fn vectors_33_tweaks_2_spends() {
         }
     }
 }
+
+#[test]
+fn accepts_more_than_64_spends() {
+    let scan = scan();
+    let tweaks = tweaks();
+    let base_spends = spends();
+    let spends = (0..65)
+        .map(|i| base_spends[i % base_spends.len()])
+        .collect::<Vec<_>>();
+
+    let per = secp256k1_spscan_sys::scan_spend_points(&scan, &tweaks[0], &spends).unwrap();
+    let bat = secp256k1_spscan_sys::scan_spend_points_batch(&scan, &tweaks[..1], &spends).unwrap();
+
+    assert_eq!(per.len(), 65);
+    assert_eq!(bat, per);
+}

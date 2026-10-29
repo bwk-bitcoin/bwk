@@ -20,7 +20,9 @@ use crate::core::{
         common::{calculate_t_n, SilentPaymentAddress},
         hash::calculate_input_hash,
     },
+    PartialSecret, SharedSecret,
 };
+use bitcoin::OutPoint;
 
 /// Create outputs for a given set of silent payment recipients and their corresponding shared secrets.
 ///
@@ -31,7 +33,7 @@ use crate::core::{
 /// # Arguments
 ///
 /// * `recipients` - A [Vec] of silent payment addresses strings to be paid.
-/// * `partial_secret` - A [SecretKey] that represents the sum of the private keys of eligible inputs of the transaction multiplied by the input hash.
+/// * `partial_secret` - The BIP352 partial secret for the transaction inputs.
 ///
 /// # Returns
 ///
@@ -46,11 +48,11 @@ use crate::core::{
 /// * Edge cases are hit during elliptic curve computation (extremely unlikely).
 pub fn generate_recipient_pubkeys(
     recipients: Vec<SilentPaymentAddress>,
-    partial_secret: SecretKey,
+    partial_secret: PartialSecret,
 ) -> Result<HashMap<SilentPaymentAddress, Vec<XOnlyPublicKey>>, Error> {
     let secp = Secp256k1::new();
 
-    let mut silent_payment_groups: HashMap<PublicKey, (PublicKey, Vec<SilentPaymentAddress>)> =
+    let mut silent_payment_groups: HashMap<PublicKey, (SharedSecret, Vec<SilentPaymentAddress>)> =
         HashMap::new();
     for address in recipients {
         let B_scan = address.get_scan_key();
@@ -58,7 +60,7 @@ pub fn generate_recipient_pubkeys(
         if let Some((_, payments)) = silent_payment_groups.get_mut(&B_scan) {
             payments.push(address);
         } else {
-            let ecdh_shared_secret = calculate_ecdh_shared_secret(&B_scan, &partial_secret);
+            let ecdh_shared_secret = calculate_ecdh_shared_secret(&B_scan, partial_secret);
 
             silent_payment_groups.insert(B_scan, (ecdh_shared_secret, vec![address]));
         }
@@ -69,7 +71,7 @@ pub fn generate_recipient_pubkeys(
         let (ecdh_shared_secret, recipients) = group;
 
         for (n, addr) in recipients.into_iter().enumerate() {
-            let t_n = calculate_t_n(&ecdh_shared_secret, n as u32)?;
+            let t_n = calculate_t_n(ecdh_shared_secret.as_inner(), n as u32)?;
 
             let res = t_n.public_key(&secp);
             let reskey = res.combine(&addr.get_spend_key())?;
@@ -87,7 +89,7 @@ pub fn generate_recipient_pubkeys(
 /// # Arguments
 ///
 /// * `input_keys` - A reference to a list of tuples, each tuple containing a [SecretKey] and [bool]. The [SecretKey] is the private key used in the input, and the [bool] indicates whether this was from a taproot address.
-/// * `outpoints_data` - The prevout outpoints used as input for this transaction. Note that the txid is given in [String] format, which is displayed in reverse order from the inner byte array.
+/// * `outpoints` - The prevout outpoints used as input for this transaction.
 ///
 /// # Returns
 ///
@@ -98,19 +100,19 @@ pub fn generate_recipient_pubkeys(
 /// This function will error if:
 ///
 /// * The input keys array is of length zero, or the summing results in an invalid key.
-/// * The outpoints_data is of length zero, or invalid.
+/// * The outpoints slice is empty.
 pub fn calculate_partial_secret(
     input_keys: &[(SecretKey, bool)],
-    outpoints_data: &[(String, u32)],
-) -> Result<SecretKey, Error> {
+    outpoints: &[OutPoint],
+) -> Result<PartialSecret, Error> {
     let a_sum = get_a_sum_secret_keys(input_keys)?;
 
     let secp = Secp256k1::signing_only();
     let A_sum = a_sum.public_key(&secp);
 
-    let input_hash = calculate_input_hash(outpoints_data, A_sum)?;
+    let input_hash = calculate_input_hash(outpoints, A_sum)?;
 
-    Ok(a_sum.mul_tweak(&input_hash)?)
+    Ok(a_sum.mul_tweak(&input_hash)?.into())
 }
 
 /// Calculate the shared secret of a transaction.
@@ -125,21 +127,22 @@ pub fn calculate_partial_secret(
 /// # Returns
 ///
 /// This function returns the shared secret of this transaction. This shared secret can be used to generate output keys for the recipient.
-pub fn calculate_ecdh_shared_secret(B_scan: &PublicKey, partial_secret: &SecretKey) -> PublicKey {
+pub fn calculate_ecdh_shared_secret(
+    B_scan: &PublicKey,
+    partial_secret: PartialSecret,
+) -> SharedSecret {
     let mut ss_bytes = [0u8; 65];
     ss_bytes[0] = 0x04;
 
     // Using `shared_secret_point` to ensure the multiplication is constant time
-    ss_bytes[1..].copy_from_slice(&shared_secret_point(B_scan, partial_secret));
+    ss_bytes[1..].copy_from_slice(&shared_secret_point(B_scan, partial_secret.as_inner()));
 
-    PublicKey::from_slice(&ss_bytes).expect("guaranteed to be a point on the curve")
+    PublicKey::from_slice(&ss_bytes)
+        .expect("guaranteed to be a point on the curve")
+        .into()
 }
 
 fn get_a_sum_secret_keys(input: &[(SecretKey, bool)]) -> Result<SecretKey, Error> {
-    if input.is_empty() {
-        return Err(Error::NoInputProvided);
-    }
-
     let secp = crate::core::secp256k1::Secp256k1::new();
 
     let mut negated_keys: Vec<SecretKey> = vec![];
@@ -154,7 +157,7 @@ fn get_a_sum_secret_keys(input: &[(SecretKey, bool)]) -> Result<SecretKey, Error
         }
     }
 
-    let (head, tail) = negated_keys.split_first().expect("input is non-empty");
+    let (head, tail) = negated_keys.split_first().ok_or(Error::NoInputProvided)?;
 
     let result: SecretKey = tail
         .iter()

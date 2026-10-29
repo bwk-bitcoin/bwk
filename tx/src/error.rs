@@ -6,14 +6,11 @@ pub enum Error {
     WrongVout,
     Update,
     Coin(bwk_coin::Error),
-    /// SP output requires partial_secret but no SpPartialSecretProvider was given
-    NoSpProvider,
-    /// Failed to compute SP partial secret
-    SpPartialSecret,
     /// Coin not found in store
     CoinNotFound,
     /// Change output already added to template
     ChangeAlreadyAdded,
+    Input,
 }
 
 impl From<bwk_coin::Error> for Error {
