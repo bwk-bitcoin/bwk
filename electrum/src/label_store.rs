@@ -109,6 +109,12 @@ impl<P: ScanProfile> LabelStore<P> {
         self.store.get(key).ok().flatten()
     }
 
+    /// Collects the live labels into owned entries ordered by key, without flushing.
+    /// With a RAM profile, includes unflushed edits and edits whose flush failed.
+    pub fn snapshot(&self) -> Result<Vec<(LabelKey, String)>, PersistError> {
+        Ok(self.store.iter()?.collect())
+    }
+
     /// Edits the label associated with the given key.
     pub fn edit(&mut self, key: LabelKey, value: Option<String>) {
         if let Err(e) = self.try_edit(key, value) {
@@ -162,22 +168,64 @@ mod tests {
     use crate::label_store::{LabelKey, LabelStore, STORE_KEY};
 
     #[test]
+    fn snapshots_own_all_label_variants_and_empty_values() {
+        let mut store = LabelStore::new();
+        assert_eq!(store.snapshot().unwrap(), vec![]);
+        let outpoint = OutPoint::null();
+        let entries = vec![
+            (LabelKey::OutPoint(outpoint), "coin".to_string()),
+            (LabelKey::Transaction(outpoint.txid), "tx".to_string()),
+            (
+                LabelKey::Address("1BoatSLRHtKNngkdXEeobR76b53LETtpyT".parse().unwrap()),
+                String::new(),
+            ),
+        ];
+        for (key, value) in entries.iter().rev() {
+            store.try_edit(key.clone(), Some(value.clone())).unwrap();
+        }
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(snapshot, entries);
+        store
+            .try_edit(entries[0].0.clone(), Some("updated".into()))
+            .unwrap();
+        store.try_remove(entries[1].0.clone()).unwrap();
+        assert_eq!(
+            store.snapshot().unwrap(),
+            vec![(entries[0].0.clone(), "updated".into()), entries[2].clone()]
+        );
+        drop(store);
+        assert_eq!(snapshot, entries);
+    }
+
+    #[test]
     fn failed_label_flush_retains_edits_and_deletions_for_retry() {
         let key = LabelKey::OutPoint(OutPoint::null());
 
-        for value in [Some("new".to_string()), None] {
+        for (initial, value) in [
+            (None, Some("new".to_string())),
+            (Some("old".to_string()), Some("new".to_string())),
+            (Some("old".to_string()), None),
+        ] {
             let dir = temp_dir::TempDir::new().unwrap();
             let backend = Arc::new(JsonBackend::open(dir.path().to_path_buf()).unwrap());
             let mut store = LabelStore::load_from_backend(backend.clone(), STORE_KEY).unwrap();
             let blocked = backend.path_for(STORE_KEY).with_extension("json.tmp");
-            store.try_edit(key.clone(), Some("old".into())).unwrap();
+            store.try_edit(key.clone(), initial.clone()).unwrap();
             store.try_persist().unwrap();
             fs::create_dir(&blocked).unwrap();
             store.try_edit(key.clone(), value.clone()).unwrap();
+            let expected: Vec<_> = value
+                .clone()
+                .map(|v| (key.clone(), v))
+                .into_iter()
+                .collect();
+            let durable: Vec<_> = initial.map(|v| (key.clone(), v)).into_iter().collect();
+            assert_eq!(store.snapshot().unwrap(), expected);
             assert!(matches!(store.try_persist(), Err(PersistError::Io(_))));
             assert_eq!(store.get(&key), value);
+            assert_eq!(store.snapshot().unwrap(), expected);
             let disk = LabelStore::load_from_backend(backend.clone(), STORE_KEY).unwrap();
-            assert_eq!(disk.get(&key).as_deref(), Some("old"));
+            assert_eq!(disk.snapshot().unwrap(), durable);
             drop(disk);
             fs::remove_dir(&blocked).unwrap();
             store.try_persist().unwrap();
@@ -187,6 +235,7 @@ mod tests {
             let reopened = Arc::new(JsonBackend::open(dir.path().to_path_buf()).unwrap());
             let store = LabelStore::load_from_backend(reopened, STORE_KEY).unwrap();
             assert_eq!(store.get(&key), value);
+            assert_eq!(store.snapshot().unwrap(), expected);
         }
     }
 }

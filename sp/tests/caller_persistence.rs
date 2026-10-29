@@ -12,7 +12,7 @@ use bitcoin::{
 use bwk::{
     bwk_electrum::{
         header_store::HeaderStore,
-        label_store::LabelKey,
+        label_store::{LabelKey, LabelStore},
         persistence::{test_support::CallerFactory, BackendIdentity, BackendKind},
     },
     persist::{
@@ -233,6 +233,88 @@ fn memory_lifecycle() {
 #[test]
 fn whole_file_lifecycle() {
     lifecycle(true, "whole-file-lifecycle");
+}
+
+#[test]
+fn root_label_snapshots_are_live_and_separate_from_scanners() {
+    let factory = Arc::new(CallerFactory::new(true));
+    let name = "label-snapshots";
+    let account = open(config(name), factory.clone()).unwrap();
+    let root = factory.backend(identity(name, BackendKind::SilentPayment));
+    let labels = account.label_store().clone();
+    assert!(Arc::ptr_eq(&labels, account.label_store()));
+    assert_eq!(labels.lock().unwrap().snapshot().unwrap(), vec![]);
+    let outpoint = OutPoint {
+        txid: Txid::all_zeros(),
+        vout: 3,
+    };
+    let key = LabelKey::OutPoint(outpoint);
+    for (index, scanner) in account.scanners().enumerate() {
+        assert!(!Arc::ptr_eq(&labels, scanner.label_store()));
+        let mut store = scanner.label_store().lock().unwrap();
+        store
+            .try_edit(key.clone(), Some(format!("sub {index}")))
+            .unwrap();
+        store.try_persist().unwrap();
+    }
+    account
+        .try_update_coin_label(outpoint, "root coin".into())
+        .unwrap();
+    account
+        .try_update_tx_label(outpoint.txid, "root tx".into())
+        .unwrap();
+    let original = vec![
+        (key.clone(), "root coin".to_string()),
+        (LabelKey::Transaction(outpoint.txid), "root tx".to_string()),
+    ];
+    let snapshot = labels.lock().unwrap().snapshot().unwrap();
+    assert_eq!(snapshot, original);
+    assert!(account.coins().is_empty());
+    assert!(account.scanners().all(|scanner| scanner.coins().is_empty()));
+
+    *root.fail_write.lock().unwrap() = Some(LABELS_STORE_KEY.into());
+    assert!(matches!(
+        account.try_update_coin_label(outpoint, "pending coin".into()),
+        Err(AccountError::Persist(PersistError::Io(_)))
+    ));
+    let pending = vec![
+        (key.clone(), "pending coin".to_string()),
+        (LabelKey::Transaction(outpoint.txid), "root tx".to_string()),
+    ];
+    assert_eq!(labels.lock().unwrap().snapshot().unwrap(), pending);
+    assert_eq!(
+        LabelStore::load_from_backend(root.clone(), LABELS_STORE_KEY)
+            .unwrap()
+            .snapshot()
+            .unwrap(),
+        original
+    );
+    *root.fail_write.lock().unwrap() = None;
+    labels.lock().unwrap().try_persist().unwrap();
+    assert_eq!(snapshot, original);
+    drop(account);
+
+    let account = open(config(name), factory).unwrap();
+    assert_eq!(
+        account.label_store().lock().unwrap().snapshot().unwrap(),
+        pending
+    );
+    account
+        .try_update_coin_label(outpoint, String::new())
+        .unwrap();
+    account
+        .try_update_tx_label(outpoint.txid, String::new())
+        .unwrap();
+    assert_eq!(
+        account.label_store().lock().unwrap().snapshot().unwrap(),
+        vec![]
+    );
+    for (index, scanner) in account.scanners().enumerate() {
+        assert_eq!(
+            scanner.label_store().lock().unwrap().snapshot().unwrap(),
+            vec![(key.clone(), format!("sub {index}"))]
+        );
+    }
 }
 
 #[test]
