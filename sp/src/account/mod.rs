@@ -969,6 +969,12 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         bwk::bwk_electrum::history::aggregate_payments(sources)
     } // Labels
 
+    /// Accesses only the root label store, not the separate scanner label stores.
+    /// Collect a snapshot under the mutex and release it before processing entries.
+    pub fn label_store(&self) -> &Arc<Mutex<LabelStore>> {
+        &self.label_store
+    }
+
     /// Update the label for a coin.
     pub fn update_coin_label(&self, outpoint: OutPoint, label: String) {
         if let Err(e) = self.try_update_coin_label(outpoint, label) {
