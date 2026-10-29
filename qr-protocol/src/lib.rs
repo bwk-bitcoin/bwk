@@ -57,6 +57,7 @@ pub mod decode;
 pub mod encode;
 #[cfg(feature = "ffi")]
 pub mod ffi;
+pub mod musig;
 pub mod reader;
 pub mod request;
 pub mod response;
@@ -78,6 +79,8 @@ pub const REQUEST_ID_LEN: usize = 2;
 pub const MAX_DESCRIPTOR_ALIAS: usize = 32;
 pub const MAX_BYTES: usize = 512 * 1024;
 pub const MAX_VEC: usize = 4096;
+pub const MAX_MUSIG_INPUTS: u8 = 8;
+pub const MAX_MUSIG_DERIVATIONS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestId(pub [u8; REQUEST_ID_LEN]);
@@ -106,6 +109,8 @@ pub enum MessageType {
     RegisterDescriptor,
     AddressVerification,
     Signing,
+    MusigPreparation,
+    MusigSigning,
 }
 
 impl MessageType {
@@ -121,6 +126,8 @@ impl From<MessageType> for u8 {
             MessageType::RegisterDescriptor => 0x02,
             MessageType::AddressVerification => 0x03,
             MessageType::Signing => 0x04,
+            MessageType::MusigPreparation => 0x05,
+            MessageType::MusigSigning => 0x06,
         }
     }
 }
@@ -134,6 +141,8 @@ impl TryFrom<u8> for MessageType {
             0x02 => Ok(Self::RegisterDescriptor),
             0x03 => Ok(Self::AddressVerification),
             0x04 => Ok(Self::Signing),
+            0x05 => Ok(Self::MusigPreparation),
+            0x06 => Ok(Self::MusigSigning),
             _ => Err(decode::Error::UnknownMessageType(value)),
         }
     }

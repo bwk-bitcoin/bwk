@@ -154,10 +154,10 @@ fn decode_rejects_an_unknown_message_type() {
 }
 
 #[test]
-fn decode_rejects_the_reserved_message_type_five() {
+fn decode_rejects_the_reserved_message_type_seven() {
     let mut bytes = encode_request(&get_keys_request()).unwrap();
-    bytes[MSG_TYPE_OFFSET] = 0x05;
-    assert_eq!(decode(&bytes), Err(decode::Error::UnknownMessageType(0x05)));
+    bytes[MSG_TYPE_OFFSET] = 0x07;
+    assert_eq!(decode(&bytes), Err(decode::Error::UnknownMessageType(0x07)));
 }
 
 #[test]
@@ -212,8 +212,8 @@ fn decode_rejects_an_oversized_vector_without_allocating_it() {
 #[test]
 fn encode_rejects_reserved_capability_bits() {
     assert_eq!(
-        encode_response(&keys_response(0x0000_0010)),
-        Err(encode::Error::ReservedCapabilityBits(0x0000_0010))
+        encode_response(&keys_response(0x0000_0020)),
+        Err(encode::Error::ReservedCapabilityBits(0x0000_0020))
     );
 }
 

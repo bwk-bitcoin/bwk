@@ -30,6 +30,25 @@ match decode(bytes)? {
 let bytes = encode_response(&response)?;
 ```
 
+Cached MuSig uses `request::Body::{PrepareMusig, SignMusig}` and
+`response::Body::{MusigPrepared, MusigSigned}`. Preparation contains a full
+descriptor, a session ID, input coverage and public derivation points, but no
+transaction. Public nonces identify their derivation, input, descriptor expression,
+participant, aggregate and optional leaf. Signing carries the session ID, a separate
+attempt ID and an opaque PSBT v0 or v2. No secret roots travel over this protocol.
+
+Check `response::Capabilities::supports_musig_cache()` before using these operations;
+`Capabilities::MUSIG_CACHE` is bit 4, separate from ordinary MuSig support. Both
+encode and decode validate preparation bounds and nonce attribution, including
+duplicate attribution. The raw C read path checks bounds and presence only; a C
+consumer must still validate a prepared response before use. The codec does
+not allocate or persist signing sessions, burn secret nonces, validate cryptography,
+or check response correlation. Those remain the consumer's responsibility.
+
+The new message codes are `0x05` and `0x06`. Version 1 and ordinary Signing (`0x04`)
+are unchanged. Old peers reject the new codes instead of ignoring a cached selector
+appended to an ordinary signing request.
+
 ## C
 
 [`include/bwk_qr_protocol.h`](include/bwk_qr_protocol.h) is written by hand and
@@ -65,8 +84,15 @@ field from `ENCODING.md`; they report local decode, encode, or FFI failures.
 | 200..299          | Protocol decoder |
 | 300..399          | Protocol encoder |
 | 400..499          | C binding        |
+| 500..599          | MuSig validation |
 +-------------------+------------------+
 ```
+
+MuSig validation codes `500` through `508` are shared by encode and decode and
+exposed as `musig::Error`. The C request union includes `prepare_musig` and
+`sign_musig`; the response union includes `musig_prepared` and `musig_signed`.
+These additions grow the C unions, so consumers must rebuild against the updated
+header. Pointer ownership is unchanged.
 
 A `staticlib` needs a global allocator and a panic handler, which a library cannot
 supply, so link this crate as an rlib from your own staticlib crate:

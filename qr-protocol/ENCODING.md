@@ -12,9 +12,9 @@
 
 This document defines the byte encoding of the signing-flow messages exchanged
 between a **wallet** (online software) and a **signer** (offline device) in the
-miniscript context: Get Keys, Register Descriptor, Address Verification, Signing
-and their exact byte layout. It is the authoritative byte-level contract two
-implementations must agree on.
+miniscript context: Get Keys, Register Descriptor, Address Verification, Signing,
+MuSig Preparation and MuSig Signing and their exact byte layout. It is the
+authoritative byte-level contract two implementations must agree on.
 
 The encoding is **transport agnostic**: a `MESSAGE` is a self-contained byte
 string, and how it is delivered (animated QR via BBQR, NFC, a file, a socket) is
@@ -159,10 +159,12 @@ Bits (bit 7 is the MSB):
 | 0x02  | Register Descriptor  |
 | 0x03  | Address Verification |
 | 0x04  | Signing              |
+| 0x05  | MuSig Preparation    |
+| 0x06  | MuSig Signing        |
 +-------+----------------------+
 ```
 
-Values `0x05`–`0x3F` are reserved. A parser MUST reject an unknown `TYPE`, and
+Values `0x07`–`0x3F` are reserved. A parser MUST reject an unknown `TYPE`, and
 MUST reject `STATUS` = `1` on a request (`DIRECTION` = `0`).
 
 #### Request Id
@@ -209,7 +211,7 @@ from the C binding return codes documented in `README.md` and
 | 0x0A      | Invalid or unparsable PSBT                           |
 | 0x0B      | Internal device error                                |
 | 0x0C      | Private key export refused (Get Keys)                |
-| 0x0D      | MuSig2 session missing or mismatch (Signing)         |
+| 0x0D      | MuSig2 session missing, consumed or mismatched       |
 | 0x0E–0xFE | Reserved for future standard codes                   |
 | 0xFF      | Vendor-specific (meaning carried by `ERROR_MESSAGE`) |
 +-----------+------------------------------------------------------+
@@ -314,7 +316,8 @@ Mandatory. Bit 0 is the LSB.
 | 1    | Miniscript, Taproot (v1)         |
 | 2    | Silent Payments (v0)             |
 | 3    | MuSig2                           |
-| 4–30 | Reserved for future capabilities |
+| 4    | MuSig cache                      |
+| 5–30 | Reserved for future capabilities |
 | 31   | Upgrade signal (MSB)             |
 +------+----------------------------------+
 ```
@@ -328,7 +331,10 @@ inside `tr()` of a registered descriptor (`FORM` `0x01`) or wallet policy (`FORM
 MuSig2 subsection of Signing, and MAY answer with `SIG_KIND` `0x04` / `0x05`. A
 wallet MUST NOT register or send a `musig()` descriptor to a signer without bit 3.
 
-Bits 4–30 are reserved for future capabilities and MUST be `0` in this version; a
+Bit 4 advertises the separate MuSig Preparation and MuSig Signing operations below.
+It is not implied by bit 3. A wallet MUST check bit 4 before using either operation.
+
+Bits 5–30 are reserved for future capabilities and MUST be `0` in this version; a
 reader MUST ignore an unknown capability bit rather than reject, so a newer signer
 can advertise capabilities an older wallet does not know. Bit 31 (the MSB) MUST be
 `0` in this version; a `1` signals that the signer exposes capabilities beyond this
@@ -513,8 +519,8 @@ and `PSBT_IN_MUSIG2_PARTIAL_SIG` (`0x1c`, 32 bytes), both keyed by
 signed for: the taproot output key on the key path (no leaf hash), the key as it
 appears in the leaf on a script path (with the leaf hash).
 
-**Rounds.** Each cosigner takes part in two Signing exchanges; there is no new
-message and `VERSION` stays 1.
+**Rounds.** For ordinary Signing (`TYPE` `0x04`), each cosigner takes part in two
+Signing exchanges. The cached operations below are separate; `VERSION` stays 1.
 
 - Round 1: the request `PSBT` carries no `0x1b` and no `0x1c` from anyone. The
   answer carries the signer's own `0x1b` only (`KIND` `0x01` with them in the PSBT,
@@ -588,6 +594,76 @@ These rules follow Bitcoin Core, Coldcard EDGE (`shared/psbt.py`
 compared with the PSBT's, the session erased after use) and Ledger (no foreign
 nonce in the round-1 PSBT, cosigners rebuilt from the registered policy). The
 reference signer is `bwk_sign::hot_signer::HotSigner` under the `musig` feature.
+
+### MuSig Preparation
+
+This operation requires capability bit 4 and has `TYPE` `0x05`. It prepares public
+nonces without a transaction, PSBT, sighash or attempt ID. It does not change the
+ordinary Signing operation. No secret nonce, root or encrypted secret export may
+appear in these messages.
+
+**Request:**
+
+`DESCRIPTOR` `SESSION_ID` `MAX_INPUTS` `DERIVATIONS`
+
+- `DESCRIPTOR`: the single `DESCRIPTOR` entry defined under Signing, including its
+  alias, optional descriptor body and optional proof. The body MUST be present.
+- `SESSION_ID`: 32 opaque bytes chosen by the caller, with no length prefix.
+- `MAX_INPUTS`: one byte, absolute input coverage from 1 through 8 inclusive.
+- `DERIVATIONS`: a vector of 1 through 32 distinct `MUSIG_DERIVATION` entries.
+  Each entry is `KEYCHAIN` `INDEX`, both 4-byte big-endian unsigned integers.
+  `KEYCHAIN` selects the descriptor's public derivation branch. `INDEX` MUST be
+  below `0x80000000`, so no hardened child index is accepted. Uniqueness uses both
+  fields. These limits are `MAX_MUSIG_INPUTS` and `MAX_MUSIG_DERIVATIONS` in Rust.
+
+**Ok response:**
+
+`SESSION_ID` `MAX_INPUTS` `NONCES`
+
+`SESSION_ID` and `MAX_INPUTS` echo the request. `NONCES` is a nonempty vector with
+at most `MAX_VEC` (4096) entries. Each entry is:
+
+`DERIVATION` `INPUT_INDEX` `EXPRESSION_INDEX` `PARTICIPANT` `AGGREGATE` `LEAF_HASH` `NONCE`
+
+- `DERIVATION`: a `MUSIG_DERIVATION` as above.
+- `INPUT_INDEX`: a 4-byte big-endian unsigned integer below `MAX_INPUTS`. The vector
+  MUST include every input index from zero through `MAX_INPUTS` minus one.
+- `EXPRESSION_INDEX`: a 4-byte big-endian unsigned integer identifying the occurrence
+  of the MuSig expression in the descriptor, not just the resulting aggregate key.
+- `PARTICIPANT`, `AGGREGATE`, `LEAF_HASH`: the compressed keys and optional 32-byte
+  leaf hash defined for ordinary MuSig public nonces.
+- `NONCE`: 66 public nonce bytes, without a length prefix.
+
+The tuple of derivation, input index, expression index, participant, aggregate and
+leaf hash MUST be unique, even if duplicate entries carry different nonce bytes.
+Both encoding and decoding reject invalid coverage, counts, hardened indices,
+duplicate attribution and missing input coverage. Matching the full descriptor's
+expected slots, derivations and participant keys is the consumer's responsibility.
+The codec carries key and nonce bytes without performing cryptographic validation.
+
+### MuSig Signing
+
+This operation requires capability bit 4 and has `TYPE` `0x06`.
+
+**Request and ok response:**
+
+`SESSION_ID` `ATTEMPT_ID` `PSBT`
+
+`SESSION_ID` selects the prepared cache session. `ATTEMPT_ID` is an independent
+caller-chosen 32-byte opaque identifier. Both have no length prefix, and the
+response echoes both. `PSBT` is a bounded `BYTES` field, carried without parsing,
+and may contain serialized PSBT v0 or v2. There is no response-kind selector.
+
+The caller checks request ID, operation, session ID and attempt ID on responses.
+Missing, consumed, lost or mismatched sessions refuse with `ERROR` `0x0D`. A
+cached request MUST NOT fall back to ordinary signing. Durable allocation, binding
+the exact descriptor-derived slots and participant nonce transcript, and burning
+secret nonces before signing belong to the signer and coordinator, not this codec.
+
+These operations use new type codes rather than appended ordinary Signing fields.
+An old parser ignores appended fields and newer version values, so neither would
+prevent it from interpreting a cached request as ordinary signing. Unknown type
+codes instead force rejection before the body is read. `VERSION` remains 1.
 
 ### Versioning
 

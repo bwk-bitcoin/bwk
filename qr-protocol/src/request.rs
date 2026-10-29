@@ -1,6 +1,6 @@
 use alloc::{string::String, vec::Vec};
 
-use crate::{decode, types::DerivationPath, MessageType, SignResponseKind};
+use crate::{decode, musig, types::DerivationPath, MessageType, SignResponseKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Body {
@@ -8,6 +8,8 @@ pub enum Body {
     RegisterDescriptor(RegisterDescriptor),
     VerifyAddress(VerifyAddress),
     Sign(Sign),
+    PrepareMusig(PrepareMusig),
+    SignMusig(SignMusig),
 }
 
 impl Body {
@@ -23,6 +25,8 @@ impl From<&Body> for MessageType {
             Body::RegisterDescriptor(_) => Self::RegisterDescriptor,
             Body::VerifyAddress(_) => Self::AddressVerification,
             Body::Sign(_) => Self::Signing,
+            Body::PrepareMusig(_) => Self::MusigPreparation,
+            Body::SignMusig(_) => Self::MusigSigning,
         }
     }
 }
@@ -100,6 +104,48 @@ pub struct Descriptor {
     pub alias: String,
     pub descriptor: Option<DescriptorBody>,
     pub proof: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MusigDerivation {
+    pub keychain: u32,
+    pub index: u32,
+}
+
+impl MusigDerivation {
+    pub fn validate(&self) -> Result<(), musig::Error> {
+        if self.index >= musig::HARDENED_INDEX {
+            return Err(musig::Error::HardenedIndex);
+        }
+        Ok(())
+    }
+}
+
+/// Transaction-independent preparation. The descriptor body must be present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrepareMusig {
+    pub descriptor: Descriptor,
+    pub session_id: [u8; 32],
+    pub max_inputs: u8,
+    pub derivations: Vec<MusigDerivation>,
+}
+
+impl PrepareMusig {
+    pub fn validate(&self) -> Result<(), musig::Error> {
+        musig::validate_input_coverage(self.max_inputs)?;
+        if self.descriptor.descriptor.is_none() {
+            return Err(musig::Error::MissingDescriptor);
+        }
+        musig::validate_derivations(&self.derivations)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignMusig {
+    pub session_id: [u8; 32],
+    pub attempt_id: [u8; 32],
+    /// A serialized PSBT v0 or v2, carried without being parsed.
+    pub psbt: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

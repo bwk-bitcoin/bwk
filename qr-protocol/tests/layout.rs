@@ -1,6 +1,6 @@
 //! Pins the layout of the C mirror types. The header in `include/` is written by
-//! hand, so a change here means the header has to change with it. The numbers were
-//! taken from a C compiler over that header on a 64-bit target.
+//! hand, so a change here means the header has to change with it. These are the
+//! expected sizes and alignments on a 64-bit target.
 #![cfg(all(feature = "ffi", target_pointer_width = "64"))]
 
 use core::{
@@ -10,9 +10,10 @@ use core::{
 
 use bwk_qr_protocol::ffi::types::{
     AddressUri, Bip388, Buf, Bytes, Descriptor, DescriptorBody, DescriptorValue, Ecdsa, ErrorBody,
-    FirmwareVersion, GetKeys, KeyRequest, Keys, List, MusigPartialSig, MusigPubNonce, Path,
-    RegisterDescriptor, Registration, Request, RequestBody, Response, ResponseBody, Sign,
-    Signature, SignatureValue, Signed, SignedValue, TapKey, TapScript, VerifyAddress,
+    FirmwareVersion, GetKeys, KeyRequest, Keys, List, MusigDerivation, MusigNonce, MusigPartialSig,
+    MusigPrepared, MusigPubNonce, MusigSigned, Path, PrepareMusig, RegisterDescriptor,
+    Registration, Request, RequestBody, Response, ResponseBody, Sign, SignMusig, Signature,
+    SignatureValue, Signed, SignedValue, TapKey, TapScript, VerifyAddress,
 };
 
 macro_rules! check {
@@ -42,8 +43,12 @@ fn the_c_mirror_matches_the_header() {
         RegisterDescriptor => 16, 8;
         VerifyAddress => 56, 8;
         Sign => 40, 8;
-        RequestBody => 56, 8;
-        Request => 64, 8;
+        MusigDerivation => 8, 4;
+        List<MusigDerivation> => 16, 8;
+        PrepareMusig => 88, 8;
+        SignMusig => 80, 8;
+        RequestBody => 88, 8;
+        Request => 96, 8;
         FirmwareVersion => 12, 4;
         Keys => 72, 8;
         Registration => 32, 8;
@@ -53,16 +58,23 @@ fn the_c_mirror_matches_the_header() {
         TapScript => 80, 8;
         MusigPubNonce => 165, 1;
         MusigPartialSig => 131, 1;
+        MusigNonce => 184, 4;
+        List<MusigNonce> => 16, 8;
+        MusigPrepared => 56, 8;
+        MusigSigned => 80, 8;
         SignatureValue => 168, 8;
         Signature => 176, 8;
         List<Signature> => 16, 8;
         SignedValue => 16, 8;
         Signed => 24, 8;
         ErrorBody => 34, 1;
-        ResponseBody => 72, 8;
-        Response => 80, 8;
+        ResponseBody => 80, 8;
+        Response => 88, 8;
         Buf => 16, 8;
     }
     assert_eq!(offset_of!(Request, body), 8);
     assert_eq!(offset_of!(Response, body), 8);
+    assert_eq!(offset_of!(PrepareMusig, derivations), 72);
+    assert_eq!(offset_of!(MusigPrepared, nonces), 40);
+    assert_eq!(offset_of!(MusigNonce, nonce), 115);
 }

@@ -13,7 +13,7 @@ use bwk_qr_protocol::{
         bwk_qr_buf_free, bwk_qr_request_decode, bwk_qr_request_free, bwk_qr_response_encode, types,
         Error, OK,
     },
-    request, response,
+    musig, request, response,
     types::{DerivationPath, ExtendedKey, Fingerprint, PublicKey},
     ErrorInfo, Message, MessageType, Request, RequestId, Response, SignResponseKind,
     ERROR_MESSAGE_LEN, MODEL_LEN, REQUEST_ID_LEN,
@@ -25,6 +25,243 @@ const ID: [u8; REQUEST_ID_LEN] = [42; REQUEST_ID_LEN];
 
 fn id() -> RequestId {
     RequestId(ID)
+}
+
+#[test]
+fn cached_preparation_request_exposes_owned_descriptor_and_derivations() {
+    for descriptor in [bip380(), bip388()] {
+        let request = request(request::Body::PrepareMusig(request::PrepareMusig {
+            descriptor: request::Descriptor {
+                alias: "cached".into(),
+                descriptor: Some(descriptor.clone()),
+                proof: Some(vec![0x81, 0x82]),
+            },
+            session_id: [0x51; 32],
+            max_inputs: 8,
+            derivations: vec![
+                request::MusigDerivation {
+                    keychain: 0,
+                    index: 7,
+                },
+                request::MusigDerivation {
+                    keychain: 1,
+                    index: 0x7fff_ffff,
+                },
+            ],
+        }));
+        unsafe {
+            let handle = view(&request);
+            assert_eq!((*handle).id, ID);
+            assert_eq!((*handle).message_type, 0x05);
+            let body = (*handle).body.prepare_musig;
+            assert_eq!(body.session_id, [0x51; 32]);
+            assert_eq!(body.max_inputs, 8);
+            assert_eq!(
+                CStr::from_ptr(body.descriptor.alias).to_str().unwrap(),
+                "cached"
+            );
+            assert_eq!(body.descriptor.proof.as_slice(), [0x81, 0x82]);
+            let descriptor_view = &*body.descriptor.body;
+            assert_eq!(descriptor_view.tag, descriptor.value());
+            match &descriptor {
+                request::DescriptorBody::Bip380(text) => {
+                    assert_eq!(
+                        CStr::from_ptr(descriptor_view.value.bip380)
+                            .to_str()
+                            .unwrap(),
+                        text
+                    );
+                }
+                request::DescriptorBody::Bip388 { keys, policy } => {
+                    let value = descriptor_view.value.bip388;
+                    let actual: Vec<_> = value
+                        .keys
+                        .as_slice()
+                        .iter()
+                        .map(|key| CStr::from_ptr(*key).to_str().unwrap())
+                        .collect();
+                    assert_eq!(actual, keys.iter().map(String::as_str).collect::<Vec<_>>());
+                    assert_eq!(CStr::from_ptr(value.policy).to_str().unwrap(), policy);
+                }
+                request::DescriptorBody::SpKeys(_) => panic!("unexpected fixture"),
+            }
+            let derivations = body.derivations.as_slice();
+            assert_eq!(derivations.len(), 2);
+            assert_eq!((derivations[0].keychain, derivations[0].index), (0, 7));
+            assert_eq!(
+                (derivations[1].keychain, derivations[1].index),
+                (1, 0x7fff_ffff)
+            );
+            bwk_qr_request_free(handle);
+        }
+    }
+}
+
+#[test]
+fn cached_signing_request_exposes_both_ids_and_psbt() {
+    let request = request(request::Body::SignMusig(request::SignMusig {
+        session_id: [0x51; 32],
+        attempt_id: [0xa7; 32],
+        psbt: vec![0x70, 0x73, 0x62, 0x74, 0xff],
+    }));
+    unsafe {
+        let handle = view(&request);
+        assert_eq!((*handle).id, ID);
+        assert_eq!((*handle).message_type, 0x06);
+        let body = (*handle).body.sign_musig;
+        assert_eq!(body.session_id, [0x51; 32]);
+        assert_eq!(body.attempt_id, [0xa7; 32]);
+        assert_eq!(body.psbt.as_slice(), b"psbt\xff");
+        bwk_qr_request_free(handle);
+    }
+}
+
+fn cached_nonce(has_leaf_hash: u8) -> types::MusigNonce {
+    types::MusigNonce {
+        derivation: types::MusigDerivation {
+            keychain: 1,
+            index: 17,
+        },
+        input_index: 0,
+        expression_index: 3,
+        participant: [0x02; 33],
+        aggregate: [0x03; 33],
+        has_leaf_hash,
+        leaf_hash: [0x44; 32],
+        nonce: [0x66; 66],
+    }
+}
+
+fn cached_response_view(nonces: &[types::MusigNonce]) -> types::Response {
+    response_view(
+        0x05,
+        false,
+        types::ResponseBody {
+            musig_prepared: types::MusigPrepared {
+                session_id: [0x51; 32],
+                max_inputs: 1,
+                nonces: list_view(nonces),
+            },
+        },
+    )
+}
+
+#[test]
+fn cached_prepared_response_converts_every_nonce_field() {
+    for has_leaf_hash in [0, 1] {
+        let nonces = [cached_nonce(has_leaf_hash)];
+        let view = cached_response_view(&nonces);
+        unsafe {
+            assert_eq!(
+                encoded(&view),
+                Response {
+                    id: id(),
+                    body: response::Body::MusigPrepared(response::MusigPrepared {
+                        session_id: [0x51; 32],
+                        max_inputs: 1,
+                        nonces: vec![response::MusigNonce {
+                            derivation: request::MusigDerivation {
+                                keychain: 1,
+                                index: 17,
+                            },
+                            input_index: 0,
+                            expression_index: 3,
+                            participant: PublicKey([0x02; 33]),
+                            aggregate: PublicKey([0x03; 33]),
+                            leaf_hash: (has_leaf_hash == 1).then_some([0x44; 32]),
+                            nonce: [0x66; 66],
+                        }],
+                    }),
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn cached_signed_response_converts_both_ids_and_psbt() {
+    let psbt = b"psbt\xff";
+    let view = response_view(
+        0x06,
+        false,
+        types::ResponseBody {
+            musig_signed: types::MusigSigned {
+                session_id: [0x51; 32],
+                attempt_id: [0xa7; 32],
+                psbt: list_view(psbt),
+            },
+        },
+    );
+    unsafe {
+        assert_eq!(
+            encoded(&view),
+            Response {
+                id: id(),
+                body: response::Body::MusigSigned(response::MusigSigned {
+                    session_id: [0x51; 32],
+                    attempt_id: [0xa7; 32],
+                    psbt: psbt.to_vec(),
+                }),
+            }
+        );
+    }
+}
+
+#[test]
+fn cached_prepared_ffi_rejects_invalid_presence_and_attribution() {
+    unsafe {
+        let nonces = [cached_nonce(2)];
+        assert_eq!(
+            encode_failure(&cached_response_view(&nonces)),
+            Error::InvalidBool.info_owned()
+        );
+        let mut nonces = [cached_nonce(0), cached_nonce(0)];
+        nonces[1].nonce = [0x77; 66];
+        let (code, _) = encode_failure(&cached_response_view(&nonces));
+        assert_eq!(code, musig::Error::DuplicateNonce.info().code);
+        let mut nonces = [cached_nonce(0)];
+        nonces[0].input_index = 1;
+        let (code, _) = encode_failure(&cached_response_view(&nonces));
+        assert_eq!(code, musig::Error::NonceInputIndex.info().code);
+        let (code, _) = encode_failure(&cached_response_view(&[]));
+        assert_eq!(code, musig::Error::NonceCount.info().code);
+    }
+}
+
+#[test]
+fn cached_response_ffi_rejects_oversized_and_absent_required_fields() {
+    unsafe {
+        let nonces = vec![cached_nonce(0); bwk_qr_protocol::MAX_VEC + 1];
+        let (code, _) = encode_failure(&cached_response_view(&nonces));
+        assert_eq!(code, musig::Error::NonceCount.info().code);
+        let view = response_view(
+            0x05,
+            false,
+            types::ResponseBody {
+                musig_prepared: types::MusigPrepared {
+                    session_id: [0x51; 32],
+                    max_inputs: 1,
+                    nonces: types::List {
+                        ptr: ptr::null(),
+                        len: 1,
+                    },
+                },
+            },
+        );
+        assert_eq!(encode_failure(&view), Error::NullPointer.info_owned());
+        let view = response_view(
+            0x06,
+            false,
+            types::ResponseBody {
+                musig_signed: types::MusigSigned {
+                    session_id: [0x51; 32],
+                    attempt_id: [0xa7; 32],
+                    psbt: types::Bytes::absent(),
+                },
+            },
+        );
+        assert_eq!(encode_failure(&view), Error::NullPointer.info_owned());
+    }
 }
 
 fn path() -> DerivationPath {

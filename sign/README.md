@@ -244,6 +244,49 @@ Slot eligibility retains the existing 0x1a and `tap_scripts` rules. If the same
 aggregate appears in the root and a selected leaf, retaining their shared 0x1a
 still requests the key path too; partial leaf data does not disable it.
 
+## Durable hot QR MuSig peer
+
+With `musig`, `qr_musig::QrMusigPeer::from_store(signer, store, cipher)` owns a
+`HotSigner`, a caller-selected `Store<Key = [u8; 32], Value = QrMusigPeerRecord>`
+and an `Arc<dyn bwk_persist::cipher::Cipher>`. The cipher must provide authenticated
+encryption. Secret exports are sealed before entering cloneable store records;
+neither the peer's record codec nor its QR responses contain plaintext roots.
+`qr_musig::{encode_record, decode_record}` are value codecs for caller-owned
+`RamStore` instances. The peer does not select a backend or perform file IO.
+
+The store must be exclusively held and durable: a successful `flush` must commit
+all preceding writes. No `NoopBackend`, parallel peer sharing the same store,
+rollback, restored backup or deletion of used session IDs is safe. Keep burned
+tombstones permanently. A cipher does not prevent rollback or nonce reuse.
+
+`prepare(PrepareMusig)` accepts a full BIP380 descriptor, bounded public
+derivations and absolute input coverage, with no transaction. An identical
+prepared request returns the same attributed public nonces after another
+successful flush. A changed request never replaces an existing same-ID root.
+
+`sign(SignMusig)` binds the selected session to the attempt, transaction, policy,
+owner and exact descriptor-resolved slots, including expression occurrence,
+derivation and actual sighash. Only advertised derivations are eligible. The
+allocation is flushed before any nonce publication. Incomplete participant
+transcripts return a `MusigSigned` PSBT containing nonces but no new signatures.
+Once complete, the attributed transcript is pinned in KeyAgg order and flushed.
+The encrypted record is then replaced with a root-free tombstone and flushed
+before the consuming `HotSigner::sign_musig_session` call. There is no ordinary
+signing fallback. Completed or missing sessions refuse signing retries.
+
+Every publication, including identical retries, requires a successful flush.
+A failed burn drops the transient root and disables further operations on that
+peer. Later calls retry persisting the tombstone but still refuse signing.
+Do not reopen an older store after a failed durability barrier; retain the live
+peer until its tombstone has been durably written. A signing failure after a
+successful burn also leaves the session permanently consumed.
+
+`handle(QrRequest)` preserves the inner request ID and returns explicit QR
+errors. `handle_remote(protocol::Request::Raw)` decodes the QR payload and returns
+`Response::Raw` with the same outer request ID and signer. Malformed wire data
+and non-Raw manager operations return attributed manager errors. Other inner
+operations are refused, never passed through to ordinary hot signing.
+
 ## HotManager
 
 The hot back end: a set of `HotSigner`s behind the `SigningManager` trait. Hot
