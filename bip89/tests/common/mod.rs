@@ -334,43 +334,67 @@ pub fn tpub(public_key: secp256k1::PublicKey, chain_code: [u8; 32]) -> bip32::Xp
     }
 }
 
-pub fn wallet() -> Wallet {
-    let secp = Secp256k1::new();
+/// The test xpubs: the NUMS internal key, the two owners and the delegator.
+struct Tpubs {
+    nums: bip32::Xpub,
+    owner1: bip32::Xpub,
+    owner2: bip32::Xpub,
+    delegator: bip32::Xpub,
+}
 
-    let nums = tpub(
-        PublicKey::from_slice(&hex_vec(NUMS_KEY)).unwrap(),
-        NUMS_CHAIN_CODE,
-    );
-    let owner1 = tpub(
-        SecretKey::from_slice(&OWNER1_SECRET)
-            .unwrap()
-            .public_key(&secp),
-        OWNER1_CHAIN_CODE,
-    );
-    let owner2 = tpub(
-        SecretKey::from_slice(&OWNER2_SECRET)
-            .unwrap()
-            .public_key(&secp),
-        OWNER2_CHAIN_CODE,
-    );
-    let delegator = tpub(
-        SecretKey::from_slice(&DELEGATOR_SECRET)
-            .unwrap()
-            .public_key(&secp),
-        DELEGATOR_CHAIN_CODE,
-    );
+fn tpubs(secp: &Secp256k1<All>) -> Tpubs {
+    let of_secret = |secret: &[u8; 32], chain_code| {
+        tpub(
+            SecretKey::from_slice(secret).unwrap().public_key(secp),
+            chain_code,
+        )
+    };
+    Tpubs {
+        nums: tpub(
+            PublicKey::from_slice(&hex_vec(NUMS_KEY)).unwrap(),
+            NUMS_CHAIN_CODE,
+        ),
+        owner1: of_secret(&OWNER1_SECRET, OWNER1_CHAIN_CODE),
+        owner2: of_secret(&OWNER2_SECRET, OWNER2_CHAIN_CODE),
+        delegator: of_secret(&DELEGATOR_SECRET, DELEGATOR_CHAIN_CODE),
+    }
+}
 
-    let descriptor = MsDescriptor::from_str(&format!(
-        "tr({nums}/<0;1>/*,multi_a(2,{owner1}/<0;1>/*,{owner2}/<0;1>/*,{delegator}/<0;1>/*))"
-    ))
-    .unwrap();
+fn wallet_of(descriptor: &str) -> Wallet {
+    let descriptor = MsDescriptor::from_str(descriptor).unwrap();
     let template = template_of(&RustBitcoin::new(), &descriptor);
-
     Wallet {
-        secp,
+        secp: Secp256k1::new(),
         descriptor,
         template,
     }
+}
+
+pub fn wallet() -> Wallet {
+    let Tpubs {
+        nums,
+        owner1,
+        owner2,
+        delegator,
+    } = tpubs(&Secp256k1::new());
+    wallet_of(&format!(
+        "tr({nums}/<0;1>/*,multi_a(2,{owner1}/<0;1>/*,{owner2}/<0;1>/*,{delegator}/<0;1>/*))"
+    ))
+}
+
+/// A wallet whose owner1 and delegator keys are each on two paths, `<0;1>`
+/// and `<2;3>`, one tapleaf per path: two slots for each of them.
+pub fn two_slot_wallet() -> Wallet {
+    let Tpubs {
+        nums,
+        owner1,
+        delegator,
+        ..
+    } = tpubs(&Secp256k1::new());
+    wallet_of(&format!(
+        "tr({nums}/<0;1>/*,{{and_v(v:pk({owner1}/<2;3>/*),pk({delegator}/<2;3>/*)),\
+         and_v(v:pk({owner1}/<0;1>/*),pk({delegator}/<0;1>/*))}})"
+    ))
 }
 
 /// The wallet template with a threshold of 1: the same base keys under another

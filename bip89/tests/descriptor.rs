@@ -331,7 +331,7 @@ fn rejects_hardened_wildcard() {
 }
 
 #[test]
-fn rejects_conflicting_key() {
+fn rejects_conflicting_chain_code() {
     let secp = Secp256k1::new();
     let nums = nums_str();
     let o1 = owner1_str(&secp);
@@ -345,12 +345,52 @@ fn rejects_conflicting_key() {
     )
     .to_string();
     let s = format!(
-        "tr({nums}/<0;1>/*,multi_a(2,{o1}/<0;1>/*,{conflicting_chain_code}/<0;1>/*,{d}/<0;1>/*))"
+        "tr({nums}/<0;1>/*,multi_a(2,{o1}/<0;1>/*,{conflicting_chain_code}/<2;3>/*,{d}/<0;1>/*))"
     );
-    assert!(matches!(xpubs(&s), Err(Error::ConflictingKey)));
+    assert_eq!(
+        xpubs(&s),
+        Err(Error::ConflictingChainCode(hex_arr(OWNER1_KEY)))
+    );
+}
 
-    let s = format!("tr({nums}/<0;1>/*,multi_a(2,{o1}/<0;1>/*,{o1}/7/<0;1>/*,{d}/<0;1>/*))");
-    assert!(matches!(xpubs(&s), Err(Error::ConflictingKey)));
+#[test]
+fn rejects_overlapping_paths() {
+    let secp = Secp256k1::new();
+    let nums = nums_str();
+    let o1 = owner1_str(&secp);
+    let d = delegator_str(&secp);
+
+    for (first, second) in [("<0;1>", "<1;2>"), ("<0;1>", "<1;0>"), ("<2;3>", "<4;2>")] {
+        let s = format!(
+            "tr({nums}/<0;1>/*,{{and_v(v:pk({o1}/{first}/*),pk({d}/<0;1>/*)),pk({o1}/{second}/*)}})"
+        );
+        assert_eq!(xpubs(&s), Err(Error::OverlappingPaths(hex_arr(OWNER1_KEY))));
+    }
+}
+
+#[test]
+fn key_on_two_paths_has_two_slots() {
+    let secp = Secp256k1::new();
+    let nums = nums_str();
+    let o1 = owner1_str(&secp);
+    let d = delegator_str(&secp);
+
+    for (second, branches) in [
+        ("<2;3>", [vec![2], vec![3]]),
+        ("7/<0;1>", [vec![7, 0], vec![7, 1]]),
+    ] {
+        let s = format!(
+            "tr({nums}/<0;1>/*,{{and_v(v:pk({o1}/{second}/*),pk({d}/<0;1>/*)),pk({o1}/<0;1>/*)}})"
+        );
+        let owner1: Vec<Xpub> = xpubs(&s)
+            .unwrap()
+            .into_iter()
+            .filter(|x| x.key == hex_arr::<33>(OWNER1_KEY))
+            .collect();
+        assert_eq!(owner1.len(), 2);
+        assert_eq!(owner1[0].branches, [vec![0], vec![1]]);
+        assert_eq!(owner1[1].branches, branches);
+    }
 }
 
 #[test]

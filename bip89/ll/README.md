@@ -179,8 +179,8 @@ freed by the caller. The coordinator and spend entry points also take a nullable
 |            | and 123 are retired and never reused. 129 is                    |
 |            | `BIP89_ERR_MISSING_PROOF`, an owned output without a proof.     |
 | 135 to 141 | Descriptor validation variants of `bwk_bip89::Error`:           |
-|            | NotTaproot, KeyType, Multipath, Wildcard, HardenedStep,         |
-|            | ConflictingKey, NoKeys.                                         |
+|            | NotTaproot, KeyType, Multipath, Wildcard, HardenedStep, NoKeys  |
+|            | (141). Code 140 is retired and never reused.                    |
 | 142        | `BIP89_ERR_MISSING_ROOT_SIGNATURE`, a root record with no       |
 |            | signature where the registration requires one.                  |
 | 143        | `BIP89_ERR_TOO_MANY_SLOTS`, a base key with more than 256       |
@@ -204,7 +204,7 @@ gives `BIP89_ERR_TEMPLATE`; from a PSBT callback, `BIP89_ERR_PSBT`.
 The protocol code sorts the xpubs the descriptor callback reports into slots,
 so an entry point reading a descriptor can return 141, 143, 145 and 146; the C
 codes do not carry the offending base key the Rust variants hold. No entry point returns
-135 to 140: they come from parsing a descriptor string, which the C consumer does
+135 to 139: they come from parsing a descriptor string, which the C consumer does
 itself.
 
 ## Linking

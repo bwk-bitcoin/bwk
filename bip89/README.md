@@ -124,8 +124,11 @@ The template carries the slot number, never the path.
 
 - **Descriptor.** Only `tr()` over multipath extended keys (`<a;b>/*`) with
   unhardened steps. `descriptor_xpubs` rejects any other shape with `NotTaproot`,
-  `KeyType`, `Multipath`, `Wildcard`, `HardenedStep`, `ConflictingKey` or
-  `NoKeys`.
+  `KeyType`, `Multipath`, `Wildcard`, `HardenedStep` or `NoKeys`. A base key may
+  appear on several paths, one slot each, but `ConflictingChainCode(key)`
+  refuses it with two chain codes, `OverlappingPaths(key)` on two paths that
+  share a branch (`<0;1>` and `<1;2>`), and `TooManySlots(key)` on more than
+  256 paths.
 - **Template.** The same `tr()` with every key reduced to a `TemplateKey`, its
   base key and slot number, written as the bare key for slot 0 and `KEY@N` for
   slot N. A descriptor whose keys each have one path gives the plain descriptor

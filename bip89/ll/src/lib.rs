@@ -319,7 +319,7 @@ fn ll_error_info(error: Error) -> (i32, &'static str) {
         Error::InvalidKeychain => (117, "invalid keychain\0"),
         Error::IndexRange => (118, "tree index range out of bounds\0"),
         Error::ProofLength => (119, "invalid proof length\0"),
-        // 120 and 123 are retired, never reused
+        // 120, 123 and 140 are retired, never reused
         Error::RootSignature => (121, "invalid root signature\0"),
         Error::NotCommitted => (122, "bundle not committed in tree\0"),
         Error::NoTree(_) => (124, "no tree for output\0"),
@@ -338,7 +338,6 @@ fn ll_error_info(error: Error) -> (i32, &'static str) {
         Error::Multipath => (137, "key does not have two multipath elements\0"),
         Error::Wildcard => (138, "key does not end with an unhardened wildcard\0"),
         Error::HardenedStep => (139, "key has a hardened derivation step\0"),
-        Error::ConflictingKey => (140, "base key repeated with another chain code or path\0"),
         Error::NoKeys => (141, "descriptor has no key\0"),
         Error::MissingRootSignature => (142, "root signature missing\0"),
         Error::TooManySlots(_) => (143, "base key has more than 256 slots\0"),
@@ -2407,7 +2406,7 @@ mod tests {
 
     use crate::FfiError;
 
-    const LL_ROWS: [(Error, i32, &str); 45] = [
+    const LL_ROWS: [(Error, i32, &str); 44] = [
         (Error::InvalidPoint, 100, "invalid point\0"),
         (Error::Infinity, 101, "point at infinity\0"),
         (Error::ScalarRange, 102, "scalar out of range\0"),
@@ -2470,11 +2469,6 @@ mod tests {
             139,
             "key has a hardened derivation step\0",
         ),
-        (
-            Error::ConflictingKey,
-            140,
-            "base key repeated with another chain code or path\0",
-        ),
         (Error::NoKeys, 141, "descriptor has no key\0"),
         (Error::MissingRootSignature, 142, "root signature missing\0"),
         (
@@ -2507,8 +2501,8 @@ mod tests {
         (FfiError::InvalidRootPolicy, 504, "invalid root policy\0"),
     ];
 
-    fn all_infos() -> [(i32, &'static str); 50] {
-        let mut out = [(0, ""); 50];
+    fn all_infos() -> [(i32, &'static str); 49] {
+        let mut out = [(0, ""); 49];
         for (i, (error, code, message)) in LL_ROWS.into_iter().enumerate() {
             let info = FfiError::Ll(error).info();
             assert_eq!(info, (code, message));

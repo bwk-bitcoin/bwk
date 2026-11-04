@@ -160,7 +160,7 @@ fn translate_err(e: TranslateErr<Error>) -> Error {
 /// The template of `d`: its `tr()` with every key reduced to its template
 /// key.
 pub(crate) fn template(d: &Descriptor<DescriptorPublicKey>) -> Result<Tr<TemplateKey>, Error> {
-    let slots = slot::slots(xpubs(d)?)?;
+    let slots = slot::slots(expressions(d)?)?;
     let Descriptor::Tr(tr) = d else {
         return Err(Error::NotTaproot);
     };
@@ -235,9 +235,9 @@ fn xpub_from_key(pk: &DescriptorPublicKey) -> Result<Xpub, Error> {
     })
 }
 
-/// Validates `d` and returns its keys sorted by base key, an identical key
-/// repeated only once.
-pub(crate) fn xpubs(d: &Descriptor<DescriptorPublicKey>) -> Result<Vec<Xpub>, Error> {
+/// Validates the shape of `d` and returns its key expressions, in descriptor
+/// order.
+fn expressions(d: &Descriptor<DescriptorPublicKey>) -> Result<Vec<Xpub>, Error> {
     if !matches!(d, Descriptor::Tr(_)) {
         return Err(Error::NotTaproot);
     }
@@ -246,26 +246,13 @@ pub(crate) fn xpubs(d: &Descriptor<DescriptorPublicKey>) -> Result<Vec<Xpub>, Er
         keys.push(pk.clone());
         true
     });
+    keys.iter().map(xpub_from_key).collect()
+}
 
-    let mut entries = Vec::with_capacity(keys.len());
-    for pk in &keys {
-        entries.push(xpub_from_key(pk)?);
-    }
-    if entries.is_empty() {
-        return Err(Error::NoKeys);
-    }
-    entries.sort_by(|a, b| a.key.cmp(&b.key));
-
-    let mut deduped: Vec<Xpub> = Vec::with_capacity(entries.len());
-    for entry in entries {
-        match deduped.last() {
-            Some(prev) if prev.key == entry.key => {
-                if *prev != entry {
-                    return Err(Error::ConflictingKey);
-                }
-            }
-            _ => deduped.push(entry),
-        }
-    }
-    Ok(deduped)
+/// Validates `d` and returns the key expressions of its slots, sorted by slot.
+pub(crate) fn xpubs(d: &Descriptor<DescriptorPublicKey>) -> Result<Vec<Xpub>, Error> {
+    Ok(slot::slots(expressions(d)?)?
+        .into_iter()
+        .map(|slot| slot.xpub)
+        .collect())
 }

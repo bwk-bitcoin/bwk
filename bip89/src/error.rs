@@ -47,8 +47,6 @@ pub enum Error {
     Wildcard,
     /// A key has a hardened derivation step.
     HardenedStep,
-    /// A base key is repeated with another chain code or path.
-    ConflictingKey,
     /// The base key appears with two different chain codes.
     ConflictingChainCode([u8; 33]),
     /// The base key appears on two derivation paths that share a branch, so
