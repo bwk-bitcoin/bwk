@@ -1,0 +1,171 @@
+{
+  "descriptor": "tr(tpubD6NzVbkrYhZ4WUjicNhwiY99hU5HrkSGgpGAoBkVTAK8u9SvizRqERT9Ppf1U4htEmVZc5rLYFQnQ4yMK4R5RFoaU9WwM1LsP7GZnvwEtPN/<0;1>/*,{and_v(v:pk(tpubD6NzVbkrYhZ4WSzr8iXBzE2xoeUnqZbFWcycoXrmVMfy6Lzr1pP7VrqBJywDtPFUMDbbUqwxcnn6MAtSTuD1wJ81Vsodoyin7gnWDoc14p4/<2;3>/*),pk(tpubD6NzVbkrYhZ4WUA6T9yh96mkjXYTX29vxkVz8dnaoE6kJDJEVGQveuFA2sFk8byGjhyKAxqna8tqoR8hhWLA4YWD6RsK3S3zorpZ29gTp4Z/<2;3>/*)),and_v(v:pk(tpubD6NzVbkrYhZ4WSzr8iXBzE2xoeUnqZbFWcycoXrmVMfy6Lzr1pP7VrqBJywDtPFUMDbbUqwxcnn6MAtSTuD1wJ81Vsodoyin7gnWDoc14p4/<0;1>/*),pk(tpubD6NzVbkrYhZ4WUA6T9yh96mkjXYTX29vxkVz8dnaoE6kJDJEVGQveuFA2sFk8byGjhyKAxqna8tqoR8hhWLA4YWD6RsK3S3zorpZ29gTp4Z/<0;1>/*))})#t5skcjc5",
+  "template": "tr(0250929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0,{and_v(v:pk(031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f@1),pk(02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337@1)),and_v(v:pk(031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f),pk(02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337))})#ul2kfa8x",
+  "template_id": "d1c98ffcbc81eada772d516f9a6a19e06c405a0bc1e8c0565d5d6e124ae7465e",
+  "slots": [
+    {
+      "base_key": "0250929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0",
+      "slot": 0,
+      "chain_code": "0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e",
+      "branches": [
+        [
+          0
+        ],
+        [
+          1
+        ]
+      ]
+    },
+    {
+      "base_key": "02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337",
+      "slot": 0,
+      "chain_code": "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
+      "branches": [
+        [
+          0
+        ],
+        [
+          1
+        ]
+      ]
+    },
+    {
+      "base_key": "02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337",
+      "slot": 1,
+      "chain_code": "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
+      "branches": [
+        [
+          2
+        ],
+        [
+          3
+        ]
+      ]
+    },
+    {
+      "base_key": "031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+      "slot": 0,
+      "chain_code": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "branches": [
+        [
+          0
+        ],
+        [
+          1
+        ]
+      ]
+    },
+    {
+      "base_key": "031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+      "slot": 1,
+      "chain_code": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "branches": [
+        [
+          2
+        ],
+        [
+          3
+        ]
+      ]
+    }
+  ],
+  "bundle": {
+    "keychain": 1,
+    "index": 305,
+    "entries": [
+      {
+        "base_key": "0250929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0",
+        "slot": 0,
+        "tweak_path": [
+          1,
+          305
+        ],
+        "tweak": "c63371bb6b9ba60663a860c8abece1759d02365f1b98b87709cba9aac991f8ff",
+        "psbt_keydata": "0250929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0"
+      },
+      {
+        "base_key": "02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337",
+        "slot": 0,
+        "tweak_path": [
+          1,
+          305
+        ],
+        "tweak": "3c36496a491d4b6f709740d38df85c92e19671f8d87dbcc8802fc3cbb66f4d9a",
+        "psbt_keydata": "02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337"
+      },
+      {
+        "base_key": "02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337",
+        "slot": 1,
+        "tweak_path": [
+          3,
+          305
+        ],
+        "tweak": "a2e554c27d6e7bb31a729566ebf712e4d302ee5725fed459f8160bf99880c5e1",
+        "psbt_keydata": "02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe33701"
+      },
+      {
+        "base_key": "031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+        "slot": 0,
+        "tweak_path": [
+          1,
+          305
+        ],
+        "tweak": "b942d054b05a42f447969ed7f8dddafb3c2c501c69be737fab5ddeea83b670cd",
+        "psbt_keydata": "031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f"
+      },
+      {
+        "base_key": "031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+        "slot": 1,
+        "tweak_path": [
+          3,
+          305
+        ],
+        "tweak": "d351d48b41d535ee6de33e5955f4df9671ff81a4cda5d62f9e8a6810246f39d6",
+        "psbt_keydata": "031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f01"
+      }
+    ],
+    "serialization": "0250929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0c63371bb6b9ba60663a860c8abece1759d02365f1b98b87709cba9aac991f8ff02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3373c36496a491d4b6f709740d38df85c92e19671f8d87dbcc8802fc3cbb66f4d9a02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337a2e554c27d6e7bb31a729566ebf712e4d302ee5725fed459f8160bf99880c5e1031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078fb942d054b05a42f447969ed7f8dddafb3c2c501c69be737fab5ddeea83b670cd031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078fd351d48b41d535ee6de33e5955f4df9671ff81a4cda5d62f9e8a6810246f39d6"
+  },
+  "roots": [
+    {
+      "keychain": 0,
+      "tree_start": 0,
+      "root": "96d0d3aa42125eb50d913dd5a988342531f59c27b6f25488a0efa33a95cfd1b3"
+    },
+    {
+      "keychain": 1,
+      "tree_start": 0,
+      "root": "0b03a77224bdbbac7f6c7d8691c838a1fe0b430e73f245cba608e586e833cb90"
+    }
+  ],
+  "proof": {
+    "keychain": 1,
+    "tree_start": 0,
+    "index": 5,
+    "bundle": "0250929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0eb246b73b90d866d3c9d039fccc8440e5d88d9006cbf19ef5102aa9a16c4184802531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337f8d5faa4d272a5ce3c8656b2621a824210091a4401881ab23ad38d95760e4c6b02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337cbb37f6adb05ad172b33c77d3d923719f900e1334dafb1dc536082de78768720031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f910ec65d3f773fd00e9a30b4f285e94ac85d9c49bfc4dab3ef99075b6d208545031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078fd733516799271518c1ac717cceb03a4681bea0ee4d50953cf627ad142435a8e8",
+    "proof": "8ff4850fb68818b7be3e2aff3feeccc70f5b40070fef8eb61e8c33493beeca49856dbda25e1a3eb92c641c8d77b4b4bf6594ebcc3f17e543790af6c141616106a701e3aae94952e82b3b901f6d60c4cacad3103bd846a2dff3e676d74652d636a55247b97b23b467902133e02aa201e3398cef5869b3eec901052ee07b81168835465c6333204cb88dbb354eb95401d196efff043e672849d911cad32fe6caf8b9176f3c5bd27298773f956edab16195d53e9fd4a3ba66a71ab77ad6ca6b72e969e5c373f295aad7ea97f4e4e554eeba00dd6ecdf44b9951ac3fbbe6c58f6a7209b9a08b2c9e02b14d701c360b6cb63199e0b853c56147aa8360dc252cfb7bb8c9125db0966ef04c72262a587bbbfda972178e1c694a109e5d4b076ef94be57b19"
+  },
+  "invalid_template_keys": [
+    "02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337@0",
+    "02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337@01",
+    "02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337@256"
+  ],
+  "invalid_psbt_keydata": [
+    "02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe33700",
+    "02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3370100"
+  ],
+  "invalid_descriptors": [
+    {
+      "description": "the delegator key with another chain code on its second path",
+      "descriptor": "tr(tpubD6NzVbkrYhZ4WUjicNhwiY99hU5HrkSGgpGAoBkVTAK8u9SvizRqERT9Ppf1U4htEmVZc5rLYFQnQ4yMK4R5RFoaU9WwM1LsP7GZnvwEtPN/<0;1>/*,{and_v(v:pk(tpubD6NzVbkrYhZ4WSzr8iXBzE2xoeUnqZbFWcycoXrmVMfy6Lzr1pP7VrqBJywDtPFUMDbbUqwxcnn6MAtSTuD1wJ81Vsodoyin7gnWDoc14p4/<2;3>/*),pk(tpubD6NzVbkrYhZ4WVKLmbSCHyWYfQc8CUicQt2MTjiQ76XXW5bcxiSjowf8kn6XB2TkpvvvUwkHfkQyXtfAgP9gXHGyvVsUFwYHtoKYKHfmceB/<2;3>/*)),and_v(v:pk(tpubD6NzVbkrYhZ4WSzr8iXBzE2xoeUnqZbFWcycoXrmVMfy6Lzr1pP7VrqBJywDtPFUMDbbUqwxcnn6MAtSTuD1wJ81Vsodoyin7gnWDoc14p4/<0;1>/*),pk(tpubD6NzVbkrYhZ4WUA6T9yh96mkjXYTX29vxkVz8dnaoE6kJDJEVGQveuFA2sFk8byGjhyKAxqna8tqoR8hhWLA4YWD6RsK3S3zorpZ29gTp4Z/<0;1>/*))})",
+      "error": "ConflictingChainCode",
+      "key": "02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337"
+    },
+    {
+      "description": "the delegator key on <0;1> and <1;2>, which share the branch 1",
+      "descriptor": "tr(tpubD6NzVbkrYhZ4WUjicNhwiY99hU5HrkSGgpGAoBkVTAK8u9SvizRqERT9Ppf1U4htEmVZc5rLYFQnQ4yMK4R5RFoaU9WwM1LsP7GZnvwEtPN/<0;1>/*,{and_v(v:pk(tpubD6NzVbkrYhZ4WSzr8iXBzE2xoeUnqZbFWcycoXrmVMfy6Lzr1pP7VrqBJywDtPFUMDbbUqwxcnn6MAtSTuD1wJ81Vsodoyin7gnWDoc14p4/<2;3>/*),pk(tpubD6NzVbkrYhZ4WUA6T9yh96mkjXYTX29vxkVz8dnaoE6kJDJEVGQveuFA2sFk8byGjhyKAxqna8tqoR8hhWLA4YWD6RsK3S3zorpZ29gTp4Z/<1;2>/*)),and_v(v:pk(tpubD6NzVbkrYhZ4WSzr8iXBzE2xoeUnqZbFWcycoXrmVMfy6Lzr1pP7VrqBJywDtPFUMDbbUqwxcnn6MAtSTuD1wJ81Vsodoyin7gnWDoc14p4/<0;1>/*),pk(tpubD6NzVbkrYhZ4WUA6T9yh96mkjXYTX29vxkVz8dnaoE6kJDJEVGQveuFA2sFk8byGjhyKAxqna8tqoR8hhWLA4YWD6RsK3S3zorpZ29gTp4Z/<0;1>/*))})",
+      "error": "OverlappingPaths",
+      "key": "02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337"
+    }
+  ]
+}

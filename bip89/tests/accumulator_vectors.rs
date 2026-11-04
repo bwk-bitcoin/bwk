@@ -4,6 +4,8 @@
 
 mod common;
 
+use std::str::FromStr;
+
 use bwk_bip89::{
     accumulator::{
         branch_hash, generate_tree, keys_digest, leaf_hash, leaf_nonce, policy_hash, policy_id,
@@ -18,17 +20,28 @@ use bwk_bip89::{
     },
     bundle::derive_bundle,
     rust_bitcoin::{
-        miniscript::bitcoin::hashes::{sha256, sha512, Hash, HashEngine, Hmac, HmacEngine},
-        RustBitcoin,
+        miniscript::{
+            bitcoin::{
+                hashes::{sha256, sha512, Hash, HashEngine, Hmac, HmacEngine},
+                secp256k1::{Secp256k1, SecretKey},
+            },
+            Descriptor as MsDescriptor, DescriptorPublicKey,
+        },
+        RustBitcoin, TemplateKey, TemplateKeyError, SUBTYPE_TWEAK,
     },
+    slot::slots,
     tweak::{compute_bip32_tweak, tweak_key},
-    BitcoinBackend, Bundle, Xpub,
+    BitcoinBackend, Bundle, Error, Xpub,
 };
-use common::{hex_arr, hex_vec, root_signature, wallet, OWNER1_SECRET};
+use common::{
+    field_key, hex_arr, hex_vec, root_signature, spend_psbt, tpub, two_slot_wallet, wallet, Wallet,
+    DELEGATOR_CHAIN_CODE, DELEGATOR_KEY, DELEGATOR_SECRET, OWNER1_SECRET,
+};
 
 const PRIMITIVES_JSON: &str = include_str!("../test_vectors/accumulator/primitives.json");
 const TREE_JSON: &str = include_str!("../test_vectors/accumulator/tree.json");
 const PROOF_JSON: &str = include_str!("../test_vectors/accumulator/proof.json");
+const SLOTS_JSON: &str = include_str!("../test_vectors/accumulator/slots.json");
 
 #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Primitives {
@@ -160,6 +173,69 @@ struct Negative {
     bundle: String,
     proof: String,
     expected: bool,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct SlotsVector {
+    descriptor: String,
+    template: String,
+    template_id: String,
+    slots: Vec<SlotRecord>,
+    bundle: SlotBundleCase,
+    roots: Vec<RootCase>,
+    proof: SlotProofCase,
+    invalid_template_keys: Vec<String>,
+    invalid_psbt_keydata: Vec<String>,
+    invalid_descriptors: Vec<InvalidDescriptor>,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct InvalidDescriptor {
+    description: String,
+    descriptor: String,
+    error: String,
+    key: String,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct SlotRecord {
+    base_key: String,
+    slot: u8,
+    chain_code: String,
+    branches: [Vec<u32>; 2],
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct SlotBundleCase {
+    keychain: u32,
+    index: u32,
+    entries: Vec<SlotBundleEntry>,
+    serialization: String,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct SlotBundleEntry {
+    base_key: String,
+    slot: u8,
+    tweak_path: Vec<u32>,
+    tweak: String,
+    psbt_keydata: String,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct RootCase {
+    keychain: u32,
+    tree_start: u32,
+    root: String,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct SlotProofCase {
+    keychain: u32,
+    tree_start: u32,
+    index: u32,
+    bundle: String,
+    proof: String,
 }
 
 fn xpub_record(x: &Xpub) -> XpubRecord {
@@ -517,6 +593,165 @@ fn proof() -> ProofVector {
     }
 }
 
+/// The PSBT tweak field keydata `set_output_bundle` writes for `bundle`. The
+/// proprietary map sorts it as the bundle sorts its entries, `P` before
+/// `P || 01`.
+fn psbt_keydata(c: &RustBitcoin, w: &Wallet, bundle: &Bundle) -> Vec<Vec<u8>> {
+    let mut psbt = spend_psbt(w);
+    c.set_output_bundle(&mut psbt, 1, bundle).unwrap();
+    psbt.outputs[1]
+        .proprietary
+        .keys()
+        .map(|key| key.key.clone())
+        .collect()
+}
+
+/// `two_slot_wallet`'s descriptor without its checksum, with the delegator's
+/// `<2;3>` expression replaced by `replacement`.
+fn altered_descriptor(c: &RustBitcoin, w: &Wallet, replacement: &str) -> String {
+    let delegator = tpub_of_delegator();
+    let policy = String::from_utf8(c.descriptor_policy(&w.descriptor)).unwrap();
+    let (policy, _checksum) = policy.split_once('#').unwrap();
+    policy.replacen(&format!("{delegator}/<2;3>/*"), replacement, 1)
+}
+
+/// The variant name and key of a descriptor refusal that names a key.
+fn refusal(error: Error) -> (String, [u8; 33]) {
+    match error {
+        Error::ConflictingChainCode(key) => ("ConflictingChainCode".to_string(), key),
+        Error::OverlappingPaths(key) => ("OverlappingPaths".to_string(), key),
+        Error::TooManySlots(key) => ("TooManySlots".to_string(), key),
+        other => panic!("{other:?} names no key"),
+    }
+}
+
+fn slots_vector() -> SlotsVector {
+    let c = RustBitcoin::new();
+    let w = two_slot_wallet();
+    let d = &w.descriptor;
+
+    let template_bytes = c.descriptor_template(d).unwrap();
+    let descriptor_slots = slots(c.descriptor_xpubs(d).unwrap()).unwrap();
+    let slot_records = descriptor_slots
+        .iter()
+        .map(|slot| SlotRecord {
+            base_key: hex::encode(slot.xpub.key),
+            slot: slot.number,
+            chain_code: hex::encode(slot.xpub.chain_code),
+            branches: slot.xpub.branches.clone(),
+        })
+        .collect();
+
+    let (keychain, index) = (1u32, 305u32);
+    let bundle = derive_bundle(&c, d, keychain, index).unwrap();
+    let keydata = psbt_keydata(&c, &w, &bundle);
+    let mut entries = Vec::with_capacity(descriptor_slots.len());
+    for (slot, keydata) in descriptor_slots.iter().zip(keydata) {
+        let xpub = &slot.xpub;
+        let mut tweak_path = xpub.branches[keychain as usize].clone();
+        tweak_path.push(index);
+        let derived = compute_bip32_tweak(&c, &xpub.key, &xpub.chain_code, &tweak_path).unwrap();
+        entries.push(SlotBundleEntry {
+            base_key: hex::encode(xpub.key),
+            slot: slot.number,
+            tweak_path,
+            tweak: hex::encode(derived.tweak),
+            psbt_keydata: hex::encode(keydata),
+        });
+    }
+    let bundle = SlotBundleCase {
+        keychain,
+        index,
+        entries,
+        serialization: hex::encode(bundle.to_bytes()),
+    };
+
+    let roots = [0u32, 1]
+        .into_iter()
+        .map(|keychain| RootCase {
+            keychain,
+            tree_start: 0,
+            root: hex::encode(build_tree(&c, d, keychain, 0).unwrap().root),
+        })
+        .collect();
+
+    let (keychain, tree_start, index) = (1u32, 0u32, 5u32);
+    let proof = build_tree(&c, d, keychain, tree_start)
+        .unwrap()
+        .proof(keychain, index)
+        .unwrap();
+    let proof = SlotProofCase {
+        keychain,
+        tree_start,
+        index,
+        bundle: hex::encode(derive_bundle(&c, d, keychain, index).unwrap().to_bytes()),
+        proof: hex::encode(proof.to_bytes()),
+    };
+
+    let delegator: [u8; 33] = hex_arr(DELEGATOR_KEY);
+    let invalid_template_keys = ["@0", "@01", "@256"]
+        .iter()
+        .map(|suffix| format!("{DELEGATOR_KEY}{suffix}"))
+        .collect();
+    let invalid_psbt_keydata = [vec![0x00], vec![0x01, 0x00]]
+        .iter()
+        .map(|suffix| hex::encode([&delegator[..], suffix].concat()))
+        .collect();
+
+    let other_chain_code = tpub(
+        SecretKey::from_slice(&DELEGATOR_SECRET)
+            .unwrap()
+            .public_key(&Secp256k1::new()),
+        [0x0f; 32],
+    );
+    let invalid_descriptors = [
+        (
+            "the delegator key with another chain code on its second path",
+            altered_descriptor(&c, &w, &format!("{other_chain_code}/<2;3>/*")),
+        ),
+        (
+            "the delegator key on <0;1> and <1;2>, which share the branch 1",
+            altered_descriptor(&c, &w, &format!("{}/<1;2>/*", tpub_of_delegator())),
+        ),
+    ]
+    .into_iter()
+    .map(|(description, descriptor)| {
+        let parsed = MsDescriptor::<DescriptorPublicKey>::from_str(&descriptor).unwrap();
+        let (error, key) = refusal(c.descriptor_xpubs(&parsed).unwrap_err());
+        InvalidDescriptor {
+            description: description.to_string(),
+            descriptor,
+            error,
+            key: hex::encode(key),
+        }
+    })
+    .collect();
+
+    SlotsVector {
+        descriptor: String::from_utf8(c.descriptor_policy(d)).unwrap(),
+        template: String::from_utf8(template_bytes.clone()).unwrap(),
+        template_id: hex::encode(template_id(&c, &template_bytes)),
+        slots: slot_records,
+        bundle,
+        roots,
+        proof,
+        invalid_template_keys,
+        invalid_psbt_keydata,
+        invalid_descriptors,
+    }
+}
+
+/// The delegator's extended public key in the test wallets.
+fn tpub_of_delegator() -> String {
+    tpub(
+        SecretKey::from_slice(&DELEGATOR_SECRET)
+            .unwrap()
+            .public_key(&Secp256k1::new()),
+        DELEGATOR_CHAIN_CODE,
+    )
+    .to_string()
+}
+
 #[test]
 #[ignore]
 fn regenerate_vectors() {
@@ -528,6 +763,9 @@ fn regenerate_vectors() {
 
     let out = serde_json::to_string_pretty(&proof()).unwrap();
     std::fs::write("test_vectors/accumulator/proof.json", out + "\n").unwrap();
+
+    let out = serde_json::to_string_pretty(&slots_vector()).unwrap();
+    std::fs::write("test_vectors/accumulator/slots.json", out + "\n").unwrap();
 }
 
 #[test]
@@ -719,5 +957,95 @@ fn vectors_proof() {
         let bundle = Bundle::from_bytes(&hex_vec(&negative.bundle)).unwrap();
         let proof = Proof::from_bytes(&hex_vec(&negative.proof)).unwrap();
         assert!(!verify_proof(&c, &bundle, &proof, &root));
+    }
+}
+
+#[test]
+fn vectors_slots() {
+    let vectors: SlotsVector = serde_json::from_str(SLOTS_JSON).unwrap();
+    assert_eq!(vectors, slots_vector());
+
+    let c = RustBitcoin::new();
+    let template_digest = sha256::Hash::hash(vectors.template.as_bytes()).to_byte_array();
+    assert_eq!(hex::encode(template_digest), vectors.template_id);
+
+    let reused: Vec<&SlotRecord> = vectors.slots.iter().filter(|s| s.slot == 1).collect();
+    assert_eq!(reused.len(), 2);
+    for slot in reused {
+        assert!(vectors.template.contains(&format!("{}@1", slot.base_key)));
+        assert!(vectors.slots.iter().any(|s| s.base_key == slot.base_key
+            && s.slot == 0
+            && s.chain_code == slot.chain_code));
+    }
+
+    let bundle_case = &vectors.bundle;
+    let mut concatenated = String::new();
+    for (entry, slot) in bundle_case.entries.iter().zip(&vectors.slots) {
+        assert_eq!((&entry.base_key, entry.slot), (&slot.base_key, slot.slot));
+        let mut tweak_path = slot.branches[bundle_case.keychain as usize].clone();
+        tweak_path.push(bundle_case.index);
+        assert_eq!(entry.tweak_path, tweak_path);
+        let key: [u8; 33] = hex_arr(&entry.base_key);
+        let chain_code: [u8; 32] = hex_arr(&slot.chain_code);
+        let derived = compute_bip32_tweak(&c, &key, &chain_code, &tweak_path).unwrap();
+        assert_eq!(hex::encode(derived.tweak), entry.tweak);
+        let keydata = hex_vec(&entry.psbt_keydata);
+        match entry.slot {
+            0 => assert_eq!(keydata, key),
+            slot => assert_eq!(keydata, [&key[..], &[slot]].concat()),
+        }
+        concatenated.push_str(&entry.base_key);
+        concatenated.push_str(&entry.tweak);
+    }
+    assert_eq!(concatenated, bundle_case.serialization);
+    let bundle = Bundle::from_bytes(&hex_vec(&bundle_case.serialization)).unwrap();
+    let mut psbt = spend_psbt(&two_slot_wallet());
+    for entry in &bundle_case.entries {
+        psbt.outputs[1].proprietary.insert(
+            field_key(SUBTYPE_TWEAK, hex_vec(&entry.psbt_keydata)),
+            hex_vec(&entry.tweak),
+        );
+    }
+    assert_eq!(c.output_bundle(&psbt, 1), Ok(Some(bundle.clone())));
+    let decoded: Vec<(String, u8)> = bundle
+        .entries()
+        .iter()
+        .map(|e| (hex::encode(e.slot.key), e.slot.number))
+        .collect();
+    let expected: Vec<(String, u8)> = bundle_case
+        .entries
+        .iter()
+        .map(|e| (e.base_key.clone(), e.slot))
+        .collect();
+    assert_eq!(decoded, expected);
+
+    let proof_case = &vectors.proof;
+    let root = vectors
+        .roots
+        .iter()
+        .find(|r| r.keychain == proof_case.keychain && r.tree_start == proof_case.tree_start)
+        .unwrap();
+    let bundle = Bundle::from_bytes(&hex_vec(&proof_case.bundle)).unwrap();
+    let proof = Proof::from_bytes(&hex_vec(&proof_case.proof)).unwrap();
+    assert!(verify_proof(&c, &bundle, &proof, &hex_arr(&root.root)));
+
+    for key in &vectors.invalid_template_keys {
+        assert_eq!(TemplateKey::from_str(key), Err(TemplateKeyError::Slot));
+    }
+    for keydata in &vectors.invalid_psbt_keydata {
+        let mut psbt = spend_psbt(&two_slot_wallet());
+        psbt.outputs[1]
+            .proprietary
+            .insert(field_key(SUBTYPE_TWEAK, hex_vec(keydata)), vec![0x01; 32]);
+        assert_eq!(c.output_bundle(&psbt, 1), Err(Error::EntryLength));
+    }
+    assert_eq!(vectors.invalid_descriptors.len(), 2);
+    for case in &vectors.invalid_descriptors {
+        let d = MsDescriptor::<DescriptorPublicKey>::from_str(&case.descriptor).unwrap();
+        let (error, key) = refusal(c.descriptor_xpubs(&d).unwrap_err());
+        assert_eq!(
+            (error, hex::encode(key)),
+            (case.error.clone(), case.key.clone())
+        );
     }
 }

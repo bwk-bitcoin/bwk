@@ -128,14 +128,39 @@ keychain and an index is:
 tweak_path(keychain, index) = (fixed_1, ..., fixed_k, element(keychain), index)
 ```
 
-If the same base key appears in more than one key expression, every such
-expression MUST carry the same chain code and the same fixed steps and
-multipath elements. Otherwise the descriptor is invalid.
+The **branch pair** of a key expression is its two branch paths, the tweak
+paths of keychain `0` and `1` without the index:
+
+```
+branches = ((fixed_1, ..., fixed_k, a), (fixed_1, ..., fixed_k, b))
+```
+
+A **slot** is a distinct pair of a base key and a branch pair: key
+expressions with the same base key, chain code and branch pair are one slot,
+whatever their key origin. A base key used on one branch pair has one slot;
+a base key used on several branch pairs, for example `/<0;1>/*` and
+`/<2;3>/*`, has one slot per branch pair. The slots of a base key are numbered
+from `0` in ascending order of their branch pairs, comparing the keychain `0`
+branch paths first, element by element as unsigned integers, a path that is a
+prefix of another first, then the keychain `1` branch paths. A slot is written
+`(P, N)` for slot number `N` of base key `P`.
+
+The descriptor is invalid if:
+
+1. Two key expressions with the same base key carry different chain codes.
+2. Two slots of the same base key share a branch path, so they would derive
+   the same keys (for example `/<0;1>/*` and `/<1;2>/*`).
+3. A base key has more than 256 slots.
 
 The **template** `D` is the descriptor with every key expression replaced by
-its base key, as used by BIP89 verification. `template_bytes` is the canonical
-string serialization of `D`, encoded as UTF-8 with no added whitespace or
-trailing newline.
+its template key: the base key `P` written as its compressed hex encoding for
+slot `0`, and as `P@N` for slot `N` above `0`, with `N` in decimal, from `1` to
+`255` and with no leading zero. The template carries the slot number and never
+the branch pair. BIP89 verification substitutes the tweaked key of slot `(P,
+N)` for template key `P@N`. `template_bytes` is the canonical string
+serialization of `D`, encoded as UTF-8 with no added whitespace or trailing
+newline. A descriptor whose base keys each have one slot gives the template
+over base keys alone.
 
 ```
 template_id = sha256(template_bytes)
@@ -143,26 +168,32 @@ template_id = sha256(template_bytes)
 
 ### Delegation bundle
 
-For a keychain and an index below 2^31, the bundle holds one entry per
-distinct base key of the descriptor:
+For a keychain and an index below 2^31, the bundle holds one entry per slot of
+the descriptor:
 
 ```
 t_i = ComputeBIP32Tweak(xpub_i, tweak_path_i(keychain, index)).t
-bundle(keychain, index) = [(P_i, t_i) for every distinct base key P_i]
+bundle(keychain, index) = [(P_i, N_i, t_i) for every slot (P_i, N_i)]
 ```
 
-`ComputeBIP32Tweak` is the algorithm of BIP89.
+`ComputeBIP32Tweak` is the algorithm of BIP89, and `tweak_path_i` is the tweak
+path of the key expressions of slot `(P_i, N_i)`. A base key with one slot has
+one entry, as in BIP89; a base key with several slots has one entry per slot,
+each with its own tweak.
 
-A bundle is serialized with entries sorted in strictly ascending byte order of
-`P_i`:
+A bundle is serialized with entries sorted in ascending byte order of `P_i`,
+and the entries of one base key in ascending order of slot number:
 
 ```
 ser(bundle) = concat_all(P_i || bytes(32, t_i))
 ```
 
-Each entry is 65 bytes. There is no count prefix. A bundle MUST contain
-exactly one entry for each distinct base key of the template and no other
-entry. An entry whose tweak is not below the curve order is invalid.
+Each entry is 65 bytes. There is no count prefix and no slot number: the
+entries of one base key are its slots `0`, `1`, `2`, ... in order, so a base key
+repeated in a serialized bundle is its next slot. A bundle MUST contain exactly
+one entry for each slot of the template and no other entry. An entry whose
+tweak is not below the curve order is invalid, and so is a base key appearing
+more than 256 times.
 
 ### Nonce derivation
 
@@ -190,7 +221,8 @@ descriptor, with extended public keys, encoded as UTF-8 with no added
 whitespace or trailing newline. `chain_code` and `public_key` are the 32-byte
 chain code and 33-byte compressed public key of each extended public key in
 the descriptor. `sort` orders the 65-byte records in ascending byte order and
-`dedup` removes records identical to their predecessor.
+`dedup` removes records identical to their predecessor, so the slots of one
+base key give one record.
 
 Nonce derivation is sequential inside a tree. Each leaf consumes the current
 chaincode and produces the next chaincode and that leaf's nonce by splitting
@@ -287,9 +319,9 @@ The following requirements each apply to every implementation:
 A root that is signed is signed by one key of the descriptor, with a BIP322
 simple signature for the single-key taproot address of that key's branch key.
 
-For a key expression whose extended public key `xpub` has base key `P` and
-chain code `c`, with secret key `p` for `P`, the branch path, branch tweak and
-branch key of a keychain are:
+For the key expressions of slot `0` of base key `P`, whose extended public key
+`xpub` has chain code `c`, with secret key `p` for `P`, the branch path, branch
+tweak and branch key of a keychain are:
 
 ```
 branch_path(keychain) = (fixed_1, ..., fixed_k, element(keychain))
@@ -477,9 +509,9 @@ Bundles and membership proofs travel in proprietary PSBT fields (BIP174 type
 `0xFC`) with the identifier `BIPXXX`:
 
 ```
-PSBT_IN_PROPRIETARY  | "BIPXXX" | 0x00 | base_key (33)  ->  tweak (32)
-PSBT_OUT_PROPRIETARY | "BIPXXX" | 0x00 | base_key (33)  ->  tweak (32)
-PSBT_OUT_PROPRIETARY | "BIPXXX" | 0x01                  ->  proof (289)
+PSBT_IN_PROPRIETARY  | "BIPXXX" | 0x00 | slot (33 or 34)  ->  tweak (32)
+PSBT_OUT_PROPRIETARY | "BIPXXX" | 0x00 | slot (33 or 34)  ->  tweak (32)
+PSBT_OUT_PROPRIETARY | "BIPXXX" | 0x01                    ->  proof (289)
 ```
 
 The key of a proprietary field is
@@ -487,8 +519,10 @@ The key of a proprietary field is
 
 - Subtype `0x00` holds one bundle entry. The entries of all subtype `0x00`
   fields in one map form the bundle of that input or output. The keydata is
-  the 33-byte base key and the value is the 32-byte big-endian tweak. Any
-  other length is invalid.
+  the slot of the entry: the 33-byte base key `P` for slot `0`, and `P ||
+  byte(N)`, 34 bytes, for slot `N` above `0`. The value is the 32-byte
+  big-endian tweak. Any other length is invalid, and so is a 34-byte keydata
+  whose last byte is `0`, so each slot has one keydata.
 - Subtype `0x01` holds the membership proof of an output, the 289-byte proof.
   Its keydata is empty. An output map MUST NOT hold more than one such field.
 
@@ -516,11 +550,37 @@ of different indexes for different participants, strands the output as surely
 as a fully forged bundle. The leaf therefore binds the whole bundle, and a
 bundle with a missing or extra entry has no leaf.
 
-**Strictly sorted, fixed-width bundle.** A bundle has exactly one encoding.
-Two encodings of one bundle would give two leaves, so a genuine bundle could
-fail to verify, and ambiguity in the encoding could let different bundles
-share a leaf. Entries are fixed width and the nonce is a fixed-size suffix, so
-no length prefix is needed.
+**One entry per slot.** A wallet may use one key on several derivation paths,
+for example a key that signs alone after a timelock on `/<2;3>/*` and with a
+cosigner on `/<0;1>/*`. Each path derives other keys, so the bundle carries a
+tweak per path and the template has to tell which tweak goes where. A base key
+alone cannot: `B/<0;1>/*` and `B/<2;3>/*` would get the same tweak. A wallet
+whose keys each have one path keeps exactly the BIP89 bundle, template and
+PSBT fields.
+
+**The template carries a slot number, not a path.** The template carries no
+derivation step, so the delegator learns that a key is used on several paths,
+and nothing of the paths themselves. The number only needs to tell the slots
+of a key apart, and numbering them in path order makes it a function of the
+descriptor, so every party derives the same template. The `P@N` form is the
+shortest that keeps the template a descriptor string: `@` belongs to the
+descriptor checksum character set, so the checksum covers the slot, and it
+appears in no key expression or miniscript fragment, so a parser reads `P@N` as
+one key and splits it at the only `@`. Slot `0` has no suffix and `N` has no
+leading zero, so each template has one spelling and one `template_id`, and a
+template whose keys each have one slot is unchanged.
+
+**Overlapping paths are refused.** Two slots of one base key sharing a branch
+path derive the same keys on two keychains, or twice on one, so an address
+would belong to two slots and a tweak to two places in the template.
+
+**Sorted, fixed-width bundle.** A bundle has exactly one encoding. Two
+encodings of one bundle would give two leaves, so a genuine bundle could fail
+to verify, and ambiguity in the encoding could let different bundles share a
+leaf. Entries are sorted by base key then slot number, and the slot number of
+an entry is its rank among the entries of its base key, so it needs no byte of
+its own and cannot be spelled two ways. Entries are fixed width and the nonce
+is a fixed-size suffix, so no length prefix is needed.
 
 **Construction reused unchanged.** The blinded address accumulator was designed
 for a signing device to build and for a constrained verifier to check. Both
@@ -530,8 +590,8 @@ proof with one running node and one sibling at a time.
 
 **Blinding still protects against the delegator.** Nonces and the shuffle key
 derive from `descriptor_bytes` and the chain codes. The delegator holds only
-the template over base keys, never the descriptor or a chain code, so it cannot
-compute a nonce or a shuffle order. A sibling is a hash of a bundle it has not
+the template over template keys, never the descriptor or a chain code, so it
+cannot compute a nonce or a shuffle order. A sibling is a hash of a bundle it has not
 seen and a nonce it cannot compute, so it reveals nothing about that bundle.
 The tweaks themselves are pseudorandom outputs of the chain code, so a bundle
 the delegator has not been shown cannot be guessed.
@@ -626,6 +686,11 @@ This proposal introduces no changes to consensus rules, transaction structure,
 or on-chain data. Bundles and membership proofs travel in PSBT proprietary
 fields that are stripped at finalization. BIP89 signing is unchanged.
 
+A descriptor whose base keys each have one slot has the BIP89 template, bundle
+and PSBT fields. Only a descriptor that uses a base key on several paths gets
+template keys `P@N`, repeated base keys in its bundles and 34-byte keydata,
+which software that does not implement slots refuses.
+
 A delegator that implements this proposal refuses owned outputs without a
 membership proof, so its coordinators and signing key holders MUST implement it
 before the delegator enables it. Software that does not implement this proposal
@@ -634,9 +699,11 @@ ignores the unknown proprietary fields.
 ## Reference Implementation
 
 The reference implementation is the `bwk-bip89` crate of this repository.
-Hash primitives and tree generation are in `accumulator/mod.rs`. The
-shuffle order is in `accumulator/shuffle.rs`. Proofs and the tree builders
-are in `accumulator/tree.rs`. Root records, their signature and the root policy
+Slots are in `slot.rs` and the bundle in `bundle.rs`; the template keys are
+`TemplateKey` in `rust_bitcoin/descriptor.rs`. Hash primitives and tree
+generation are in `accumulator/mod.rs`. The shuffle order is in
+`accumulator/shuffle.rs`. Proofs and the tree builders are in
+`accumulator/tree.rs`. Root records, their signature and the root policy
 are in `accumulator/record.rs`. Registration and verification on the delegator
 side are in `delegator.rs`. BIP322 signing and verification are in
 `rust_bitcoin/mod.rs`, and the PSBT fields are in `rust_bitcoin/psbt.rs`.
@@ -651,7 +718,7 @@ cargo test -p bwk-bip89 --test accumulator_vectors regenerate_vectors -- --ignor
 
 ## Test Vectors
 
-The reference implementation generates three files under
+The reference implementation generates four files under
 `test_vectors/accumulator/`:
 
 ```
@@ -664,6 +731,9 @@ The reference implementation generates three files under
 |                 | signature.                                                |
 | proof.json      | One 289-byte proof with its trace, and four negative      |
 |                 | vectors.                                                  |
+| slots.json      | Two keys each on two paths: slots, template, template id, |
+|                 | bundle with PSBT keydata, roots and one proof, and        |
+|                 | refused template keys, keydata and descriptors.           |
 +-----------------+-----------------------------------------------------------+
 ```
 
@@ -690,12 +760,24 @@ Each bullet of the minimum coverage below maps to a field of these files:
   altered, one because a sibling is altered, one because the position is
   altered, and one because the nonce is altered: `proof.json`, field
   `negatives`, in that order.
+- A descriptor with base keys on two paths, `/<0;1>/*` and `/<2;3>/*`: its
+  slots with their numbers and branch pairs, the template with `P@1` keys and
+  its id, a bundle with one entry per slot, its tweak paths and the PSBT
+  keydata of each entry, the receive and change roots and a proof that
+  verifies against one: `slots.json`, fields `slots`, `template`,
+  `template_id`, `bundle`, `roots` and `proof`.
+- Refused slot encodings and descriptors: template keys `P@0`, `P@01` and
+  `P@256`, PSBT keydata `P || 00` and `P || 01 00`, a base key with a second
+  chain code and a base key on two paths sharing a branch, each with the
+  refusal and the base key it names: `slots.json`, fields
+  `invalid_template_keys`, `invalid_psbt_keydata` and `invalid_descriptors`.
 
 Byte strings in every vector file are lowercase hex. The tags are the
 literal `BIPXXX` placeholder used throughout this document, so every
 vector MUST be regenerated once the BIP number is assigned. The wallet
-descriptor, template and signer secret key used across all three files are
-the ones recorded in `primitives.json` and `tree.json`.
+descriptor, template and signer secret key used across the first three files
+are the ones recorded in `primitives.json` and `tree.json`; `slots.json`
+records its own descriptor.
 
 ## Open Items
 
@@ -707,8 +789,9 @@ for them; interoperable deployments require they be settled first.
 
 - **Canonical descriptor and template strings.** `descriptor_bytes` and
   `template_bytes` require one canonical string form: hardened step marker,
-  checksum, key origin, and key encoding. Two implementations that disagree
-  produce different trees and a different template id, with no error.
+  checksum, key origin, key encoding, and the `@N` slot suffix of a template
+  key. Two implementations that disagree produce different trees and a
+  different template id, with no error.
 
 - **Test vectors.** As above, MUST be generated from the reference
   implementation.
