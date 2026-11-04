@@ -1,7 +1,7 @@
 mod common;
 
 use bwk_bip89::{bundle::derive_bundle, tweak::compute_bip32_tweak, Error, Xpub};
-use common::{hex_arr, SliceDescriptor, VectorBackend};
+use common::{hex_arr, slot0, SliceDescriptor, VectorBackend};
 
 fn xpub0() -> Xpub {
     Xpub {
@@ -45,7 +45,7 @@ fn derive_bundle_matches_compute_bip32_tweak() {
                 let expected = compute_bip32_tweak(&c, &xpub.key, &xpub.chain_code, &path)
                     .unwrap()
                     .tweak;
-                assert_eq!(bundle.tweak(&xpub.key), Some(expected));
+                assert_eq!(bundle.tweak(&slot0(xpub.key)), Some(expected));
             }
         }
     }
@@ -58,7 +58,7 @@ fn derive_bundle_literal_tweak() {
     let bundle = derive_bundle(&c, &desc, 0, 1).unwrap();
     let expected: [u8; 32] =
         hex_arr("d81d8e239630639ac24f3976257d9e4d905272b3da3a6507841c1ec80b04b91b");
-    assert_eq!(bundle.tweak(&xpub0().key), Some(expected));
+    assert_eq!(bundle.tweak(&slot0(xpub0().key)), Some(expected));
 }
 
 #[test]
@@ -79,8 +79,26 @@ fn derive_bundle_rejects_hardened_index() {
 }
 
 #[test]
-fn derive_bundle_rejects_duplicate_xpub_key() {
+fn derive_bundle_counts_a_repeated_xpub_once() {
     let c = VectorBackend::default();
-    let desc = SliceDescriptor(vec![xpub0(), xpub0()]);
-    assert_eq!(derive_bundle(&c, &desc, 0, 0), Err(Error::DuplicateKey));
+    let repeated = SliceDescriptor(vec![xpub0(), xpub0()]);
+    let single = SliceDescriptor(vec![xpub0()]);
+    assert_eq!(
+        derive_bundle(&c, &repeated, 0, 0),
+        derive_bundle(&c, &single, 0, 0)
+    );
+}
+
+#[test]
+fn derive_bundle_rejects_a_second_chain_code() {
+    let c = VectorBackend::default();
+    let other = Xpub {
+        chain_code: [0x0f; 32],
+        ..xpub0()
+    };
+    let desc = SliceDescriptor(vec![xpub0(), other]);
+    assert_eq!(
+        derive_bundle(&c, &desc, 0, 0),
+        Err(Error::ConflictingChainCode(xpub0().key))
+    );
 }

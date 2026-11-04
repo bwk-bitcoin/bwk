@@ -64,39 +64,39 @@ fn honest() -> Setup {
     }
 }
 
-/// A bundle with the three lowest sorted base keys tweaked to attacker-chosen
+/// A bundle with the three lowest sorted slots tweaked to attacker-chosen
 /// scalars, and the highest keeping the genuine (1, 3) tweak, plus the script
 /// it forges. Never the output of `ComputeBIP32Tweak` for any index.
 fn forged_change(c: &RustBitcoin, w: &Wallet) -> (Bundle, Vec<u8>) {
     let template = &w.template;
-    let base = c.template_base_keys(template);
+    let slots = c.template_slots(template);
     let genuine = derive_bundle(c, &w.descriptor, 1, 3).unwrap();
 
     let entries = vec![
         Entry {
-            key: base[0],
+            slot: slots[0],
             tweak: [0x41; 32],
         },
         Entry {
-            key: base[1],
+            slot: slots[1],
             tweak: [0x42; 32],
         },
         Entry {
-            key: base[2],
+            slot: slots[2],
             tweak: [0x43; 32],
         },
         Entry {
-            key: base[3],
-            tweak: genuine.tweak(&base[3]).unwrap(),
+            slot: slots[3],
+            tweak: genuine.tweak(&slots[3]).unwrap(),
         },
     ];
     let forged = Bundle::new(entries).unwrap();
     let forged_script = c
-        .template_script_pubkey(template, &tweaked_keys(c, &base, &forged).unwrap())
+        .template_script_pubkey(template, &tweaked_keys(c, &slots, &forged).unwrap())
         .unwrap();
 
     let genuine_script = c
-        .template_script_pubkey(template, &tweaked_keys(c, &base, &genuine).unwrap())
+        .template_script_pubkey(template, &tweaked_keys(c, &slots, &genuine).unwrap())
         .unwrap();
     assert_ne!(forged_script, genuine_script);
 
@@ -190,10 +190,10 @@ fn forged_change_with_self_made_tree_is_refused() {
 fn genuine_bundle_of_other_index_is_accepted_and_recoverable() {
     let mut s = honest();
     let template = &s.w.template;
-    let base = s.c.template_base_keys(template);
+    let slots = s.c.template_slots(template);
     let bundle = derive_bundle(&s.c, &s.w.descriptor, 1, 7).unwrap();
     let script =
-        s.c.template_script_pubkey(template, &tweaked_keys(&s.c, &base, &bundle).unwrap())
+        s.c.template_script_pubkey(template, &tweaked_keys(&s.c, &slots, &bundle).unwrap())
             .unwrap();
     install(&s.c, &mut s.psbt, 1, script, &bundle);
 
@@ -209,7 +209,7 @@ fn genuine_bundle_of_other_index_is_accepted_and_recoverable() {
             let candidate = derive_bundle(&s.c, &s.w.descriptor, keychain, index).unwrap();
             let candidate_script = s
                 .c
-                .template_script_pubkey(template, &tweaked_keys(&s.c, &base, &candidate).unwrap())
+                .template_script_pubkey(template, &tweaked_keys(&s.c, &slots, &candidate).unwrap())
                 .unwrap();
             if ScriptBuf::from_bytes(candidate_script) == target {
                 found = Some((keychain, index));

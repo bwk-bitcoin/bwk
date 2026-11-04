@@ -7,24 +7,23 @@
 
 use alloc::vec::Vec;
 
-use crate::{backend::BitcoinBackend, bundle::Bundle, tweak::tweak_key, Error};
+use crate::{backend::BitcoinBackend, bundle::Bundle, slot::Slot, tweak::tweak_key, Error};
 
-/// Substitutes each base key of `base_keys` with its tweaked key from
-/// `bundle`. A base key with no entry in `bundle` is `MissingTweak`; a bundle
-/// entry whose key is not in `base_keys` is `ExtraTweak`. The result is
-/// sorted by base key, following `base_keys`.
-#[allow(clippy::type_complexity)]
+/// Substitutes each slot of `slots` with its base key tweaked by the slot's
+/// tweak from `bundle`. A slot with no entry in `bundle` is `MissingTweak`; a
+/// bundle entry whose slot is not in `slots` is `ExtraTweak`. The result is
+/// sorted by slot, following `slots`.
 pub fn tweaked_keys<B: BitcoinBackend>(
     c: &B,
-    base_keys: &[[u8; 33]],
+    slots: &[Slot],
     bundle: &Bundle,
-) -> Result<Vec<([u8; 33], [u8; 33])>, Error> {
-    let mut out = Vec::with_capacity(base_keys.len());
-    for key in base_keys {
-        let tweak = bundle.tweak(key).ok_or(Error::MissingTweak)?;
-        out.push((*key, tweak_key(c, key, &tweak)?));
+) -> Result<Vec<(Slot, [u8; 33])>, Error> {
+    let mut out = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let tweak = bundle.tweak(slot).ok_or(Error::MissingTweak)?;
+        out.push((*slot, tweak_key(c, &slot.key, &tweak)?));
     }
-    if bundle.entries().len() != base_keys.len() {
+    if bundle.entries().len() != slots.len() {
         return Err(Error::ExtraTweak);
     }
     Ok(out)
@@ -36,7 +35,7 @@ fn verify<B: BitcoinBackend>(
     script: &[u8],
     bundle: &Bundle,
 ) -> Result<bool, Error> {
-    let tweaked = tweaked_keys(c, &c.template_base_keys(template), bundle)?;
+    let tweaked = tweaked_keys(c, &c.template_slots(template), bundle)?;
     Ok(c.template_script_pubkey(template, &tweaked)? == script)
 }
 

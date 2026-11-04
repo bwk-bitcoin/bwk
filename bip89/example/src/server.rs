@@ -10,13 +10,12 @@ use bwk_bip89::{
     rust_bitcoin::{
         miniscript::{
             bitcoin::{
-                self,
                 psbt::{self, Psbt},
                 secp256k1::{Keypair, Secp256k1},
             },
             Descriptor,
         },
-        RustBitcoin,
+        RustBitcoin, TemplateKey,
     },
     Error,
 };
@@ -75,7 +74,7 @@ impl SigningServer {
     pub fn register(
         &mut self,
         account: u64,
-        template: Descriptor<bitcoin::PublicKey>,
+        template: Descriptor<TemplateKey>,
         policy: RootPolicy,
         receive: &RootRecord,
         change: &RootRecord,

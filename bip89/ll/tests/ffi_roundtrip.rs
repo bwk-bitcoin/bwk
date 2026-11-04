@@ -17,13 +17,15 @@ use bwk_bip89::{
     delegator,
     rust_bitcoin::{
         miniscript::{
-            bitcoin::{self, Psbt, ScriptBuf},
+            bitcoin::{Psbt, ScriptBuf},
             Descriptor as MsDescriptor, DescriptorPublicKey,
         },
-        RustBitcoin, SUBTYPE_PROOF,
+        RustBitcoin, TemplateKey, SUBTYPE_PROOF,
     },
     scalar::{scalar_neg, xbytes, N},
-    sign, tweak, verify, BitcoinBackend, Error, Rng, Sha256Engine, Sha512Engine, Xpub,
+    sign,
+    slot::Slot,
+    tweak, verify, BitcoinBackend, Error, Rng, Sha256Engine, Sha512Engine, Xpub,
 };
 use bwk_bip89_ll::{
     bip89_blind_challenge_gen, bip89_blind_nonce_gen, bip89_blind_sign, bip89_build_tree,
@@ -37,8 +39,9 @@ use bwk_bip89_ll::{
     BIP89_ROOT_POLICY_ALLOW_UNSIGNED, BIP89_ROOT_POLICY_REQUIRE_SIGNATURE,
 };
 use common::{
-    hex_arr, hex_vec, root_signature, signed_roots, spend_psbt, standard_lists, unsigned_roots,
-    wallet, FixedRng, DELEGATOR_SECRET, OWNER1_SECRET,
+    hex_arr, hex_vec, root_signature, signed_roots, slot0, spend_psbt, standard_lists,
+    unsigned_roots, wallet, FixedRng, SliceDescriptor, VectorBackend, DELEGATOR_SECRET,
+    OWNER1_CHAIN_CODE, OWNER1_KEY, OWNER1_SECRET,
 };
 
 const G: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
@@ -351,11 +354,11 @@ unsafe extern "C" fn bad_branch_xpubs(
 
 struct TplCtx {
     b: RustBitcoin,
-    tpl: MsDescriptor<bitcoin::PublicKey>,
+    tpl: MsDescriptor<TemplateKey>,
 }
 
 impl TplCtx {
-    fn new(tpl: &MsDescriptor<bitcoin::PublicKey>) -> Self {
+    fn new(tpl: &MsDescriptor<TemplateKey>) -> Self {
         Self {
             b: RustBitcoin::new(),
             tpl: tpl.clone(),
@@ -363,14 +366,29 @@ impl TplCtx {
     }
 }
 
-unsafe fn pairs_from_raw(tweaked: *const u8, n: usize) -> Vec<([u8; 33], [u8; 33])> {
+unsafe fn pairs_from_raw(tweaked: *const u8, n: usize) -> Vec<(Slot, [u8; 33])> {
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
-        let base = unsafe { *tweaked.add(i * 66).cast::<[u8; 33]>() };
-        let tw = unsafe { *tweaked.add(i * 66 + 33).cast::<[u8; 33]>() };
-        out.push((base, tw));
+        let record = unsafe { tweaked.add(i * 67) };
+        let key = unsafe { *record.cast::<[u8; 33]>() };
+        let number = unsafe { *record.add(33) };
+        let tw = unsafe { *record.add(34).cast::<[u8; 33]>() };
+        out.push((Slot { key, number }, tw));
     }
     out
+}
+
+/// The 34-byte `key || number` records of `slots`.
+fn slot_records(slots: &[Slot]) -> Vec<[u8; 34]> {
+    slots
+        .iter()
+        .map(|slot| {
+            let mut record = [0u8; 34];
+            record[..33].copy_from_slice(&slot.key);
+            record[33] = slot.number;
+            record
+        })
+        .collect()
 }
 
 unsafe extern "C" fn template_bytes_cb(
@@ -384,15 +402,15 @@ unsafe extern "C" fn template_bytes_cb(
     unsafe { write_buf(&bytes, out, cap, out_len) }
 }
 
-unsafe extern "C" fn base_keys(
+unsafe extern "C" fn slots(
     ctx: *mut c_void,
     out: *mut u8,
     cap: usize,
     out_count: *mut usize,
 ) -> i32 {
     let ctx = unsafe { &*ctx.cast::<TplCtx>() };
-    let keys = ctx.b.template_base_keys(&ctx.tpl);
-    unsafe { write_records(&keys, out.cast(), cap, out_count) }
+    let records = slot_records(&ctx.b.template_slots(&ctx.tpl));
+    unsafe { write_records(&records, out.cast(), cap, out_count) }
 }
 
 unsafe extern "C" fn script_pubkey(
@@ -433,7 +451,7 @@ fn template_vtable(ctx: &mut TplCtx) -> TemplateVtable {
     TemplateVtable {
         ctx: (ctx as *mut TplCtx).cast::<c_void>(),
         bytes: Some(template_bytes_cb),
-        base_keys: Some(base_keys),
+        slots: Some(slots),
         script_pubkey: Some(script_pubkey),
         leaf_hashes: Some(leaf_hashes),
     }
@@ -480,19 +498,20 @@ unsafe extern "C" fn mismatched_leaf_hashes(
     0
 }
 
-unsafe extern "C" fn descending_base_keys(
+unsafe extern "C" fn descending_slots(
     ctx: *mut c_void,
     out: *mut u8,
     cap: usize,
     out_count: *mut usize,
 ) -> i32 {
     let ctx = unsafe { &*ctx.cast::<TplCtx>() };
-    let mut keys = ctx.b.template_base_keys(&ctx.tpl);
-    keys.sort_by(|a, b| b.cmp(a));
-    unsafe { write_records(&keys, out.cast(), cap, out_count) }
+    let mut slots = ctx.b.template_slots(&ctx.tpl);
+    slots.sort_by(|a, b| b.cmp(a));
+    let records = slot_records(&slots);
+    unsafe { write_records(&records, out.cast(), cap, out_count) }
 }
 
-unsafe extern "C" fn zero_base_keys(
+unsafe extern "C" fn zero_slots(
     _ctx: *mut c_void,
     _out: *mut u8,
     _cap: usize,
@@ -2354,8 +2373,7 @@ fn input_verification_matches_rust() {
     let mut err: *const c_char = core::ptr::null();
 
     let bundle05 = bundle::derive_bundle(&rust_c, &w.descriptor, 0, 5).unwrap();
-    let pairs05 =
-        verify::tweaked_keys(&rust_c, &rust_c.template_base_keys(&tpl), &bundle05).unwrap();
+    let pairs05 = verify::tweaked_keys(&rust_c, &rust_c.template_slots(&tpl), &bundle05).unwrap();
     let script05 = rust_c.template_script_pubkey(&tpl, &pairs05).unwrap();
     let bundle_bytes05 = bundle05.to_bytes();
 
@@ -2380,8 +2398,7 @@ fn input_verification_matches_rust() {
     );
 
     let bundle06 = bundle::derive_bundle(&rust_c, &w.descriptor, 0, 6).unwrap();
-    let pairs06 =
-        verify::tweaked_keys(&rust_c, &rust_c.template_base_keys(&tpl), &bundle06).unwrap();
+    let pairs06 = verify::tweaked_keys(&rust_c, &rust_c.template_slots(&tpl), &bundle06).unwrap();
     let script06 = rust_c.template_script_pubkey(&tpl, &pairs06).unwrap();
 
     let mut valid_out2 = 0xaau8;
@@ -2417,8 +2434,7 @@ fn change_output_verification_matches_rust() {
     let mut err: *const c_char = core::ptr::null();
 
     let bundle13 = bundle::derive_bundle(&rust_c, &w.descriptor, 1, 3).unwrap();
-    let pairs13 =
-        verify::tweaked_keys(&rust_c, &rust_c.template_base_keys(&tpl), &bundle13).unwrap();
+    let pairs13 = verify::tweaked_keys(&rust_c, &rust_c.template_slots(&tpl), &bundle13).unwrap();
     let script13 = rust_c.template_script_pubkey(&tpl, &pairs13).unwrap();
     let bundle_bytes13 = bundle13.to_bytes();
 
@@ -2475,8 +2491,7 @@ fn verification_bundle_errors() {
     let mut err: *const c_char = core::ptr::null();
 
     let bundle13 = bundle::derive_bundle(&rust_c, &w.descriptor, 1, 3).unwrap();
-    let pairs13 =
-        verify::tweaked_keys(&rust_c, &rust_c.template_base_keys(&tpl), &bundle13).unwrap();
+    let pairs13 = verify::tweaked_keys(&rust_c, &rust_c.template_slots(&tpl), &bundle13).unwrap();
     let script13 = rust_c.template_script_pubkey(&tpl, &pairs13).unwrap();
     let bundle_bytes13 = bundle13.to_bytes();
 
@@ -2505,7 +2520,7 @@ fn verification_bundle_errors() {
     let g = hex_arr::<33>(G);
     let mut extra_entries = bundle13.entries().to_vec();
     extra_entries.push(Entry {
-        key: g,
+        slot: slot0(g),
         tweak: [0x01; 32],
     });
     let extra_bundle = Bundle::new(extra_entries).unwrap();
@@ -2635,11 +2650,11 @@ fn template_adapter_matches_tr_template() {
     assert_eq!(b.template_bytes(&adapter), rust_c.template_bytes(&tpl));
 
     let bundle05 = bundle::derive_bundle(&rust_c, &w.descriptor, 0, 5).unwrap();
-    let pairs = verify::tweaked_keys(&rust_c, &rust_c.template_base_keys(&tpl), &bundle05).unwrap();
+    let pairs = verify::tweaked_keys(&rust_c, &rust_c.template_slots(&tpl), &bundle05).unwrap();
     let delegator_base = rust_c.base_mul(&DELEGATOR_SECRET).unwrap();
     let d = pairs
         .iter()
-        .find(|(base, _)| *base == delegator_base)
+        .find(|(slot, _)| slot.key == delegator_base)
         .unwrap()
         .1;
 
@@ -2674,7 +2689,7 @@ fn template_adapter_matches_tr_template() {
     );
 
     let mut tv_desc = template_vtable(&mut tpl_ctx);
-    tv_desc.base_keys = Some(descending_base_keys);
+    tv_desc.slots = Some(descending_slots);
     assert!(matches!(
         unsafe { VtableTemplate::new(&tv_desc) },
         Err(FfiError::Ll(Error::Template))
@@ -2763,7 +2778,7 @@ fn register_through_c() {
     assert!(out3.is_null());
 
     let mut tv_zero = template_vtable(&mut tpl_ctx);
-    tv_zero.base_keys = Some(zero_base_keys);
+    tv_zero.slots = Some(zero_slots);
     let mut out4: *mut RegistrationHandle = core::ptr::null_mut();
     let rc4 = unsafe {
         bip89_register(
@@ -2780,7 +2795,7 @@ fn register_through_c() {
     assert_eq!(message(err), "template rejected or callback failed");
 
     let mut tv_desc = template_vtable(&mut tpl_ctx);
-    tv_desc.base_keys = Some(descending_base_keys);
+    tv_desc.slots = Some(descending_slots);
     let mut out5: *mut RegistrationHandle = core::ptr::null_mut();
     let rc5 = unsafe {
         bip89_register(
@@ -3225,31 +3240,31 @@ fn forged_change_refused_through_c() {
     assert_eq!(rc, BIP89_OK);
 
     let template = &w.template;
-    let base = rust_c.template_base_keys(template);
+    let slots = rust_c.template_slots(template);
     let genuine = bundle::derive_bundle(&rust_c, &w.descriptor, 1, 3).unwrap();
     let entries = vec![
         Entry {
-            key: base[0],
+            slot: slots[0],
             tweak: [0x41; 32],
         },
         Entry {
-            key: base[1],
+            slot: slots[1],
             tweak: [0x42; 32],
         },
         Entry {
-            key: base[2],
+            slot: slots[2],
             tweak: [0x43; 32],
         },
         Entry {
-            key: base[3],
-            tweak: genuine.tweak(&base[3]).unwrap(),
+            slot: slots[3],
+            tweak: genuine.tweak(&slots[3]).unwrap(),
         },
     ];
     let forged = Bundle::new(entries).unwrap();
     let forged_script = rust_c
         .template_script_pubkey(
             template,
-            &verify::tweaked_keys(&rust_c, &base, &forged).unwrap(),
+            &verify::tweaked_keys(&rust_c, &slots, &forged).unwrap(),
         )
         .unwrap();
 
@@ -3756,4 +3771,160 @@ fn psbt_callback_failures_through_c() {
     unsafe { bip89_tree_free(tree0_c) };
     unsafe { bip89_tree_free(tree1_c) };
     unsafe { bip89_registration_free(reg) };
+}
+
+/// The bundle of keychain 0, index 5 that `bip89_derive_bundle` writes in a
+/// `cap`-byte buffer for the xpubs `desc_ctx` reports, or its error code and
+/// message.
+fn derive_bundle_through_c(
+    desc_ctx: &mut DescCtx,
+    cap: usize,
+) -> Result<Vec<u8>, (i32, &'static str)> {
+    let mut ctx = test_ctx();
+    let v = vtable(&mut ctx);
+    let dv = descriptor_vtable(desc_ctx);
+    let mut err: *const c_char = core::ptr::null();
+    let mut out = vec![0u8; cap];
+    let mut out_len: usize = 0;
+    let rc = unsafe {
+        bip89_derive_bundle(
+            &v,
+            &dv,
+            0,
+            5,
+            out.as_mut_ptr(),
+            out.len(),
+            &mut out_len,
+            &mut err,
+        )
+    };
+    match rc {
+        BIP89_OK => Ok(out[..out_len].to_vec()),
+        rc => Err((rc, message(err))),
+    }
+}
+
+#[test]
+fn descriptor_slots_through_c() {
+    let w = wallet();
+    let mut desc_ctx = DescCtx::new(&w.descriptor);
+    let single = desc_ctx.xpubs.clone();
+    let owner1 = hex_arr::<33>(OWNER1_KEY);
+    let second_path = |branches: [Vec<u32>; 2]| Xpub {
+        key: owner1,
+        chain_code: OWNER1_CHAIN_CODE,
+        branches,
+    };
+
+    let mut two_slots = single.clone();
+    two_slots.push(second_path([vec![2], vec![3]]));
+    let expected = bundle::derive_bundle(
+        &VectorBackend::default(),
+        &SliceDescriptor(two_slots.clone()),
+        0,
+        5,
+    )
+    .unwrap();
+    assert_eq!(expected.entries().len(), 5);
+    desc_ctx.xpubs = two_slots.iter().rev().cloned().collect();
+    desc_ctx.xpubs.push(two_slots[0].clone());
+    assert_eq!(
+        derive_bundle_through_c(&mut desc_ctx, 5 * 65),
+        Ok(expected.to_bytes())
+    );
+
+    desc_ctx.xpubs = two_slots.clone();
+    desc_ctx.xpubs[4].chain_code = [0x0f; 32];
+    assert_eq!(
+        derive_bundle_through_c(&mut desc_ctx, 400),
+        Err((145, "base key with two chain codes"))
+    );
+
+    desc_ctx.xpubs = single.clone();
+    desc_ctx.xpubs.push(second_path([vec![1], vec![2]]));
+    assert_eq!(
+        derive_bundle_through_c(&mut desc_ctx, 400),
+        Err((146, "base key on two overlapping paths"))
+    );
+
+    desc_ctx.xpubs = single;
+    desc_ctx
+        .xpubs
+        .extend((1..257).map(|i| second_path([vec![2 * i], vec![2 * i + 1]])));
+    assert_eq!(
+        derive_bundle_through_c(&mut desc_ctx, 400),
+        Err((143, "base key has more than 256 slots"))
+    );
+
+    desc_ctx.xpubs = Vec::new();
+    assert_eq!(
+        derive_bundle_through_c(&mut desc_ctx, 400),
+        Err((141, "descriptor has no key"))
+    );
+}
+
+unsafe extern "C" fn gap_slots(
+    ctx: *mut c_void,
+    out: *mut u8,
+    cap: usize,
+    out_count: *mut usize,
+) -> i32 {
+    let ctx = unsafe { &*ctx.cast::<TplCtx>() };
+    let mut slots = ctx.b.template_slots(&ctx.tpl);
+    slots[0].number = 1;
+    let records = slot_records(&slots);
+    unsafe { write_records(&records, out.cast(), cap, out_count) }
+}
+
+unsafe extern "C" fn repeated_slots(
+    ctx: *mut c_void,
+    out: *mut u8,
+    cap: usize,
+    out_count: *mut usize,
+) -> i32 {
+    let ctx = unsafe { &*ctx.cast::<TplCtx>() };
+    let mut slots = ctx.b.template_slots(&ctx.tpl);
+    slots.insert(0, slots[0]);
+    let records = slot_records(&slots);
+    unsafe { write_records(&records, out.cast(), cap, out_count) }
+}
+
+#[test]
+fn template_slots_checked_through_c() {
+    let w = wallet();
+    let rust_c = RustBitcoin::new();
+    let mut tpl_ctx = TplCtx::new(&w.template);
+    let mut ctx = test_ctx();
+    let v = vtable(&mut ctx);
+    let mut err: *const c_char = core::ptr::null();
+    let [receive, change] = signed_roots(&rust_c, &w);
+    let (c_receive, c_change) = (ffi_root_record(&receive), ffi_root_record(&change));
+
+    let mut tv_gap = template_vtable(&mut tpl_ctx);
+    tv_gap.slots = Some(gap_slots);
+    let mut out: *mut RegistrationHandle = core::ptr::null_mut();
+    let rc = unsafe {
+        bip89_register(
+            &v,
+            &tv_gap,
+            BIP89_ROOT_POLICY_REQUIRE_SIGNATURE,
+            &c_receive,
+            &c_change,
+            &mut out,
+            &mut err,
+        )
+    };
+    assert_eq!(rc, 144);
+    assert_eq!(
+        message(err),
+        "slots of a key not numbered from 0 without a gap"
+    );
+    assert!(out.is_null());
+
+    let mut tv_repeated = template_vtable(&mut tpl_ctx);
+    tv_repeated.slots = Some(repeated_slots);
+    assert!(matches!(
+        unsafe { VtableTemplate::new(&tv_repeated) },
+        Err(FfiError::Ll(Error::Template))
+    ));
 }

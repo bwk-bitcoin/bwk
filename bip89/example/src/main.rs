@@ -9,7 +9,6 @@ use bwk_bip89::{
         miniscript::{
             self,
             bitcoin::{
-                self,
                 hashes::Hash,
                 hex::DisplayHex,
                 psbt::{self, ExtractTxError},
@@ -20,7 +19,7 @@ use bwk_bip89::{
             psbt::UtxoUpdateError,
             Descriptor,
         },
-        RustBitcoin, PREFIX, SUBTYPE_PROOF,
+        RustBitcoin, TemplateKey, PREFIX, SUBTYPE_PROOF,
     },
     verify::{change_output_verification, tweaked_keys},
     BitcoinBackend, Bundle, Entry, Error, Rng,
@@ -144,18 +143,18 @@ fn refusal(result: Result<(Vec<u8>, u64), ServerError>) -> Result<ServerError, E
 /// passes.
 fn forged_change(
     b: &RustBitcoin,
-    template: &Descriptor<bitcoin::PublicKey>,
+    template: &Descriptor<TemplateKey>,
 ) -> Result<(Bundle, Vec<u8>), Error> {
-    let base = b.template_base_keys(template);
-    let mut entries = Vec::with_capacity(base.len());
-    for (i, key) in base.iter().enumerate() {
+    let slots = b.template_slots(template);
+    let mut entries = Vec::with_capacity(slots.len());
+    for (i, slot) in slots.iter().enumerate() {
         entries.push(Entry {
-            key: *key,
+            slot: *slot,
             tweak: [0x41 + i as u8; 32],
         });
     }
     let forged = Bundle::new(entries)?;
-    let script = b.template_script_pubkey(template, &tweaked_keys(b, &base, &forged)?)?;
+    let script = b.template_script_pubkey(template, &tweaked_keys(b, &slots, &forged)?)?;
     Ok((forged, script))
 }
 
@@ -216,7 +215,7 @@ fn main() -> Result<(), ExampleError> {
     let passes = change_output_verification(&backend, &template, &script, &bundle)?;
     let mut forged = Psbt::deserialize(&honest)?;
     forged.unsigned_tx.output[CHANGE_OUTPUT].script_pubkey = ScriptBuf::from_bytes(script);
-    // bundle entries are keyed by base key, so the genuine ones are overwritten
+    // bundle entries are keyed by slot, so the genuine ones are overwritten
     backend.set_output_bundle(&mut forged, CHANGE_OUTPUT, &bundle)?;
     let old_proof = refusal(server.sign(ACCOUNT, &forged.serialize(), &mut rng))?;
     forged.outputs[CHANGE_OUTPUT]

@@ -8,7 +8,6 @@ use bwk_bip89::{
     rust_bitcoin::{
         miniscript::{
             bitcoin::{
-                self,
                 absolute::LockTime,
                 bip32::{self, ChainCode, ChildNumber, Fingerprint},
                 psbt::raw::ProprietaryKey,
@@ -19,10 +18,16 @@ use bwk_bip89::{
             },
             Descriptor as MsDescriptor, DescriptorPublicKey,
         },
-        RustBitcoin, PREFIX,
+        RustBitcoin, TemplateKey, PREFIX,
     },
+    slot::Slot,
     BitcoinBackend, Error, Rng, Xpub,
 };
+
+/// Slot 0 of `key`, the only slot of a key used on one path.
+pub fn slot0(key: [u8; 33]) -> Slot {
+    Slot { key, number: 0 }
+}
 
 pub fn hex_vec(s: &str) -> Vec<u8> {
     hex::decode(s).unwrap()
@@ -231,22 +236,22 @@ impl BitcoinBackend for VectorBackend {
         Vec::new()
     }
 
-    fn template_base_keys(&self, t: &SortedMulti) -> Vec<[u8; 33]> {
-        let mut keys = t.keys.clone();
-        keys.sort();
-        keys.dedup();
-        keys
+    fn template_slots(&self, t: &SortedMulti) -> Vec<Slot> {
+        let mut slots: Vec<Slot> = t.keys.iter().map(|key| slot0(*key)).collect();
+        slots.sort();
+        slots.dedup();
+        slots
     }
 
     fn template_script_pubkey(
         &self,
         t: &SortedMulti,
-        tweaked: &[([u8; 33], [u8; 33])],
+        tweaked: &[(Slot, [u8; 33])],
     ) -> Result<Vec<u8>, Error> {
         let mut tweaked_keys = Vec::with_capacity(t.keys.len());
-        for key in &self.template_base_keys(t) {
+        for slot in &self.template_slots(t) {
             let pos = tweaked
-                .binary_search_by(|(base, _)| base.cmp(key))
+                .binary_search_by(|(base, _)| base.cmp(slot))
                 .map_err(|_| Error::MissingTweak)?;
             tweaked_keys.push(tweaked[pos].1);
         }
@@ -266,7 +271,7 @@ impl BitcoinBackend for VectorBackend {
     fn template_leaf_hashes(
         &self,
         _t: &SortedMulti,
-        _tweaked: &[([u8; 33], [u8; 33])],
+        _tweaked: &[(Slot, [u8; 33])],
         _key: &[u8; 33],
     ) -> Result<Vec<[u8; 32]>, Error> {
         Ok(Vec::new())
@@ -315,7 +320,7 @@ pub const TEMPLATE: &str = "tr(0250929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d
 pub struct Wallet {
     pub secp: Secp256k1<All>,
     pub descriptor: MsDescriptor<DescriptorPublicKey>,
-    pub template: MsDescriptor<bitcoin::PublicKey>,
+    pub template: MsDescriptor<TemplateKey>,
 }
 
 pub fn tpub(public_key: secp256k1::PublicKey, chain_code: [u8; 32]) -> bip32::Xpub {
@@ -370,7 +375,7 @@ pub fn wallet() -> Wallet {
 
 /// The wallet template with a threshold of 1: the same base keys under another
 /// template id.
-pub fn other_template() -> MsDescriptor<bitcoin::PublicKey> {
+pub fn other_template() -> MsDescriptor<TemplateKey> {
     MsDescriptor::from_str(&format!(
         "tr({NUMS_KEY},multi_a(1,{OWNER1_KEY},{OWNER2_KEY},{DELEGATOR_KEY}))"
     ))
@@ -381,7 +386,7 @@ pub fn other_template() -> MsDescriptor<bitcoin::PublicKey> {
 pub fn template_of(
     c: &RustBitcoin,
     d: &MsDescriptor<DescriptorPublicKey>,
-) -> MsDescriptor<bitcoin::PublicKey> {
+) -> MsDescriptor<TemplateKey> {
     let bytes = c.descriptor_template(d).unwrap();
     MsDescriptor::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap()
 }

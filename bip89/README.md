@@ -52,8 +52,8 @@ canonical scalars and 32-byte x-only keys. Its associated types:
 | Descriptor | The full wallet descriptor, held by the signing key holder and  |
 |            | the coordinator: every key carries its chain code and fixed     |
 |            | steps.                                                          |
-| Template   | What the delegator holds: the descriptor reduced to its base    |
-|            | keys.                                                           |
+| Template   | What the delegator holds: the descriptor reduced to its key     |
+|            | slots, base keys with slot numbers.                             |
 | Psbt       | The PSBT the coordinator prepares and the delegator signs.      |
 +------------+-----------------------------------------------------------------+
 ```
@@ -69,8 +69,8 @@ Its methods, by group:
 |             | scalar_mul                                                     |
 | BIP322      | bip322_sign, bip322_verify                                     |
 | Descriptor  | descriptor_policy, descriptor_template, descriptor_xpubs       |
-| Template    | template_bytes, template_base_keys, template_script_pubkey,    |
-|             | template_leaf_hashes                                           |
+| Template    | template_bytes, template_slots, template_base_keys (provided), |
+|             | template_script_pubkey, template_leaf_hashes                   |
 | PSBT getter | input_count, output_count, spent_output, output, input_bundle, |
 |             | output_bundle, output_proof, tap_leaf_sighash                  |
 | PSBT setter | set_input_bundle, set_output_bundle, set_output_proof,         |
@@ -97,6 +97,15 @@ Randomness is not part of the backend. `sign_spend`, `blind_nonce_gen` and
 `blind_challenge_gen` take a caller `R: Rng` per call.
 Nothing is bundled, and no OS randomness is assumed.
 
+## Key slots
+
+A slot is one distinct (base key, branch pair) of the descriptor, a
+`slot::Slot` of a base key and a slot number. A key used on one path has one
+slot, 0. A key used on several paths, for example `<0;1>` and `<2;3>`, has one
+slot per path, numbered from 0 in path order, and each slot gets its own tweak
+in a bundle. Bundles, the template and the tweaked keys are all keyed by slot.
+The template carries the slot number, never the path.
+
 ## RustBitcoin
 
 `rust_bitcoin::RustBitcoin` implements the trait on rust-miniscript, rust-bitcoin's
@@ -108,7 +117,7 @@ Nothing is bundled, and no OS randomness is assumed.
 | Type       | RustBitcoin                                                     |
 +------------+-----------------------------------------------------------------+
 | Descriptor | `miniscript::Descriptor<DescriptorPublicKey>`                   |
-| Template   | `miniscript::Descriptor<bitcoin::PublicKey>`                    |
+| Template   | `miniscript::Descriptor<TemplateKey>`                           |
 | Psbt       | `bitcoin::Psbt`                                                 |
 +------------+-----------------------------------------------------------------+
 ```
@@ -117,16 +126,19 @@ Nothing is bundled, and no OS randomness is assumed.
   unhardened steps. `descriptor_xpubs` rejects any other shape with `NotTaproot`,
   `KeyType`, `Multipath`, `Wildcard`, `HardenedStep`, `ConflictingKey` or
   `NoKeys`.
-- **Template.** The same `tr()` with every key reduced to its base key. The
-  delegator gets it as the string `descriptor_template` returns, parsed as a
-  `Descriptor<bitcoin::PublicKey>`.
+- **Template.** The same `tr()` with every key reduced to a `TemplateKey`, its
+  base key and slot number, written as the bare key for slot 0 and `KEY@N` for
+  slot N. A descriptor whose keys each have one path gives the plain descriptor
+  over base keys. The delegator gets it as the string `descriptor_template`
+  returns, parsed as a `Descriptor<TemplateKey>`.
 - **BIP322.** `bip322_sign` and `bip322_verify` call `bip322::sign_simple` and
   `bip322::verify_simple` for `Address::p2tr` of the key with no script tree. The
   address network is fixed, since BIP322 only reads its script. Signing uses no
   auxiliary randomness, so a signature is deterministic.
 - **PSBT.** Bundles and proofs use the spec's fields, identifier `PREFIX`
-  (`BIPXXX`), subtype `SUBTYPE_TWEAK` (0x00, one field per bundle entry) and
-  `SUBTYPE_PROOF` (0x01, 289 bytes), with strict lengths. The unsigned
+  (`BIPXXX`), subtype `SUBTYPE_TWEAK` (0x00, one field per bundle entry, keydata
+  the base key for slot 0 and the base key then the slot number byte for slot 1
+  and above) and `SUBTYPE_PROOF` (0x01, 289 bytes), with strict lengths. The unsigned
   transaction is the truth: an index outside its inputs or outputs is `Psbt`.
 
 ## Implementing another backend
@@ -135,11 +147,13 @@ Implement `BitcoinBackend` on your own type and pick the associated types that f
 your bitcoin library; nothing requires rust-bitcoin. The protocol code relies on
 this contract:
 
-- `descriptor_xpubs` validates the descriptor shape and returns its keys sorted by
-  key.
-- `template_base_keys` returns the base keys sorted and deduplicated.
+- `descriptor_xpubs` validates the descriptor shape and returns its key
+  expressions as `Xpub`s, in any order and repeats allowed. The protocol code
+  turns them into slots with `slot::slots`.
+- `template_slots` returns the slots sorted and deduplicated.
+  `template_base_keys` is provided from it.
 - `template_script_pubkey` and `template_leaf_hashes` receive `tweaked` as
-  `(base, tweaked)` pairs sorted by base key.
+  `(slot, tweaked)` pairs sorted by slot.
 - A PSBT getter returns `Ok(None)` when the field is absent, and an error when the
   stored value does not decode.
 - `tap_leaf_sighash` is the BIP341 script path sighash over every spent output
@@ -173,7 +187,8 @@ template to run the BIP89 verification vectors.
   either way. Any base key of the template is accepted as signer: which keys a
   delegator requires is its policy with its users, left to the consumer. `delegator::verify_spend` checks each owned output's proof against
   any recorded root and returns the outflow including the fee;
-  `delegator::sign_spend` verifies, then adds BIP340 script path signatures.
+  `delegator::sign_spend` verifies, then adds BIP340 script path signatures,
+  once per slot of the delegator's key.
 
 This verification flow applies to the non-blinded signing mode; blinded signing is
 available in `blind`.

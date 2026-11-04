@@ -48,11 +48,14 @@ trait methods:
     BIP322 simple signature of `msg` for the single-key taproot address of the
     33-byte `key`. Any other value is an invalid signature.
 - **Descriptor.** `policy_bytes`, `template_bytes` and `xpubs`, read once per
-  entry point. The branch pointers of each `bip89_xpub` must stay valid
-  until the entry point returns.
-- **Template.** `bytes` and `base_keys` (strictly ascending, read once), then
-  `script_pubkey` and `leaf_hashes` over `BIP89_TWEAKED_PAIR_LEN`-byte
-  `base || tweaked` records sorted by base key.
+  entry point. `xpubs` reports one record per key expression, in any order
+  and repeats allowed; the library sorts them into slots with
+  `bwk_bip89::slot::slots`. The branch pointers of each `bip89_xpub` must stay
+  valid until the entry point returns.
+- **Template.** `bytes` and `slots` (`BIP89_SLOT_LEN`-byte `base || number`
+  records, strictly ascending, read once), then `script_pubkey` and
+  `leaf_hashes` over `BIP89_TWEAKED_PAIR_LEN`-byte `base || number || tweaked`
+  records sorted by slot.
 - **PSBT.** `input_count`, `output_count`, `spent_output`, `output`,
   `input_bundle`/`set_input_bundle`, `output_bundle`/`set_output_bundle`,
   `output_proof`/`set_output_proof`, `tap_leaf_sighash` and `add_tap_script_sig`.
@@ -78,7 +81,7 @@ fields, and how the values are stored in the PSBT is up to the consumer.
   and `out_len`. It writes the full length to `*out_len`, writes the bytes only
   when they fit in `cap`, and returns 0 in both cases. When the data did not fit,
   the library calls again once with a buffer of exactly the reported length, and
-  the second report must match. Array callbacks (`xpubs`, `base_keys`,
+  the second report must match. Array callbacks (`xpubs`, `slots`,
   `leaf_hashes`) follow the same rule with `cap` and `*out_count` counted in
   records.
 - **Entry point buffers.** `bip89_derive_bundle`, `bip89_blind_challenge_gen` and
@@ -180,6 +183,13 @@ freed by the caller. The coordinator and spend entry points also take a nullable
 |            | ConflictingKey, NoKeys.                                         |
 | 142        | `BIP89_ERR_MISSING_ROOT_SIGNATURE`, a root record with no       |
 |            | signature where the registration requires one.                  |
+| 143        | `BIP89_ERR_TOO_MANY_SLOTS`, a base key with more than 256       |
+|            | slots.                                                          |
+| 144        | `BIP89_ERR_SLOT_GAP`, slots of a key not numbered 0, 1, 2, ...  |
+| 145        | `BIP89_ERR_CONFLICTING_CHAIN_CODE`, a base key with two chain   |
+|            | codes.                                                          |
+| 146        | `BIP89_ERR_OVERLAPPING_PATHS`, two slots of a base key sharing  |
+|            | a branch.                                                       |
 | 500        | Null pointer.                                                   |
 | 501        | Vtable with a null callback.                                    |
 | 502        | Output buffer too small; the needed length is written back.     |
@@ -191,8 +201,11 @@ freed by the caller. The coordinator and spend entry points also take a nullable
 Every vtable callback must be non-null: a null callback fails with
 `BIP89_ERR_BAD_VTABLE`. A nonzero return from a descriptor or template callback
 gives `BIP89_ERR_TEMPLATE`; from a PSBT callback, `BIP89_ERR_PSBT`.
-`VtableBackend` passes the xpubs the descriptor callback reports through
-unvalidated, so no C entry point returns codes 135 to 141.
+The protocol code sorts the xpubs the descriptor callback reports into slots,
+so an entry point reading a descriptor can return 141, 143, 145 and 146; the C
+codes do not carry the offending base key the Rust variants hold. No entry point returns
+135 to 140: they come from parsing a descriptor string, which the C consumer does
+itself.
 
 ## Linking
 

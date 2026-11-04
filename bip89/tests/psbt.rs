@@ -16,9 +16,10 @@ use bwk_bip89::{
         },
         RustBitcoin, SUBTYPE_PROOF, SUBTYPE_TWEAK,
     },
-    BitcoinBackend, Error, Output,
+    slot::Slot,
+    BitcoinBackend, Bundle, Entry, Error, Output,
 };
-use common::{field_key, hex_arr, hex_vec, DELEGATOR_KEY, OWNER2_KEY};
+use common::{field_key, hex_arr, hex_vec, slot0, DELEGATOR_KEY, OWNER2_KEY};
 
 const EXTERNAL_SCRIPT: &str =
     "51203d5b271037bf8ac843db767c6cf7fe4acc341bf053b51e0a4f88515e3ce34190";
@@ -384,4 +385,76 @@ fn output_map_without_tx_output_ignored() {
     assert_eq!(c.output(&psbt, 3), Err(Error::Psbt));
     assert_eq!(c.output_bundle(&psbt, 3), Ok(None));
     assert_eq!(c.set_output_bundle(&mut psbt, 3, &bundle), Err(Error::Psbt));
+}
+
+#[test]
+fn slot_keydata_roundtrip() {
+    let c = RustBitcoin::new();
+    let w = common::wallet();
+    let mut psbt = common::spend_psbt(&w);
+
+    let owner2 = hex_arr::<33>(OWNER2_KEY);
+    let delegator = hex_arr::<33>(DELEGATOR_KEY);
+    let bundle = Bundle::new(vec![
+        Entry {
+            slot: slot0(owner2),
+            tweak: [0x01; 32],
+        },
+        Entry {
+            slot: Slot {
+                key: owner2,
+                number: 1,
+            },
+            tweak: [0x02; 32],
+        },
+        Entry {
+            slot: slot0(delegator),
+            tweak: [0x03; 32],
+        },
+    ])
+    .unwrap();
+    c.set_output_bundle(&mut psbt, 1, &bundle).unwrap();
+
+    let fields: Vec<(Vec<u8>, Vec<u8>)> = psbt.outputs[1]
+        .proprietary
+        .iter()
+        .map(|(key, value)| (key.key.clone(), value.clone()))
+        .collect();
+    assert_eq!(
+        fields,
+        vec![
+            (owner2.to_vec(), vec![0x01; 32]),
+            ([&owner2[..], &[0x01]].concat(), vec![0x02; 32]),
+            (delegator.to_vec(), vec![0x03; 32]),
+        ]
+    );
+    assert_eq!(c.output_bundle(&psbt, 1), Ok(Some(bundle)));
+}
+
+#[test]
+fn bad_slot_keydata_rejected() {
+    let c = RustBitcoin::new();
+    let w = common::wallet();
+    let owner2 = hex_arr::<33>(OWNER2_KEY);
+
+    for keydata in [
+        [&owner2[..], &[0x00]].concat(),
+        [&owner2[..], &[0x01, 0x00]].concat(),
+    ] {
+        let mut psbt = common::spend_psbt(&w);
+        psbt.inputs[0]
+            .proprietary
+            .insert(field_key(SUBTYPE_TWEAK, owner2.to_vec()), vec![0x01; 32]);
+        psbt.inputs[0]
+            .proprietary
+            .insert(field_key(SUBTYPE_TWEAK, keydata), vec![0x02; 32]);
+        assert_eq!(c.input_bundle(&psbt, 0), Err(Error::EntryLength));
+    }
+
+    let mut psbt = common::spend_psbt(&w);
+    psbt.inputs[0].proprietary.insert(
+        field_key(SUBTYPE_TWEAK, [&owner2[..], &[0x01]].concat()),
+        vec![0x02; 32],
+    );
+    assert_eq!(c.input_bundle(&psbt, 0), Err(Error::SlotGap));
 }

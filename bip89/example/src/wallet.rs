@@ -14,7 +14,6 @@ use bwk_bip89::{
     rust_bitcoin::{
         miniscript::{
             bitcoin::{
-                self,
                 absolute::LockTime,
                 bip32::{self, ChainCode, ChildNumber, Fingerprint},
                 hashes::Hash,
@@ -27,8 +26,9 @@ use bwk_bip89::{
             psbt::PsbtExt,
             DefiniteDescriptorKey, Descriptor, DescriptorPublicKey,
         },
-        RustBitcoin,
+        RustBitcoin, TemplateKey,
     },
+    slot::Slot,
     BitcoinBackend, Error,
 };
 
@@ -97,10 +97,10 @@ impl Wallet {
     /// server to register. Builds both proof trees.
     pub fn registration(
         &mut self,
-    ) -> Result<(Descriptor<bitcoin::PublicKey>, RootRecord, RootRecord), ExampleError> {
+    ) -> Result<(Descriptor<TemplateKey>, RootRecord, RootRecord), ExampleError> {
         // the backend gives the template as its canonical string only
         let bytes = self.backend.descriptor_template(&self.descriptor)?;
-        let template = Descriptor::<bitcoin::PublicKey>::from_str(str::from_utf8(&bytes)?)?;
+        let template = Descriptor::<TemplateKey>::from_str(str::from_utf8(&bytes)?)?;
         let receive = self.add_tree(RECEIVE, 0)?;
         let change = self.add_tree(CHANGE, 0)?;
         Ok((template, receive, change))
@@ -235,7 +235,7 @@ impl Wallet {
     }
 
     /// Signs every tapleaf of `input` holding the wallet key, derived with the
-    /// input's bundle tweak.
+    /// input's bundle tweak. The wallet key has one path, so its only slot is 0.
     fn sign_input(&self, psbt: &mut Psbt, input: usize) -> Result<(), ExampleError> {
         let outpoint = psbt.unsigned_tx.input[input].previous_output;
         let utxo = self
@@ -247,7 +247,7 @@ impl Wallet {
 
         let key = self.keypair.public_key().serialize();
         let tweak = derive_bundle(&self.backend, &self.descriptor, utxo.keychain, utxo.index)?
-            .tweak(&key)
+            .tweak(&Slot { key, number: 0 })
             .ok_or(Error::MissingTweak)?;
         let secret = SecretKey::from_slice(
             &self

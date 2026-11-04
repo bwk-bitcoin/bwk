@@ -10,6 +10,7 @@ use crate::{
     accumulator::tree::Proof,
     backend::Output,
     bundle::{Bundle, Entry},
+    slot::Slot,
     Error,
 };
 use miniscript::bitcoin::{
@@ -22,7 +23,9 @@ use miniscript::bitcoin::{
 
 /// Proprietary field identifier for BIP89 fields.
 pub const PREFIX: &[u8] = b"BIPXXX";
-/// Bundle entry: keydata is the 33-byte base key, value is the 32-byte tweak.
+/// Bundle entry: keydata is the 33-byte base key for slot 0, the base key
+/// followed by the slot number byte for slot 1 and above; value is the 32-byte
+/// tweak.
 pub const SUBTYPE_TWEAK: u8 = 0x00;
 /// Accumulator proof, outputs only: empty keydata, 289-byte value.
 pub const SUBTYPE_PROOF: u8 = 0x01;
@@ -68,8 +71,31 @@ fn insert(map: &mut Proprietary, subtype: u8, key: Vec<u8>, value: Vec<u8>) {
     );
 }
 
+/// The slot a subtype 0x00 keydata names: a 33-byte key is slot 0, a key and
+/// a nonzero slot number byte is that slot. Anything else, a key followed by
+/// slot 0 included, is `EntryLength`, so each slot has one keydata.
+fn decode_slot(keydata: &[u8]) -> Result<Slot, Error> {
+    let number = match keydata.len() {
+        33 => 0,
+        34 if keydata[33] != 0 => keydata[33],
+        _ => return Err(Error::EntryLength),
+    };
+    let mut key = [0u8; 33];
+    key.copy_from_slice(&keydata[..33]);
+    Ok(Slot { key, number })
+}
+
+/// The subtype 0x00 keydata of `slot`, the inverse of `decode_slot`.
+fn encode_slot(slot: &Slot) -> Vec<u8> {
+    let mut keydata = slot.key.to_vec();
+    if slot.number != 0 {
+        keydata.push(slot.number);
+    }
+    keydata
+}
+
 /// Decodes a bundle from its subtype 0x00 fields. No entries is `Ok(None)`; a
-/// keydata other than 33 bytes or a value other than 32 bytes is
+/// keydata that is not a slot or a value other than 32 bytes is
 /// `EntryLength`.
 pub(crate) fn read_bundle(map: &Proprietary) -> Result<Option<Bundle>, Error> {
     let fields = fields(map, SUBTYPE_TWEAK);
@@ -77,11 +103,10 @@ pub(crate) fn read_bundle(map: &Proprietary) -> Result<Option<Bundle>, Error> {
         return Ok(None);
     }
     let mut entries = Vec::with_capacity(fields.len());
-    for (key, value) in fields {
-        let (Ok(key), Ok(tweak)) = (key.try_into(), value.try_into()) else {
-            return Err(Error::EntryLength);
-        };
-        entries.push(Entry { key, tweak });
+    for (keydata, value) in fields {
+        let slot = decode_slot(keydata)?;
+        let tweak = value.try_into().map_err(|_| Error::EntryLength)?;
+        entries.push(Entry { slot, tweak });
     }
     Bundle::new(entries).map(Some)
 }
@@ -89,7 +114,12 @@ pub(crate) fn read_bundle(map: &Proprietary) -> Result<Option<Bundle>, Error> {
 /// Writes `bundle` as one subtype 0x00 field per entry.
 pub(crate) fn write_bundle(map: &mut Proprietary, bundle: &Bundle) {
     for entry in bundle.entries() {
-        insert(map, SUBTYPE_TWEAK, entry.key.to_vec(), entry.tweak.to_vec());
+        insert(
+            map,
+            SUBTYPE_TWEAK,
+            encode_slot(&entry.slot),
+            entry.tweak.to_vec(),
+        );
     }
 }
 

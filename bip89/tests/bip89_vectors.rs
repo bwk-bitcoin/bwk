@@ -14,7 +14,7 @@ use bwk_bip89::{
     scalar::{point_neg, scalar_neg, scalar_reduce, tagged_hash256, xbytes, N},
     sign, tweak, verify, BitcoinBackend, Bundle, Entry, Error, Sha256Engine,
 };
-use common::{hex_arr, hex_vec, FixedRng, SortedMulti, VectorBackend};
+use common::{hex_arr, hex_vec, slot0, FixedRng, SortedMulti, VectorBackend};
 use serde::{de::DeserializeOwned, Deserialize};
 
 #[derive(Deserialize)]
@@ -267,15 +267,15 @@ fn sorted_multi_template() -> SortedMulti {
 fn input_bundle_entries() -> Vec<Entry> {
     vec![
         Entry {
-            key: k1(),
+            slot: slot0(k1()),
             tweak: hex_arr("6e4dd29833f7b88751dad6ea6ff536959122f2d07074006657d0e2ef26af3ef6"),
         },
         Entry {
-            key: k2(),
+            slot: slot0(k2()),
             tweak: hex_arr("b30d8530e3464dc71ed6e20897ef5c3c9d1149ecc11f332336520addab1454f3"),
         },
         Entry {
-            key: k3(),
+            slot: slot0(k3()),
             tweak: hex_arr("c1efff9fb89227d09e54b403ae269f1991003e964f66f412e8302f8bb1c71644"),
         },
     ]
@@ -297,7 +297,10 @@ fn decode_entries(map: &BTreeMap<String, String>) -> Option<Vec<Entry>> {
         .map(|(key_hex, tweak_hex)| {
             let key: [u8; 33] = hex::decode(key_hex).ok()?.try_into().ok()?;
             let tweak: [u8; 32] = hex::decode(tweak_hex).ok()?.try_into().ok()?;
-            Some(Entry { key, tweak })
+            Some(Entry {
+                slot: slot0(key),
+                tweak,
+            })
         })
         .collect()
 }
@@ -375,12 +378,12 @@ fn tweaked_keys_missing_tweak() {
     let template = sorted_multi_template();
     let entries = input_bundle_entries()
         .into_iter()
-        .filter(|entry| entry.key != k1())
+        .filter(|entry| entry.slot.key != k1())
         .collect();
     let bundle = Bundle::new(entries).unwrap();
 
     assert_eq!(
-        verify::tweaked_keys(&c, &c.template_base_keys(&template), &bundle),
+        verify::tweaked_keys(&c, &c.template_slots(&template), &bundle),
         Err(Error::MissingTweak)
     );
     assert_eq!(
@@ -395,13 +398,15 @@ fn tweaked_keys_extra_tweak() {
     let template = sorted_multi_template();
     let mut entries = input_bundle_entries();
     entries.push(Entry {
-        key: hex_arr("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"),
+        slot: slot0(hex_arr(
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        )),
         tweak: [0x01; 32],
     });
     let bundle = Bundle::new(entries).unwrap();
 
     assert_eq!(
-        verify::tweaked_keys(&c, &c.template_base_keys(&template), &bundle),
+        verify::tweaked_keys(&c, &c.template_slots(&template), &bundle),
         Err(Error::ExtraTweak)
     );
     assert_eq!(
@@ -416,13 +421,13 @@ fn tweaked_keys_pairs_sorted_by_base() {
     let template = sorted_multi_template();
     let bundle = Bundle::new(input_bundle_entries()).unwrap();
 
-    let pairs = verify::tweaked_keys(&c, &c.template_base_keys(&template), &bundle).unwrap();
+    let pairs = verify::tweaked_keys(&c, &c.template_slots(&template), &bundle).unwrap();
     assert_eq!(pairs.len(), 3);
 
     let bases = [k1(), k2(), k3()];
     for (i, base) in bases.iter().enumerate() {
-        assert_eq!(pairs[i].0, *base);
-        let tweak = bundle.tweak(base).unwrap();
+        assert_eq!(pairs[i].0, slot0(*base));
+        let tweak = bundle.tweak(&slot0(*base)).unwrap();
         assert_eq!(pairs[i].1, tweak::tweak_key(&c, base, &tweak).unwrap());
     }
 }

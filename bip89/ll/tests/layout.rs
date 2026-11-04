@@ -67,7 +67,7 @@ fn template_vtable_layout() {
     assert_eq!(align_of::<TemplateVtable>(), 8);
     assert_eq!(offset_of!(TemplateVtable, ctx), 0);
     assert_eq!(offset_of!(TemplateVtable, bytes), 8);
-    assert_eq!(offset_of!(TemplateVtable, base_keys), 16);
+    assert_eq!(offset_of!(TemplateVtable, slots), 16);
     assert_eq!(offset_of!(TemplateVtable, script_pubkey), 24);
     assert_eq!(offset_of!(TemplateVtable, leaf_hashes), 32);
 }

@@ -16,6 +16,7 @@ use crate::{
     },
     backend::{BitcoinBackend, Sha256Engine},
     scalar::{scalar_is_valid, scalar_is_zero, tagged_hash256},
+    slot::descriptor_slots,
     tweak::{compute_bip32_tweak, tweak_key},
     Error,
 };
@@ -87,8 +88,8 @@ pub fn tree_root<B: BitcoinBackend>(
 }
 
 /// `tree_root`, with the root signed by the branch key of `secret` for
-/// `keychain`. A secret whose public key is not a key of `d` is
-/// `NotParticipant`.
+/// `keychain`, the branch of slot 0 when the key has several slots. A secret
+/// whose public key is not a key of `d` is `NotParticipant`.
 pub fn sign_tree_root<B: BitcoinBackend>(
     c: &B,
     d: &B::Descriptor,
@@ -100,11 +101,11 @@ pub fn sign_tree_root<B: BitcoinBackend>(
         return Err(Error::SecretKey);
     }
     let key = c.base_mul(secret).ok_or(Error::SecretKey)?;
-    let xpub = c
-        .descriptor_xpubs(d)?
+    let xpub = descriptor_slots(c, d)?
         .into_iter()
-        .find(|xpub| xpub.key == key)
-        .ok_or(Error::NotParticipant)?;
+        .find(|slot| slot.xpub.key == key && slot.number == 0)
+        .ok_or(Error::NotParticipant)?
+        .xpub;
     let branch = xpub
         .branches
         .get(keychain as usize)

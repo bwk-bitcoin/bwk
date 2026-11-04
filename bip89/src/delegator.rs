@@ -18,7 +18,7 @@ use crate::{
     backend::{BitcoinBackend, Rng},
     scalar::{scalar_is_valid, xbytes},
     sign::delegator_sign,
-    tweak::tweak_key,
+    slot::{check_numbering, Slot},
     verify::{change_output_verification, input_verification, tweaked_keys},
     Error,
 };
@@ -27,15 +27,15 @@ use crate::{
 pub struct Registration<B: BitcoinBackend> {
     template: B::Template,
     policy: RootPolicy,
-    base_keys: Vec<[u8; 33]>,
+    slots: Vec<Slot>,
     roots: Vec<[u8; 32]>,
 }
 
 /// Registers `template` under `policy` with the root of the receive tree
-/// (keychain 0) and of the change tree (keychain 1). A template with no base
-/// keys is `Template`; a root on another keychain is `InvalidKeychain`. Both
-/// records must pass `verify_root` under `policy` before their roots are
-/// recorded.
+/// (keychain 0) and of the change tree (keychain 1). A template with no key
+/// is `Template`, one whose slots of a key are not numbered 0, 1, 2, ...
+/// `SlotGap`; a root on another keychain is `InvalidKeychain`. Both records
+/// must pass `verify_root` under `policy` before their roots are recorded.
 pub fn register<B: BitcoinBackend>(
     b: &B,
     template: B::Template,
@@ -43,10 +43,11 @@ pub fn register<B: BitcoinBackend>(
     receive: &RootRecord,
     change: &RootRecord,
 ) -> Result<Registration<B>, Error> {
-    let base_keys = b.template_base_keys(&template);
-    if base_keys.is_empty() {
+    let slots = b.template_slots(&template);
+    if slots.is_empty() {
         return Err(Error::Template);
     }
+    check_numbering(&slots)?;
     if receive.keychain != 0 || change.keychain != 1 {
         return Err(Error::InvalidKeychain);
     }
@@ -55,7 +56,7 @@ pub fn register<B: BitcoinBackend>(
     Ok(Registration {
         template,
         policy,
-        base_keys,
+        slots,
         roots: vec![receive.root, change.root],
     })
 }
@@ -125,8 +126,10 @@ pub fn verify_spend<B: BitcoinBackend>(
 /// Verifies `psbt` against `reg`, then signs every tapleaf that carries the
 /// delegator's tweaked key on every input with BIP89 `DelegatorSign`, and
 /// adds the signatures through the backend. Verification always runs
-/// first, so a refused spend writes no signature. The signing key of each
-/// input is `secret` plus that input's tweak for `secret`'s base key.
+/// first, so a refused spend writes no signature. The delegator's key signs
+/// once per slot: the signing key of a slot is `secret` plus that input's
+/// tweak for the slot, and it signs the tapleaves that carry the slot's
+/// tweaked key. An input where no slot has a tapleaf is `NothingToSign`.
 pub fn sign_spend<B: BitcoinBackend, R: Rng>(
     b: &B,
     rng: &mut R,
@@ -140,21 +143,26 @@ pub fn sign_spend<B: BitcoinBackend, R: Rng>(
         return Err(Error::SecretKey);
     }
     let base = b.base_mul(secret).ok_or(Error::SecretKey)?;
-    reg.base_keys
-        .binary_search(&base)
-        .map_err(|_| Error::NotParticipant)?;
+    if !reg.slots.iter().any(|slot| slot.key == base) {
+        return Err(Error::NotParticipant);
+    }
 
-    let mut planned = Vec::with_capacity(b.input_count(psbt));
+    let mut planned = Vec::new();
     for i in 0..b.input_count(psbt) {
         let bundle = b.input_bundle(psbt, i)?.ok_or(Error::MissingBundle(i))?;
-        let tweak = bundle.tweak(&base).ok_or(Error::MissingTweak)?;
-        let tweaked = tweak_key(b, &base, &tweak)?;
-        let pairs = tweaked_keys(b, &reg.base_keys, &bundle)?;
-        let leaves = b.template_leaf_hashes(&reg.template, &pairs, &tweaked)?;
-        if leaves.is_empty() {
+        let pairs = tweaked_keys(b, &reg.slots, &bundle)?;
+        let mut signing = Vec::new();
+        for (slot, tweaked) in pairs.iter().filter(|(slot, _)| slot.key == base) {
+            let tweak = bundle.tweak(slot).ok_or(Error::MissingTweak)?;
+            let leaves = b.template_leaf_hashes(&reg.template, &pairs, tweaked)?;
+            if !leaves.is_empty() {
+                signing.push((i, tweak, xbytes(tweaked), leaves));
+            }
+        }
+        if signing.is_empty() {
             return Err(Error::NothingToSign(i));
         }
-        planned.push((i, tweak, xbytes(&tweaked), leaves));
+        planned.extend(signing);
     }
 
     for (i, tweak, xonly, leaves) in planned {

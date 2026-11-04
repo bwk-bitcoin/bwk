@@ -115,7 +115,7 @@ pub fn root_hash<B: BitcoinBackend>(c: &B, root: &[u8; 32]) -> [u8; 32] {
 
 /// Same bytes as `leaf_hash` over the bundle these states derive at `index`,
 /// streamed without allocating a `Bundle`. `states` must already be sorted
-/// strictly ascending by key.
+/// strictly ascending by slot.
 pub(crate) fn leaf_hash_derived<B: BitcoinBackend>(
     c: &B,
     states: &[KeychainState],
@@ -125,7 +125,7 @@ pub(crate) fn leaf_hash_derived<B: BitcoinBackend>(
     let mut engine = tagged_hash256(c, LEAF_TAG);
     for state in states {
         let tweak = state.tweak_at(c, index)?;
-        engine.update(state.key());
+        engine.update(&state.slot().key);
         engine.update(&tweak);
     }
     engine.update(nonce);
@@ -176,13 +176,7 @@ pub fn generate_tree<B: BitcoinBackend, T: TreeBuilder>(
 
     let pid = policy_id(c, &c.descriptor_policy(d));
     let kd = keys_digest(c, &c.descriptor_xpubs(d)?);
-    let mut states = keychain_states(c, d, keychain)?;
-    states.sort_unstable_by(|a, b| a.key().cmp(b.key()));
-    for pair in states.windows(2) {
-        if pair[0].key() == pair[1].key() {
-            return Err(Error::DuplicateKey);
-        }
-    }
+    let states = keychain_states(c, d, keychain)?;
 
     let order = shuffle_order(c, &shuffle_key(c, &pid, keychain, tree_start));
     let inv = invert(&order);

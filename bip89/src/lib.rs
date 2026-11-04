@@ -19,6 +19,7 @@ mod error;
 pub mod rust_bitcoin;
 pub mod scalar;
 pub mod sign;
+pub mod slot;
 pub mod tweak;
 pub mod verify;
 

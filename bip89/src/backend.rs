@@ -7,7 +7,7 @@
 
 use alloc::vec::Vec;
 
-use crate::{accumulator::tree::Proof, bundle::Bundle, Error};
+use crate::{accumulator::tree::Proof, bundle::Bundle, slot::Slot, Error};
 
 /// A streaming SHA-256 engine.
 pub trait Sha256Engine {
@@ -27,9 +27,10 @@ pub trait Rng {
     fn fill_bytes(&mut self, buf: &mut [u8]);
 }
 
-/// An extended public key inside a descriptor. `branches[k]` is the fixed
-/// steps followed by multipath element `k`: the tweak path of keychain `k`
-/// without the final index.
+/// A key expression of a descriptor: an extended public key with its branch
+/// pair, one slot of its base key. `branches[k]` is the fixed steps followed
+/// by multipath element `k`: the tweak path of keychain `k` without the final
+/// index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Xpub {
     pub key: [u8; 33],
@@ -51,7 +52,7 @@ pub trait BitcoinBackend {
     /// The full wallet descriptor, held by the signing key holder and the
     /// coordinator: every key carries its chain code and fixed steps.
     type Descriptor;
-    /// What the delegator holds: the descriptor reduced to its base keys.
+    /// What the delegator holds: the descriptor reduced to its key slots.
     type Template;
     type Psbt;
 
@@ -79,25 +80,32 @@ pub trait BitcoinBackend {
     fn descriptor_policy(&self, d: &Self::Descriptor) -> Vec<u8>;
     /// The canonical bytes of the descriptor's template.
     fn descriptor_template(&self, d: &Self::Descriptor) -> Result<Vec<u8>, Error>;
-    /// Validates the descriptor shape and returns its keys sorted by key.
+    /// Validates the descriptor shape and returns its key expressions, in any
+    /// order and repeats allowed. `slot::slots` turns them into the slots.
     fn descriptor_xpubs(&self, d: &Self::Descriptor) -> Result<Vec<Xpub>, Error>;
 
     /// The canonical template bytes.
     fn template_bytes(&self, t: &Self::Template) -> Vec<u8>;
+    /// The slots of the template, sorted and deduplicated.
+    fn template_slots(&self, t: &Self::Template) -> Vec<Slot>;
     /// The base keys of the template, sorted and deduplicated.
-    fn template_base_keys(&self, t: &Self::Template) -> Vec<[u8; 33]>;
-    /// Builds the script pubkey from tweaked keys. `tweaked` pairs each base
-    /// key with its tweaked key, sorted by base key.
+    fn template_base_keys(&self, t: &Self::Template) -> Vec<[u8; 33]> {
+        let mut keys: Vec<[u8; 33]> = self.template_slots(t).iter().map(|slot| slot.key).collect();
+        keys.dedup();
+        keys
+    }
+    /// Builds the script pubkey from tweaked keys. `tweaked` pairs each slot
+    /// with its tweaked key, sorted by slot.
     fn template_script_pubkey(
         &self,
         t: &Self::Template,
-        tweaked: &[([u8; 33], [u8; 33])],
+        tweaked: &[(Slot, [u8; 33])],
     ) -> Result<Vec<u8>, Error>;
     /// The tapleaf hashes in which `key`, a tweaked key, appears.
     fn template_leaf_hashes(
         &self,
         t: &Self::Template,
-        tweaked: &[([u8; 33], [u8; 33])],
+        tweaked: &[(Slot, [u8; 33])],
         key: &[u8; 33],
     ) -> Result<Vec<[u8; 32]>, Error>;
 

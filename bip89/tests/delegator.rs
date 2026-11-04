@@ -1,5 +1,7 @@
 mod common;
 
+use std::str::FromStr;
+
 use bwk_bip89::{
     accumulator::{
         record::{build_tree, sign_tree_root, tree_root, RootPolicy, RootRecord, RootSignature},
@@ -11,7 +13,6 @@ use bwk_bip89::{
     rust_bitcoin::{
         miniscript::{
             bitcoin::{
-                self,
                 hashes::Hash,
                 secp256k1::{Keypair, Message, Scalar, SecretKey},
                 sighash::{Prevouts, SighashCache},
@@ -20,16 +21,17 @@ use bwk_bip89::{
             psbt::PsbtExt,
             Descriptor as MsDescriptor, DescriptorPublicKey,
         },
-        RustBitcoin, SUBTYPE_PROOF, SUBTYPE_TWEAK,
+        RustBitcoin, TemplateKey, SUBTYPE_PROOF, SUBTYPE_TWEAK,
     },
+    slot::Slot,
     tweak::tweak_key,
     BitcoinBackend, Error, Xpub,
 };
 use common::{
     delegate_to_rust_bitcoin, field_key, hex_arr, hex_vec, other_template, root_signature,
-    signed_roots, spend_psbt, standard_lists, unsigned_roots, wallet, FixedRng, SortedMulti,
+    signed_roots, slot0, spend_psbt, standard_lists, unsigned_roots, wallet, FixedRng, SortedMulti,
     VectorBackend, Wallet, DELEGATOR_KEY, DELEGATOR_SECRET, EXTERNAL_KEY, EXTERNAL_SECRET,
-    OWNER1_KEY, OWNER1_SECRET, OWNER2_SECRET,
+    NUMS_KEY, OWNER1_KEY, OWNER1_SECRET, OWNER2_KEY, OWNER2_SECRET,
 };
 
 const LEAF_0_5: &str = "207c17af83390bb0de2146733fe837d30cd68b4c16a22f75edbc2b2fe8a580ee";
@@ -400,7 +402,7 @@ impl BitcoinBackend for NoLeaves {
     delegate_to_rust_bitcoin!();
 
     type Descriptor = MsDescriptor<DescriptorPublicKey>;
-    type Template = MsDescriptor<bitcoin::PublicKey>;
+    type Template = MsDescriptor<TemplateKey>;
 
     fn descriptor_policy(&self, d: &Self::Descriptor) -> Vec<u8> {
         self.0.descriptor_policy(d)
@@ -418,14 +420,14 @@ impl BitcoinBackend for NoLeaves {
         self.0.template_bytes(t)
     }
 
-    fn template_base_keys(&self, t: &Self::Template) -> Vec<[u8; 33]> {
-        self.0.template_base_keys(t)
+    fn template_slots(&self, t: &Self::Template) -> Vec<Slot> {
+        self.0.template_slots(t)
     }
 
     fn template_script_pubkey(
         &self,
         t: &Self::Template,
-        tweaked: &[([u8; 33], [u8; 33])],
+        tweaked: &[(Slot, [u8; 33])],
     ) -> Result<Vec<u8>, Error> {
         self.0.template_script_pubkey(t, tweaked)
     }
@@ -433,7 +435,7 @@ impl BitcoinBackend for NoLeaves {
     fn template_leaf_hashes(
         &self,
         _t: &Self::Template,
-        _tweaked: &[([u8; 33], [u8; 33])],
+        _tweaked: &[(Slot, [u8; 33])],
         _key: &[u8; 33],
     ) -> Result<Vec<[u8; 32]>, Error> {
         Ok(Vec::new())
@@ -452,7 +454,7 @@ fn honest_spend_verifies_and_signs() {
 
     let tweak = derive_bundle(&s.c, &s.w.descriptor, 0, 5)
         .unwrap()
-        .tweak(&delegator_key)
+        .tweak(&slot0(delegator_key))
         .unwrap();
     let tweaked = tweak_key(&s.c, &delegator_key, &tweak).unwrap();
     let xonly = XOnlyPublicKey::from_slice(&tweaked[1..]).unwrap();
@@ -492,7 +494,7 @@ fn honest_spend_verifies_and_signs() {
         .unwrap();
     let owner_tweak = derive_bundle(&s.c, &s.w.descriptor, 0, 5)
         .unwrap()
-        .tweak(&hex_arr::<33>(OWNER1_KEY))
+        .tweak(&slot0(hex_arr::<33>(OWNER1_KEY)))
         .unwrap();
     let owner_secret = SecretKey::from_slice(&OWNER1_SECRET)
         .unwrap()
@@ -616,4 +618,18 @@ fn register_rejects_swapped_keychains_and_empty_template() {
         &change
     )
     .is_ok());
+}
+
+#[test]
+fn register_rejects_a_slot_gap() {
+    let s = setup();
+    let [receive, change] = unsigned_roots(&s.c, &s.w);
+    let gap = MsDescriptor::<TemplateKey>::from_str(&format!(
+        "tr({NUMS_KEY},{{pk({OWNER1_KEY}),pk({OWNER2_KEY}@1)}})"
+    ))
+    .unwrap();
+    assert!(matches!(
+        register(&s.c, gap, RootPolicy::AllowUnsigned, &receive, &change),
+        Err(Error::SlotGap)
+    ));
 }

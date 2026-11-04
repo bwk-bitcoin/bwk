@@ -12,15 +12,17 @@ use bwk_bip89::{
             },
             Descriptor, DescriptorPublicKey,
         },
-        RustBitcoin,
+        RustBitcoin, TemplateKey, TemplateKeyError,
     },
+    slot::Slot,
+    tweak::tweak_key,
     verify::tweaked_keys,
     BitcoinBackend, Error, Xpub,
 };
 use common::{
-    hex_arr, hex_vec, template_of, tpub, DELEGATOR_CHAIN_CODE, DELEGATOR_KEY, DELEGATOR_SECRET,
-    EXTERNAL_KEY, NUMS_CHAIN_CODE, NUMS_KEY, OWNER1_CHAIN_CODE, OWNER1_KEY, OWNER1_SECRET,
-    OWNER2_CHAIN_CODE, OWNER2_KEY, OWNER2_SECRET, POLICY, TEMPLATE,
+    hex_arr, hex_vec, slot0, template_of, tpub, DELEGATOR_CHAIN_CODE, DELEGATOR_KEY,
+    DELEGATOR_SECRET, EXTERNAL_KEY, NUMS_CHAIN_CODE, NUMS_KEY, OWNER1_CHAIN_CODE, OWNER1_KEY,
+    OWNER1_SECRET, OWNER2_CHAIN_CODE, OWNER2_KEY, OWNER2_SECRET, POLICY, TEMPLATE,
 };
 
 /// Parses `s` and validates it as a wallet descriptor.
@@ -105,10 +107,7 @@ fn fixture_literals() {
         Descriptor::<DescriptorPublicKey>::from_str(POLICY).unwrap(),
         w.descriptor
     );
-    assert_eq!(
-        Descriptor::<bitcoin::PublicKey>::from_str(TEMPLATE).unwrap(),
-        *t
-    );
+    assert_eq!(Descriptor::<TemplateKey>::from_str(TEMPLATE).unwrap(), *t);
 }
 
 #[test]
@@ -150,7 +149,7 @@ fn template_script_pubkey_matches_miniscript() {
     for keychain in [0u32, 1] {
         for index in [0u32, 5, 300] {
             let bundle = derive_bundle(&c, &w.descriptor, keychain, index).unwrap();
-            let tweaked = tweaked_keys(&c, &c.template_base_keys(t), &bundle).unwrap();
+            let tweaked = tweaked_keys(&c, &c.template_slots(t), &bundle).unwrap();
             assert_eq!(
                 c.template_script_pubkey(t, &tweaked).unwrap(),
                 w.script_pubkey(keychain as usize, index).to_bytes()
@@ -177,7 +176,7 @@ fn template_script_pubkey_matches_miniscript() {
     ];
     for (keychain, index, expected) in literal_cases {
         let bundle = derive_bundle(&c, &w.descriptor, keychain, index).unwrap();
-        let tweaked = tweaked_keys(&c, &c.template_base_keys(t), &bundle).unwrap();
+        let tweaked = tweaked_keys(&c, &c.template_slots(t), &bundle).unwrap();
         assert_eq!(
             c.template_script_pubkey(t, &tweaked).unwrap(),
             hex_vec(expected)
@@ -185,8 +184,8 @@ fn template_script_pubkey_matches_miniscript() {
     }
 
     let bundle = derive_bundle(&c, &w.descriptor, 0, 5).unwrap();
-    let mut tweaked = tweaked_keys(&c, &c.template_base_keys(t), &bundle).unwrap();
-    tweaked.retain(|(base, _)| *base != hex_arr::<33>(DELEGATOR_KEY));
+    let mut tweaked = tweaked_keys(&c, &c.template_slots(t), &bundle).unwrap();
+    tweaked.retain(|(base, _)| base.key != hex_arr::<33>(DELEGATOR_KEY));
     assert_eq!(
         c.template_script_pubkey(t, &tweaked),
         Err(Error::MissingTweak)
@@ -200,16 +199,16 @@ fn leaf_hashes_filter_by_tweaked_key() {
     let t = &w.template;
 
     let bundle = derive_bundle(&c, &w.descriptor, 0, 5).unwrap();
-    let tweaked = tweaked_keys(&c, &c.template_base_keys(t), &bundle).unwrap();
+    let tweaked = tweaked_keys(&c, &c.template_slots(t), &bundle).unwrap();
 
     let delegator_tweaked = tweaked
         .iter()
-        .find(|(base, _)| *base == hex_arr::<33>(DELEGATOR_KEY))
+        .find(|(base, _)| base.key == hex_arr::<33>(DELEGATOR_KEY))
         .unwrap()
         .1;
     let nums_tweaked = tweaked
         .iter()
-        .find(|(base, _)| *base == hex_arr::<33>(NUMS_KEY))
+        .find(|(base, _)| base.key == hex_arr::<33>(NUMS_KEY))
         .unwrap()
         .1;
 
@@ -258,7 +257,7 @@ fn rejects_non_taproot() {
     assert!(matches!(xpubs(&sh_wsh), Err(Error::NotTaproot)));
 
     let wpkh_template =
-        Descriptor::<bitcoin::PublicKey>::from_str(&format!("wpkh({OWNER1_KEY})")).unwrap();
+        Descriptor::<TemplateKey>::from_str(&format!("wpkh({OWNER1_KEY})")).unwrap();
     assert!(matches!(
         c.template_script_pubkey(&wpkh_template, &[]),
         Err(Error::NotTaproot)
@@ -366,4 +365,102 @@ fn identical_key_is_deduplicated() {
     let descriptor = Descriptor::from_str(&s).unwrap();
     assert_eq!(c.descriptor_xpubs(&descriptor).unwrap().len(), 3);
     assert_eq!(c.template_base_keys(&template_of(&c, &descriptor)).len(), 3);
+}
+
+#[test]
+fn template_key_syntax() {
+    let key = bitcoin::PublicKey::from_str(OWNER1_KEY).unwrap();
+    for (s, slot) in [
+        (OWNER1_KEY.to_string(), 0u8),
+        (format!("{OWNER1_KEY}@1"), 1),
+        (format!("{OWNER1_KEY}@10"), 10),
+        (format!("{OWNER1_KEY}@255"), 255),
+    ] {
+        let parsed = TemplateKey::from_str(&s).unwrap();
+        assert_eq!(parsed, TemplateKey { key, slot });
+        assert_eq!(parsed.to_string(), s);
+    }
+    for suffix in ["@0", "@01", "@256", "@", "@+1", "@1a", "@1@2"] {
+        assert_eq!(
+            TemplateKey::from_str(&format!("{OWNER1_KEY}{suffix}")),
+            Err(TemplateKeyError::Slot)
+        );
+    }
+    assert!(matches!(
+        TemplateKey::from_str("02zz@1"),
+        Err(TemplateKeyError::Key(_))
+    ));
+}
+
+/// `tr(NUMS,{pk(OWNER1),pk(OWNER1@1)})`: owner1 on two slots.
+fn two_slot_template() -> Descriptor<TemplateKey> {
+    Descriptor::from_str(&format!(
+        "tr({NUMS_KEY},{{pk({OWNER1_KEY}),pk({OWNER1_KEY}@1)}})"
+    ))
+    .unwrap()
+}
+
+#[test]
+fn template_slots_of_a_key_on_two_slots() {
+    let c = RustBitcoin::new();
+    let t = two_slot_template();
+
+    assert_eq!(
+        c.template_slots(&t),
+        vec![
+            slot0(hex_arr(NUMS_KEY)),
+            slot0(hex_arr(OWNER1_KEY)),
+            Slot {
+                key: hex_arr(OWNER1_KEY),
+                number: 1
+            },
+        ]
+    );
+    assert_eq!(
+        c.template_base_keys(&t),
+        vec![hex_arr::<33>(NUMS_KEY), hex_arr::<33>(OWNER1_KEY)]
+    );
+    let bytes = c.template_bytes(&t);
+    assert!(std::str::from_utf8(&bytes)
+        .unwrap()
+        .contains(&format!("pk({OWNER1_KEY}@1)")));
+    assert_eq!(
+        Descriptor::<TemplateKey>::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap(),
+        t
+    );
+}
+
+#[test]
+fn template_script_pubkey_tweaks_each_slot() {
+    let c = RustBitcoin::new();
+    let t = two_slot_template();
+    let slots = c.template_slots(&t);
+    let tweaked: Vec<[u8; 33]> = (1u8..=3)
+        .zip(&slots)
+        .map(|(tweak, slot)| tweak_key(&c, &slot.key, &[tweak; 32]).unwrap())
+        .collect();
+    let pairs: Vec<(Slot, [u8; 33])> = slots.iter().copied().zip(tweaked.clone()).collect();
+
+    let expected = Descriptor::<bitcoin::PublicKey>::from_str(&format!(
+        "tr({},{{pk({}),pk({})}})",
+        hex::encode(tweaked[0]),
+        hex::encode(tweaked[1]),
+        hex::encode(tweaked[2])
+    ))
+    .unwrap();
+    assert_eq!(
+        c.template_script_pubkey(&t, &pairs).unwrap(),
+        expected.script_pubkey().to_bytes()
+    );
+
+    let slot1_leaves = c.template_leaf_hashes(&t, &pairs, &tweaked[2]).unwrap();
+    let slot0_leaves = c.template_leaf_hashes(&t, &pairs, &tweaked[1]).unwrap();
+    assert_eq!(slot1_leaves.len(), 1);
+    assert_eq!(slot0_leaves.len(), 1);
+    assert_ne!(slot1_leaves, slot0_leaves);
+
+    assert_eq!(
+        c.template_script_pubkey(&t, &pairs[..2]),
+        Err(Error::MissingTweak)
+    );
 }

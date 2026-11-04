@@ -33,9 +33,10 @@ use bwk_bip89::{
         tree::{Proof, Tree},
     },
     blind::SessionContext,
-    bundle::{Bundle, ENTRY_LEN},
+    bundle::Bundle,
     coordinator::Owned,
     delegator::Registration,
+    slot::Slot,
     BitcoinBackend, Error, Output, Rng, Sha256Engine, Sha512Engine, Xpub,
 };
 
@@ -85,7 +86,7 @@ pub type XpubsFn = unsafe extern "C" fn(
     cap: usize,
     out_count: *mut usize,
 ) -> i32;
-pub type BaseKeysFn =
+pub type SlotsFn =
     unsafe extern "C" fn(ctx: *mut c_void, out: *mut u8, cap: usize, out_count: *mut usize) -> i32;
 pub type ScriptPubkeyFn = unsafe extern "C" fn(
     ctx: *mut c_void,
@@ -155,13 +156,13 @@ pub struct DescriptorVtable {
     pub xpubs: Option<XpubsFn>,
 }
 
-/// The BIP89 template over base keys supplied by the C consumer, one callback
+/// The BIP89 template over key slots supplied by the C consumer, one callback
 /// per template method of `BitcoinBackend`.
 #[repr(C)]
 pub struct TemplateVtable {
     pub ctx: *mut c_void,
     pub bytes: Option<BytesFn>,
-    pub base_keys: Option<BaseKeysFn>,
+    pub slots: Option<SlotsFn>,
     pub script_pubkey: Option<ScriptPubkeyFn>,
     pub leaf_hashes: Option<LeafHashesFn>,
 }
@@ -340,6 +341,10 @@ fn ll_error_info(error: Error) -> (i32, &'static str) {
         Error::ConflictingKey => (140, "base key repeated with another chain code or path\0"),
         Error::NoKeys => (141, "descriptor has no key\0"),
         Error::MissingRootSignature => (142, "root signature missing\0"),
+        Error::TooManySlots(_) => (143, "base key has more than 256 slots\0"),
+        Error::SlotGap => (144, "slots of a key not numbered from 0 without a gap\0"),
+        Error::ConflictingChainCode(_) => (145, "base key with two chain codes\0"),
+        Error::OverlappingPaths(_) => (146, "base key on two overlapping paths\0"),
     }
 }
 
@@ -639,27 +644,32 @@ impl VtableDescriptor {
     }
 }
 
-const TWEAKED_PAIR_LEN: usize = 66;
+/// Length of one slot record: base key (33) then slot number (1).
+const SLOT_LEN: usize = 34;
 
-/// Flattens tweaked pairs into `TWEAKED_PAIR_LEN`-byte `base || tweaked` records.
-fn flatten_tweaked(tweaked: &[([u8; 33], [u8; 33])]) -> Vec<u8> {
+const TWEAKED_PAIR_LEN: usize = 67;
+
+/// Flattens tweaked pairs into `TWEAKED_PAIR_LEN`-byte `base || number ||
+/// tweaked` records.
+fn flatten_tweaked(tweaked: &[(Slot, [u8; 33])]) -> Vec<u8> {
     let mut out = Vec::with_capacity(tweaked.len() * TWEAKED_PAIR_LEN);
-    for (base, tw) in tweaked {
-        out.extend_from_slice(base);
+    for (slot, tw) in tweaked {
+        out.extend_from_slice(&slot.key);
+        out.push(slot.number);
         out.extend_from_slice(tw);
     }
     out
 }
 
-/// The template adapter over a C template vtable. The template bytes and base
-/// keys are preloaded at construction, so only `script_pubkey` and
+/// The template adapter over a C template vtable. The template bytes and
+/// slots are preloaded at construction, so only `script_pubkey` and
 /// `leaf_hashes` call back into C.
 pub struct VtableTemplate {
     ctx: *mut c_void,
     script_pubkey: ScriptPubkeyFn,
     leaf_hashes: LeafHashesFn,
     bytes: Vec<u8>,
-    base_keys: Vec<[u8; 33]>,
+    slots: Vec<Slot>,
 }
 
 impl VtableTemplate {
@@ -673,7 +683,7 @@ impl VtableTemplate {
         }
         let v = unsafe { &*vtable };
         let bytes_fn = v.bytes.ok_or(FfiError::BadVtable)?;
-        let base_keys_fn = v.base_keys.ok_or(FfiError::BadVtable)?;
+        let slots_fn = v.slots.ok_or(FfiError::BadVtable)?;
         let script_pubkey = v.script_pubkey.ok_or(FfiError::BadVtable)?;
         let leaf_hashes = v.leaf_hashes.ok_or(FfiError::BadVtable)?;
 
@@ -681,10 +691,23 @@ impl VtableTemplate {
             bytes_fn(v.ctx, out, cap, out_len)
         })?;
 
-        let base_keys = read_records(Error::Template, [0u8; 33], |out, cap, out_count| unsafe {
-            base_keys_fn(v.ctx, out.cast(), cap, out_count)
-        })?;
-        if base_keys.windows(2).any(|pair| pair[1] <= pair[0]) {
+        let records = read_records(
+            Error::Template,
+            [0u8; SLOT_LEN],
+            |out, cap, out_count| unsafe { slots_fn(v.ctx, out.cast(), cap, out_count) },
+        )?;
+        let slots: Vec<Slot> = records
+            .iter()
+            .map(|record| {
+                let mut key = [0u8; 33];
+                key.copy_from_slice(&record[..33]);
+                Slot {
+                    key,
+                    number: record[33],
+                }
+            })
+            .collect();
+        if slots.windows(2).any(|pair| pair[1] <= pair[0]) {
             return Err(FfiError::Ll(Error::Template));
         }
 
@@ -693,7 +716,7 @@ impl VtableTemplate {
             script_pubkey,
             leaf_hashes,
             bytes,
-            base_keys,
+            slots,
         })
     }
 }
@@ -910,14 +933,14 @@ impl<'a> BitcoinBackend for VtableBackend<'a> {
         t.bytes.clone()
     }
 
-    fn template_base_keys(&self, t: &VtableTemplate) -> Vec<[u8; 33]> {
-        t.base_keys.clone()
+    fn template_slots(&self, t: &VtableTemplate) -> Vec<Slot> {
+        t.slots.clone()
     }
 
     fn template_script_pubkey(
         &self,
         t: &VtableTemplate,
-        tweaked: &[([u8; 33], [u8; 33])],
+        tweaked: &[(Slot, [u8; 33])],
     ) -> Result<Vec<u8>, Error> {
         let flat = flatten_tweaked(tweaked);
         read_bytes(Error::Template, |out, cap, out_len| unsafe {
@@ -928,7 +951,7 @@ impl<'a> BitcoinBackend for VtableBackend<'a> {
     fn template_leaf_hashes(
         &self,
         t: &VtableTemplate,
-        tweaked: &[([u8; 33], [u8; 33])],
+        tweaked: &[(Slot, [u8; 33])],
         key: &[u8; 33],
     ) -> Result<Vec<[u8; 32]>, Error> {
         let flat = flatten_tweaked(tweaked);
@@ -1714,7 +1737,7 @@ unsafe fn unblind_signature_inner(
 }
 
 /// Serializes the BIP89 delegation bundle of the descriptor for `keychain`
-/// and `index`: one tweak entry per distinct base key.
+/// and `index`: one tweak entry per slot.
 ///
 /// # Safety
 /// `crypto` and `descriptor` must point to sound vtables. `out` must be
@@ -1752,21 +1775,15 @@ unsafe fn derive_bundle_inner(
     let b = VtableBackend::new(crypto)?;
     let descriptor = VtableDescriptor::new(descriptor)?;
 
-    let needed = descriptor
-        .xpubs
-        .len()
-        .checked_mul(ENTRY_LEN)
-        .ok_or(FfiError::BufferTooSmall)?;
-    if needed > out_cap {
-        *out_len = needed;
+    let bytes = bwk_bip89::bundle::derive_bundle(&b, &descriptor, keychain, index)?.to_bytes();
+    if bytes.len() > out_cap {
+        *out_len = bytes.len();
         return Err(FfiError::BufferTooSmall);
     }
     if out.is_null() {
         return Err(FfiError::NullPointer);
     }
 
-    let bundle = bwk_bip89::bundle::derive_bundle(&b, &descriptor, keychain, index)?;
-    let bytes = bundle.to_bytes();
     ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
     *out_len = bytes.len();
     Ok(())
@@ -2390,7 +2407,7 @@ mod tests {
 
     use crate::FfiError;
 
-    const LL_ROWS: [(Error, i32, &str); 41] = [
+    const LL_ROWS: [(Error, i32, &str); 45] = [
         (Error::InvalidPoint, 100, "invalid point\0"),
         (Error::Infinity, 101, "point at infinity\0"),
         (Error::ScalarRange, 102, "scalar out of range\0"),
@@ -2460,6 +2477,26 @@ mod tests {
         ),
         (Error::NoKeys, 141, "descriptor has no key\0"),
         (Error::MissingRootSignature, 142, "root signature missing\0"),
+        (
+            Error::TooManySlots([0x02; 33]),
+            143,
+            "base key has more than 256 slots\0",
+        ),
+        (
+            Error::SlotGap,
+            144,
+            "slots of a key not numbered from 0 without a gap\0",
+        ),
+        (
+            Error::ConflictingChainCode([0x02; 33]),
+            145,
+            "base key with two chain codes\0",
+        ),
+        (
+            Error::OverlappingPaths([0x02; 33]),
+            146,
+            "base key on two overlapping paths\0",
+        ),
     ];
 
     const BOUNDARY_ROWS: [(FfiError, i32, &str); 5] = [
@@ -2470,8 +2507,8 @@ mod tests {
         (FfiError::InvalidRootPolicy, 504, "invalid root policy\0"),
     ];
 
-    fn all_infos() -> [(i32, &'static str); 46] {
-        let mut out = [(0, ""); 46];
+    fn all_infos() -> [(i32, &'static str); 50] {
+        let mut out = [(0, ""); 50];
         for (i, (error, code, message)) in LL_ROWS.into_iter().enumerate() {
             let info = FfiError::Ll(error).info();
             assert_eq!(info, (code, message));

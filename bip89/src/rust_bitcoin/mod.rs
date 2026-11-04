@@ -2,7 +2,7 @@
 //! `bitcoin_hashes` and libsecp256k1. Zero and infinity are mapped explicitly
 //! because libsecp256k1 refuses them while the trait models them as valid
 //! inputs and outputs. The descriptor is a `tr()` descriptor over multipath
-//! extended keys, the template is the same descriptor over base keys, and the
+//! extended keys, the template is the same descriptor over `TemplateKey`s, and the
 //! PSBT carries bundles and proofs in the spec's proprietary fields. BIP322
 //! signing and verification use the `bip322` crate.
 
@@ -11,6 +11,7 @@ use crate::{
     backend::{BitcoinBackend, Output, Sha256Engine, Sha512Engine, Xpub},
     bundle::Bundle,
     scalar::scalar_is_zero,
+    slot::Slot,
     Error,
 };
 use bip322::Verification;
@@ -27,6 +28,7 @@ use miniscript::{
 mod descriptor;
 mod psbt;
 
+pub use descriptor::{TemplateKey, TemplateKeyError};
 pub use miniscript;
 pub use psbt::{PREFIX, SUBTYPE_PROOF, SUBTYPE_TWEAK};
 
@@ -85,7 +87,7 @@ impl BitcoinBackend for RustBitcoin {
     type Sha256 = Sha256;
     type Sha512 = Sha512;
     type Descriptor = miniscript::Descriptor<DescriptorPublicKey>;
-    type Template = miniscript::Descriptor<miniscript::bitcoin::PublicKey>;
+    type Template = miniscript::Descriptor<TemplateKey>;
     type Psbt = miniscript::bitcoin::Psbt;
 
     fn sha256(&self) -> Self::Sha256 {
@@ -201,14 +203,14 @@ impl BitcoinBackend for RustBitcoin {
         t.to_string().into_bytes()
     }
 
-    fn template_base_keys(&self, t: &Self::Template) -> Vec<[u8; 33]> {
-        descriptor::base_keys(t)
+    fn template_slots(&self, t: &Self::Template) -> Vec<Slot> {
+        descriptor::slots(t)
     }
 
     fn template_script_pubkey(
         &self,
         t: &Self::Template,
-        tweaked: &[([u8; 33], [u8; 33])],
+        tweaked: &[(Slot, [u8; 33])],
     ) -> Result<Vec<u8>, Error> {
         Ok(descriptor::tweak_template(t, tweaked)?
             .script_pubkey()
@@ -218,7 +220,7 @@ impl BitcoinBackend for RustBitcoin {
     fn template_leaf_hashes(
         &self,
         t: &Self::Template,
-        tweaked: &[([u8; 33], [u8; 33])],
+        tweaked: &[(Slot, [u8; 33])],
         key: &[u8; 33],
     ) -> Result<Vec<[u8; 32]>, Error> {
         descriptor::leaf_hashes(t, tweaked, key)

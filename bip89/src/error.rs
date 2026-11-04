@@ -49,6 +49,15 @@ pub enum Error {
     HardenedStep,
     /// A base key is repeated with another chain code or path.
     ConflictingKey,
+    /// The base key appears with two different chain codes.
+    ConflictingChainCode([u8; 33]),
+    /// The base key appears on two derivation paths that share a branch, so
+    /// two of its slots would derive the same keys.
+    OverlappingPaths([u8; 33]),
     /// The descriptor has no key.
     NoKeys,
+    /// The base key has more than 256 slots.
+    TooManySlots([u8; 33]),
+    /// The slots of a base key are not numbered 0, 1, 2, ... without a gap.
+    SlotGap,
 }

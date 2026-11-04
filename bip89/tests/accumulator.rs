@@ -30,7 +30,7 @@ use bwk_bip89::{
     BitcoinBackend, Bundle, Entry, Error, Sha256Engine, Xpub,
 };
 use common::{
-    hex_arr, other_template, root_signature, tpub, wallet, SliceDescriptor, VectorBackend,
+    hex_arr, other_template, root_signature, slot0, tpub, wallet, SliceDescriptor, VectorBackend,
     OWNER1_CHAIN_CODE, OWNER1_KEY, OWNER1_SECRET, OWNER2_SECRET,
 };
 
@@ -168,15 +168,15 @@ fn leaf_hash_is_tagged_bundle_and_nonce() {
 
     let bundle = Bundle::new(vec![
         Entry {
-            key: pk3(),
+            slot: slot0(pk3()),
             tweak: [0x33; 32],
         },
         Entry {
-            key: pk1(),
+            slot: slot0(pk1()),
             tweak: [0x11; 32],
         },
         Entry {
-            key: pk2(),
+            slot: slot0(pk2()),
             tweak: [0x22; 32],
         },
     ])
@@ -192,15 +192,15 @@ fn leaf_hash_is_tagged_bundle_and_nonce() {
 
     let changed = Bundle::new(vec![
         Entry {
-            key: pk3(),
+            slot: slot0(pk3()),
             tweak: [0x33; 32],
         },
         Entry {
-            key: pk1(),
+            slot: slot0(pk1()),
             tweak: [0x12; 32],
         },
         Entry {
-            key: pk2(),
+            slot: slot0(pk2()),
             tweak: [0x22; 32],
         },
     ])
@@ -325,7 +325,11 @@ fn committed_tree(c: &RustBitcoin) -> (Tree, Vec<Bundle>) {
     for offset in 0..256usize {
         let mut tweak = [0u8; 32];
         tweak[31] = offset as u8;
-        let bundle = Bundle::new(vec![Entry { key: pk1(), tweak }]).unwrap();
+        let bundle = Bundle::new(vec![Entry {
+            slot: slot0(pk1()),
+            tweak,
+        }])
+        .unwrap();
         let nonce = [offset as u8; 32];
         let position = 255 - offset;
         level[position] = leaf_hash(c, &bundle, &nonce);
@@ -663,7 +667,7 @@ fn derived_leaf_matches_bundle_leaf() {
     let dup = SliceDescriptor(dup_xpubs);
     assert_eq!(
         generate_tree(&v, &dup, 0, 0, NullTreeBuilder),
-        Err(Error::DuplicateKey)
+        generate_tree(&v, &s, 0, 0, NullTreeBuilder)
     );
 }
 

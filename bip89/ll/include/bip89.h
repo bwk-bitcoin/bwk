@@ -41,8 +41,11 @@ extern "C" {
 /* Byte length of a serialized accumulator proof. */
 #define BIP89_PROOF_LEN 289
 
-/* Length of one tweaked pair record: base key (33) then tweaked key (33). */
-#define BIP89_TWEAKED_PAIR_LEN 66
+/* Length of one slot record: base key (33) then slot number (1). */
+#define BIP89_SLOT_LEN 34
+
+/* Length of one tweaked pair record: base key (33), slot number (1), tweaked key (33). */
+#define BIP89_TWEAKED_PAIR_LEN 67
 
 /* Root policy of a registration: a root with no signature is refused. */
 #define BIP89_ROOT_POLICY_REQUIRE_SIGNATURE 0
@@ -99,6 +102,10 @@ extern "C" {
 #define BIP89_ERR_CONFLICTING_KEY 140
 #define BIP89_ERR_NO_KEYS 141
 #define BIP89_ERR_MISSING_ROOT_SIGNATURE 142
+#define BIP89_ERR_TOO_MANY_SLOTS 143
+#define BIP89_ERR_SLOT_GAP 144
+#define BIP89_ERR_CONFLICTING_CHAIN_CODE 145
+#define BIP89_ERR_OVERLAPPING_PATHS 146
 #define BIP89_ERR_NULL_POINTER 500
 #define BIP89_ERR_BAD_VTABLE 501
 #define BIP89_ERR_BUFFER_TOO_SMALL 502
@@ -284,11 +291,15 @@ typedef struct bip89_descriptor_vtable {
     void *ctx;
     /* The full descriptor string with extended keys, UTF-8, no trailing newline. */
     int32_t (*policy_bytes)(void *ctx, uint8_t *out, size_t cap, size_t *out_len);
-    /* The template string over base keys, UTF-8, no trailing newline. */
+    /* The template string over base keys and slot numbers, UTF-8, no trailing newline. */
     int32_t (*template_bytes)(void *ctx, uint8_t *out, size_t cap, size_t *out_len);
     /*
-     * The xpubs sorted by key, one record each; branch pointers must stay valid until
-     * the entry point returns.
+     * One record per key expression, in any order, repeats allowed. The library sorts
+     * them by key then branches into slots and refuses a base key with two chain codes
+     * (BIP89_ERR_CONFLICTING_CHAIN_CODE), two slots of a key sharing a branch
+     * (BIP89_ERR_OVERLAPPING_PATHS), more than 256 slots of a key
+     * (BIP89_ERR_TOO_MANY_SLOTS) and no record (BIP89_ERR_NO_KEYS). Branch pointers
+     * must stay valid until the entry point returns.
      */
     int32_t (*xpubs)(void *ctx, bip89_xpub *out, size_t cap, size_t *out_count);
 } bip89_descriptor_vtable;
@@ -298,7 +309,7 @@ typedef struct bip89_tree bip89_tree;
 
 /*
  * Serialize the delegation bundle of `keychain` and `index` (BIP89_ENTRY_LEN bytes
- * per distinct base key) into `out`. When out_cap is too small returns
+ * per slot) into `out`. When out_cap is too small returns
  * BIP89_ERR_BUFFER_TOO_SMALL with the needed length in *out_len (`out` may be NULL
  * when out_cap is 0).
  */
@@ -337,7 +348,8 @@ int32_t bip89_tree_proof(const bip89_tree *tree, uint32_t keychain, uint32_t ind
 void bip89_tree_free(bip89_tree *tree);
 
 /*
- * `tweaked` points at `n` BIP89_TWEAKED_PAIR_LEN records in ascending base key order.
+ * `tweaked` points at `n` BIP89_TWEAKED_PAIR_LEN records in ascending slot order: base
+ * key, then slot number.
  * Buffer and array callbacks follow the rule of bip89_descriptor_vtable; leaf_hashes
  * counts 32-byte hashes in `cap` and `*out_count`. Nonzero means failure and gives
  * BIP89_ERR_TEMPLATE.
@@ -346,8 +358,11 @@ typedef struct bip89_template_vtable {
     void *ctx;
     /* The template string, UTF-8, no trailing newline. */
     int32_t (*bytes)(void *ctx, uint8_t *out, size_t cap, size_t *out_len);
-    /* The distinct base keys, 33 bytes each, strictly ascending; counts in keys. */
-    int32_t (*base_keys)(void *ctx, uint8_t *out, size_t cap, size_t *out_count);
+    /*
+     * The distinct slots, BIP89_SLOT_LEN bytes each (base key then slot number), strictly
+     * ascending; counts in slots.
+     */
+    int32_t (*slots)(void *ctx, uint8_t *out, size_t cap, size_t *out_count);
     /* Write the output scriptPubKey of the template over the tweaked keys. */
     int32_t (*script_pubkey)(void *ctx, const uint8_t *tweaked, size_t n, uint8_t *out,
                              size_t cap, size_t *out_len);
@@ -493,8 +508,8 @@ int32_t bip89_delegator_verify_spend(const bip89_crypto_vtable *crypto,
 
 /*
  * Verify as bip89_delegator_verify_spend, then add BIP340 script path signatures with
- * the 32-byte delegator `secret` (aux from fill_random). No signature is added when
- * verification fails.
+ * the 32-byte delegator `secret` (aux from fill_random), once per slot of its key. No
+ * signature is added when verification fails.
  */
 int32_t bip89_delegator_sign_spend(const bip89_crypto_vtable *crypto,
                                    const bip89_registration *registration,
