@@ -106,6 +106,24 @@ pub fn read_line<R: ElectrumRead>(stream: &mut R, buf: &mut Vec<u8>) -> Result<S
     }
 }
 
+/// Connects to the first of `addrs` that accepts within `timeout`, in order, as
+/// `TcpStream::connect` does without a timeout: a host resolving to an address it
+/// cannot be reached on (an IPv6 one without IPv6 routing) still connects on the
+/// next. Fails with the last address's error.
+pub(crate) fn connect_timeout(
+    addrs: impl IntoIterator<Item = net::SocketAddr>,
+    timeout: Duration,
+) -> Result<net::TcpStream, Error> {
+    let mut last = Error::SocketAddr;
+    for addr in addrs {
+        match net::TcpStream::connect_timeout(&addr, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last = Error::TcpStream(e),
+        }
+    }
+    Err(last)
+}
+
 /// Whether the TLS certificate a server presents is checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -407,6 +425,35 @@ mod tests {
         net::{TcpListener, TcpStream},
         sync::mpsc,
     };
+
+    /// A loopback port nothing listens on: bound, then released.
+    fn closed_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.local_addr().expect("addr").port()
+    }
+
+    #[test]
+    fn a_timed_connect_falls_back_to_the_next_resolved_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let live = listener.local_addr().expect("addr");
+        let dead = net::SocketAddr::from(([127, 0, 0, 1], closed_port()));
+        let stream = connect_timeout([dead, live], Duration::from_secs(5))
+            .expect("the second address connects");
+        assert_eq!(stream.peer_addr().expect("peer"), live);
+    }
+
+    #[test]
+    fn a_timed_connect_reports_the_last_failure() {
+        let dead = net::SocketAddr::from(([127, 0, 0, 1], closed_port()));
+        assert!(matches!(
+            connect_timeout([dead], Duration::from_secs(5)),
+            Err(Error::TcpStream(_))
+        ));
+        assert!(matches!(
+            connect_timeout([], Duration::from_secs(5)),
+            Err(Error::SocketAddr)
+        ));
+    }
 
     /// Accept one connection, write `greeting`, then close. Returns the port
     /// and a channel that yields the accepted stream so the test controls when
