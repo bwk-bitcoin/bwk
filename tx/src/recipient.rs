@@ -160,30 +160,41 @@ impl Recipient {
         let (Some(descr), Some((kc, index))) = (&self.descriptor, &self.origin) else {
             return Ok(bitcoin::psbt::Output::default());
         };
-        let descr = derive_descriptor(descr, *kc, *index)?;
-
-        let dummy_tx = bitcoin::Transaction {
-            version: bitcoin::transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![],
-            output: vec![self.clone().into()],
-        };
-
-        let mut dummy_psbt = bitcoin::Psbt {
-            unsigned_tx: dummy_tx,
-            version: 0,
-            xpub: Default::default(),
-            proprietary: Default::default(),
-            unknown: Default::default(),
-            inputs: Default::default(),
-            outputs: vec![bitcoin::psbt::Output::default()],
-        };
-
-        bwk_descriptor::updater::update_output(&mut dummy_psbt, 0, &descr)
-            .map_err(|_| Error::Update)?;
-
-        Ok(dummy_psbt.outputs[0].clone())
+        descriptor_output(self.clone().into(), descr, *kc, *index)
     }
+}
+
+/// The PSBT output fields a signer needs to verify that `txout` pays the
+/// wallet's `keychain`/`index` script of `descriptor`.
+fn descriptor_output(
+    txout: TxOut,
+    descriptor: &WalletDescriptor,
+    keychain: KeyChain,
+    index: u32,
+) -> Result<bitcoin::psbt::Output, Error> {
+    let descr = derive_descriptor(descriptor, keychain, index)?;
+
+    let dummy_tx = bitcoin::Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![],
+        output: vec![txout],
+    };
+
+    let mut dummy_psbt = bitcoin::Psbt {
+        unsigned_tx: dummy_tx,
+        version: 0,
+        xpub: Default::default(),
+        proprietary: Default::default(),
+        unknown: Default::default(),
+        inputs: Default::default(),
+        outputs: vec![bitcoin::psbt::Output::default()],
+    };
+
+    bwk_descriptor::updater::update_output(&mut dummy_psbt, 0, &descr)
+        .map_err(|_| Error::Update)?;
+
+    Ok(dummy_psbt.outputs[0].clone())
 }
 
 impl RecipientProvider for Recipient {
@@ -310,6 +321,22 @@ impl<T: ChangeTip> ChangeRecipientProvider<T> {
     }
 }
 
+impl<T: ChangeTip> ChangeRecipientProvider<T> {
+    /// The change script at `index`.
+    fn script_at(&self, index: u32) -> ScriptBuf {
+        self.descriptor
+            .single_paths()
+            .expect("multipath")
+            .get(1)
+            .expect("change descriptor")
+            .derive_at(index)
+            .expect("derivation")
+            .address(self.network)
+            .expect("address")
+            .script_pubkey()
+    }
+}
+
 impl<T: ChangeTip + Clone> Clone for ChangeRecipientProvider<T> {
     fn clone(&self) -> Self {
         Self {
@@ -345,17 +372,7 @@ impl<T: ChangeTip + Clone + 'static> RecipientProvider for ChangeRecipientProvid
     fn create_script(&mut self, _ctx: &FinalizationContext) -> ScriptBuf {
         let index = self.tip_updater.next_index();
         self.current_index = Some(index);
-
-        self.descriptor
-            .single_paths()
-            .expect("multipath")
-            .get(1)
-            .expect("change descriptor")
-            .derive_at(index)
-            .expect("derivation")
-            .address(self.network)
-            .expect("address")
-            .script_pubkey()
+        self.script_at(index)
     }
 
     fn psbt_output_info(&self) -> PsbtOutputInfo {
@@ -378,6 +395,19 @@ impl<T: ChangeTip + Clone + 'static> RecipientProvider for ChangeRecipientProvid
 
     fn set_amount(&mut self, amount: Amount) {
         self.amount = amount;
+    }
+
+    /// The change output's derivation fields, so a signer can verify the
+    /// change pays back to the wallet. Empty before create_script().
+    fn to_psbt_output(&self) -> Result<bitcoin::psbt::Output, Error> {
+        let Some(index) = self.current_index else {
+            return Ok(bitcoin::psbt::Output::default());
+        };
+        let txout = TxOut {
+            value: bitcoin::Amount::ZERO,
+            script_pubkey: self.script_at(index),
+        };
+        descriptor_output(txout, &self.descriptor, KeyChain::Change, index)
     }
 
     fn network(&self) -> Network {

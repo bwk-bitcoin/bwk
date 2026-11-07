@@ -905,6 +905,48 @@ mod tests {
     }
 
     #[test]
+    fn change_output_carries_its_derivation() {
+        let (_signer, derivator) = wpkh_signer();
+        let change_provider = Box::new(
+            crate::recipient::ChangeRecipientProvider::new(
+                derivator.descriptor(),
+                Network::Regtest,
+            )
+            .tip(4),
+        );
+        let mut builder = TxBuilder::new_with_derivator(change_provider, derivator.clone());
+        builder.receive_coin(test::receive_coin(100_000, &derivator, 0));
+        builder.dummy_external_output(50_000);
+
+        let change_spk = derivator.change_at(5).script_pubkey();
+        let v0 = builder.generate().unwrap();
+        let v2 = builder.generate_v2().unwrap();
+        let in_v0 = v0
+            .unsigned_tx
+            .output
+            .iter()
+            .zip(&v0.outputs)
+            .find(|(txout, _)| txout.script_pubkey == change_spk)
+            .map(|(_, output)| output.clone());
+        let in_v2 = v2
+            .outputs
+            .iter()
+            .find(|output| output.script_pubkey.as_ref() == Some(&change_spk))
+            .map(|output| output.psbt.clone());
+        for output in [in_v0, in_v2] {
+            let output = output.expect("change at the next index");
+            let origins: Vec<_> = output.bip32_derivation.values().collect();
+            assert_eq!(origins.len(), 1, "the change key's origin is set");
+            let path: Vec<u32> = origins[0].1.into_iter().map(|c| u32::from(*c)).collect();
+            assert_eq!(
+                &path[path.len() - 2..],
+                &[1, 5],
+                "on the change keychain at 5"
+            );
+        }
+    }
+
+    #[test]
     fn process_transaction_no_selector_keeps_no_inputs_error() {
         // The engine, called directly with no selector, keeps the manual-inputs
         // contract: empty inputs is an error. (Via the builder, simulate() would
