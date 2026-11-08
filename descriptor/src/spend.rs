@@ -87,7 +87,8 @@ pub enum Maturity {
 }
 
 impl Maturity {
-    fn and(self, other: Self) -> Self {
+    /// Combine two independent requirements: one unmet makes the whole immature.
+    pub fn and(self, other: Self) -> Self {
         match (self, other) {
             (Self::Immature, _) | (_, Self::Immature) => Self::Immature,
             (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
@@ -124,6 +125,25 @@ pub struct ChainContext {
     /// BIP113 uses tip MTP, not wall-clock time or the next block's timestamp.
     pub median_time_past: Option<u32>,
     pub confirmation: Confirmation,
+}
+
+/// Blocks a coinbase output waits before it can be spent (consensus
+/// `COINBASE_MATURITY`).
+pub const COINBASE_MATURITY: u32 = 100;
+
+impl ChainContext {
+    /// Whether a coinbase output confirmed at `confirmation` may be spent in the
+    /// block after the tip: that block must be at least `COINBASE_MATURITY`
+    /// blocks above the confirmation. A coinbase never sits in the mempool, so an
+    /// unconfirmed one is `Unknown`.
+    pub fn coinbase_maturity(&self) -> Maturity {
+        match self.confirmation {
+            Confirmation::Confirmed { height, .. } => Maturity::from_met(
+                u64::from(self.height) + 1 >= u64::from(height) + u64::from(COINBASE_MATURITY),
+            ),
+            Confirmation::Unconfirmed | Confirmation::Unknown => Maturity::Unknown,
+        }
+    }
 }
 
 impl Locks {
