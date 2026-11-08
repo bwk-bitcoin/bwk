@@ -153,6 +153,8 @@ uses tip MTP, never wall-clock time. Missing data returns `Unknown`; a known
 unmet constraint returns `Immature`. `Mature` is only timelock eligibility, not
 coinbase maturity, unspent status or signer readiness. Recompute on every chain
 change, including reorgs; never reuse confirmation data from another tip.
+`ChainContext::coinbase_maturity` checks the 100-block coinbase rule against the
+same context; combine it with the lock maturity through `Maturity::and`.
 
 `Locks::apply` sets the minimum transaction version, locktime and input sequence
 before signing. `validate_transaction` checks an assembled transaction. CLTV

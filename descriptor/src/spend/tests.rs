@@ -463,6 +463,26 @@ fn unconfirmed_and_reorg_maturity() {
 }
 
 #[test]
+fn coinbase_maturity_needs_a_hundred_confirmations() {
+    let mut chain = context();
+    for (confirmation, expected) in [
+        (1, Maturity::Mature),
+        (2, Maturity::Immature),
+        (100, Maturity::Immature),
+    ] {
+        chain.confirmation = Confirmation::Confirmed {
+            height: confirmation,
+            previous_mtp: None,
+        };
+        assert_eq!(chain.coinbase_maturity(), expected);
+    }
+    chain.confirmation = Confirmation::Unconfirmed;
+    assert_eq!(chain.coinbase_maturity(), Maturity::Unknown);
+    chain.confirmation = Confirmation::Unknown;
+    assert_eq!(chain.coinbase_maturity(), Maturity::Unknown);
+}
+
+#[test]
 fn lock_compatibility_is_per_input() {
     let absolutes = [None, Some(100), Some(500_000_100)];
     let relatives = [None, Some(10), Some((1 << 22) | 2)];
