@@ -1670,10 +1670,8 @@ impl<P: OpenScanFromBackend> Account<P> {
         !self.scanner.online()
     }
 
-    /// Test-only accessor for the account's `HeaderStore` handle, used to
-    /// assert store identity (`Arc::ptr_eq`) across accounts sharing one.
-    /// `None` without a header scanner.
-    #[cfg(any(test, feature = "test"))]
+    /// The validated header chain this account's scan promotes against, `None`
+    /// without a header scanner.
     pub fn header_store(&self) -> Option<&Arc<HeaderStore<P::HeaderStore>>> {
         self.header_scanner
             .as_ref()
