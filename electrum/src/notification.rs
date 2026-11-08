@@ -73,6 +73,10 @@ pub enum Notification {
     /// A chain-tip-advance (CTA) pass mutated tx state in response to a
     /// HeaderStore update.
     HeaderStoreUpdated,
+    /// The header store's chain changed: a new tip, a reorg, or a change of its
+    /// validation state. A [`ChainSnapshot`](crate::header_store::ChainSnapshot)
+    /// taken before is stale.
+    ChainChanged,
     HeaderProgress(crate::header_store::HeaderProgressEvent),
     /// The header store's merkle client ended, so no inclusion proof is
     /// fetched any more; confirmed entries stay unverified until the store
