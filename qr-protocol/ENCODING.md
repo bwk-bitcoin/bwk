@@ -22,8 +22,7 @@ out of scope.
 
 ### Scope
 
-Transport is out of scope,the encoding defined here is independent of any
-third-party serialization format.
+The encoding is independent of any third-party serialization format.
 
 ## Specification
 
@@ -116,16 +115,7 @@ step has bit 31 set, `index | 0x80000000`).
   Exactly one of `SCAN_PATH` and `SCAN_KEY` MUST be present: a reader MUST reject
   the form when both or neither are.
 
-  The spend key is always the signer's: it derives the spend key at `SPEND_PATH`
-  from its own seed, and MUST refuse the form when `FINGERPRINT` is not its own. It
-  gets the scan private key by deriving it at `SCAN_PATH` from its own seed, or by
-  taking `SCAN_KEY` as it is. Either way it holds the scan private key, so it
-  computes the scan public key and the BIP-352 label tweak itself, and a labelled
-  address verifies the same in both cases. From the spend public key and the scan
-  private key it rebuilds the account's BIP-392 `sp()` descriptor. The scan private
-  key reveals the account's incoming silent payments but cannot spend them, so
-  sending it is a privacy matter, not a custody one. A signer SHOULD NOT keep a
-  received `SCAN_KEY` beyond the request. Used only by Address Verification.
+  Used only by Address Verification.
 
   Example, the master fingerprint `73c5da0a` with the spend key at
   `m/352'/1'/0'/0'/0` and the signer's own scan key at `m/352'/1'/0'/1'/0`:
@@ -206,18 +196,11 @@ Bit 0 is the LSB.
 +------+----------------------------------+
 ```
 
-Bit 2 implies the signer can return a signed `PSBT` (Signing response `KIND`
-`0x01`), the form a silent payment send falls back to when the signer cannot answer
-with `KIND` `0x02` and its ECDH shares and DLEQ proofs (see Signing).
-
-Bit 3 means the signer is a BIP-327 MuSig2 participant for BIP-390 `musig()` keys
-inside `tr()` of a registered descriptor (`FORM` `0x01`) or wallet policy (`FORM`
-`0x02`): it reads and writes the BIP-373 PSBT fields, follows the rules of the
-MuSig2 subsection of Signing, and MAY answer with `SIG_KIND` `0x04` / `0x05`. A
-wallet MUST NOT register or send a `musig()` descriptor to a signer without bit 3.
+Bit 3 means the signer is a BIP-327 MuSig2 participant for BIP-390 `musig()` keys,
+and MAY answer with `SIG_KIND` `0x04` / `0x05` (see Signing).
 
 Bit 4 advertises the separate MuSig Preparation and MuSig Signing operations below.
-It is not implied by bit 3. A wallet MUST check bit 4 before using either operation.
+It is not implied by bit 3.
 
 Bits 5–30 are reserved for future capabilities and MUST be `0` in this version; a
 reader MUST ignore an unknown capability bit rather than reject, so a newer signer
@@ -368,20 +351,6 @@ body.
 
 Values `0x02`–`0xFF` are reserved; a parser MUST reject them.
 
-A signer MUST refuse a `KEY_REQUEST` of `KIND` `0x01` unless its path is a BIP-352
-scan key path or under it: `m/352'/coin'/account'/1'` and deeper, with `coin` and
-`account` hardened. Exporting the scan key reveals the account's incoming silent
-payments but cannot spend them; any other private key spends funds. A signer
-without the Silent Payments capability (bit 2) MUST refuse any `KIND` `0x01`. A
-signer refusing a `KEY_REQUEST` refuses the whole request with an error response,
-`ERROR` `0x0C`, never a partial answer. The signer SHOULD tell the user, before
-exporting, that the key reveals incoming payments but cannot spend them.
-
-A silent payment wallet asks for the spend key public and the scan key private
-(e.g. `m/352'/0'/0'/0'` `KIND` `0x00` and `m/352'/0'/0'/1'` `KIND` `0x01`) and builds
-the BIP-392 `sp()` descriptor itself, alongside any other xpubs (e.g. `m/86'/0'/0'`,
-`m/84'/0'/0'`) in the same request.
-
 **Ok response** (`TYPE` = `0x01`, response):
 
 `KEYS` `FINGERPRINT` `VENDOR` `MODEL` `VERSION` `CAPABILITIES`
@@ -410,15 +379,10 @@ registration status of `DESCRIPTOR_ALIAS`. At most one descriptor per request.
 `DESCRIPTOR_ALIAS`: echoes the alias from the request.
 `REGISTERED`: OPTIONAL `BOOL`, the registration status.
 `STORED`: OPTIONAL `BOOL`, whether the device persisted the descriptor under
-`DESCRIPTOR_ALIAS`. A device may persist the descriptor, or stay stateless and
-prove the registration with a `POR`; a device supporting both lets the user choose
-on the device, so only the device knows which happened. When `true`, a later
-request MAY reference the descriptor by `DESCRIPTOR_ALIAS` alone. When `false` or
-absent, the wallet MUST send the `DESCRIPTOR_BODY` again in every later request,
-together with the `POR` when the device issued one; absent means the device does
-not report whether it stored the descriptor, so the wallet MUST assume it did not.
-A device MAY both store the descriptor and return a `POR`, so `STORED` and the
-presence of `POR` are independent.
+`DESCRIPTOR_ALIAS`. When `true`, a later request MAY reference the descriptor by
+`DESCRIPTOR_ALIAS` alone. When `false` or absent, later requests carry the
+`DESCRIPTOR_BODY`, together with the `POR` when the device issued one. `STORED`
+and the presence of `POR` are independent.
 `POR`: OPTIONAL `BYTES`, a proof of registration (for stateless devices).
 
 A failed registration is reported as an error response (`STATUS` = `1`), not via a
@@ -444,11 +408,8 @@ A silent payment address is verified with a `DESCRIPTOR` of `FORM` `0x03`
   for the address labelled `m` (`m` ≥ 1, as label `0` is reserved for change).
 - `ADDRESS`: the expected silent payment address.
 
-The signer gets the spend key and the scan private key as `FORM` `0x03` describes
-(the scan key derived at `SCAN_PATH`, or given as `SCAN_KEY`), applies the label
-tweak when `DERIV` has one, encodes the address for its network, shows it, and
-answers with a `URI` holding it, or with the error `0x08` when it differs from
-`ADDRESS`. Only a signer advertising capability bit 2 accepts it.
+The answer is a `URI` holding the address, or the error `0x08` when the address
+differs from `ADDRESS`. It requires capability bit 2.
 
 **Ok response** (`TYPE` = `0x03`, response):
 
@@ -506,8 +467,7 @@ When the transaction has silent payment outputs, a `KIND` `0x02` answer MUST
 contain, for every scan key of those outputs, an ECDH share (`SIG_KIND` `0x06`) and
 its BIP-374 DLEQ proof (`SIG_KIND` `0x07`), either global or one per eligible input
 the signer signs, as BIP-375 lays them out, plus the usual signatures. A signer that
-cannot provide them answers with `KIND` `0x01`. Output scripts do not travel: the
-wallet computes them from the shares, and the signatures commit to them.
+cannot provide them answers with `KIND` `0x01`. Output scripts are not carried.
 
 `SIG_ENTRY` follows this format:
 
@@ -590,106 +550,18 @@ When `GLOBAL` is `true`, `INPUT_INDEX` MUST be `0`, and a reader MUST reject any
 other value. `GLOBAL` is a field of its own rather than a reserved `INPUT_INDEX`
 value, as every input index is a valid one.
 
-BIP-375 pairs every share with the proof that lets others verify it, so in one
-response a scope (global, or one input) and `SCAN_KEY` with a `0x06` or `0x07` entry
-MUST have exactly one of each, and a reader MUST reject a share without its proof, a
-proof without its share, or a duplicate of either. Whether every scan key and every
-eligible input is covered depends on the transaction, so the wallet checks it
-against its PSBT. The wallet puts each pair in its PSBT under the BIP-375 field it
-maps to, verifies the proofs and computes the output scripts as BIP-375 lays out,
-then adds the signatures.
-
-The key material travels with the signature because the coordinator inserts each
-signature into its PSBT keyed by those values. No control block is sent: the
-coordinator rebuilds it from the descriptor at finalize time.
-
-Spending an output received via silent payments is an ordinary taproot key-path
-spend, so `0x02` (tapkey) already covers it.
+In one response, a scope (global, or one input) and `SCAN_KEY` with a `0x06` or
+`0x07` entry MUST have exactly one of each, and a reader MUST reject a share
+without its proof, a proof without its share, or a duplicate of either.
 
 #### MuSig2
 
-This subsection applies to a signer advertising capability bit 3. A MuSig2 key
-uses the BIP-373 PSBT fields: `PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS` (`0x1a`), keyed
-by the untweaked KeyAgg aggregate; `PSBT_IN_MUSIG2_PUB_NONCE` (`0x1b`, 66 bytes)
-and `PSBT_IN_MUSIG2_PARTIAL_SIG` (`0x1c`, 32 bytes), both keyed by
-`participant(33) || aggregate(33) [|| leaf_hash(32)]`, where `aggregate` is the key
-signed for: the taproot output key on the key path (no leaf hash), the key as it
-appears in the leaf on a script path (with the leaf hash).
-
-**Rounds.** For ordinary Signing (`TYPE` `0x04`), each cosigner takes part in two
-Signing exchanges. The cached operations below are separate; `VERSION` stays 1.
-
-- Round 1: the request `PSBT` carries no `0x1b` and no `0x1c` from anyone. The
-  answer carries the signer's own `0x1b` only (`KIND` `0x01` with them in the PSBT,
-  or `KIND` `0x02` with `SIG_KIND` `0x04` entries) and no signature of any kind.
-- Round 2: the request `PSBT` carries every participant's `0x1b` for every slot.
-  The answer carries the signer's `0x1c` (`SIG_KIND` `0x05` entries, or in the
-  PSBT) and its ordinary signatures (`SIG_KIND` `0x01` to `0x03`). A signer that
-  holds every partial signature MAY also aggregate them and add the final
-  signature; the wallet MUST accept either.
-
-**Slots.** A slot is one (input, participant, aggregate, leaf). The signer tells
-the rounds apart from its own `0x1b` over its slots only; foreign `0x1b` / `0x1c`
-never decide the round, and a signer in round 1 ignores them (a wallet still strips
-them, see the wallet rules):
-
-```
-+--------------------------------------+----------------------+
-| Signer's own `0x1b` in the PSBT      | Meaning              |
-+--------------------------------------+----------------------+
-| on none of its slots                 | Round 1              |
-| on all of its slots                  | Round 2              |
-| on some of its slots only            | Error `0x0D`         |
-| the signer has no MuSig2 slot        | Ordinary signing     |
-+--------------------------------------+----------------------+
-```
-
-**Signer rules.** The signer MUST:
-
-- take the cosigners and the slots from the registered descriptor, never from the
-  PSBT `0x1a`, and ignore a `0x1a` whose aggregate it does not know;
-- consider a script-path slot only for a leaf present in the input's
-  `PSBT_IN_TAP_LEAF_SCRIPT`, and the key-path slot only when the input carries the
-  `0x1a` of the internal aggregate;
-- require the session of round 1 for round 2, and answer `0x0D` when that session
-  is missing, when the transaction or a spent output changed, when a recomputed
-  sighash or its own `0x1b` differs from what the session holds, or when any
-  cosigner's `0x1b` is missing;
-- never sign with a participant key outside MuSig2.
-
-**Nonce safety.** The signer MUST:
-
-- draw each secret nonce from BIP-327 `NonceGen` with 32 fresh bytes from a
-  cryptographically secure random source, bound to its slot's key and sighash;
-- bind the session to the unsigned transaction, every spent output, the registered
-  policy and the signer's fingerprint;
-- keep secret nonces in volatile memory only, never export, serialize, log or
-  persist them, and use each at most once;
-- erase the session before a partial signature leaves the signer, and on any
-  round-2 failure after the session was looked up;
-- replace any earlier session for the same transaction on a new round 1.
-
-Losing the session (power cycle, timeout) only costs a restart from round 1, never
-a nonce reuse.
-
-**Wallet rules.** The wallet MUST:
-
-- strip every `0x1b` and `0x1c` from the PSBT before round 1, so no foreign nonce
-  reaches a signer in that round;
-- for an m-of-n policy, restrict the PSBT to one leaf (one m-subset) before round 1,
-  so each cosigner answers for that leaf only;
-- never change the transaction, a spent output or the chosen leaf between the
-  rounds;
-- send round 2 only once every participant's `0x1b` is merged;
-- on `0x0D` from any cosigner, discard every nonce of the attempt and restart
-  round 1 with every cosigner;
-- verify each partial signature (BIP-327 `PartialSigVerify`) before aggregating it
-  into `PSBT_IN_TAP_KEY_SIG` or `PSBT_IN_TAP_SCRIPT_SIG`.
-
-These rules follow Bitcoin Core, Coldcard EDGE (`shared/psbt.py`
-`musig_process_input`: strict round separation, the public nonce recomputed and
-compared with the PSBT's, the session erased after use) and Ledger (no foreign
-nonce in the round-1 PSBT, cosigners rebuilt from the registered policy).
+A MuSig2 signer takes part in two Signing exchanges on the same transaction. Its
+first answer carries its public nonces only (`SIG_KIND` `0x04` entries, or in the
+PSBT with `KIND` `0x01`), and no signature of any kind. Its second answer carries
+its partial signatures (`SIG_KIND` `0x05` entries, or in the PSBT) and its ordinary
+signatures (`SIG_KIND` `0x01` to `0x03`). A session missing, consumed or mismatched
+on the second exchange is refused with `ERROR` `0x0D`.
 
 ### MuSig Preparation
 
@@ -751,12 +623,7 @@ caller-chosen 32-byte opaque identifier. Both have no length prefix, and the
 response echoes both. `PSBT` is a bounded `BYTES` field, carried without parsing,
 and may contain serialized PSBT v0 or v2. There is no response-kind selector.
 
-The caller checks request ID, operation, session ID and attempt ID on responses.
-Missing, consumed, lost or mismatched sessions refuse with `ERROR` `0x0D`. A
-cached request MUST NOT fall back to ordinary signing. Durable allocation, binding
-the exact descriptor-derived slots and participant nonce transcript, and burning
-secret nonces before signing belong to the signer and coordinator, not to this
-encoding.
+Missing, consumed, lost or mismatched sessions refuse with `ERROR` `0x0D`.
 
 These operations use new type codes rather than appended ordinary Signing fields.
 An old parser ignores appended fields and newer version values, so neither would
@@ -769,10 +636,7 @@ codes instead force rejection before the body is read. `VERSION` remains 1.
 
 The body is empty.
 
-A signer MUST answer it without any user interaction, also when it is locked or
-holds no seed, and MUST NOT derive or reveal any key to answer it, except for
-`FINGERPRINT` below. This lets a wallet learn what a signer supports, and whether it
-is ready, before sending anything that needs the user.
+A signer answers it without user interaction, also when locked or without a seed.
 
 **Ok response** (`TYPE` = `0x07`, response):
 
@@ -815,8 +679,7 @@ not know.
 Bits 4–7 are reserved: they MUST be `0` when written, and a reader MUST ignore them.
 
 `MAX_MESSAGE`: 4-byte big-endian unsigned integer, the size in bytes of the largest
-complete `MESSAGE` the signer accepts. A wallet SHOULD check a request against it
-before sending it.
+complete `MESSAGE` the signer accepts.
 `MAX_ALIAS`: 1-byte unsigned integer, the length in bytes of the longest
 `DESCRIPTOR_ALIAS` the signer stores. It MUST be at most 32, the `DESCRIPTOR_ALIAS`
 bound, and a reader MUST reject a larger value.
@@ -882,8 +745,7 @@ Rules for future versions:
 
 ### Parser limits
 
-These are not wire-format fields but the bounds a parser applies so absurd input
-is rejected before anything large is allocated. Recommended values:
+Recommended bounds for a parser:
 
 ```
 +-------------------+---------------+
@@ -897,9 +759,7 @@ is rejected before anything large is allocated. Recommended values:
 ```
 
 The `BYTES` bound also applies to the `LENGTH` of a `SIG_ENTRY`. A parser MAY use
-different bounds, but it MUST reject input that exceeds what it can hold rather than
-allocate unboundedly. A `COUNT` is attacker-controlled, so a
-parser MUST NOT reserve room for it before the items have been read.
+different bounds.
 
 ### Worked examples
 
