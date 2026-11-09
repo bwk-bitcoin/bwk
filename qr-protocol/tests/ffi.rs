@@ -8,12 +8,12 @@ use std::{
 };
 
 use bwk_qr_protocol::{
-    encode_request,
+    encode, encode_request,
     ffi::{
         bwk_qr_buf_free, bwk_qr_request_decode, bwk_qr_request_free, bwk_qr_response_encode, types,
         Error, OK,
     },
-    musig, request,
+    get_info, musig, request,
     response::{self, SpScope},
     sp,
     types::{DerivationPath, ExtendedKey, Fingerprint, PublicKey},
@@ -685,6 +685,127 @@ fn a_model_filling_its_field_keeps_its_terminator() {
 }
 
 #[test]
+fn get_info_request_view() {
+    unsafe {
+        let view = view(&request(request::Body::GetInfo));
+        assert_eq!((*view).id, ID);
+        assert_eq!((*view).message_type, MessageType::GetInfo.value());
+        bwk_qr_request_free(view);
+    }
+}
+
+fn info_view(state: u8, has_fingerprint: u8, max_alias: u8) -> types::Response {
+    response_view(
+        MessageType::GetInfo.value(),
+        false,
+        types::ResponseBody {
+            info: types::Info {
+                vendor: fixed("bwk"),
+                model: fixed("bwk-signer"),
+                version: types::FirmwareVersion {
+                    major: 1,
+                    minor: 7,
+                    patch: 0x00ab_cdef,
+                    flag: response::ReleaseFlag::Alpha.value(),
+                },
+                capabilities: 0x0000_0013,
+                state,
+                networks: response::Networks::MAINNET | response::Networks::REGTEST,
+                max_message: 0x0002_0000,
+                max_alias,
+                max_keys: 15,
+                slots: 300,
+                has_fingerprint,
+                fingerprint: [0xde, 0xad, 0xbe, 0xef],
+            },
+        },
+    )
+}
+
+#[test]
+fn info_response_encodes() {
+    unsafe {
+        let expected = |state, fingerprint| Response {
+            id: id(),
+            body: response::Body::Info(response::Info {
+                vendor: "bwk".to_string(),
+                model: "bwk-signer".to_string(),
+                version: response::FirmwareVersion {
+                    major: 1,
+                    minor: 7,
+                    patch: 0x00ab_cdef,
+                    flag: response::ReleaseFlag::Alpha,
+                },
+                capabilities: response::Capabilities(0x0000_0013),
+                state,
+                networks: response::Networks(0x09),
+                max_message: 0x0002_0000,
+                max_alias: 32,
+                max_keys: 15,
+                slots: 300,
+                fingerprint,
+            }),
+        };
+        assert_eq!(
+            encoded(&info_view(response::STATE_READY, 1, 32)),
+            expected(
+                response::State::Ready,
+                Some(Fingerprint([0xde, 0xad, 0xbe, 0xef]))
+            )
+        );
+        // the fingerprint bytes are ignored when has_fingerprint is 0
+        assert_eq!(
+            encoded(&info_view(response::STATE_LOCKED, 0, 32)),
+            expected(response::State::Locked, None)
+        );
+    }
+}
+
+#[test]
+fn info_encode_rejects_an_invalid_fingerprint_presence() {
+    unsafe {
+        let view = info_view(response::STATE_READY, 2, 32);
+        assert_eq!(encode_failure(&view), Error::InvalidBool.info_owned());
+    }
+}
+
+#[test]
+fn info_encode_rejects_a_fingerprint_when_not_ready() {
+    unsafe {
+        for state in [response::STATE_LOCKED, response::STATE_UNINITIALIZED, 0x03] {
+            let view = info_view(state, 1, 32);
+            assert_eq!(
+                encode_failure(&view),
+                get_info::Error::FingerprintWhenNotReady.info_owned()
+            );
+        }
+    }
+}
+
+#[test]
+fn info_encode_rejects_a_max_alias_above_the_alias_bound() {
+    unsafe {
+        let view = info_view(response::STATE_READY, 1, 33);
+        assert_eq!(
+            encode_failure(&view),
+            get_info::Error::MaxAliasTooLarge(33).info_owned()
+        );
+    }
+}
+
+#[test]
+fn info_encode_rejects_reserved_network_bits() {
+    unsafe {
+        let mut view = info_view(response::STATE_READY, 1, 32);
+        view.body.info.networks = 0x80;
+        assert_eq!(
+            encode_failure(&view),
+            encode::Error::ReservedNetworkBits(0x80).info_owned()
+        );
+    }
+}
+
+#[test]
 fn registration_response_encodes_every_tri_state() {
     for (registered, stored, expected_registered, expected_stored) in [
         (1i8, 1i8, Some(true), Some(true)),
@@ -1208,6 +1329,18 @@ trait InfoOwned {
 }
 
 impl InfoOwned for Error {
+    fn info_owned(&self) -> (i32, String) {
+        owned(self.info())
+    }
+}
+
+impl InfoOwned for get_info::Error {
+    fn info_owned(&self) -> (i32, String) {
+        owned(self.info())
+    }
+}
+
+impl InfoOwned for encode::Error {
     fn info_owned(&self) -> (i32, String) {
         owned(self.info())
     }

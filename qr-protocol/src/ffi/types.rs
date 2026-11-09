@@ -209,6 +209,7 @@ pub union ResponseBody {
     pub signed: Signed,
     pub musig_prepared: MusigPrepared,
     pub musig_signed: MusigSigned,
+    pub info: Info,
     pub error: ErrorBody,
 }
 
@@ -231,6 +232,25 @@ pub struct FirmwareVersion {
     pub patch: u32,
     /// A `ReleaseFlag` wire code.
     pub flag: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Info {
+    pub vendor: [c_char; VENDOR_LEN + 1],
+    pub model: [c_char; MODEL_LEN + 1],
+    pub version: FirmwareVersion,
+    pub capabilities: u32,
+    /// A `State` wire code.
+    pub state: u8,
+    pub networks: u8,
+    pub max_message: u32,
+    pub max_alias: u8,
+    pub max_keys: u8,
+    pub slots: u16,
+    /// 0 or 1.
+    pub has_fingerprint: u8,
+    pub fingerprint: [u8; FINGERPRINT_LEN],
 }
 
 #[repr(C)]

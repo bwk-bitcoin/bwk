@@ -1,7 +1,7 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::{
-    musig, request, response, sp,
+    get_info, musig, request, response, sp,
     types::{DerivationPath, ExtendedKey, PublicKey, TAP_LEAF_HASH_LEN},
     ErrorInfo, MessageType, Request, RequestId, Response, SignResponseKind, DIRECTION_REQUEST,
     DIRECTION_RESPONSE, ERROR_MESSAGE_LEN, MAGIC, MAX_BYTES, MAX_DESCRIPTOR_ALIAS, MAX_VEC,
@@ -13,11 +13,16 @@ pub const MAX_PATCH: u32 = 0x00ff_ffff;
 const ERROR_CODE_FUTURE_MIN: u8 = 0x0e;
 const ERROR_CODE_FUTURE_MAX: u8 = 0xfe;
 const CAPABILITIES_MASK: u32 = 0x0000_000f | response::Capabilities::MUSIG_CACHE;
+const NETWORKS_MASK: u8 = response::Networks::MAINNET
+    | response::Networks::TESTNET
+    | response::Networks::SIGNET
+    | response::Networks::REGTEST;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     Musig(musig::Error),
     Sp(sp::Error),
+    GetInfo(get_info::Error),
     PathTooLong(usize),
     PatchTooLarge(u32),
     ReservedCapabilityBits(u32),
@@ -29,6 +34,8 @@ pub enum Error {
     FixedStringTooLong { len: usize, max: usize },
     Unreachable,
     DefinedSignatureKind(u8),
+    ReservedNetworkBits(u8),
+    DefinedState(u8),
 }
 
 impl Error {
@@ -36,6 +43,7 @@ impl Error {
         match self {
             Self::Musig(error) => error.info(),
             Self::Sp(error) => error.info(),
+            Self::GetInfo(error) => error.info(),
             Self::PathTooLong(_) => error_info!(300, "derivation path exceeds the maximum depth"),
             Self::PatchTooLarge(_) => error_info!(301, "firmware patch version is too large"),
             Self::ReservedCapabilityBits(_) => error_info!(302, "reserved capability bits are set"),
@@ -56,6 +64,8 @@ impl Error {
                     "unknown signature entry uses a defined or reserved kind"
                 )
             }
+            Self::ReservedNetworkBits(_) => error_info!(311, "reserved network bits are set"),
+            Self::DefinedState(_) => error_info!(312, "unknown signer state uses a defined value"),
         }
     }
 }
@@ -71,6 +81,12 @@ impl From<musig::Error> for Error {
 impl From<sp::Error> for Error {
     fn from(error: sp::Error) -> Self {
         Self::Sp(error)
+    }
+}
+
+impl From<get_info::Error> for Error {
+    fn from(error: get_info::Error) -> Self {
+        Self::GetInfo(error)
     }
 }
 
@@ -115,6 +131,7 @@ fn encode_request_body(out: &mut Vec<u8>, body: &request::Body) -> Result<(), Er
         request::Body::Sign(request) => encode_sign_request(out, request),
         request::Body::PrepareMusig(request) => encode_prepare_musig(out, request),
         request::Body::SignMusig(request) => encode_sign_musig(out, request),
+        request::Body::GetInfo => Ok(()),
     }
 }
 
@@ -126,6 +143,7 @@ fn encode_response_body(out: &mut Vec<u8>, body: &response::Body) -> Result<(), 
         response::Body::Signed(response) => encode_signed_response(out, response),
         response::Body::MusigPrepared(response) => encode_musig_prepared(out, response),
         response::Body::MusigSigned(response) => encode_musig_signed(out, response),
+        response::Body::Info(response) => encode_info_response(out, response),
         response::Body::Error(response) => encode_error_response(out, response),
     }
 }
@@ -224,6 +242,24 @@ fn encode_keys_response(out: &mut Vec<u8>, response: &response::Keys) -> Result<
     write_fixed_string(out, &response.model, MODEL_LEN)?;
     write_version(out, &response.version)?;
     write_capabilities(out, &response.capabilities)
+}
+
+fn encode_info_response(out: &mut Vec<u8>, response: &response::Info) -> Result<(), Error> {
+    response.validate()?;
+    write_fixed_string(out, &response.vendor, VENDOR_LEN)?;
+    write_fixed_string(out, &response.model, MODEL_LEN)?;
+    write_version(out, &response.version)?;
+    write_capabilities(out, &response.capabilities)?;
+    write_state(out, response.state)?;
+    write_networks(out, &response.networks)?;
+    out.extend_from_slice(&response.max_message.to_be_bytes());
+    out.push(response.max_alias);
+    out.push(response.max_keys);
+    out.extend_from_slice(&response.slots.to_be_bytes());
+    write_option(out, response.fingerprint.as_ref(), |out, fingerprint| {
+        out.extend_from_slice(&fingerprint.0);
+        Ok(())
+    })
 }
 
 fn encode_registration_response(
@@ -508,6 +544,26 @@ fn write_capabilities(
         return Err(Error::ReservedCapabilityBits(capabilities.0));
     }
     out.extend_from_slice(&capabilities.0.to_be_bytes());
+    Ok(())
+}
+
+// The decoder reads a defined state as its own variant, so none may hide behind
+// `Unknown`.
+fn write_state(out: &mut Vec<u8>, state: response::State) -> Result<(), Error> {
+    if let response::State::Unknown(value) = state {
+        if value <= response::STATE_UNINITIALIZED {
+            return Err(Error::DefinedState(value));
+        }
+    }
+    out.push(state.value());
+    Ok(())
+}
+
+fn write_networks(out: &mut Vec<u8>, networks: &response::Networks) -> Result<(), Error> {
+    if networks.0 & !NETWORKS_MASK != 0 {
+        return Err(Error::ReservedNetworkBits(networks.0));
+    }
+    out.push(networks.0);
     Ok(())
 }
 

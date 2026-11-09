@@ -1,7 +1,7 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::{
-    musig,
+    get_info, musig,
     reader::{self, Reader},
     request, response, sp,
     types::{DerivationPath, ExtendedKey, Fingerprint, PublicKey},
@@ -23,6 +23,7 @@ pub enum Error {
     SignatureLength(u8),
     GlobalInputIndex(u32),
     Sp(sp::Error),
+    GetInfo(get_info::Error),
     Read(reader::Error),
 }
 
@@ -44,6 +45,7 @@ impl Error {
                 error_info!(209, "global silent payment entry has a nonzero input index")
             }
             Self::Sp(error) => error.info(),
+            Self::GetInfo(error) => error.info(),
             Self::Read(inner) => inner.info(),
         }
     }
@@ -60,6 +62,12 @@ impl From<musig::Error> for Error {
 impl From<sp::Error> for Error {
     fn from(error: sp::Error) -> Self {
         Self::Sp(error)
+    }
+}
+
+impl From<get_info::Error> for Error {
+    fn from(error: get_info::Error) -> Self {
+        Self::GetInfo(error)
     }
 }
 
@@ -110,6 +118,10 @@ pub fn decode(bytes: &[u8]) -> Result<Message, Error> {
             id,
             body: request::Body::SignMusig(read_sign_musig(&mut reader)?),
         }),
+        (false, _, MessageType::GetInfo) => Message::Request(Request {
+            id,
+            body: request::Body::GetInfo,
+        }),
         (true, true, _) => Message::Response(Response {
             id,
             body: response::Body::Error(read_error_response(&mut reader, message_type)?),
@@ -137,6 +149,10 @@ pub fn decode(bytes: &[u8]) -> Result<Message, Error> {
         (true, false, MessageType::MusigSigning) => Message::Response(Response {
             id,
             body: response::Body::MusigSigned(read_musig_signed(&mut reader)?),
+        }),
+        (true, false, MessageType::GetInfo) => Message::Response(Response {
+            id,
+            body: response::Body::Info(read_info_response(&mut reader)?),
         }),
     };
     Ok(decoded)
@@ -268,6 +284,24 @@ fn read_keys_response(reader: &mut Reader<'_>) -> Result<response::Keys, Error> 
         version: read_version(reader)?,
         capabilities: read_capabilites(reader)?,
     })
+}
+
+fn read_info_response(reader: &mut Reader<'_>) -> Result<response::Info, Error> {
+    let response = response::Info {
+        vendor: reader.take_fixed_string(VENDOR_LEN)?,
+        model: reader.take_fixed_string(MODEL_LEN)?,
+        version: read_version(reader)?,
+        capabilities: read_capabilites(reader)?,
+        state: reader.take_u8()?.into(),
+        networks: response::Networks(reader.take_u8()?),
+        max_message: reader.take_u32_be()?,
+        max_alias: reader.take_u8()?,
+        max_keys: reader.take_u8()?,
+        slots: reader.take_u16_be()?,
+        fingerprint: reader.take_option(read_fingerprint)?,
+    };
+    response.validate()?;
+    Ok(response)
 }
 
 fn read_registration_response(reader: &mut Reader<'_>) -> Result<response::Registration, Error> {

@@ -13,8 +13,8 @@
 This document defines the byte encoding of the signing-flow messages exchanged
 between a **wallet** (online software) and a **signer** (offline device) in the
 miniscript context: Get Keys, Register Descriptor, Address Verification, Signing,
-MuSig Preparation and MuSig Signing and their exact byte layout. It is the
-authoritative byte-level contract two implementations must agree on.
+MuSig Preparation, MuSig Signing and Get Info and their exact byte layout. It is
+the authoritative byte-level contract two implementations must agree on.
 
 The encoding is **transport agnostic**: a `MESSAGE` is a self-contained byte
 string, and how it is delivered (animated QR via BBQR, NFC, a file, a socket) is
@@ -133,6 +133,69 @@ step has bit 31 set, `index | 0x80000000`).
 
 Note: `KEYS` must be sorted following the `@n` order.
 
+`VENDOR`: 16 bytes, a UTF-8 device-vendor string with no `LENGTH` prefix, right-padded
+with `0x00` when shorter than 16 bytes. The value is the bytes up to the first
+`0x00` (or all 16 bytes when none is `0x00`); every byte after it MUST be `0x00`.
+
+`MODEL`: 16 bytes, a UTF-8 device-model string with no `LENGTH` prefix, right-padded
+with `0x00` when shorter than 16 bytes. The value is the bytes up to the first
+`0x00` (or all 16 bytes when none is `0x00`); every byte after it MUST be `0x00`.
+
+`VERSION`: in a response body, 8 bytes of device firmware version, `MAJOR` `MINOR`
+`PATCH` `FLAG` (the message's protocol `VERSION` is defined under Encoding). `MAJOR`
+and `MINOR` are 2-byte big-endian unsigned integers, `PATCH` is a 3-byte big-endian
+unsigned integer, and `FLAG` is a 1-byte pre-release channel.
+
+```
++--------+-------------------+
+| `FLAG` | Pre-release       |
++--------+-------------------+
+| 0x00   | Stable (final)    |
+| 0x01   | Alpha             |
+| 0x02   | Beta              |
+| 0x03   | Release candidate |
++--------+-------------------+
+```
+
+Values `0x04`–`0xFF` are reserved. A reader SHOULD treat an unknown `FLAG` as an
+unspecified pre-release rather than reject.
+
+`CAPABILITIES`: 4-byte big-endian bitfield of the capabilities the signer supports.
+Bit 0 is the LSB.
+
+```
++------+----------------------------------+
+| Bit  | Capability                       |
++------+----------------------------------+
+| 0    | Miniscript, SegWit v0            |
+| 1    | Miniscript, Taproot (v1)         |
+| 2    | Silent Payments (v0)             |
+| 3    | MuSig2                           |
+| 4    | MuSig cache                      |
+| 5–30 | Reserved for future capabilities |
+| 31   | Upgrade signal (MSB)             |
++------+----------------------------------+
+```
+
+Bit 2 implies the signer can return a signed `PSBT` (Signing response `KIND`
+`0x01`), the form a silent payment send falls back to when the signer cannot answer
+with `KIND` `0x02` and its ECDH shares and DLEQ proofs (see Signing).
+
+Bit 3 means the signer is a BIP-327 MuSig2 participant for BIP-390 `musig()` keys
+inside `tr()` of a registered descriptor (`FORM` `0x01`) or wallet policy (`FORM`
+`0x02`): it reads and writes the BIP-373 PSBT fields, follows the rules of the
+MuSig2 subsection of Signing, and MAY answer with `SIG_KIND` `0x04` / `0x05`. A
+wallet MUST NOT register or send a `musig()` descriptor to a signer without bit 3.
+
+Bit 4 advertises the separate MuSig Preparation and MuSig Signing operations below.
+It is not implied by bit 3. A wallet MUST check bit 4 before using either operation.
+
+Bits 5–30 are reserved for future capabilities and MUST be `0` in this version; a
+reader MUST ignore an unknown capability bit rather than reject, so a newer signer
+can advertise capabilities an older wallet does not know. Bit 31 (the MSB) MUST be
+`0` in this version; a `1` signals that the signer exposes capabilities beyond this
+bitfield and the wallet should upgrade to interpret them.
+
 ### Encoding
 
 A message is encoded as follows:
@@ -181,10 +244,11 @@ Bits (bit 7 is the MSB):
 | 0x04  | Signing              |
 | 0x05  | MuSig Preparation    |
 | 0x06  | MuSig Signing        |
+| 0x07  | Get Info             |
 +-------+----------------------+
 ```
 
-Values `0x07`–`0x3F` are reserved. A parser MUST reject an unknown `TYPE`, and
+Values `0x08`–`0x3F` are reserved. A parser MUST reject an unknown `TYPE`, and
 MUST reject `STATUS` = `1` on a request (`DIRECTION` = `0`).
 
 #### Request Id
@@ -296,66 +360,8 @@ the BIP-392 `sp()` descriptor itself, alongside any other xpubs (e.g. `m/86'/0'/
 `KEYS`: a vector of `EXTENDED_KEY`, one per request `KEY_REQUEST` in the same
 order, each of the `KIND` requested.
 `FINGERPRINT`: the `FINGERPRINT` of the master key. Mandatory.
-`VENDOR`: 16 bytes, a UTF-8 device-vendor string with no `LENGTH` prefix, right-padded
-with `0x00` when shorter than 16 bytes. The value is the bytes up to the first
-`0x00` (or all 16 bytes when none is `0x00`); every byte after it MUST be `0x00`.
-Mandatory.
-`MODEL`: 16 bytes, a UTF-8 device-model string with no `LENGTH` prefix, right-padded
-with `0x00` when shorter than 16 bytes. The value is the bytes up to the first
-`0x00` (or all 16 bytes when none is `0x00`); every byte after it MUST be `0x00`.
-Mandatory.
-`VERSION`: 8 bytes of device firmware version, `MAJOR` `MINOR` `PATCH` `FLAG`.
-`MAJOR` and `MINOR` are 2-byte big-endian unsigned integers, `PATCH` is a 3-byte
-big-endian unsigned integer, and `FLAG` is a 1-byte pre-release channel. Mandatory.
-
-```
-+--------+-------------------+
-| `FLAG` | Pre-release       |
-+--------+-------------------+
-| 0x00   | Stable (final)    |
-| 0x01   | Alpha             |
-| 0x02   | Beta              |
-| 0x03   | Release candidate |
-+--------+-------------------+
-```
-
-Values `0x04`–`0xFF` are reserved. A reader SHOULD treat an unknown `FLAG` as an
-unspecified pre-release rather than reject.
-`CAPABILITIES`: 4-byte big-endian bitfield of the capabilities the signer supports.
-Mandatory. Bit 0 is the LSB.
-
-```
-+------+----------------------------------+
-| Bit  | Capability                       |
-+------+----------------------------------+
-| 0    | Miniscript, SegWit v0            |
-| 1    | Miniscript, Taproot (v1)         |
-| 2    | Silent Payments (v0)             |
-| 3    | MuSig2                           |
-| 4    | MuSig cache                      |
-| 5–30 | Reserved for future capabilities |
-| 31   | Upgrade signal (MSB)             |
-+------+----------------------------------+
-```
-
-Bit 2 implies the signer can return a signed `PSBT` (Signing response `KIND`
-`0x01`), the form a silent payment send falls back to when the signer cannot answer
-with `KIND` `0x02` and its ECDH shares and DLEQ proofs (see Signing).
-
-Bit 3 means the signer is a BIP-327 MuSig2 participant for BIP-390 `musig()` keys
-inside `tr()` of a registered descriptor (`FORM` `0x01`) or wallet policy (`FORM`
-`0x02`): it reads and writes the BIP-373 PSBT fields, follows the rules of the
-MuSig2 subsection of Signing, and MAY answer with `SIG_KIND` `0x04` / `0x05`. A
-wallet MUST NOT register or send a `musig()` descriptor to a signer without bit 3.
-
-Bit 4 advertises the separate MuSig Preparation and MuSig Signing operations below.
-It is not implied by bit 3. A wallet MUST check bit 4 before using either operation.
-
-Bits 5–30 are reserved for future capabilities and MUST be `0` in this version; a
-reader MUST ignore an unknown capability bit rather than reject, so a newer signer
-can advertise capabilities an older wallet does not know. Bit 31 (the MSB) MUST be
-`0` in this version; a `1` signals that the signer exposes capabilities beyond this
-bitfield and the wallet should upgrade to interpret them.
+`VENDOR`, `MODEL`, `VERSION`, `CAPABILITIES`: the device fields defined in Common
+Field Encodings. Mandatory.
 
 ### Register Descriptor
 
@@ -727,6 +733,75 @@ An old parser ignores appended fields and newer version values, so neither would
 prevent it from interpreting a cached request as ordinary signing. Unknown type
 codes instead force rejection before the body is read. `VERSION` remains 1.
 
+### Get Info
+
+**Request** (`TYPE` = `0x07`, request):
+
+The body is empty.
+
+A signer MUST answer it without any user interaction, also when it is locked or
+holds no seed, and MUST NOT derive or reveal any key to answer it, except for
+`FINGERPRINT` below. This lets a wallet learn what a signer supports, and whether it
+is ready, before sending anything that needs the user.
+
+**Ok response** (`TYPE` = `0x07`, response):
+
+`VENDOR` `MODEL` `VERSION` `CAPABILITIES` `STATE` `NETWORKS` `MAX_MESSAGE` `MAX_ALIAS`
+`MAX_KEYS` `SLOTS` `FINGERPRINT`
+
+`VENDOR`, `MODEL`, `VERSION`, `CAPABILITIES`: the device fields defined in Common
+Field Encodings.
+`STATE`: 1-byte unsigned integer, whether the signer can serve a request now.
+
+```
++-----------+---------------------------------------+
+| Value     | State                                 |
++-----------+---------------------------------------+
+| 0x00      | Ready: seed present, signer unlocked  |
+| 0x01      | Locked: seed present, signer locked   |
+| 0x02      | Uninitialized: no seed                |
+| 0x03–0xFF | Reserved                              |
++-----------+---------------------------------------+
+```
+
+Values `0x03`–`0xFF` are reserved. A reader MUST treat an unknown `STATE` as not
+ready rather than reject, so a newer signer can report a state an older wallet does
+not know.
+
+`NETWORKS`: 1-byte bitfield of the networks the signer signs for. Bit 0 is the LSB.
+
+```
++-----+----------+
+| Bit | Network  |
++-----+----------+
+| 0   | Mainnet  |
+| 1   | Testnet  |
+| 2   | Signet   |
+| 3   | Regtest  |
+| 4–7 | Reserved |
++-----+----------+
+```
+
+Bits 4–7 are reserved: they MUST be `0` when written, and a reader MUST ignore them.
+
+`MAX_MESSAGE`: 4-byte big-endian unsigned integer, the size in bytes of the largest
+complete `MESSAGE` the signer accepts. A wallet SHOULD check a request against it
+before sending it.
+`MAX_ALIAS`: 1-byte unsigned integer, the length in bytes of the longest
+`DESCRIPTOR_ALIAS` the signer stores. It MUST be at most 32, the `DESCRIPTOR_ALIAS`
+bound, and a reader MUST reject a larger value.
+`MAX_KEYS`: 1-byte unsigned integer, the most keys one descriptor or wallet policy
+may hold on this signer.
+`SLOTS`: 2-byte big-endian unsigned integer, the number of registrations the signer
+can store. `0` means it stores none and relies on the proof of registration (`POR`)
+alone.
+`FINGERPRINT`: OPTIONAL, the `FINGERPRINT` of the master key. It is present only
+when `STATE` is `0x00` (ready) and MUST be absent otherwise; a reader MUST reject a
+response carrying it with any other `STATE`.
+
+Fields added to this response later are appended after `FINGERPRINT`, so an older
+reader ignores them as trailing bytes (see Versioning).
+
 ### Versioning
 
 `BODY` is encoded append-only: fields are ordered by the `VERSION` in which they
@@ -768,6 +843,9 @@ Rules for future versions:
   `KIND_FIELDS` do not exactly fill its `LENGTH`, a global silent payment entry
   whose `INPUT_INDEX` is not `0`, and an ECDH share and DLEQ proof that do not pair
   up (Signing).
+- `STATE` is not such a discriminant either: a reader treats an unknown `STATE` as
+  not ready. It MUST reject a Get Info response whose `MAX_ALIAS` is above 32, or
+  that carries `FINGERPRINT` while `STATE` is not `0x00` (Get Info).
 - Trailing bytes after the final field a parser understands are NOT an error
   (Versioning).
 
@@ -839,6 +917,8 @@ Machine-checkable vectors accompany this specification:
   an unknown `SIG_KIND` that a reader skips.
 - `musig.json`: MuSig Preparation and MuSig Signing request/response, including
   nonce entries with and without a leaf hash.
+- `get_info.json`: Get Info request, an ok response from a ready signer with its
+  `FINGERPRINT`, and one from a locked signer without it.
 - `errors.json`: error responses (`STATUS` = `1`), standard and vendor codes,
   including `0x0D` (MuSig2 session).
 - `versioning.json`: forward compatibility, a message whose `VERSION` is above 1

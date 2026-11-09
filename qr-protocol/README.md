@@ -57,6 +57,12 @@ either; checking that every scan key and eligible input is covered needs the PSB
 it is the wallet's job. An entry of a kind the codec does not know decodes to
 `SignatureEntry::Unknown` with its raw fields, and re-encodes unchanged.
 
+Get Info (`0x07`) uses `request::Body::GetInfo`, which carries no body, and
+`response::Body::Info`. Both encode and decode reject a `max_alias` above 32 and a
+`fingerprint` when `state` is not `State::Ready`; an unknown state decodes to
+`State::Unknown` and counts as not ready. Encode also rejects reserved `Networks`
+bits, which decode keeps as they are.
+
 ## C
 
 [`include/bwk_qr_protocol.h`](include/bwk_qr_protocol.h) is written by hand and
@@ -94,12 +100,15 @@ field from `ENCODING.md`; they report local decode, encode, or FFI failures.
 | 400..499          | C binding        |
 | 500..599          | MuSig validation |
 | 600..699          | Silent payments  |
+| 700..799          | Get Info         |
 +-------------------+------------------+
 ```
 
 MuSig validation codes `500` through `508` are shared by encode and decode and
-exposed as `musig::Error`. The C request union includes `prepare_musig` and
-`sign_musig`; the response union includes `musig_prepared` and `musig_signed`.
+exposed as `musig::Error`, and Get Info validation codes `700` and `701` as
+`get_info::Error`. The C request union includes `prepare_musig` and `sign_musig`; a
+Get Info request has no body and leaves it unused. The response union includes
+`musig_prepared`, `musig_signed` and `info`.
 These additions grow the C unions, so consumers must rebuild against the updated
 header. Pointer ownership is unchanged.
 

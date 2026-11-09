@@ -1,12 +1,12 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::{
-    musig, request, sp,
+    get_info, musig, request, sp,
     types::{
         ExtendedKey, Fingerprint, PublicKey, DLEQ_PROOF_LEN, MUSIG_PARTIAL_SIG_LEN,
         MUSIG_PUB_NONCE_LEN,
     },
-    MessageType,
+    MessageType, MAX_DESCRIPTOR_ALIAS,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +17,7 @@ pub enum Body {
     Signed(Signed),
     MusigPrepared(MusigPrepared),
     MusigSigned(MusigSigned),
+    Info(Info),
     Error(ErrorBody),
 }
 
@@ -35,6 +36,7 @@ impl From<&Body> for MessageType {
             Body::Signed(_) => Self::Signing,
             Body::MusigPrepared(_) => Self::MusigPreparation,
             Body::MusigSigned(_) => Self::MusigSigning,
+            Body::Info(_) => Self::GetInfo,
             Body::Error(e) => e.message_type,
         }
     }
@@ -106,6 +108,86 @@ impl Capabilities {
     pub fn supports_musig_cache(self) -> bool {
         self.0 & Self::MUSIG_CACHE != 0
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Info {
+    pub vendor: String,
+    pub model: String,
+    pub version: FirmwareVersion,
+    pub capabilities: Capabilities,
+    pub state: State,
+    pub networks: Networks,
+    pub max_message: u32,
+    pub max_alias: u8,
+    pub max_keys: u8,
+    pub slots: u16,
+    /// Present only when `state` is `State::Ready`.
+    pub fingerprint: Option<Fingerprint>,
+}
+
+impl Info {
+    pub fn validate(&self) -> Result<(), get_info::Error> {
+        if usize::from(self.max_alias) > MAX_DESCRIPTOR_ALIAS {
+            return Err(get_info::Error::MaxAliasTooLarge(self.max_alias));
+        }
+        if self.fingerprint.is_some() && self.state != State::Ready {
+            return Err(get_info::Error::FingerprintWhenNotReady);
+        }
+        Ok(())
+    }
+}
+
+/// Whether the signer can serve a request now. An unknown value counts as not ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    Ready,
+    Locked,
+    Uninitialized,
+    Unknown(u8),
+}
+
+impl State {
+    pub fn value(self) -> u8 {
+        self.into()
+    }
+}
+
+impl From<State> for u8 {
+    fn from(state: State) -> Self {
+        match state {
+            State::Ready => STATE_READY,
+            State::Locked => STATE_LOCKED,
+            State::Uninitialized => STATE_UNINITIALIZED,
+            State::Unknown(value) => value,
+        }
+    }
+}
+
+impl From<u8> for State {
+    fn from(value: u8) -> Self {
+        match value {
+            STATE_READY => Self::Ready,
+            STATE_LOCKED => Self::Locked,
+            STATE_UNINITIALIZED => Self::Uninitialized,
+            value => Self::Unknown(value),
+        }
+    }
+}
+
+pub const STATE_READY: u8 = 0x00;
+pub const STATE_LOCKED: u8 = 0x01;
+pub const STATE_UNINITIALIZED: u8 = 0x02;
+
+/// The networks the signer signs for, one bit each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Networks(pub u8);
+
+impl Networks {
+    pub const MAINNET: u8 = 1 << 0;
+    pub const TESTNET: u8 = 1 << 1;
+    pub const SIGNET: u8 = 1 << 2;
+    pub const REGTEST: u8 = 1 << 3;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

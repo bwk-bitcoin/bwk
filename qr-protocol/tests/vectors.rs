@@ -316,6 +316,61 @@ fn musig_messages() -> Vec<(&'static str, Message)> {
     ]
 }
 
+fn info(state: response::State) -> response::Info {
+    response::Info {
+        vendor: "bwk".to_string(),
+        model: "bwk-signer".to_string(),
+        version: response::FirmwareVersion {
+            major: 1,
+            minor: 2,
+            patch: 3,
+            flag: response::ReleaseFlag::Beta,
+        },
+        capabilities: response::Capabilities(0x0000_000f),
+        state,
+        networks: response::Networks(0x00),
+        max_message: 0,
+        max_alias: 0,
+        max_keys: 0,
+        slots: 0,
+        fingerprint: None,
+    }
+}
+
+fn get_info_messages() -> Vec<(&'static str, Message)> {
+    vec![
+        ("get_info_request", request(request::Body::GetInfo)),
+        (
+            "get_info_response_ready",
+            response(response::Body::Info(response::Info {
+                networks: response::Networks(
+                    response::Networks::MAINNET
+                        | response::Networks::TESTNET
+                        | response::Networks::SIGNET
+                        | response::Networks::REGTEST,
+                ),
+                max_message: 512 * 1024,
+                max_alias: 32,
+                max_keys: 16,
+                slots: 8,
+                fingerprint: Some(Fingerprint([0xde, 0xad, 0xbe, 0xef])),
+                ..info(response::State::Ready)
+            })),
+        ),
+        (
+            "get_info_response_locked",
+            response(response::Body::Info(response::Info {
+                networks: response::Networks(response::Networks::MAINNET),
+                max_message: 4096,
+                max_alias: 16,
+                max_keys: 5,
+                slots: 0,
+                ..info(response::State::Locked)
+            })),
+        ),
+    ]
+}
+
 fn error_messages() -> Vec<(&'static str, Message)> {
     vec![
         (
@@ -452,6 +507,11 @@ fn signing_vectors() {
 #[test]
 fn musig_vectors() {
     check(include_str!("musig.json"), &musig_messages());
+}
+
+#[test]
+fn get_info_vectors() {
+    check(include_str!("get_info.json"), &get_info_messages());
 }
 
 #[test]

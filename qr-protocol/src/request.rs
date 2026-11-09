@@ -14,6 +14,8 @@ pub enum Body {
     Sign(Sign),
     PrepareMusig(PrepareMusig),
     SignMusig(SignMusig),
+    /// Get Info carries no body.
+    GetInfo,
 }
 
 impl Body {
@@ -31,6 +33,7 @@ impl From<&Body> for MessageType {
             Body::Sign(_) => Self::Signing,
             Body::PrepareMusig(_) => Self::MusigPreparation,
             Body::SignMusig(_) => Self::MusigSigning,
+            Body::GetInfo => Self::GetInfo,
         }
     }
 }

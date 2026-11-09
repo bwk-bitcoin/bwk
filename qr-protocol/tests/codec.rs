@@ -3,7 +3,7 @@
 mod common;
 
 use bwk_qr_protocol::{
-    decode, encode, encode_request, encode_response, reader, request,
+    decode, encode, encode_request, encode_response, get_info, reader, request,
     response::{self, SpScope},
     sp,
     types::Fingerprint,
@@ -168,10 +168,10 @@ fn decode_rejects_an_unknown_message_type() {
 }
 
 #[test]
-fn decode_rejects_the_reserved_message_type_seven() {
+fn decode_rejects_the_reserved_message_type_eight() {
     let mut bytes = encode_request(&get_keys_request()).unwrap();
-    bytes[MSG_TYPE_OFFSET] = 0x07;
-    assert_eq!(decode(&bytes), Err(decode::Error::UnknownMessageType(0x07)));
+    bytes[MSG_TYPE_OFFSET] = 0x08;
+    assert_eq!(decode(&bytes), Err(decode::Error::UnknownMessageType(0x08)));
 }
 
 #[test]
@@ -310,6 +310,10 @@ fn every_error_message_is_terminated_and_uniquely_coded() {
         decode::Error::SignatureLength(0),
         decode::Error::GlobalInputIndex(0),
     ];
+    let get_info_errors = [
+        get_info::Error::MaxAliasTooLarge(0),
+        get_info::Error::FingerprintWhenNotReady,
+    ];
     let encode_errors = [
         encode::Error::PathTooLong(0),
         encode::Error::PatchTooLarge(0),
@@ -322,6 +326,8 @@ fn every_error_message_is_terminated_and_uniquely_coded() {
         encode::Error::FixedStringTooLong { len: 0, max: 0 },
         encode::Error::Unreachable,
         encode::Error::DefinedSignatureKind(0),
+        encode::Error::ReservedNetworkBits(0),
+        encode::Error::DefinedState(0),
     ];
     let sp_errors = [
         sp::Error::DuplicateShare,
@@ -335,6 +341,7 @@ fn every_error_message_is_terminated_and_uniquely_coded() {
     infos.extend(decode_errors.iter().map(decode::Error::info));
     infos.extend(encode_errors.iter().map(encode::Error::info));
     infos.extend(sp_errors.iter().map(sp::Error::info));
+    infos.extend(get_info_errors.iter().map(get_info::Error::info));
 
     let mut codes = Vec::new();
     for info in &infos {
@@ -653,4 +660,183 @@ fn a_second_share_or_proof_for_a_scan_key_is_refused() {
         encode_response(&signatures_response(entries)),
         Err(encode::Error::Sp(sp::Error::DuplicateProof))
     );
+}
+
+mod get_info_response {
+    use bwk_qr_protocol::{
+        decode, encode, encode_request, encode_response, get_info, reader, request, response,
+        types::Fingerprint, Message, Request, Response, MAX_DESCRIPTOR_ALIAS,
+    };
+
+    use crate::{id, HEADER_LEN};
+
+    // VENDOR, MODEL, VERSION and CAPABILITIES come before STATE
+    const STATE_OFFSET: usize = HEADER_LEN + 16 + 16 + 8 + 4;
+    const NETWORKS_OFFSET: usize = STATE_OFFSET + 1;
+    // NETWORKS and MAX_MESSAGE come before MAX_ALIAS
+    const MAX_ALIAS_OFFSET: usize = NETWORKS_OFFSET + 1 + 4;
+
+    fn info(state: response::State, fingerprint: Option<Fingerprint>) -> response::Info {
+        response::Info {
+            vendor: "bwk".to_string(),
+            model: "bwk-signer".to_string(),
+            version: response::FirmwareVersion {
+                major: 1,
+                minor: 7,
+                patch: 0x00ab_cdef,
+                flag: response::ReleaseFlag::Stable,
+            },
+            capabilities: response::Capabilities(0x0000_001f),
+            state,
+            networks: response::Networks(response::Networks::SIGNET),
+            max_message: 0x0001_0000,
+            max_alias: MAX_DESCRIPTOR_ALIAS as u8,
+            max_keys: 20,
+            slots: 0xffff,
+            fingerprint,
+        }
+    }
+
+    fn info_response(info: response::Info) -> Response {
+        Response {
+            id: id(),
+            body: response::Body::Info(info),
+        }
+    }
+
+    fn ready() -> response::Info {
+        info(
+            response::State::Ready,
+            Some(Fingerprint([0xde, 0xad, 0xbe, 0xef])),
+        )
+    }
+
+    #[test]
+    fn the_request_has_an_empty_body() {
+        let request = Request {
+            id: id(),
+            body: request::Body::GetInfo,
+        };
+        let bytes = encode_request(&request).unwrap();
+        assert_eq!(bytes.len(), HEADER_LEN);
+        assert_eq!(decode(&bytes), Ok(Message::Request(request)));
+    }
+
+    #[test]
+    fn every_state_round_trips() {
+        for info in [
+            ready(),
+            info(response::State::Ready, None),
+            info(response::State::Locked, None),
+            info(response::State::Uninitialized, None),
+            info(response::State::Unknown(0x03), None),
+            info(response::State::Unknown(0xff), None),
+        ] {
+            let response = info_response(info);
+            let bytes = encode_response(&response).unwrap();
+            assert_eq!(decode(&bytes), Ok(Message::Response(response)));
+        }
+    }
+
+    #[test]
+    fn encode_rejects_a_fingerprint_when_not_ready() {
+        for state in [
+            response::State::Locked,
+            response::State::Uninitialized,
+            response::State::Unknown(0x03),
+        ] {
+            let response = info_response(info(state, Some(Fingerprint([1, 2, 3, 4]))));
+            assert_eq!(
+                encode_response(&response),
+                Err(encode::Error::GetInfo(
+                    get_info::Error::FingerprintWhenNotReady
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn decode_rejects_a_fingerprint_when_not_ready() {
+        let mut bytes = encode_response(&info_response(ready())).unwrap();
+        for state in [0x01, 0x02, 0x03] {
+            bytes[STATE_OFFSET] = state;
+            assert_eq!(
+                decode(&bytes),
+                Err(decode::Error::GetInfo(
+                    get_info::Error::FingerprintWhenNotReady
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn encode_rejects_a_max_alias_above_the_alias_bound() {
+        let mut info = ready();
+        info.max_alias = MAX_DESCRIPTOR_ALIAS as u8 + 1;
+        assert_eq!(
+            encode_response(&info_response(info)),
+            Err(encode::Error::GetInfo(get_info::Error::MaxAliasTooLarge(
+                33
+            )))
+        );
+    }
+
+    #[test]
+    fn decode_rejects_a_max_alias_above_the_alias_bound() {
+        let mut bytes = encode_response(&info_response(ready())).unwrap();
+        assert_eq!(bytes[MAX_ALIAS_OFFSET], 32);
+        bytes[MAX_ALIAS_OFFSET] = 33;
+        assert_eq!(
+            decode(&bytes),
+            Err(decode::Error::GetInfo(get_info::Error::MaxAliasTooLarge(
+                33
+            )))
+        );
+    }
+
+    #[test]
+    fn encode_rejects_reserved_network_bits() {
+        let mut info = ready();
+        info.networks = response::Networks(0x10 | response::Networks::MAINNET);
+        assert_eq!(
+            encode_response(&info_response(info)),
+            Err(encode::Error::ReservedNetworkBits(0x11))
+        );
+    }
+
+    #[test]
+    fn decode_ignores_reserved_network_bits() {
+        let mut bytes = encode_response(&info_response(ready())).unwrap();
+        assert_eq!(bytes[NETWORKS_OFFSET], response::Networks::SIGNET);
+        bytes[NETWORKS_OFFSET] = 0xf4;
+        let mut expected = ready();
+        expected.networks = response::Networks(0xf4);
+        assert_eq!(
+            decode(&bytes),
+            Ok(Message::Response(info_response(expected)))
+        );
+    }
+
+    #[test]
+    fn encode_rejects_an_unknown_state_of_a_defined_value() {
+        for value in [0x00, 0x01, 0x02] {
+            let response = info_response(info(response::State::Unknown(value), None));
+            assert_eq!(
+                encode_response(&response),
+                Err(encode::Error::DefinedState(value))
+            );
+        }
+    }
+
+    #[test]
+    fn decode_rejects_an_invalid_fingerprint_presence() {
+        let mut bytes = encode_response(&info_response(ready())).unwrap();
+        let presence = bytes.len() - 5;
+        assert_eq!(bytes[presence], 0x01);
+        bytes[presence] = 0x02;
+        assert_eq!(
+            decode(&bytes),
+            Err(decode::Error::Read(reader::Error::InvalidPresence(0x02)))
+        );
+    }
 }

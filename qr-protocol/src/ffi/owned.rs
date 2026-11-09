@@ -113,6 +113,9 @@ impl Keep {
                     psbt: self.bytes(&body.psbt),
                 },
             },
+            // no arm describes an empty body, so C never reads the union
+            // SAFETY: every arm is plain data or raw pointers, valid when zeroed
+            request::Body::GetInfo => unsafe { core::mem::zeroed() },
         })
     }
 

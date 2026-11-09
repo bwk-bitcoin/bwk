@@ -10,7 +10,7 @@ use core::ffi::{c_char, CStr};
 use crate::{
     ffi::{types, Error},
     musig, request, response,
-    types::{ExtendedKey, Fingerprint, PublicKey, TAP_LEAF_HASH_LEN},
+    types::{ExtendedKey, Fingerprint, PublicKey},
     MessageType, RequestId, Response, SignResponseKind, MAX_VEC,
 };
 
@@ -36,6 +36,7 @@ pub unsafe fn response(view: &types::Response) -> Result<Response, Error> {
             MessageType::MusigSigning => {
                 response::Body::MusigSigned(musig_signed(&view.body.musig_signed)?)
             }
+            MessageType::GetInfo => response::Body::Info(info(&view.body.info)?),
         }
     };
     Ok(Response {
@@ -63,7 +64,7 @@ unsafe fn musig_prepared(view: &types::MusigPrepared) -> Result<response::MusigP
             expression_index: nonce.expression_index,
             participant: PublicKey(nonce.participant),
             aggregate: PublicKey(nonce.aggregate),
-            leaf_hash: optional_leaf_hash(nonce.has_leaf_hash, nonce.leaf_hash)?,
+            leaf_hash: optional(nonce.has_leaf_hash, nonce.leaf_hash)?,
             nonce: nonce.nonce,
         });
     }
@@ -82,6 +83,22 @@ unsafe fn musig_signed(view: &types::MusigSigned) -> Result<response::MusigSigne
     })
 }
 
+unsafe fn info(view: &types::Info) -> Result<response::Info, Error> {
+    Ok(response::Info {
+        vendor: fixed_string(&view.vendor)?,
+        model: fixed_string(&view.model)?,
+        version: firmware_version(&view.version),
+        capabilities: response::Capabilities(view.capabilities),
+        state: view.state.into(),
+        networks: response::Networks(view.networks),
+        max_message: view.max_message,
+        max_alias: view.max_alias,
+        max_keys: view.max_keys,
+        slots: view.slots,
+        fingerprint: optional(view.has_fingerprint, Fingerprint(view.fingerprint))?,
+    })
+}
+
 unsafe fn keys(view: &types::Keys) -> Result<response::Keys, Error> {
     Ok(response::Keys {
         keys: view
@@ -94,14 +111,18 @@ unsafe fn keys(view: &types::Keys) -> Result<response::Keys, Error> {
         fingerprint: Fingerprint(view.fingerprint),
         vendor: fixed_string(&view.vendor)?,
         model: fixed_string(&view.model)?,
-        version: response::FirmwareVersion {
-            major: view.version.major,
-            minor: view.version.minor,
-            patch: view.version.patch,
-            flag: view.version.flag.into(),
-        },
+        version: firmware_version(&view.version),
         capabilities: response::Capabilities(view.capabilities),
     })
+}
+
+fn firmware_version(view: &types::FirmwareVersion) -> response::FirmwareVersion {
+    response::FirmwareVersion {
+        major: view.major,
+        minor: view.minor,
+        patch: view.patch,
+        flag: view.flag.into(),
+    }
 }
 
 unsafe fn registration(view: &types::Registration) -> Result<response::Registration, Error> {
@@ -150,7 +171,7 @@ unsafe fn signature(view: &types::Signature) -> Result<response::SignatureEntry,
                 input_index,
                 participant: PublicKey(value.participant),
                 aggregate: PublicKey(value.aggregate),
-                leaf_hash: optional_leaf_hash(value.has_leaf_hash, value.leaf_hash)?,
+                leaf_hash: optional(value.has_leaf_hash, value.leaf_hash)?,
                 nonce: value.nonce,
             })
         }
@@ -160,7 +181,7 @@ unsafe fn signature(view: &types::Signature) -> Result<response::SignatureEntry,
                 input_index,
                 participant: PublicKey(value.participant),
                 aggregate: PublicKey(value.aggregate),
-                leaf_hash: optional_leaf_hash(value.has_leaf_hash, value.leaf_hash)?,
+                leaf_hash: optional(value.has_leaf_hash, value.leaf_hash)?,
                 signature: value.signature,
             })
         }
@@ -239,13 +260,11 @@ fn optional_bool(value: i8) -> Result<Option<bool>, Error> {
     }
 }
 
-fn optional_leaf_hash(
-    has_leaf_hash: u8,
-    leaf_hash: [u8; TAP_LEAF_HASH_LEN],
-) -> Result<Option<[u8; TAP_LEAF_HASH_LEN]>, Error> {
-    match has_leaf_hash {
+/// A C field that is present when its `has_` flag is 1 and absent when it is 0.
+fn optional<T>(has: u8, value: T) -> Result<Option<T>, Error> {
+    match has {
         0 => Ok(None),
-        1 => Ok(Some(leaf_hash)),
+        1 => Ok(Some(value)),
         _ => Err(Error::InvalidBool),
     }
 }
