@@ -57,6 +57,7 @@ pub mod decode;
 pub mod encode;
 #[cfg(feature = "ffi")]
 pub mod ffi;
+pub mod get_info;
 pub mod musig;
 pub mod reader;
 pub mod request;
@@ -112,6 +113,7 @@ pub enum MessageType {
     Signing,
     MusigPreparation,
     MusigSigning,
+    GetInfo,
 }
 
 impl MessageType {
@@ -129,6 +131,7 @@ impl From<MessageType> for u8 {
             MessageType::Signing => 0x04,
             MessageType::MusigPreparation => 0x05,
             MessageType::MusigSigning => 0x06,
+            MessageType::GetInfo => 0x07,
         }
     }
 }
@@ -144,6 +147,7 @@ impl TryFrom<u8> for MessageType {
             0x04 => Ok(Self::Signing),
             0x05 => Ok(Self::MusigPreparation),
             0x06 => Ok(Self::MusigSigning),
+            0x07 => Ok(Self::GetInfo),
             _ => Err(decode::Error::UnknownMessageType(value)),
         }
     }

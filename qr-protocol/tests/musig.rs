@@ -446,9 +446,9 @@ fn ordinary_signing_still_ignores_newer_fields_so_cache_requires_new_codes() {
     bytes.extend_from_slice(&SESSION);
     bytes.extend_from_slice(&ATTEMPT);
     assert_eq!(decode(&bytes).unwrap(), Message::Request(ordinary));
-    for code in [0x07, 0x87, 0xc7] {
+    for code in [0x08, 0x88, 0xc8] {
         bytes[7] = code;
-        assert_eq!(decode(&bytes), Err(decode::Error::UnknownMessageType(0x07)));
+        assert_eq!(decode(&bytes), Err(decode::Error::UnknownMessageType(0x08)));
     }
 }
 

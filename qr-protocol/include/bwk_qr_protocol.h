@@ -53,11 +53,28 @@ enum bwk_qr_message_type {
     BWK_QR_MESSAGE_ADDRESS_VERIFICATION = 0x03,
     BWK_QR_MESSAGE_SIGNING = 0x04,
     BWK_QR_MESSAGE_MUSIG_PREPARATION = 0x05,
-    BWK_QR_MESSAGE_MUSIG_SIGNING = 0x06
+    BWK_QR_MESSAGE_MUSIG_SIGNING = 0x06,
+    BWK_QR_MESSAGE_GET_INFO = 0x07 /* no request body: the body union is unused */
 };
 
 enum bwk_qr_capability {
     BWK_QR_CAPABILITY_MUSIG_CACHE = 1u << 4
+};
+
+/* Open: a value outside this list is a newer state, which counts as not ready. To
+ * encode, it must sit above BWK_QR_STATE_UNINITIALIZED. */
+enum bwk_qr_state {
+    BWK_QR_STATE_READY = 0x00,
+    BWK_QR_STATE_LOCKED = 0x01,
+    BWK_QR_STATE_UNINITIALIZED = 0x02
+};
+
+/* Encoding a response rejects any other bit. */
+enum bwk_qr_network {
+    BWK_QR_NETWORK_MAINNET = 1u << 0,
+    BWK_QR_NETWORK_TESTNET = 1u << 1,
+    BWK_QR_NETWORK_SIGNET = 1u << 2,
+    BWK_QR_NETWORK_REGTEST = 1u << 3
 };
 
 /* Closed: the decoder rejects any other value. */
@@ -125,8 +142,9 @@ enum bwk_qr_absent {
 
 /* What the four functions return. 100..=199 come from the byte reader, 200..=299
  * from the decoder, 300..=399 from the encoder, 400..=499 from this binding,
- * 500..=599 from shared MuSig validation and 600..=699 from shared silent payment
- * validation, both on encode and decode. */
+ * 500..=599 from shared MuSig validation, 600..=699 from shared silent payment
+ * validation and 700..=799 from shared Get Info validation, the last three both on
+ * encode and decode. */
 enum bwk_qr_status {
     BWK_QR_OK = 0,
 
@@ -164,6 +182,8 @@ enum bwk_qr_status {
     BWK_QR_ERR_FIXED_STRING_TOO_LONG = 308,
     BWK_QR_ERR_UNREACHABLE = 309,
     BWK_QR_ERR_DEFINED_SIGNATURE_KIND = 310,
+    BWK_QR_ERR_RESERVED_NETWORK_BITS = 311,
+    BWK_QR_ERR_DEFINED_STATE = 312,
 
     BWK_QR_ERR_NULL_POINTER = 400,
     BWK_QR_ERR_FFI_STRING_NUL = 401,
@@ -187,7 +207,10 @@ enum bwk_qr_status {
     BWK_QR_ERR_SP_DUPLICATE_SHARE = 600,
     BWK_QR_ERR_SP_DUPLICATE_PROOF = 601,
     BWK_QR_ERR_SP_MISSING_PROOF = 602,
-    BWK_QR_ERR_SP_MISSING_SHARE = 603
+    BWK_QR_ERR_SP_MISSING_SHARE = 603,
+
+    BWK_QR_ERR_GET_INFO_MAX_ALIAS_TOO_LARGE = 700,
+    BWK_QR_ERR_GET_INFO_FINGERPRINT_WHEN_NOT_READY = 701
 };
 
 /* A borrowed run of items. A NULL ptr means the field is absent, which is distinct
@@ -343,6 +366,21 @@ typedef struct {
 } bwk_qr_keys;
 
 typedef struct {
+    char vendor[BWK_QR_VENDOR_LEN + 1];
+    char model[BWK_QR_MODEL_LEN + 1];
+    bwk_qr_firmware_version version;
+    uint32_t capabilities;   /* only the low five bits may be set */
+    uint8_t state;           /* BWK_QR_STATE_* */
+    uint8_t networks;        /* BWK_QR_NETWORK_* bits */
+    uint32_t max_message;    /* bytes */
+    uint8_t max_alias;       /* at most BWK_QR_MAX_DESCRIPTOR_ALIAS */
+    uint8_t max_keys;
+    uint16_t slots;          /* 0 when the signer relies on the proof of registration */
+    uint8_t has_fingerprint; /* 0 or 1, and 1 only when state is BWK_QR_STATE_READY */
+    uint8_t fingerprint[BWK_QR_FINGERPRINT_LEN];
+} bwk_qr_info;
+
+typedef struct {
     const char *descriptor_alias;
     int8_t registered; /* 0, 1 or BWK_QR_ABSENT_BOOL */
     int8_t stored;     /* 0, 1 or BWK_QR_ABSENT_BOOL */
@@ -467,6 +505,7 @@ typedef union {
     bwk_qr_signed signed_body;
     bwk_qr_musig_prepared musig_prepared;
     bwk_qr_musig_signed musig_signed;
+    bwk_qr_info info;
     bwk_qr_error_body error;
 } bwk_qr_response_body;
 
