@@ -768,6 +768,8 @@ checked into `qr-protocol/tests/`:
 - `signing.json`: Signing request and both response `KIND`s, including the MuSig2
   signatures-only entries (`SIG_KIND` `0x04` and `0x05`, with and without a leaf
   hash).
+- `musig.json`: MuSig Preparation and MuSig Signing request/response, including
+  nonce entries with and without a leaf hash.
 - `errors.json`: error responses (`STATUS` = `1`), standard and vendor codes,
   including `0x0D` (MuSig2 session).
 - `versioning.json`: forward compatibility, a message whose `VERSION` is above 1
