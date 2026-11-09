@@ -49,6 +49,14 @@ The new message codes are `0x05` and `0x06`. Version 1 and ordinary Signing (`0x
 are unchanged. Old peers reject the new codes instead of ignoring a cached selector
 appended to an ordinary signing request.
 
+A signatures-only Signing response carries the BIP-375 ECDH shares and BIP-374 DLEQ
+proofs of a silent payment send as `SignatureEntry::{SpEcdhShare, SpDleqProof}`, each
+scoped to one input or to the whole transaction by `SpScope`. Both encode and decode
+reject a share without its proof, a proof without its share and a duplicate of
+either; checking that every scan key and eligible input is covered needs the PSBT, so
+it is the wallet's job. An entry of a kind the codec does not know decodes to
+`SignatureEntry::Unknown` with its raw fields, and re-encodes unchanged.
+
 ## C
 
 [`include/bwk_qr_protocol.h`](include/bwk_qr_protocol.h) is written by hand and
@@ -85,6 +93,7 @@ field from `ENCODING.md`; they report local decode, encode, or FFI failures.
 | 300..399          | Protocol encoder |
 | 400..499          | C binding        |
 | 500..599          | MuSig validation |
+| 600..699          | Silent payments  |
 +-------------------+------------------+
 ```
 

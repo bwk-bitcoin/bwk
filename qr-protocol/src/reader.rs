@@ -84,11 +84,15 @@ impl<'a> Reader<'a> {
     }
 
     pub fn take_bytes(&mut self) -> Result<Vec<u8>, Error> {
+        Ok(self.take_bytes_slice()?.to_vec())
+    }
+
+    pub fn take_bytes_slice(&mut self) -> Result<&'a [u8], Error> {
         let len = self.take_compact()?;
         if len > MAX_BYTES {
             return Err(Error::BytesTooLarge(len));
         }
-        Ok(self.take_slice(len)?.to_vec())
+        self.take_slice(len)
     }
 
     pub fn take_string(&mut self) -> Result<String, Error> {
@@ -180,6 +184,16 @@ impl<'a> Reader<'a> {
         let mut out = [0u8; N];
         out.copy_from_slice(self.take_slice(N)?);
         Ok(out)
+    }
+
+    pub fn take_rest(&mut self) -> &'a [u8] {
+        let rest = &self.bytes[self.cursor..];
+        self.cursor = self.bytes.len();
+        rest
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cursor == self.bytes.len()
     }
 
     pub fn take_slice(&mut self, len: usize) -> Result<&'a [u8], Error> {

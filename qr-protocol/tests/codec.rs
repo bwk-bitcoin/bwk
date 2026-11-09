@@ -3,11 +3,17 @@
 mod common;
 
 use bwk_qr_protocol::{
-    decode, encode, encode_request, encode_response, reader, request, response, types::Fingerprint,
+    decode, encode, encode_request, encode_response, reader, request,
+    response::{self, SpScope},
+    sp,
+    types::Fingerprint,
     Message, MessageType, Request, RequestId, Response, MAX_DESCRIPTOR_ALIAS, REQUEST_ID_LEN,
 };
 
-use common::{key_request, musig_partial_sigs, musig_pub_nonces, xpub};
+use common::{
+    aggregate, key_request, musig_partial_sigs, musig_pub_nonces, sp_global_send,
+    sp_per_input_send, sp_proof, sp_share, xpub,
+};
 
 // MAGIC is 6 bytes, so VERSION sits at index 6 and MSG_TYPE right after it
 const VERSION_OFFSET: usize = 6;
@@ -16,9 +22,17 @@ const HEADER_LEN: usize = MSG_TYPE_OFFSET + 1 + REQUEST_ID_LEN;
 // STORED's value follows the header, the alias "main" as a STRING (1 + 4),
 // REGISTERED (1 + 1), and STORED's own presence byte
 const STORED_VALUE_OFFSET: usize = HEADER_LEN + 5 + 2 + 1;
-// the first LEAF_HASH presence byte of musig_pub_nonces() follows KIND, the SIG_ENTRY
-// count, INPUT_INDEX, SIG_KIND, PARTICIPANT and AGGREGATE
-const FIRST_LEAF_HASH_PRESENCE_OFFSET: usize = HEADER_LEN + 1 + 1 + 4 + 1 + 33 + 33;
+// the first SIG_ENTRY follows KIND and the SIG_ENTRY count
+const FIRST_ENTRY_OFFSET: usize = HEADER_LEN + 1 + 1;
+// INPUT_INDEX, SIG_KIND and a one-byte LENGTH come before an entry's KIND_FIELDS
+const ENTRY_HEADER_LEN: usize = 4 + 1 + 1;
+// the first LEAF_HASH presence byte of musig_pub_nonces() follows the entry header,
+// PARTICIPANT and AGGREGATE
+const FIRST_LEAF_HASH_PRESENCE_OFFSET: usize = FIRST_ENTRY_OFFSET + ENTRY_HEADER_LEN + 33 + 33;
+// a tapkey entry holds a 64-byte SIGNATURE behind its own one-byte LENGTH
+const TAP_KEY_ENTRY_LEN: usize = ENTRY_HEADER_LEN + 1 + 64;
+// GLOBAL, SCAN_KEY and SHARE
+const SP_SHARE_ENTRY_LEN: usize = ENTRY_HEADER_LEN + 1 + 33 + 33;
 // the first KIND of get_keys_request() follows the KEYS count and its path m/48'/0'/0'/2'
 // (CHILD_COUNT + 4 steps of 4 bytes)
 const FIRST_KEY_KIND_OFFSET: usize = HEADER_LEN + 1 + 1 + 4 * 4;
@@ -291,9 +305,10 @@ fn every_error_message_is_terminated_and_uniquely_coded() {
         decode::Error::UnknownMessageType(0),
         decode::Error::ErrorStatusOnRequest,
         decode::Error::UnknownDescriptorForm(0),
-        decode::Error::UnknownSignatureKind(0),
         decode::Error::UnknownSignResponseKind(0),
         decode::Error::UnknownKeyKind(0),
+        decode::Error::SignatureLength(0),
+        decode::Error::GlobalInputIndex(0),
     ];
     let encode_errors = [
         encode::Error::PathTooLong(0),
@@ -306,12 +321,20 @@ fn every_error_message_is_terminated_and_uniquely_coded() {
         encode::Error::StringNul,
         encode::Error::FixedStringTooLong { len: 0, max: 0 },
         encode::Error::Unreachable,
+        encode::Error::DefinedSignatureKind(0),
+    ];
+    let sp_errors = [
+        sp::Error::DuplicateShare,
+        sp::Error::DuplicateProof,
+        sp::Error::MissingProof,
+        sp::Error::MissingShare,
     ];
 
     let mut infos = Vec::new();
     infos.extend(reader_errors.iter().map(reader::Error::info));
     infos.extend(decode_errors.iter().map(decode::Error::info));
     infos.extend(encode_errors.iter().map(encode::Error::info));
+    infos.extend(sp_errors.iter().map(sp::Error::info));
 
     let mut codes = Vec::new();
     for info in &infos {
@@ -473,4 +496,161 @@ fn musig_session_error_code_round_trips() {
     let response = error_response(response::Error::Unknown(0x0e));
     let bytes = encode_response(&response).unwrap();
     assert_eq!(decode(&bytes), Ok(Message::Response(response)));
+}
+
+fn tap_key_response() -> Response {
+    signatures_response(vec![response::SignatureEntry::TapKey {
+        input_index: 0,
+        signature: vec![0x01; 64],
+    }])
+}
+
+#[test]
+fn decode_rejects_known_fields_overflowing_their_length() {
+    let mut bytes = encode_response(&tap_key_response()).unwrap();
+    let length = FIRST_ENTRY_OFFSET + ENTRY_HEADER_LEN - 1;
+    assert_eq!(bytes[length], 0x41);
+    // one byte short: the SIGNATURE no longer fits
+    bytes[length] = 0x40;
+    bytes.pop();
+    assert_eq!(decode(&bytes), Err(decode::Error::SignatureLength(0x02)));
+}
+
+#[test]
+fn decode_rejects_known_fields_short_of_their_length() {
+    let mut bytes = encode_response(&tap_key_response()).unwrap();
+    let length = FIRST_ENTRY_OFFSET + ENTRY_HEADER_LEN - 1;
+    // one byte past the SIGNATURE that a tapkey entry does not hold
+    bytes[length] = 0x42;
+    bytes.push(0x00);
+    assert_eq!(decode(&bytes), Err(decode::Error::SignatureLength(0x02)));
+}
+
+#[test]
+fn decode_keeps_an_unknown_kind_whatever_its_fields() {
+    let mut bytes = encode_response(&tap_key_response()).unwrap();
+    // the same entry under the reserved kind 0x00: 65 bytes no known kind would parse
+    bytes[FIRST_ENTRY_OFFSET + 4] = 0x00;
+    let mut fields = vec![0x40];
+    fields.extend([0x01; 64]);
+    assert_eq!(
+        decode(&bytes),
+        Ok(Message::Response(signatures_response(vec![
+            response::SignatureEntry::Unknown {
+                input_index: 0,
+                kind: 0x00,
+                fields,
+            }
+        ])))
+    );
+}
+
+#[test]
+fn encode_rejects_an_unknown_entry_of_a_defined_or_reserved_kind() {
+    for kind in [0x00, 0x02, 0x07] {
+        let response = signatures_response(vec![response::SignatureEntry::Unknown {
+            input_index: 0,
+            kind,
+            fields: vec![],
+        }]);
+        assert_eq!(
+            encode_response(&response),
+            Err(encode::Error::DefinedSignatureKind(kind))
+        );
+    }
+}
+
+#[test]
+fn silent_payment_entries_round_trip() {
+    for entries in [sp_global_send(), sp_per_input_send()] {
+        let response = signatures_response(entries);
+        let bytes = encode_response(&response).unwrap();
+        assert_eq!(decode(&bytes), Ok(Message::Response(response)));
+    }
+}
+
+#[test]
+fn a_global_entry_carries_input_index_zero() {
+    let mut bytes = encode_response(&signatures_response(sp_global_send())).unwrap();
+    let share = FIRST_ENTRY_OFFSET + 2 * TAP_KEY_ENTRY_LEN;
+    assert_eq!(bytes[share..share + 5], [0, 0, 0, 0, 0x06]);
+    bytes[share + 3] = 0x01;
+    assert_eq!(decode(&bytes), Err(decode::Error::GlobalInputIndex(1)));
+}
+
+#[test]
+fn decode_rejects_a_global_byte_outside_bool() {
+    let mut bytes = encode_response(&signatures_response(sp_global_send())).unwrap();
+    let global = FIRST_ENTRY_OFFSET + 2 * TAP_KEY_ENTRY_LEN + ENTRY_HEADER_LEN;
+    assert_eq!(bytes[global], 0x01);
+    bytes[global] = 0x02;
+    assert_eq!(
+        decode(&bytes),
+        Err(decode::Error::Read(reader::Error::InvalidBool(0x02)))
+    );
+}
+
+#[test]
+fn a_share_without_its_proof_is_refused() {
+    let scan = aggregate(0x02, 0x5a);
+    let response = signatures_response(vec![sp_share(SpScope::Input(0), scan, 0xa0)]);
+    assert_eq!(
+        encode_response(&response),
+        Err(encode::Error::Sp(sp::Error::MissingProof))
+    );
+
+    // a proof for another input does not cover the share of input 0
+    let paired = signatures_response(vec![
+        sp_share(SpScope::Input(0), scan, 0xa0),
+        sp_proof(SpScope::Input(0), scan, 0xb0),
+    ]);
+    let mut bytes = encode_response(&paired).unwrap();
+    let proof = FIRST_ENTRY_OFFSET + SP_SHARE_ENTRY_LEN;
+    assert_eq!(bytes[proof..proof + 5], [0, 0, 0, 0, 0x07]);
+    bytes[proof + 3] = 0x01;
+    assert_eq!(
+        decode(&bytes),
+        Err(decode::Error::Sp(sp::Error::MissingProof))
+    );
+}
+
+#[test]
+fn a_global_proof_does_not_cover_a_per_input_share() {
+    let scan = aggregate(0x02, 0x5a);
+    let response = signatures_response(vec![
+        sp_share(SpScope::Input(0), scan, 0xa0),
+        sp_proof(SpScope::Global, scan, 0xb0),
+    ]);
+    assert_eq!(
+        encode_response(&response),
+        Err(encode::Error::Sp(sp::Error::MissingProof))
+    );
+}
+
+#[test]
+fn a_proof_without_its_share_is_refused() {
+    let scan = aggregate(0x02, 0x5a);
+    let response = signatures_response(vec![sp_proof(SpScope::Global, scan, 0xb0)]);
+    assert_eq!(
+        encode_response(&response),
+        Err(encode::Error::Sp(sp::Error::MissingShare))
+    );
+}
+
+#[test]
+fn a_second_share_or_proof_for_a_scan_key_is_refused() {
+    let scan = aggregate(0x02, 0x5a);
+    let mut entries = sp_per_input_send();
+    entries.push(sp_share(SpScope::Input(2), scan, 0xa3));
+    assert_eq!(
+        encode_response(&signatures_response(entries)),
+        Err(encode::Error::Sp(sp::Error::DuplicateShare))
+    );
+
+    let mut entries = sp_per_input_send();
+    entries.push(sp_proof(SpScope::Input(0), scan, 0xb3));
+    assert_eq!(
+        encode_response(&signatures_response(entries)),
+        Err(encode::Error::Sp(sp::Error::DuplicateProof))
+    );
 }

@@ -1,8 +1,11 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::{
-    musig, request,
-    types::{ExtendedKey, Fingerprint, PublicKey, MUSIG_PARTIAL_SIG_LEN, MUSIG_PUB_NONCE_LEN},
+    musig, request, sp,
+    types::{
+        ExtendedKey, Fingerprint, PublicKey, DLEQ_PROOF_LEN, MUSIG_PARTIAL_SIG_LEN,
+        MUSIG_PUB_NONCE_LEN,
+    },
     MessageType,
 };
 
@@ -189,6 +192,25 @@ pub enum SignatureEntry {
         leaf_hash: Option<[u8; 32]>,
         signature: [u8; MUSIG_PARTIAL_SIG_LEN],
     },
+    /// The value of BIP-375 `PSBT_GLOBAL_SP_ECDH_SHARE` or `PSBT_IN_SP_ECDH_SHARE`.
+    SpEcdhShare {
+        scope: SpScope,
+        scan_key: PublicKey,
+        share: PublicKey,
+    },
+    /// The value of BIP-375 `PSBT_GLOBAL_SP_DLEQ` or `PSBT_IN_SP_DLEQ`, a BIP-374 proof.
+    SpDleqProof {
+        scope: SpScope,
+        scan_key: PublicKey,
+        proof: [u8; DLEQ_PROOF_LEN],
+    },
+    /// An entry whose kind this codec does not know. It is kept rather than dropped so
+    /// a consumer sees it and a relay re-encodes the message unchanged.
+    Unknown {
+        input_index: u32,
+        kind: u8,
+        fields: Vec<u8>,
+    },
 }
 
 impl SignatureEntry {
@@ -199,6 +221,51 @@ impl SignatureEntry {
             Self::TapScript { .. } => SIGNATURE_TAP_SCRIPT,
             Self::MusigPubNonce { .. } => SIGNATURE_MUSIG_PUB_NONCE,
             Self::MusigPartialSig { .. } => SIGNATURE_MUSIG_PARTIAL_SIG,
+            Self::SpEcdhShare { .. } => SIGNATURE_SP_ECDH_SHARE,
+            Self::SpDleqProof { .. } => SIGNATURE_SP_DLEQ_PROOF,
+            Self::Unknown { kind, .. } => *kind,
+        }
+    }
+
+    /// The input the entry is for, `None` for a global silent payment entry.
+    pub fn input_index(&self) -> Option<u32> {
+        match self {
+            Self::Ecdsa { input_index, .. }
+            | Self::TapKey { input_index, .. }
+            | Self::TapScript { input_index, .. }
+            | Self::MusigPubNonce { input_index, .. }
+            | Self::MusigPartialSig { input_index, .. }
+            | Self::Unknown { input_index, .. } => Some(*input_index),
+            Self::SpEcdhShare { scope, .. } | Self::SpDleqProof { scope, .. } => {
+                scope.input_index()
+            }
+        }
+    }
+}
+
+/// Whether a silent payment share or proof covers the whole transaction (the signer
+/// owns every eligible input) or a single input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SpScope {
+    Global,
+    Input(u32),
+}
+
+impl SpScope {
+    /// The scope of an entry whose `GLOBAL` and `INPUT_INDEX` wire fields are given,
+    /// `None` when a global entry carries another index than `GLOBAL_INPUT_INDEX`.
+    pub fn from_wire(global: bool, input_index: u32) -> Option<Self> {
+        match (global, input_index) {
+            (false, index) => Some(Self::Input(index)),
+            (true, sp::GLOBAL_INPUT_INDEX) => Some(Self::Global),
+            (true, _) => None,
+        }
+    }
+
+    pub fn input_index(self) -> Option<u32> {
+        match self {
+            Self::Global => None,
+            Self::Input(index) => Some(index),
         }
     }
 }
@@ -208,6 +275,8 @@ pub const SIGNATURE_TAP_KEY: u8 = 0x02;
 pub const SIGNATURE_TAP_SCRIPT: u8 = 0x03;
 pub const SIGNATURE_MUSIG_PUB_NONCE: u8 = 0x04;
 pub const SIGNATURE_MUSIG_PARTIAL_SIG: u8 = 0x05;
+pub const SIGNATURE_SP_ECDH_SHARE: u8 = 0x06;
+pub const SIGNATURE_SP_DLEQ_PROOF: u8 = 0x07;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorBody {

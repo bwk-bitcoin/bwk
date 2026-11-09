@@ -125,3 +125,70 @@ pub fn musig_partial_sigs() -> Vec<response::SignatureEntry> {
         },
     ]
 }
+
+#[cfg(feature = "bitcoin")]
+pub fn sp_share(
+    scope: response::SpScope,
+    scan_key: PublicKey,
+    fill: u8,
+) -> response::SignatureEntry {
+    response::SignatureEntry::SpEcdhShare {
+        scope,
+        scan_key,
+        share: aggregate(0x02, fill),
+    }
+}
+
+#[cfg(feature = "bitcoin")]
+pub fn sp_proof(
+    scope: response::SpScope,
+    scan_key: PublicKey,
+    fill: u8,
+) -> response::SignatureEntry {
+    response::SignatureEntry::SpDleqProof {
+        scope,
+        scan_key,
+        proof: [fill; 64],
+    }
+}
+
+// One signer owns both inputs and pays two scan keys: a global pair per scan key.
+#[cfg(feature = "bitcoin")]
+pub fn sp_global_send() -> Vec<response::SignatureEntry> {
+    let scan_a = aggregate(0x02, 0x5a);
+    let scan_b = aggregate(0x03, 0x5b);
+    vec![
+        response::SignatureEntry::TapKey {
+            input_index: 0,
+            signature: vec![0x01; 64],
+        },
+        response::SignatureEntry::TapKey {
+            input_index: 1,
+            signature: vec![0x02; 64],
+        },
+        sp_share(response::SpScope::Global, scan_a, 0xa0),
+        sp_proof(response::SpScope::Global, scan_a, 0xb0),
+        sp_share(response::SpScope::Global, scan_b, 0xa1),
+        sp_proof(response::SpScope::Global, scan_b, 0xb1),
+    ]
+}
+
+// The signer owns inputs 0 and 2 of a transaction paying one scan key: a pair per input.
+#[cfg(feature = "bitcoin")]
+pub fn sp_per_input_send() -> Vec<response::SignatureEntry> {
+    let scan = aggregate(0x02, 0x5a);
+    vec![
+        response::SignatureEntry::TapKey {
+            input_index: 0,
+            signature: vec![0x01; 64],
+        },
+        sp_share(response::SpScope::Input(0), scan, 0xa0),
+        sp_proof(response::SpScope::Input(0), scan, 0xb0),
+        response::SignatureEntry::TapKey {
+            input_index: 2,
+            signature: vec![0x03; 64],
+        },
+        sp_share(response::SpScope::Input(2), scan, 0xa2),
+        sp_proof(response::SpScope::Input(2), scan, 0xb2),
+    ]
+}

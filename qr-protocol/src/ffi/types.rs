@@ -5,8 +5,8 @@ use core::{ffi::c_char, ptr};
 
 use crate::{
     types::{
-        EXTENDED_KEY_LEN, FINGERPRINT_LEN, MUSIG_PARTIAL_SIG_LEN, MUSIG_PUB_NONCE_LEN,
-        PUBLIC_KEY_LEN, TAP_LEAF_HASH_LEN,
+        DLEQ_PROOF_LEN, EXTENDED_KEY_LEN, FINGERPRINT_LEN, MUSIG_PARTIAL_SIG_LEN,
+        MUSIG_PUB_NONCE_LEN, PUBLIC_KEY_LEN, TAP_LEAF_HASH_LEN,
     },
     ERROR_MESSAGE_LEN, MODEL_LEN, REQUEST_ID_LEN, VENDOR_LEN,
 };
@@ -268,9 +268,11 @@ pub union SignedValue {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Signature {
+    /// Unused and `0` for a global silent payment entry.
     pub input_index: u32,
     /// `SIGNATURE_ECDSA`, `SIGNATURE_TAP_KEY`, `SIGNATURE_TAP_SCRIPT`,
-    /// `SIGNATURE_MUSIG_PUB_NONCE` or `SIGNATURE_MUSIG_PARTIAL_SIG`.
+    /// `SIGNATURE_MUSIG_PUB_NONCE`, `SIGNATURE_MUSIG_PARTIAL_SIG`,
+    /// `SIGNATURE_SP_ECDH_SHARE` or `SIGNATURE_SP_DLEQ_PROOF`.
     pub kind: u8,
     pub value: SignatureValue,
 }
@@ -283,6 +285,8 @@ pub union SignatureValue {
     pub tap_script: TapScript,
     pub musig_pub_nonce: MusigPubNonce,
     pub musig_partial_sig: MusigPartialSig,
+    pub sp_ecdh_share: SpEcdhShare,
+    pub sp_dleq_proof: SpDleqProof,
 }
 
 #[repr(C)]
@@ -326,6 +330,24 @@ pub struct MusigPartialSig {
     pub has_leaf_hash: u8,
     pub leaf_hash: [u8; TAP_LEAF_HASH_LEN],
     pub signature: [u8; MUSIG_PARTIAL_SIG_LEN],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SpEcdhShare {
+    /// 0 for the input at `input_index`, 1 for the whole transaction.
+    pub global: u8,
+    pub scan_key: [u8; PUBLIC_KEY_LEN],
+    pub share: [u8; PUBLIC_KEY_LEN],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SpDleqProof {
+    /// 0 for the input at `input_index`, 1 for the whole transaction.
+    pub global: u8,
+    pub scan_key: [u8; PUBLIC_KEY_LEN],
+    pub proof: [u8; DLEQ_PROOF_LEN],
 }
 
 #[repr(C)]

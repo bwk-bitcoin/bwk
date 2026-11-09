@@ -3,7 +3,7 @@ use alloc::{string::String, vec::Vec};
 use crate::{
     musig,
     reader::{self, Reader},
-    request, response,
+    request, response, sp,
     types::{DerivationPath, ExtendedKey, Fingerprint, PublicKey},
     ErrorInfo, Message, MessageType, Request, RequestId, Response, SignResponseKind,
     DIRECTION_RESPONSE, ERROR_MESSAGE_LEN, MAGIC, MAX_DESCRIPTOR_ALIAS, MAX_MUSIG_DERIVATIONS,
@@ -18,9 +18,11 @@ pub enum Error {
     UnknownMessageType(u8),
     ErrorStatusOnRequest,
     UnknownDescriptorForm(u8),
-    UnknownSignatureKind(u8),
     UnknownSignResponseKind(u8),
     UnknownKeyKind(u8),
+    SignatureLength(u8),
+    GlobalInputIndex(u32),
+    Sp(sp::Error),
     Read(reader::Error),
 }
 
@@ -33,9 +35,15 @@ impl Error {
             Self::UnknownMessageType(_) => error_info!(202, "unknown message type"),
             Self::ErrorStatusOnRequest => error_info!(203, "request cannot carry error status"),
             Self::UnknownDescriptorForm(_) => error_info!(204, "unknown descriptor form"),
-            Self::UnknownSignatureKind(_) => error_info!(205, "unknown signature kind"),
             Self::UnknownSignResponseKind(_) => error_info!(206, "unknown signing response kind"),
             Self::UnknownKeyKind(_) => error_info!(207, "unknown key kind"),
+            Self::SignatureLength(_) => {
+                error_info!(208, "signature entry fields do not fill its length")
+            }
+            Self::GlobalInputIndex(_) => {
+                error_info!(209, "global silent payment entry has a nonzero input index")
+            }
+            Self::Sp(error) => error.info(),
             Self::Read(inner) => inner.info(),
         }
     }
@@ -46,6 +54,12 @@ error_display!(Error);
 impl From<musig::Error> for Error {
     fn from(error: musig::Error) -> Self {
         Self::Musig(error)
+    }
+}
+
+impl From<sp::Error> for Error {
+    fn from(error: sp::Error) -> Self {
+        Self::Sp(error)
     }
 }
 
@@ -274,9 +288,11 @@ fn read_address_response(reader: &mut Reader<'_>) -> Result<response::AddressUri
 fn read_signed_response(reader: &mut Reader<'_>) -> Result<response::Signed, Error> {
     match read_sign_response_kind(reader)? {
         SignResponseKind::Psbt => Ok(response::Signed::Psbt(reader.take_bytes()?)),
-        SignResponseKind::Signatures => Ok(response::Signed::Signatures(
-            reader.take_vec(read_signature)?,
-        )),
+        SignResponseKind::Signatures => {
+            let entries = reader.take_vec(read_signature)?;
+            sp::validate_entries(&entries)?;
+            Ok(response::Signed::Signatures(entries))
+        }
     }
 }
 
@@ -321,7 +337,26 @@ fn read_sp_keys(reader: &mut Reader<'_>) -> Result<request::SpKeys, Error> {
 
 fn read_signature(reader: &mut Reader<'_>) -> Result<response::SignatureEntry, Error> {
     let input_index = reader.take_u32_be()?;
-    match reader.take_u8()? {
+    let kind = reader.take_u8()?;
+    let mut fields = Reader::new(reader.take_bytes_slice()?);
+    // running out of bytes inside the fields means they overflow the entry's LENGTH
+    let entry =
+        read_signature_fields(&mut fields, input_index, kind).map_err(|error| match error {
+            Error::Read(reader::Error::Truncated) => Error::SignatureLength(kind),
+            error => error,
+        })?;
+    if !fields.is_empty() {
+        return Err(Error::SignatureLength(kind));
+    }
+    Ok(entry)
+}
+
+fn read_signature_fields(
+    reader: &mut Reader<'_>,
+    input_index: u32,
+    kind: u8,
+) -> Result<response::SignatureEntry, Error> {
+    match kind {
         response::SIGNATURE_ECDSA => Ok(response::SignatureEntry::Ecdsa {
             input_index,
             public_key: read_pubkey(reader)?,
@@ -351,8 +386,27 @@ fn read_signature(reader: &mut Reader<'_>) -> Result<response::SignatureEntry, E
             leaf_hash: reader.take_option(|r| r.take_array())?,
             signature: reader.take_array()?,
         }),
-        value => Err(Error::UnknownSignatureKind(value)),
+        response::SIGNATURE_SP_ECDH_SHARE => Ok(response::SignatureEntry::SpEcdhShare {
+            scope: read_sp_scope(reader, input_index)?,
+            scan_key: read_pubkey(reader)?,
+            share: read_pubkey(reader)?,
+        }),
+        response::SIGNATURE_SP_DLEQ_PROOF => Ok(response::SignatureEntry::SpDleqProof {
+            scope: read_sp_scope(reader, input_index)?,
+            scan_key: read_pubkey(reader)?,
+            proof: reader.take_array()?,
+        }),
+        kind => Ok(response::SignatureEntry::Unknown {
+            input_index,
+            kind,
+            fields: reader.take_rest().to_vec(),
+        }),
     }
+}
+
+fn read_sp_scope(reader: &mut Reader<'_>, input_index: u32) -> Result<response::SpScope, Error> {
+    response::SpScope::from_wire(reader.take_bool()?, input_index)
+        .ok_or(Error::GlobalInputIndex(input_index))
 }
 
 fn read_key_request(reader: &mut Reader<'_>) -> Result<request::KeyRequest, Error> {

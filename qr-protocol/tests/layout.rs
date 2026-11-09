@@ -13,7 +13,8 @@ use bwk_qr_protocol::ffi::types::{
     FirmwareVersion, GetKeys, KeyRequest, Keys, List, MusigDerivation, MusigNonce, MusigPartialSig,
     MusigPrepared, MusigPubNonce, MusigSigned, Path, PrepareMusig, RegisterDescriptor,
     Registration, Request, RequestBody, Response, ResponseBody, Sign, SignMusig, Signature,
-    SignatureValue, Signed, SignedValue, SpKeys, TapKey, TapScript, VerifyAddress,
+    SignatureValue, Signed, SignedValue, SpDleqProof, SpEcdhShare, SpKeys, TapKey, TapScript,
+    VerifyAddress,
 };
 
 macro_rules! check {
@@ -59,6 +60,8 @@ fn the_c_mirror_matches_the_header() {
         TapScript => 80, 8;
         MusigPubNonce => 165, 1;
         MusigPartialSig => 131, 1;
+        SpEcdhShare => 67, 1;
+        SpDleqProof => 98, 1;
         MusigNonce => 184, 4;
         List<MusigNonce> => 16, 8;
         MusigPrepared => 56, 8;
