@@ -887,6 +887,15 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         self.config.clone()
     }
 
+    /// Returns the height scanning starts at, as the scan state persisted it: the
+    /// config's birthday seeds a fresh store only, a loaded one keeps its own.
+    pub fn scan_start(&self) -> u32 {
+        self.scan_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .birthday_height()
+    }
+
     /// Returns the Silent Payment address for this account.
     pub fn sp_address(&self) -> SilentPaymentAddress {
         self.sp_receiver.get_receiving_address()
