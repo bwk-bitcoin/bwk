@@ -60,9 +60,8 @@ it is the wallet's job. An entry of a kind the codec does not know decodes to
 
 Address Verification of a silent payment address carries
 `request::DescriptorBody::SpKeys`, whose scan key is the signer's own at a path
-(`Scan::Path`) or a scan private key it does not hold (`Scan::Key`). Both encode and
-decode reject a scan key that is not a valid secp256k1 secret key; decode also
-rejects a body with both or neither. `SecretKey`'s `Debug` does not print the key.
+(`Scan::Path`) or a scan private key it does not hold (`Scan::Key`). Decode rejects
+a body with both or neither. `SecretKey`'s `Debug` does not print the key.
 
 Get Info (`0x07`) uses `request::Body::GetInfo`, which carries no body, and
 `response::Body::Info`. Both encode and decode reject a `max_alias` above 32 and a

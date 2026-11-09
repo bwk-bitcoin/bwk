@@ -111,13 +111,10 @@ step has bit 31 set, `index | 0x80000000`).
   - `SCAN_PATH`: OPTIONAL `DERIVATION_PATH`, the path of the BIP-352 scan key from
     the master key, when the scan key is the signer's.
   - `SCAN_KEY`: OPTIONAL, 32 bytes, the BIP-352 scan private key as a big-endian
-    scalar, when the scan key is not the signer's. It MUST be a valid secp256k1
-    secret key: nonzero and below the curve order
-    (`FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFE BAAEDCE6 AF48A03B BFD25E8C D0364141`).
+    scalar, when the scan key is not the signer's.
 
   Exactly one of `SCAN_PATH` and `SCAN_KEY` MUST be present: a reader MUST reject
-  the form when both or neither are, and MUST reject a `SCAN_KEY` that is not a
-  valid secret key.
+  the form when both or neither are.
 
   The spend key is always the signer's: it derives the spend key at `SPEND_PATH`
   from its own seed, and MUST refuse the form when `FINGERPRINT` is not its own. It
@@ -871,8 +868,7 @@ Rules for future versions:
   `PRESENCE` outside `{0x00, 0x01}`, a discriminant (`TYPE`, `FORM`, `KIND`)
   outside its defined range, `STATUS` = `1` on a request, a `STRING` that is not
   valid UTF-8 or that contains a nul byte, or a `FORM` `0x03` body with both or
-  neither of `SCAN_PATH` and `SCAN_KEY`, or with a `SCAN_KEY` that is not a valid
-  secret key.
+  neither of `SCAN_PATH` and `SCAN_KEY`.
 - `SIG_KIND` is not such a discriminant: a reader skips an entry whose `SIG_KIND`
   it does not know. It MUST reject a `SIG_ENTRY` of a known `SIG_KIND` whose
   `KIND_FIELDS` do not exactly fill its `LENGTH`, a global silent payment entry

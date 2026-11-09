@@ -218,7 +218,6 @@ enum bwk_qr_status {
     BWK_QR_ERR_SP_DUPLICATE_PROOF = 601,
     BWK_QR_ERR_SP_MISSING_PROOF = 602,
     BWK_QR_ERR_SP_MISSING_SHARE = 603,
-    BWK_QR_ERR_SP_INVALID_SCAN_KEY = 604,
 
     BWK_QR_ERR_GET_INFO_MAX_ALIAS_TOO_LARGE = 700,
     BWK_QR_ERR_GET_INFO_FINGERPRINT_WHEN_NOT_READY = 701
@@ -272,7 +271,7 @@ typedef struct {
 
 typedef union {
     bwk_qr_path path;                     /* from the master key */
-    uint8_t key[BWK_QR_SECRET_KEY_LEN];   /* big-endian scalar, a valid secret key */
+    uint8_t key[BWK_QR_SECRET_KEY_LEN];   /* big-endian scalar */
 } bwk_qr_scan_value;
 
 typedef struct {
