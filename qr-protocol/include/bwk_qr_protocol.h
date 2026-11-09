@@ -29,13 +29,9 @@ extern "C" {
 #define BWK_QR_MUSIG_PARTIAL_SIG_LEN 32
 #define BWK_QR_TAP_LEAF_HASH_LEN 32
 #define BWK_QR_DLEQ_PROOF_LEN 64
-#define BWK_QR_VENDOR_LEN 16
-#define BWK_QR_MODEL_LEN 16
-#define BWK_QR_ERROR_MESSAGE_LEN 32
+#define BWK_QR_SCHNORR_SIGNATURE_LEN 64 /* 65 with a sighash type byte */
 #define BWK_QR_MAX_PATH 255
 #define BWK_QR_MAX_VEC 4096
-#define BWK_QR_MAX_MUSIG_INPUTS 8
-#define BWK_QR_MAX_MUSIG_DERIVATIONS 32
 #define BWK_QR_MAX_STRING (64 * 1024)
 #define BWK_QR_MAX_BYTES (512 * 1024)
 
@@ -49,13 +45,13 @@ extern "C" {
 
 /* Closed: the decoder rejects any other value. */
 enum bwk_qr_message_type {
-    BWK_QR_MESSAGE_GET_KEYS = 0x01,
-    BWK_QR_MESSAGE_REGISTER_DESCRIPTOR = 0x02,
-    BWK_QR_MESSAGE_ADDRESS_VERIFICATION = 0x03,
-    BWK_QR_MESSAGE_SIGNING = 0x04,
-    BWK_QR_MESSAGE_MUSIG_PREPARATION = 0x05,
-    BWK_QR_MESSAGE_MUSIG_SIGNING = 0x06,
-    BWK_QR_MESSAGE_GET_INFO = 0x07 /* no request body: the body union is unused */
+    BWK_QR_MESSAGE_GET_INFO = 0x01, /* no request body: the body union is unused */
+    BWK_QR_MESSAGE_GET_KEYS = 0x02,
+    BWK_QR_MESSAGE_REGISTER_DESCRIPTOR = 0x03,
+    BWK_QR_MESSAGE_ADDRESS_VERIFICATION = 0x04,
+    BWK_QR_MESSAGE_SIGNING = 0x05,
+    BWK_QR_MESSAGE_MUSIG_PREPARATION = 0x06,
+    BWK_QR_MESSAGE_MUSIG_SIGNING = 0x07
 };
 
 enum bwk_qr_capability {
@@ -72,10 +68,10 @@ enum bwk_qr_state {
 
 /* Encoding a response rejects any other bit. */
 enum bwk_qr_network {
-    BWK_QR_NETWORK_MAINNET = 1u << 0,
-    BWK_QR_NETWORK_TESTNET = 1u << 1,
-    BWK_QR_NETWORK_SIGNET = 1u << 2,
-    BWK_QR_NETWORK_REGTEST = 1u << 3
+    BWK_QR_NETWORK_MAINNET = 1u << 1,
+    BWK_QR_NETWORK_TESTNET = 1u << 2,
+    BWK_QR_NETWORK_SIGNET = 1u << 3,
+    BWK_QR_NETWORK_REGTEST = 1u << 4
 };
 
 /* Closed: the decoder rejects any other value. */
@@ -151,8 +147,8 @@ enum bwk_qr_absent {
 /* What the four functions return. 100..=199 come from the byte reader, 200..=299
  * from the decoder, 300..=399 from the encoder, 400..=499 from this binding,
  * 500..=599 from shared MuSig validation, 600..=699 from shared silent payment
- * validation and 700..=799 from shared Get Info validation, the last three both on
- * encode and decode. */
+ * validation, 700..=799 from shared Get Info validation and 800..=899 from shared
+ * signature validation, the last four both on encode and decode. */
 enum bwk_qr_status {
     BWK_QR_OK = 0,
 
@@ -165,7 +161,6 @@ enum bwk_qr_status {
     BWK_QR_ERR_STRING_TOO_LARGE = 106,
     BWK_QR_ERR_BYTES_TOO_LARGE = 107,
     BWK_QR_ERR_VEC_TOO_LARGE = 108,
-    BWK_QR_ERR_INVALID_FIXED_STRING_PADDING = 109,
     BWK_QR_ERR_INVALID_UTF8 = 110,
     BWK_QR_ERR_STRING_NUL = 111,
 
@@ -189,7 +184,6 @@ enum bwk_qr_status {
     BWK_QR_ERR_ENCODE_BYTES_TOO_LARGE = 305,
     BWK_QR_ERR_STRING_TOO_LONG = 306,
     BWK_QR_ERR_ENCODE_STRING_NUL = 307,
-    BWK_QR_ERR_FIXED_STRING_TOO_LONG = 308,
     BWK_QR_ERR_UNREACHABLE = 309,
     BWK_QR_ERR_DEFINED_SIGNATURE_KIND = 310,
     BWK_QR_ERR_RESERVED_NETWORK_BITS = 311,
@@ -200,7 +194,6 @@ enum bwk_qr_status {
     BWK_QR_ERR_FFI_INVALID_UTF8 = 402,
     BWK_QR_ERR_FFI_INVALID_BOOL = 403,
     BWK_QR_ERR_UNKNOWN_TAG = 404,
-    BWK_QR_ERR_UNTERMINATED_FIXED_STRING = 405,
     BWK_QR_ERR_UNEXPECTED_RESPONSE = 406,
     BWK_QR_ERR_FFI_GLOBAL_INPUT_INDEX = 407,
 
@@ -208,7 +201,6 @@ enum bwk_qr_status {
     BWK_QR_ERR_MUSIG_DERIVATION_COUNT = 501,
     BWK_QR_ERR_MUSIG_DUPLICATE_DERIVATION = 502,
     BWK_QR_ERR_MUSIG_HARDENED_INDEX = 503,
-    BWK_QR_ERR_MUSIG_MISSING_DESCRIPTOR = 504,
     BWK_QR_ERR_MUSIG_NONCE_COUNT = 505,
     BWK_QR_ERR_MUSIG_NONCE_INPUT_INDEX = 506,
     BWK_QR_ERR_MUSIG_DUPLICATE_NONCE = 507,
@@ -220,7 +212,9 @@ enum bwk_qr_status {
     BWK_QR_ERR_SP_MISSING_SHARE = 603,
 
     BWK_QR_ERR_GET_INFO_MAX_ALIAS_TOO_LARGE = 700,
-    BWK_QR_ERR_GET_INFO_FINGERPRINT_WHEN_NOT_READY = 701
+    BWK_QR_ERR_GET_INFO_FINGERPRINT_WHEN_NOT_READY = 701,
+
+    BWK_QR_ERR_TAPROOT_SIGNATURE_LENGTH = 800
 };
 
 /* A borrowed run of items. A NULL ptr means the field is absent, which is distinct
@@ -374,15 +368,15 @@ typedef struct {
 typedef struct {
     bwk_qr_extended_key_list keys; /* one per request key, in request order */
     uint8_t fingerprint[BWK_QR_FINGERPRINT_LEN];
-    char vendor[BWK_QR_VENDOR_LEN + 1];
-    char model[BWK_QR_MODEL_LEN + 1];
+    const char *vendor;
+    const char *model;
     bwk_qr_firmware_version version;
     uint32_t capabilities; /* only the low five bits may be set */
 } bwk_qr_keys;
 
 typedef struct {
-    char vendor[BWK_QR_VENDOR_LEN + 1];
-    char model[BWK_QR_MODEL_LEN + 1];
+    const char *vendor;
+    const char *model;
     bwk_qr_firmware_version version;
     uint32_t capabilities;   /* only the low five bits may be set */
     uint8_t state;           /* BWK_QR_STATE_* */
@@ -510,7 +504,7 @@ typedef struct {
 
 typedef struct {
     uint8_t error; /* BWK_QR_RESPONSE_ERROR_* */
-    char message[BWK_QR_ERROR_MESSAGE_LEN + 1];
+    const char *message;
 } bwk_qr_error_body;
 
 typedef union {

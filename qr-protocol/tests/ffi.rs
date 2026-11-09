@@ -15,10 +15,10 @@ use bwk_qr_protocol::{
     },
     get_info, musig, request,
     response::{self, SpScope},
-    sp,
+    signature, sp,
     types::{DerivationPath, ExtendedKey, Fingerprint, PublicKey},
     ErrorInfo, Message, MessageType, Request, RequestId, Response, SignResponseKind,
-    ERROR_MESSAGE_LEN, MODEL_LEN, REQUEST_ID_LEN,
+    REQUEST_ID_LEN,
 };
 
 use common::{bip380, bip388, sp_foreign_scan_keys, sp_keys, FOREIGN_SCAN_KEY};
@@ -54,7 +54,7 @@ fn cached_preparation_request_exposes_owned_descriptor_and_derivations() {
         unsafe {
             let handle = view(&request);
             assert_eq!((*handle).id, ID);
-            assert_eq!((*handle).message_type, 0x05);
+            assert_eq!((*handle).message_type, 0x06);
             let body = (*handle).body.prepare_musig;
             assert_eq!(body.session_id, [0x51; 32]);
             assert_eq!(body.max_inputs, 8);
@@ -100,6 +100,32 @@ fn cached_preparation_request_exposes_owned_descriptor_and_derivations() {
 }
 
 #[test]
+fn cached_preparation_request_with_only_an_alias_has_a_null_body() {
+    let request = request(request::Body::PrepareMusig(request::PrepareMusig {
+        descriptor: request::Descriptor {
+            alias: "cached".into(),
+            descriptor: None,
+            proof: None,
+        },
+        session_id: [0x51; 32],
+        max_inputs: 1,
+        derivations: vec![request::MusigDerivation {
+            keychain: 0,
+            index: 7,
+        }],
+    }));
+    unsafe {
+        let handle = view(&request);
+        let body = (*handle).body.prepare_musig;
+        assert_eq!(text(body.descriptor.alias), "cached");
+        assert!(body.descriptor.body.is_null());
+        assert!(body.descriptor.proof.ptr.is_null());
+        assert_eq!(body.derivations.as_slice().len(), 1);
+        bwk_qr_request_free(handle);
+    }
+}
+
+#[test]
 fn cached_signing_request_exposes_both_ids_and_psbt() {
     let request = request(request::Body::SignMusig(request::SignMusig {
         session_id: [0x51; 32],
@@ -109,7 +135,7 @@ fn cached_signing_request_exposes_both_ids_and_psbt() {
     unsafe {
         let handle = view(&request);
         assert_eq!((*handle).id, ID);
-        assert_eq!((*handle).message_type, 0x06);
+        assert_eq!((*handle).message_type, 0x07);
         let body = (*handle).body.sign_musig;
         assert_eq!(body.session_id, [0x51; 32]);
         assert_eq!(body.attempt_id, [0xa7; 32]);
@@ -136,7 +162,7 @@ fn cached_nonce(has_leaf_hash: u8) -> types::MusigNonce {
 
 fn cached_response_view(nonces: &[types::MusigNonce]) -> types::Response {
     response_view(
-        0x05,
+        0x06,
         false,
         types::ResponseBody {
             musig_prepared: types::MusigPrepared {
@@ -184,7 +210,7 @@ fn cached_prepared_response_converts_every_nonce_field() {
 fn cached_signed_response_converts_both_ids_and_psbt() {
     let psbt = b"psbt\xff";
     let view = response_view(
-        0x06,
+        0x07,
         false,
         types::ResponseBody {
             musig_signed: types::MusigSigned {
@@ -237,7 +263,7 @@ fn cached_response_ffi_rejects_oversized_and_absent_required_fields() {
         let (code, _) = encode_failure(&cached_response_view(&nonces));
         assert_eq!(code, musig::Error::NonceCount.info().code);
         let view = response_view(
-            0x05,
+            0x06,
             false,
             types::ResponseBody {
                 musig_prepared: types::MusigPrepared {
@@ -252,7 +278,7 @@ fn cached_response_ffi_rejects_oversized_and_absent_required_fields() {
         );
         assert_eq!(encode_failure(&view), Error::NullPointer.info_owned());
         let view = response_view(
-            0x06,
+            0x07,
             false,
             types::ResponseBody {
                 musig_signed: types::MusigSigned {
@@ -268,10 +294,6 @@ fn cached_response_ffi_rejects_oversized_and_absent_required_fields() {
 
 fn path() -> DerivationPath {
     DerivationPath(vec![0x8000_0030, 0x8000_0000, 7])
-}
-
-fn extended_key() -> ExtendedKey {
-    ExtendedKey([0xab; 78])
 }
 
 fn request(body: request::Body) -> Request {
@@ -323,14 +345,6 @@ fn empty_buf() -> types::Buf {
         ptr: ptr::null_mut(),
         len: 0,
     }
-}
-
-fn fixed<const N: usize>(text: &str) -> [c_char; N] {
-    let mut field = [0; N];
-    for (slot, byte) in field.iter_mut().zip(text.bytes()) {
-        *slot = byte as c_char;
-    }
-    field
 }
 
 /// Encodes a request and hands back the C view the signer would read.
@@ -454,6 +468,29 @@ fn register_descriptor_bip388_view() {
 }
 
 #[test]
+fn register_descriptor_sp_keys_view() {
+    unsafe {
+        let request = register_descriptor_request(Some(sp_keys()));
+        let view = view(&request);
+        let body = (*view).body.register_descriptor;
+        assert_eq!(text(body.descriptor_alias), "main");
+        assert_eq!((*body.descriptor).tag, request::DESCRIPTOR_SP_KEYS);
+        let keys = (*body.descriptor).value.sp_keys;
+        assert_eq!(keys.fingerprint, [0x73, 0xc5, 0xda, 0x0a]);
+        assert_eq!(
+            keys.spend_path.as_slice(),
+            &[0x8000_0160, 0x8000_0001, 0x8000_0000, 0x8000_0000, 0]
+        );
+        assert_eq!(keys.scan_kind, types::SCAN_PATH);
+        assert_eq!(
+            keys.scan.path.as_slice(),
+            &[0x8000_0160, 0x8000_0001, 0x8000_0000, 0x8000_0001, 0]
+        );
+        bwk_qr_request_free(view);
+    }
+}
+
+#[test]
 fn absent_descriptor_is_a_null_pointer() {
     unsafe {
         let request = register_descriptor_request(None);
@@ -513,6 +550,25 @@ fn verify_address_view_with_silent_payment_keys() {
             keys.scan.path.as_slice(),
             &[0x8000_0160, 0x8000_0001, 0x8000_0000, 0x8000_0001, 0]
         );
+        bwk_qr_request_free(view);
+    }
+}
+
+#[test]
+fn verify_address_view_with_silent_payment_keys_and_a_proof() {
+    unsafe {
+        let request = request(request::Body::VerifyAddress(request::VerifyAddress {
+            descriptor_alias: "main".to_string(),
+            derivation_path: DerivationPath(vec![]),
+            address: Some("sp1qxyz".to_string()),
+            descriptor: Some(sp_keys()),
+            proof: Some(vec![0x5a; 4]),
+        }));
+        let view = view(&request);
+        let body = (*view).body.verify_address;
+        assert_eq!(text(body.descriptor_alias), "main");
+        assert_eq!((*body.descriptor).tag, request::DESCRIPTOR_SP_KEYS);
+        assert_eq!(body.proof.as_slice(), &[0x5a; 4]);
         bwk_qr_request_free(view);
     }
 }
@@ -646,8 +702,8 @@ fn keys_response_encodes() {
                 keys: types::Keys {
                     keys: list_view(&keys),
                     fingerprint: [0xde, 0xad, 0xbe, 0xef],
-                    vendor: fixed("bwk"),
-                    model: fixed("bwk-signer"),
+                    vendor: c"bwk".as_ptr(),
+                    model: c"bwk-signer".as_ptr(),
                     version: types::FirmwareVersion {
                         major: 1,
                         minor: 7,
@@ -681,38 +737,6 @@ fn keys_response_encodes() {
 }
 
 #[test]
-fn a_model_filling_its_field_keeps_its_terminator() {
-    unsafe {
-        let model = "0123456789abcdef";
-        assert_eq!(model.len(), MODEL_LEN);
-        let keys = [extended_key().0];
-        let view = response_view(
-            MessageType::GetKeys.value(),
-            false,
-            types::ResponseBody {
-                keys: types::Keys {
-                    keys: list_view(&keys),
-                    fingerprint: [0; 4],
-                    vendor: fixed("bwk"),
-                    model: fixed(model),
-                    version: types::FirmwareVersion {
-                        major: 0,
-                        minor: 0,
-                        patch: 0,
-                        flag: 0,
-                    },
-                    capabilities: 0,
-                },
-            },
-        );
-        let response::Body::Keys(body) = encoded(&view).body else {
-            panic!("not a keys response")
-        };
-        assert_eq!(body.model, model);
-    }
-}
-
-#[test]
 fn get_info_request_view() {
     unsafe {
         let view = view(&request(request::Body::GetInfo));
@@ -728,8 +752,8 @@ fn info_view(state: u8, has_fingerprint: u8, max_alias: u8) -> types::Response {
         false,
         types::ResponseBody {
             info: types::Info {
-                vendor: fixed("bwk"),
-                model: fixed("bwk-signer"),
+                vendor: c"bwk".as_ptr(),
+                model: c"bwk-signer".as_ptr(),
                 version: types::FirmwareVersion {
                     major: 1,
                     minor: 7,
@@ -766,7 +790,7 @@ fn info_response_encodes() {
                 },
                 capabilities: response::Capabilities(0x0000_0013),
                 state,
-                networks: response::Networks(0x09),
+                networks: response::Networks(0x12),
                 max_message: 0x0002_0000,
                 max_alias: 32,
                 max_keys: 15,
@@ -825,11 +849,13 @@ fn info_encode_rejects_a_max_alias_above_the_alias_bound() {
 fn info_encode_rejects_reserved_network_bits() {
     unsafe {
         let mut view = info_view(response::STATE_READY, 1, 32);
-        view.body.info.networks = 0x80;
-        assert_eq!(
-            encode_failure(&view),
-            encode::Error::ReservedNetworkBits(0x80).info_owned()
-        );
+        for networks in [0x01, 0x80] {
+            view.body.info.networks = networks;
+            assert_eq!(
+                encode_failure(&view),
+                encode::Error::ReservedNetworkBits(networks).info_owned()
+            );
+        }
     }
 }
 
@@ -1115,7 +1141,7 @@ fn error_response_encodes() {
             types::ResponseBody {
                 error: types::ErrorBody {
                     error: response::Error::UserDeclined.value(),
-                    message: fixed::<{ ERROR_MESSAGE_LEN + 1 }>("signing was declined"),
+                    message: c"signing was declined".as_ptr(),
                 },
             },
         );
@@ -1222,6 +1248,45 @@ fn encode_rejects_an_unknown_signature_kind() {
     }
 }
 
+#[test]
+fn encode_rejects_a_taproot_signature_of_another_length() {
+    unsafe {
+        let short = [0x01; 63];
+        let long = [0x01; 66];
+        for signature in [&short[..], &long[..]] {
+            let entries = [
+                types::Signature {
+                    input_index: 0,
+                    kind: response::SIGNATURE_TAP_KEY,
+                    value: types::SignatureValue {
+                        tap_key: types::TapKey {
+                            signature: list_view(signature),
+                        },
+                    },
+                },
+                types::Signature {
+                    input_index: 1,
+                    kind: response::SIGNATURE_TAP_SCRIPT,
+                    value: types::SignatureValue {
+                        tap_script: types::TapScript {
+                            xonly_public_key: [0x05; 32],
+                            tap_leaf_hash: [0x06; 32],
+                            signature: list_view(signature),
+                        },
+                    },
+                },
+            ];
+            for entry in entries {
+                let view = signatures_view(&[entry]);
+                assert_eq!(
+                    encode_failure(&view),
+                    signature::Error::TaprootLength(signature.len()).info_owned()
+                );
+            }
+        }
+    }
+}
+
 fn sp_share_view(input_index: u32, global: u8) -> types::Signature {
     types::Signature {
         input_index,
@@ -1305,26 +1370,6 @@ fn encode_rejects_an_invalid_tri_state() {
 }
 
 #[test]
-fn encode_rejects_an_unterminated_fixed_string() {
-    unsafe {
-        let view = response_view(
-            MessageType::Signing.value(),
-            true,
-            types::ResponseBody {
-                error: types::ErrorBody {
-                    error: response::Error::InternalError.value(),
-                    message: [0x41; ERROR_MESSAGE_LEN + 1],
-                },
-            },
-        );
-        assert_eq!(
-            encode_failure(&view),
-            Error::UnterminatedFixedString.info_owned()
-        );
-    }
-}
-
-#[test]
 fn encode_rejects_a_null_required_string() {
     unsafe {
         let view = response_view(
@@ -1369,6 +1414,12 @@ impl InfoOwned for get_info::Error {
 }
 
 impl InfoOwned for encode::Error {
+    fn info_owned(&self) -> (i32, String) {
+        owned(self.info())
+    }
+}
+
+impl InfoOwned for signature::Error {
     fn info_owned(&self) -> (i32, String) {
         owned(self.info())
     }

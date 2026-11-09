@@ -8,7 +8,7 @@ use crate::{
         DLEQ_PROOF_LEN, EXTENDED_KEY_LEN, FINGERPRINT_LEN, MUSIG_PARTIAL_SIG_LEN,
         MUSIG_PUB_NONCE_LEN, PUBLIC_KEY_LEN, SECRET_KEY_LEN, TAP_LEAF_HASH_LEN,
     },
-    ERROR_MESSAGE_LEN, MODEL_LEN, REQUEST_ID_LEN, VENDOR_LEN,
+    REQUEST_ID_LEN,
 };
 
 /// A borrowed run of `len` items. A null `ptr` means the field is absent, which is
@@ -231,8 +231,8 @@ pub union ResponseBody {
 pub struct Keys {
     pub keys: List<[u8; EXTENDED_KEY_LEN]>,
     pub fingerprint: [u8; FINGERPRINT_LEN],
-    pub vendor: [c_char; VENDOR_LEN + 1],
-    pub model: [c_char; MODEL_LEN + 1],
+    pub vendor: *const c_char,
+    pub model: *const c_char,
     pub version: FirmwareVersion,
     pub capabilities: u32,
 }
@@ -250,8 +250,8 @@ pub struct FirmwareVersion {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Info {
-    pub vendor: [c_char; VENDOR_LEN + 1],
-    pub model: [c_char; MODEL_LEN + 1],
+    pub vendor: *const c_char,
+    pub model: *const c_char,
     pub version: FirmwareVersion,
     pub capabilities: u32,
     /// A `State` wire code.
@@ -418,7 +418,7 @@ pub struct MusigSigned {
 pub struct ErrorBody {
     /// A `response::Error` wire code.
     pub error: u8,
-    pub message: [c_char; ERROR_MESSAGE_LEN + 1],
+    pub message: *const c_char,
 }
 
 /// A byte buffer the codec allocated. Release it with `bwk_qr_buf_free`.

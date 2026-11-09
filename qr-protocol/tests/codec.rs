@@ -5,14 +5,14 @@ mod common;
 use bwk_qr_protocol::{
     decode, encode, encode_request, encode_response, get_info, reader, request,
     response::{self, SpScope},
-    sp,
-    types::Fingerprint,
+    signature, sp,
+    types::{Fingerprint, SCHNORR_SIGNATURE_LEN},
     Message, MessageType, Request, RequestId, Response, MAX_DESCRIPTOR_ALIAS, REQUEST_ID_LEN,
 };
 
 use common::{
     aggregate, key_request, musig_partial_sigs, musig_pub_nonces, sp_global_send,
-    sp_per_input_send, sp_proof, sp_share, xpub,
+    sp_per_input_send, sp_proof, sp_share, xpub, xpub_key,
 };
 
 // MAGIC is 6 bytes, so VERSION sits at index 6 and MSG_TYPE right after it
@@ -274,7 +274,7 @@ fn decode_rejects_an_oversized_descriptor_alias() {
 }
 
 #[test]
-fn encode_rejects_a_fixed_string_holding_a_nul() {
+fn encode_rejects_a_model_holding_a_nul() {
     let mut response = keys_response(0);
     let response::Body::Keys(body) = &mut response.body else {
         unreachable!()
@@ -295,7 +295,6 @@ fn every_error_message_is_terminated_and_uniquely_coded() {
         reader::Error::StringTooLarge(0),
         reader::Error::BytesTooLarge(0),
         reader::Error::VecTooLarge(0),
-        reader::Error::InvalidFixedStringPadding,
         reader::Error::InvalidUtf8(String::from_utf8(vec![0xff]).unwrap_err()),
         reader::Error::StringNul,
     ];
@@ -325,12 +324,12 @@ fn every_error_message_is_terminated_and_uniquely_coded() {
         encode::Error::BytesTooLarge(0),
         encode::Error::StringTooLong { len: 0, max: 0 },
         encode::Error::StringNul,
-        encode::Error::FixedStringTooLong { len: 0, max: 0 },
         encode::Error::Unreachable,
         encode::Error::DefinedSignatureKind(0),
         encode::Error::ReservedNetworkBits(0),
         encode::Error::DefinedState(0),
     ];
+    let signature_errors = [signature::Error::TaprootLength(0)];
     let sp_errors = [
         sp::Error::DuplicateShare,
         sp::Error::DuplicateProof,
@@ -344,6 +343,7 @@ fn every_error_message_is_terminated_and_uniquely_coded() {
     infos.extend(encode_errors.iter().map(encode::Error::info));
     infos.extend(sp_errors.iter().map(sp::Error::info));
     infos.extend(get_info_errors.iter().map(get_info::Error::info));
+    infos.extend(signature_errors.iter().map(signature::Error::info));
 
     let mut codes = Vec::new();
     for info in &infos {
@@ -392,6 +392,35 @@ mod sp_keys {
                 descriptor: Some(descriptor),
                 proof: None,
             }),
+        }
+    }
+
+    #[test]
+    fn register_descriptor_requests_round_trip() {
+        for keys in [sp_keys(), sp_foreign_scan_keys()] {
+            let request = Request {
+                id: id(),
+                body: request::Body::RegisterDescriptor(request::RegisterDescriptor {
+                    descriptor_alias: "main".to_string(),
+                    descriptor: Some(keys),
+                }),
+            };
+            let bytes = encode_request(&request).unwrap();
+            assert_eq!(decode(&bytes), Ok(Message::Request(request)));
+        }
+    }
+
+    #[test]
+    fn verify_address_requests_with_a_proof_round_trip() {
+        for keys in [sp_keys(), sp_foreign_scan_keys()] {
+            let mut verify = verify_address_request(keys);
+            let request::Body::VerifyAddress(body) = &mut verify.body else {
+                unreachable!()
+            };
+            body.proof = Some(vec![0x5a; 4]);
+            let bytes = encode_request(&verify).unwrap();
+            assert_eq!(bytes[bytes.len() - 6..], [1, 4, 0x5a, 0x5a, 0x5a, 0x5a]);
+            assert_eq!(decode(&bytes), Ok(Message::Request(verify)));
         }
     }
 
@@ -608,6 +637,89 @@ fn decode_rejects_known_fields_short_of_their_length() {
     assert_eq!(decode(&bytes), Err(decode::Error::SignatureLength(0x02)));
 }
 
+fn tap_key_entry(signature: Vec<u8>) -> response::SignatureEntry {
+    response::SignatureEntry::TapKey {
+        input_index: 0,
+        signature,
+    }
+}
+
+fn tap_script_entry(signature: Vec<u8>) -> response::SignatureEntry {
+    response::SignatureEntry::TapScript {
+        input_index: 0,
+        xonly_public_key: [0x02; 32],
+        tap_leaf_hash: [0x03; 32],
+        signature,
+    }
+}
+
+/// A one-entry Signing response whose taproot SIGNATURE is `len` bytes, built by hand
+/// as the encoder refuses any length but 64 and 65.
+fn taproot_signature_bytes(entry: response::SignatureEntry, len: usize) -> Vec<u8> {
+    let mut bytes = encode_response(&signatures_response(vec![entry])).unwrap();
+    // the entry ends with its 64-byte SIGNATURE, right after that SIGNATURE's LENGTH
+    let signature = bytes.len() - SCHNORR_SIGNATURE_LEN;
+    bytes.truncate(signature);
+    bytes[signature - 1] = len as u8;
+    bytes.resize(signature + len, 0x01);
+    let length = FIRST_ENTRY_OFFSET + ENTRY_HEADER_LEN - 1;
+    bytes[length] = (usize::from(bytes[length]) + len - SCHNORR_SIGNATURE_LEN) as u8;
+    bytes
+}
+
+#[test]
+fn taproot_signatures_of_64_or_65_bytes_round_trip() {
+    for len in [64, 65] {
+        for entry in [
+            tap_key_entry(vec![0x01; len]),
+            tap_script_entry(vec![0x01; len]),
+        ] {
+            let response = signatures_response(vec![entry]);
+            let bytes = encode_response(&response).unwrap();
+            assert_eq!(decode(&bytes), Ok(Message::Response(response)));
+        }
+    }
+}
+
+#[test]
+fn taproot_signatures_of_another_length_are_rejected_in_both_directions() {
+    for len in [0, 63, 66] {
+        for entry in [
+            tap_key_entry(vec![0x01; len]),
+            tap_script_entry(vec![0x01; len]),
+        ] {
+            assert_eq!(
+                encode_response(&signatures_response(vec![entry])),
+                Err(encode::Error::Signature(signature::Error::TaprootLength(
+                    len
+                )))
+            );
+        }
+        for entry in [
+            tap_key_entry(vec![0x01; 64]),
+            tap_script_entry(vec![0x01; 64]),
+        ] {
+            assert_eq!(
+                decode(&taproot_signature_bytes(entry, len)),
+                Err(decode::Error::Signature(signature::Error::TaprootLength(
+                    len
+                )))
+            );
+        }
+    }
+}
+
+#[test]
+fn ecdsa_signatures_are_not_bound_to_a_length() {
+    let response = signatures_response(vec![response::SignatureEntry::Ecdsa {
+        input_index: 0,
+        public_key: xpub_key(),
+        signature: vec![0x30; 9],
+    }]);
+    let bytes = encode_response(&response).unwrap();
+    assert_eq!(decode(&bytes), Ok(Message::Response(response)));
+}
+
 #[test]
 fn decode_keeps_an_unknown_kind_whatever_its_fields() {
     let mut bytes = encode_response(&tap_key_response()).unwrap();
@@ -745,16 +857,19 @@ mod get_info_response {
 
     use crate::{id, HEADER_LEN};
 
-    // VENDOR, MODEL, VERSION and CAPABILITIES come before STATE
-    const STATE_OFFSET: usize = HEADER_LEN + 16 + 16 + 8 + 4;
+    const VENDOR: &str = "bwk";
+    const MODEL: &str = "bwk-signer";
+    // VENDOR, MODEL (each a one-byte LENGTH and its text), VERSION and CAPABILITIES
+    // come before STATE
+    const STATE_OFFSET: usize = HEADER_LEN + 1 + VENDOR.len() + 1 + MODEL.len() + 8 + 4;
     const NETWORKS_OFFSET: usize = STATE_OFFSET + 1;
     // NETWORKS and MAX_MESSAGE come before MAX_ALIAS
     const MAX_ALIAS_OFFSET: usize = NETWORKS_OFFSET + 1 + 4;
 
     fn info(state: response::State, fingerprint: Option<Fingerprint>) -> response::Info {
         response::Info {
-            vendor: "bwk".to_string(),
-            model: "bwk-signer".to_string(),
+            vendor: VENDOR.to_string(),
+            model: MODEL.to_string(),
             version: response::FirmwareVersion {
                 major: 1,
                 minor: 7,
@@ -871,21 +986,26 @@ mod get_info_response {
 
     #[test]
     fn encode_rejects_reserved_network_bits() {
-        let mut info = ready();
-        info.networks = response::Networks(0x10 | response::Networks::MAINNET);
-        assert_eq!(
-            encode_response(&info_response(info)),
-            Err(encode::Error::ReservedNetworkBits(0x11))
-        );
+        for reserved in [0x01, 0x20] {
+            let mut info = ready();
+            info.networks = response::Networks(reserved | response::Networks::MAINNET);
+            assert_eq!(
+                encode_response(&info_response(info)),
+                Err(encode::Error::ReservedNetworkBits(
+                    reserved | response::Networks::MAINNET
+                ))
+            );
+        }
     }
 
     #[test]
     fn decode_ignores_reserved_network_bits() {
         let mut bytes = encode_response(&info_response(ready())).unwrap();
         assert_eq!(bytes[NETWORKS_OFFSET], response::Networks::SIGNET);
-        bytes[NETWORKS_OFFSET] = 0xf4;
+        // SIGNET with bit 0 and bits 5 to 7, all reserved, set
+        bytes[NETWORKS_OFFSET] = 0xe9;
         let mut expected = ready();
-        expected.networks = response::Networks(0xf4);
+        expected.networks = response::Networks(0xe9);
         assert_eq!(
             decode(&bytes),
             Ok(Message::Response(info_response(expected)))

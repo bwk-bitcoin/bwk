@@ -85,8 +85,8 @@ unsafe fn musig_signed(view: &types::MusigSigned) -> Result<response::MusigSigne
 
 unsafe fn info(view: &types::Info) -> Result<response::Info, Error> {
     Ok(response::Info {
-        vendor: fixed_string(&view.vendor)?,
-        model: fixed_string(&view.model)?,
+        vendor: string(view.vendor)?,
+        model: string(view.model)?,
         version: firmware_version(&view.version),
         capabilities: response::Capabilities(view.capabilities),
         state: view.state.into(),
@@ -109,8 +109,8 @@ unsafe fn keys(view: &types::Keys) -> Result<response::Keys, Error> {
             .map(ExtendedKey)
             .collect(),
         fingerprint: Fingerprint(view.fingerprint),
-        vendor: fixed_string(&view.vendor)?,
-        model: fixed_string(&view.model)?,
+        vendor: string(view.vendor)?,
+        model: string(view.model)?,
         version: firmware_version(&view.version),
         capabilities: response::Capabilities(view.capabilities),
     })
@@ -221,7 +221,7 @@ unsafe fn error_body(
     Ok(response::ErrorBody {
         message_type,
         error: view.error.into(),
-        message: fixed_string(&view.message)?,
+        message: string(view.message)?,
     })
 }
 
@@ -240,15 +240,6 @@ unsafe fn string(ptr: *const c_char) -> Result<String, Error> {
         .to_str()
         .map(ToString::to_string)
         .map_err(|_| Error::InvalidUtf8)
-}
-
-fn fixed_string(field: &[c_char]) -> Result<String, Error> {
-    let bytes = field.iter().map(|c| *c as u8).collect::<Vec<_>>();
-    let nul = bytes
-        .iter()
-        .position(|b| *b == 0)
-        .ok_or(Error::UnterminatedFixedString)?;
-    String::from_utf8(bytes[..nul].to_vec()).map_err(|_| Error::InvalidUtf8)
 }
 
 fn optional_bool(value: i8) -> Result<Option<bool>, Error> {

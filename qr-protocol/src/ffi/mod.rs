@@ -27,7 +27,6 @@ pub enum Error {
     InvalidUtf8,
     InvalidBool,
     UnknownTag,
-    UnterminatedFixedString,
     UnexpectedResponse,
     GlobalInputIndex,
 }
@@ -41,7 +40,6 @@ impl Error {
             Self::InvalidUtf8 => error_info!(402, "invalid utf-8 string"),
             Self::InvalidBool => error_info!(403, "invalid tri-state bool"),
             Self::UnknownTag => error_info!(404, "unknown union tag"),
-            Self::UnterminatedFixedString => error_info!(405, "fixed string is not nul-terminated"),
             Self::UnexpectedResponse => error_info!(406, "expected a request, got a response"),
             Self::GlobalInputIndex => {
                 error_info!(407, "global silent payment entry has a nonzero input index")

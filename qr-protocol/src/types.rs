@@ -9,6 +9,8 @@ pub const MUSIG_PARTIAL_SIG_LEN: usize = 32;
 pub const TAP_LEAF_HASH_LEN: usize = 32;
 /// A BIP-374 DLEQ proof, `e || s`.
 pub const DLEQ_PROOF_LEN: usize = 64;
+/// A BIP-340 signature, which a sighash type byte may follow.
+pub const SCHNORR_SIGNATURE_LEN: usize = 64;
 
 /// BIP-32 child numbers with the hardened bit set, exactly as they sit on the wire.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
