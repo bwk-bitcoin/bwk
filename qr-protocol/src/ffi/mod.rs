@@ -29,6 +29,7 @@ pub enum Error {
     UnknownTag,
     UnterminatedFixedString,
     UnexpectedResponse,
+    GlobalInputIndex,
 }
 
 impl Error {
@@ -42,6 +43,9 @@ impl Error {
             Self::UnknownTag => error_info!(404, "unknown union tag"),
             Self::UnterminatedFixedString => error_info!(405, "fixed string is not nul-terminated"),
             Self::UnexpectedResponse => error_info!(406, "expected a request, got a response"),
+            Self::GlobalInputIndex => {
+                error_info!(407, "global silent payment entry has a nonzero input index")
+            }
         }
     }
 }

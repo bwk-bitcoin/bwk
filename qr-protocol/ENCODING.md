@@ -339,7 +339,8 @@ Mandatory. Bit 0 is the LSB.
 ```
 
 Bit 2 implies the signer can return a signed `PSBT` (Signing response `KIND`
-`0x01`), the only response form carrying the BIP-375 shares and proofs.
+`0x01`), the form a silent payment send falls back to when the signer cannot answer
+with `KIND` `0x02` and its ECDH shares and DLEQ proofs (see Signing).
 
 Bit 3 means the signer is a BIP-327 MuSig2 participant for BIP-390 `musig()` keys
 inside `tr()` of a registered descriptor (`FORM` `0x01`) or wallet policy (`FORM`
@@ -458,21 +459,27 @@ requires `0x01`.
 ```
 
 `DATA` depends on `KIND`:
-- `0x01`: a `PSBT`. A silent-payment send carries its BIP-375 fields in the PSBT
-  itself (`PSBT_IN_SP_ECDH_SHARE` or `PSBT_GLOBAL_SP_ECDH_SHARE` and the matching
-  DLEQ proofs), so nothing extra is encoded here.
-- `0x02`: `SIGS`, a vector of `SIG_ENTRY`.
+- `0x01`: a `PSBT`. A silent payment send carries its BIP-375 fields in the PSBT
+  itself (`PSBT_GLOBAL_SP_ECDH_SHARE` and `PSBT_GLOBAL_SP_DLEQ`, or
+  `PSBT_IN_SP_ECDH_SHARE` and `PSBT_IN_SP_DLEQ`), so nothing extra is encoded here.
+- `0x02`: `SIGS`, a vector of `SIG_ENTRY`. A silent payment send carries its
+  BIP-375 ECDH shares and DLEQ proofs as `SIG_KIND` `0x06` and `0x07` entries next
+  to the signatures.
 
-When the transaction has silent-payment outputs, the signer MUST answer with
-`KIND` `0x01` regardless of `WANT_KIND`: the BIP-375 shares and DLEQ proofs have
-no representation in the signatures-only form.
+When the transaction has silent payment outputs, a `KIND` `0x02` answer MUST
+contain, for every scan key of those outputs, an ECDH share (`SIG_KIND` `0x06`) and
+its BIP-374 DLEQ proof (`SIG_KIND` `0x07`), either global or one per eligible input
+the signer signs, as BIP-375 lays them out, plus the usual signatures. A signer that
+cannot provide them answers with `KIND` `0x01`. Output scripts do not travel: the
+wallet computes them from the shares, and the signatures commit to them.
 
 `SIG_ENTRY` follows this format:
 
-`INPUT_INDEX` `SIG_KIND` `KIND_FIELDS`
+`INPUT_INDEX` `SIG_KIND` `LENGTH` `KIND_FIELDS`
 
 `INPUT_INDEX`: 4-byte big-endian unsigned integer, the input index.
 `SIG_KIND`: 1-byte unsigned integer.
+`LENGTH`: compact size, the byte length of `KIND_FIELDS`.
 
 ```
 +-----------+-------------------+
@@ -484,9 +491,17 @@ no representation in the signatures-only form.
 | 0x03      | taptree           |
 | 0x04      | musig pubnonce    |
 | 0x05      | musig partial sig |
-| 0x06–0xFF | Reserved          |
+| 0x06      | sp ecdh share     |
+| 0x07      | sp dleq proof     |
+| 0x08–0xFF | Reserved          |
 +-----------+-------------------+
 ```
+
+`0x00` is reserved and MUST NOT be sent; `0x08`–`0xFF` are reserved for future
+kinds. A reader MUST skip an entry whose `SIG_KIND` it does not know, reserved
+values included, by reading past its `LENGTH` bytes, rather than reject the message.
+`KIND_FIELDS` of a known `SIG_KIND` MUST fill its `LENGTH` exactly; a reader MUST
+reject the message otherwise.
 
 `KIND_FIELDS` depends on `SIG_KIND`:
 - `0x01` segwit: `PUBLIC_KEY` `SIGNATURE`.
@@ -517,6 +532,36 @@ no representation in the signatures-only form.
 
   Together they are the key and value of the PSBT `PSBT_IN_MUSIG2_PARTIAL_SIG`
   (`0x1c`) field.
+- `0x06` sp ecdh share: `GLOBAL` `SCAN_KEY` `SHARE`.
+  - `GLOBAL`: `BOOL`, `true` when the share covers every eligible input of the
+    transaction, `false` when it covers the input at `INPUT_INDEX` only.
+  - `SCAN_KEY`: 33 bytes, the compressed scan key of the recipient the share is for.
+  - `SHARE`: 33 bytes, the compressed ECDH share point.
+
+  Together they are the key and value of the BIP-375 `PSBT_GLOBAL_SP_ECDH_SHARE`
+  (`0x07`) field when `GLOBAL` is `true`, of the input's `PSBT_IN_SP_ECDH_SHARE`
+  (`0x1d`) field when it is `false`.
+- `0x07` sp dleq proof: `GLOBAL` `SCAN_KEY` `PROOF`.
+  - `GLOBAL`, `SCAN_KEY`: as for `0x06`.
+  - `PROOF`: 64 bytes, no `LENGTH`, the BIP-374 DLEQ proof of the share for the
+    same `GLOBAL`, `INPUT_INDEX` and `SCAN_KEY`.
+
+  Together they are the key and value of the BIP-375 `PSBT_GLOBAL_SP_DLEQ` (`0x08`)
+  field when `GLOBAL` is `true`, of the input's `PSBT_IN_SP_DLEQ` (`0x1e`) field
+  when it is `false`.
+
+When `GLOBAL` is `true`, `INPUT_INDEX` MUST be `0`, and a reader MUST reject any
+other value. `GLOBAL` is a field of its own rather than a reserved `INPUT_INDEX`
+value, as every input index is a valid one.
+
+BIP-375 pairs every share with the proof that lets others verify it, so in one
+response a scope (global, or one input) and `SCAN_KEY` with a `0x06` or `0x07` entry
+MUST have exactly one of each, and a reader MUST reject a share without its proof, a
+proof without its share, or a duplicate of either. Whether every scan key and every
+eligible input is covered depends on the transaction, so the wallet checks it
+against its PSBT. The wallet puts each pair in its PSBT under the BIP-375 field it
+maps to, verifies the proofs and computes the output scripts as BIP-375 lays out,
+then adds the signatures.
 
 The key material travels with the signature because the coordinator inserts each
 signature into its PSBT keyed by those values. No control block is sent: the
@@ -715,9 +760,14 @@ Rules for future versions:
 - A parser MUST reject input whose first 6 bytes are not `MAGIC`.
 - A parser MUST reject input that ends before a required field is fully read, a
   compact-size `LENGTH`/`COUNT` that exceeds the remaining input, a `BOOL` or
-  `PRESENCE` outside `{0x00, 0x01}`, a discriminant (`TYPE`, `FORM`, `KIND`,
-  `SIG_KIND`) outside its defined range, `STATUS` = `1` on a request, or a
-  `STRING` that is not valid UTF-8 or that contains a nul byte.
+  `PRESENCE` outside `{0x00, 0x01}`, a discriminant (`TYPE`, `FORM`, `KIND`)
+  outside its defined range, `STATUS` = `1` on a request, or a `STRING` that is not
+  valid UTF-8 or that contains a nul byte.
+- `SIG_KIND` is not such a discriminant: a reader skips an entry whose `SIG_KIND`
+  it does not know. It MUST reject a `SIG_ENTRY` of a known `SIG_KIND` whose
+  `KIND_FIELDS` do not exactly fill its `LENGTH`, a global silent payment entry
+  whose `INPUT_INDEX` is not `0`, and an ECDH share and DLEQ proof that do not pair
+  up (Signing).
 - Trailing bytes after the final field a parser understands are NOT an error
   (Versioning).
 
@@ -737,8 +787,9 @@ is rejected before anything large is allocated. Recommended values:
 +-------------------+---------------+
 ```
 
-A parser MAY use different bounds, but it MUST reject input that exceeds what it
-can hold rather than allocate unboundedly. A `COUNT` is attacker-controlled, so a
+The `BYTES` bound also applies to the `LENGTH` of a `SIG_ENTRY`. A parser MAY use
+different bounds, but it MUST reject input that exceeds what it can hold rather than
+allocate unboundedly. A `COUNT` is attacker-controlled, so a
 parser MUST NOT reserve room for it before the items have been read.
 
 ### Worked examples
@@ -783,7 +834,9 @@ Machine-checkable vectors accompany this specification:
 - `address_verification.json`: Address Verification request/response.
 - `signing.json`: Signing request and both response `KIND`s, including the MuSig2
   signatures-only entries (`SIG_KIND` `0x04` and `0x05`, with and without a leaf
-  hash).
+  hash), a silent payment send answered with a global ECDH share and DLEQ proof and
+  one answered with per-input ones (`SIG_KIND` `0x06` and `0x07`), and an entry of
+  an unknown `SIG_KIND` that a reader skips.
 - `musig.json`: MuSig Preparation and MuSig Signing request/response, including
   nonce entries with and without a leaf hash.
 - `errors.json`: error responses (`STATUS` = `1`), standard and vendor codes,

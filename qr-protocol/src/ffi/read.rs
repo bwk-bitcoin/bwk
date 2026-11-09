@@ -164,8 +164,33 @@ unsafe fn signature(view: &types::Signature) -> Result<response::SignatureEntry,
                 signature: value.signature,
             })
         }
+        response::SIGNATURE_SP_ECDH_SHARE => {
+            let value = view.value.sp_ecdh_share;
+            Ok(response::SignatureEntry::SpEcdhShare {
+                scope: sp_scope(value.global, input_index)?,
+                scan_key: PublicKey(value.scan_key),
+                share: PublicKey(value.share),
+            })
+        }
+        response::SIGNATURE_SP_DLEQ_PROOF => {
+            let value = view.value.sp_dleq_proof;
+            Ok(response::SignatureEntry::SpDleqProof {
+                scope: sp_scope(value.global, input_index)?,
+                scan_key: PublicKey(value.scan_key),
+                proof: value.proof,
+            })
+        }
         _ => Err(Error::UnknownTag),
     }
+}
+
+fn sp_scope(global: u8, input_index: u32) -> Result<response::SpScope, Error> {
+    let global = match global {
+        0 => false,
+        1 => true,
+        _ => return Err(Error::InvalidBool),
+    };
+    response::SpScope::from_wire(global, input_index).ok_or(Error::GlobalInputIndex)
 }
 
 unsafe fn error_body(

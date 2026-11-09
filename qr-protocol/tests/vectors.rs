@@ -11,8 +11,8 @@ use bwk_qr_protocol::{self as protocol, request, response, types::Fingerprint, M
 use serde_json::Value;
 
 use common::{
-    aggregate, bip380, bip388, key_request, musig_partial_sigs, musig_pub_nonces, path, sp_keys,
-    xpriv, xpub, xpub_key,
+    aggregate, bip380, bip388, key_request, musig_partial_sigs, musig_pub_nonces, path,
+    sp_global_send, sp_keys, sp_per_input_send, xpriv, xpub, xpub_key,
 };
 
 fn id() -> protocol::RequestId {
@@ -206,6 +206,32 @@ fn signing_messages() -> Vec<(&'static str, Message)> {
             response(response::Body::Signed(response::Signed::Signatures(
                 musig_partial_sigs(),
             ))),
+        ),
+        (
+            "signing_response_silent_payment_global",
+            response(response::Body::Signed(response::Signed::Signatures(
+                sp_global_send(),
+            ))),
+        ),
+        (
+            "signing_response_silent_payment_per_input",
+            response(response::Body::Signed(response::Signed::Signatures(
+                sp_per_input_send(),
+            ))),
+        ),
+        (
+            "signing_response_unknown_sig_kind",
+            response(response::Body::Signed(response::Signed::Signatures(vec![
+                response::SignatureEntry::Unknown {
+                    input_index: 0,
+                    kind: 0x08,
+                    fields: vec![0xde, 0xad, 0xbe, 0xef],
+                },
+                response::SignatureEntry::TapKey {
+                    input_index: 0,
+                    signature: vec![0x01; 64],
+                },
+            ]))),
         ),
     ]
 }

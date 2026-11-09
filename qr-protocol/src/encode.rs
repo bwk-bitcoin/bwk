@@ -1,7 +1,7 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::{
-    musig, request, response,
+    musig, request, response, sp,
     types::{DerivationPath, ExtendedKey, PublicKey, TAP_LEAF_HASH_LEN},
     ErrorInfo, MessageType, Request, RequestId, Response, SignResponseKind, DIRECTION_REQUEST,
     DIRECTION_RESPONSE, ERROR_MESSAGE_LEN, MAGIC, MAX_BYTES, MAX_DESCRIPTOR_ALIAS, MAX_VEC,
@@ -17,6 +17,7 @@ const CAPABILITIES_MASK: u32 = 0x0000_000f | response::Capabilities::MUSIG_CACHE
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     Musig(musig::Error),
+    Sp(sp::Error),
     PathTooLong(usize),
     PatchTooLarge(u32),
     ReservedCapabilityBits(u32),
@@ -27,12 +28,14 @@ pub enum Error {
     StringNul,
     FixedStringTooLong { len: usize, max: usize },
     Unreachable,
+    DefinedSignatureKind(u8),
 }
 
 impl Error {
     pub fn info(&self) -> ErrorInfo {
         match self {
             Self::Musig(error) => error.info(),
+            Self::Sp(error) => error.info(),
             Self::PathTooLong(_) => error_info!(300, "derivation path exceeds the maximum depth"),
             Self::PatchTooLarge(_) => error_info!(301, "firmware patch version is too large"),
             Self::ReservedCapabilityBits(_) => error_info!(302, "reserved capability bits are set"),
@@ -47,6 +50,12 @@ impl Error {
                 error_info!(308, "string does not fit its fixed field")
             }
             Self::Unreachable => error_info!(309, "unreachable encoder branch"),
+            Self::DefinedSignatureKind(_) => {
+                error_info!(
+                    310,
+                    "unknown signature entry uses a defined or reserved kind"
+                )
+            }
         }
     }
 }
@@ -56,6 +65,12 @@ error_display!(Error);
 impl From<musig::Error> for Error {
     fn from(error: musig::Error) -> Self {
         Self::Musig(error)
+    }
+}
+
+impl From<sp::Error> for Error {
+    fn from(error: sp::Error) -> Self {
+        Self::Sp(error)
     }
 }
 
@@ -248,6 +263,7 @@ fn encode_signed_signatures_response(
     out: &mut Vec<u8>,
     signatures: &[response::SignatureEntry],
 ) -> Result<(), Error> {
+    sp::validate_entries(signatures)?;
     out.push(SignResponseKind::Signatures.value());
     write_vec(out, signatures, write_signature)
 }
@@ -288,25 +304,36 @@ fn write_sp_keys(out: &mut Vec<u8>, keys: &request::SpKeys) -> Result<(), Error>
 }
 
 fn write_signature(out: &mut Vec<u8>, entry: &response::SignatureEntry) -> Result<(), Error> {
+    let mut fields = Vec::new();
     match entry {
-        response::SignatureEntry::Ecdsa { .. } => write_ecdsa_signature(out, entry),
-        response::SignatureEntry::TapKey { .. } => write_tap_key_signature(out, entry),
-        response::SignatureEntry::TapScript { .. } => write_tap_script_signature(out, entry),
-        response::SignatureEntry::MusigPubNonce { .. } => write_musig_pub_nonce(out, entry),
-        response::SignatureEntry::MusigPartialSig { .. } => write_musig_partial_sig(out, entry),
-    }
+        response::SignatureEntry::Ecdsa { .. } => write_ecdsa_signature(&mut fields, entry),
+        response::SignatureEntry::TapKey { .. } => write_tap_key_signature(&mut fields, entry),
+        response::SignatureEntry::TapScript { .. } => {
+            write_tap_script_signature(&mut fields, entry)
+        }
+        response::SignatureEntry::MusigPubNonce { .. } => write_musig_pub_nonce(&mut fields, entry),
+        response::SignatureEntry::MusigPartialSig { .. } => {
+            write_musig_partial_sig(&mut fields, entry)
+        }
+        response::SignatureEntry::SpEcdhShare { .. } => write_sp_ecdh_share(&mut fields, entry),
+        response::SignatureEntry::SpDleqProof { .. } => write_sp_dleq_proof(&mut fields, entry),
+        response::SignatureEntry::Unknown { .. } => write_unknown_signature(&mut fields, entry),
+    }?;
+    let input_index = entry.input_index().unwrap_or(sp::GLOBAL_INPUT_INDEX);
+    out.extend_from_slice(&input_index.to_be_bytes());
+    out.push(entry.value());
+    write_bytes(out, &fields)
 }
 
 fn write_ecdsa_signature(out: &mut Vec<u8>, entry: &response::SignatureEntry) -> Result<(), Error> {
     let response::SignatureEntry::Ecdsa {
-        input_index,
         public_key,
         signature,
+        ..
     } = entry
     else {
         return Err(Error::Unreachable);
     };
-    write_signature_header(out, *input_index, response::SIGNATURE_ECDSA);
     out.extend_from_slice(&public_key.0);
     write_bytes(out, signature)
 }
@@ -315,14 +342,9 @@ fn write_tap_key_signature(
     out: &mut Vec<u8>,
     entry: &response::SignatureEntry,
 ) -> Result<(), Error> {
-    let response::SignatureEntry::TapKey {
-        input_index,
-        signature,
-    } = entry
-    else {
+    let response::SignatureEntry::TapKey { signature, .. } = entry else {
         return Err(Error::Unreachable);
     };
-    write_signature_header(out, *input_index, response::SIGNATURE_TAP_KEY);
     write_bytes(out, signature)
 }
 
@@ -331,15 +353,14 @@ fn write_tap_script_signature(
     entry: &response::SignatureEntry,
 ) -> Result<(), Error> {
     let response::SignatureEntry::TapScript {
-        input_index,
         xonly_public_key,
         tap_leaf_hash,
         signature,
+        ..
     } = entry
     else {
         return Err(Error::Unreachable);
     };
-    write_signature_header(out, *input_index, response::SIGNATURE_TAP_SCRIPT);
     out.extend_from_slice(xonly_public_key);
     out.extend_from_slice(tap_leaf_hash);
     write_bytes(out, signature)
@@ -347,16 +368,15 @@ fn write_tap_script_signature(
 
 fn write_musig_pub_nonce(out: &mut Vec<u8>, entry: &response::SignatureEntry) -> Result<(), Error> {
     let response::SignatureEntry::MusigPubNonce {
-        input_index,
         participant,
         aggregate,
         leaf_hash,
         nonce,
+        ..
     } = entry
     else {
         return Err(Error::Unreachable);
     };
-    write_signature_header(out, *input_index, response::SIGNATURE_MUSIG_PUB_NONCE);
     write_musig_slot(out, participant, aggregate, leaf_hash.as_ref())?;
     out.extend_from_slice(nonce);
     Ok(())
@@ -367,16 +387,15 @@ fn write_musig_partial_sig(
     entry: &response::SignatureEntry,
 ) -> Result<(), Error> {
     let response::SignatureEntry::MusigPartialSig {
-        input_index,
         participant,
         aggregate,
         leaf_hash,
         signature,
+        ..
     } = entry
     else {
         return Err(Error::Unreachable);
     };
-    write_signature_header(out, *input_index, response::SIGNATURE_MUSIG_PARTIAL_SIG);
     write_musig_slot(out, participant, aggregate, leaf_hash.as_ref())?;
     out.extend_from_slice(signature);
     Ok(())
@@ -396,9 +415,54 @@ fn write_musig_slot(
     })
 }
 
-fn write_signature_header(out: &mut Vec<u8>, input_index: u32, kind: u8) {
-    out.extend_from_slice(&input_index.to_be_bytes());
-    out.push(kind);
+fn write_sp_ecdh_share(out: &mut Vec<u8>, entry: &response::SignatureEntry) -> Result<(), Error> {
+    let response::SignatureEntry::SpEcdhShare {
+        scope,
+        scan_key,
+        share,
+    } = entry
+    else {
+        return Err(Error::Unreachable);
+    };
+    write_sp_scope(out, scope)?;
+    out.extend_from_slice(&scan_key.0);
+    out.extend_from_slice(&share.0);
+    Ok(())
+}
+
+fn write_sp_dleq_proof(out: &mut Vec<u8>, entry: &response::SignatureEntry) -> Result<(), Error> {
+    let response::SignatureEntry::SpDleqProof {
+        scope,
+        scan_key,
+        proof,
+    } = entry
+    else {
+        return Err(Error::Unreachable);
+    };
+    write_sp_scope(out, scope)?;
+    out.extend_from_slice(&scan_key.0);
+    out.extend_from_slice(proof);
+    Ok(())
+}
+
+fn write_sp_scope(out: &mut Vec<u8>, scope: &response::SpScope) -> Result<(), Error> {
+    write_bool(out, &(*scope == response::SpScope::Global))
+}
+
+// The decoder reads a defined kind as its own variant and the reserved 0x00 is never
+// sent, so neither may hide behind `Unknown`.
+fn write_unknown_signature(
+    out: &mut Vec<u8>,
+    entry: &response::SignatureEntry,
+) -> Result<(), Error> {
+    let response::SignatureEntry::Unknown { kind, fields, .. } = entry else {
+        return Err(Error::Unreachable);
+    };
+    if *kind <= response::SIGNATURE_SP_DLEQ_PROOF {
+        return Err(Error::DefinedSignatureKind(*kind));
+    }
+    out.extend_from_slice(fields);
+    Ok(())
 }
 
 fn write_key_request(out: &mut Vec<u8>, key: &request::KeyRequest) -> Result<(), Error> {

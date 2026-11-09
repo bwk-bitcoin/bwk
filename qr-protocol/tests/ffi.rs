@@ -13,7 +13,9 @@ use bwk_qr_protocol::{
         bwk_qr_buf_free, bwk_qr_request_decode, bwk_qr_request_free, bwk_qr_response_encode, types,
         Error, OK,
     },
-    musig, request, response,
+    musig, request,
+    response::{self, SpScope},
+    sp,
     types::{DerivationPath, ExtendedKey, Fingerprint, PublicKey},
     ErrorInfo, Message, MessageType, Request, RequestId, Response, SignResponseKind,
     ERROR_MESSAGE_LEN, MODEL_LEN, REQUEST_ID_LEN,
@@ -292,6 +294,21 @@ fn response_view(message_type: u8, is_error: bool, body: types::ResponseBody) ->
         is_error,
         body,
     }
+}
+
+fn signatures_view(entries: &[types::Signature]) -> types::Response {
+    response_view(
+        MessageType::Signing.value(),
+        false,
+        types::ResponseBody {
+            signed: types::Signed {
+                kind: SignResponseKind::Signatures.value(),
+                value: types::SignedValue {
+                    signatures: list_view(entries),
+                },
+            },
+        },
+    )
 }
 
 fn list_view<T>(items: &[T]) -> types::List<T> {
@@ -837,19 +854,52 @@ fn signed_signatures_response_encodes_every_kind() {
                     },
                 },
             },
-        ];
-        let view = response_view(
-            MessageType::Signing.value(),
-            false,
-            types::ResponseBody {
-                signed: types::Signed {
-                    kind: SignResponseKind::Signatures.value(),
-                    value: types::SignedValue {
-                        signatures: list_view(&entries),
+            types::Signature {
+                input_index: 0,
+                kind: response::SIGNATURE_SP_ECDH_SHARE,
+                value: types::SignatureValue {
+                    sp_ecdh_share: types::SpEcdhShare {
+                        global: 1,
+                        scan_key: [0x0e; 33],
+                        share: [0x0f; 33],
                     },
                 },
             },
-        );
+            types::Signature {
+                input_index: 0,
+                kind: response::SIGNATURE_SP_DLEQ_PROOF,
+                value: types::SignatureValue {
+                    sp_dleq_proof: types::SpDleqProof {
+                        global: 1,
+                        scan_key: [0x0e; 33],
+                        proof: [0x10; 64],
+                    },
+                },
+            },
+            types::Signature {
+                input_index: 5,
+                kind: response::SIGNATURE_SP_ECDH_SHARE,
+                value: types::SignatureValue {
+                    sp_ecdh_share: types::SpEcdhShare {
+                        global: 0,
+                        scan_key: [0x11; 33],
+                        share: [0x12; 33],
+                    },
+                },
+            },
+            types::Signature {
+                input_index: 5,
+                kind: response::SIGNATURE_SP_DLEQ_PROOF,
+                value: types::SignatureValue {
+                    sp_dleq_proof: types::SpDleqProof {
+                        global: 0,
+                        scan_key: [0x11; 33],
+                        proof: [0x13; 64],
+                    },
+                },
+            },
+        ];
+        let view = signatures_view(&entries);
         assert_eq!(
             encoded(&view).body,
             response::Body::Signed(response::Signed::Signatures(vec![
@@ -881,6 +931,26 @@ fn signed_signatures_response_encodes_every_kind() {
                     aggregate: PublicKey([0x0b; 33]),
                     leaf_hash: Some([0x0c; 32]),
                     signature: [0x0d; 32],
+                },
+                response::SignatureEntry::SpEcdhShare {
+                    scope: SpScope::Global,
+                    scan_key: PublicKey([0x0e; 33]),
+                    share: PublicKey([0x0f; 33]),
+                },
+                response::SignatureEntry::SpDleqProof {
+                    scope: SpScope::Global,
+                    scan_key: PublicKey([0x0e; 33]),
+                    proof: [0x10; 64],
+                },
+                response::SignatureEntry::SpEcdhShare {
+                    scope: SpScope::Input(5),
+                    scan_key: PublicKey([0x11; 33]),
+                    share: PublicKey([0x12; 33]),
+                },
+                response::SignatureEntry::SpDleqProof {
+                    scope: SpScope::Input(5),
+                    scan_key: PublicKey([0x11; 33]),
+                    proof: [0x13; 64],
                 },
             ]))
         );
@@ -998,19 +1068,49 @@ fn encode_rejects_an_unknown_signature_kind() {
                 },
             },
         }];
-        let view = response_view(
-            MessageType::Signing.value(),
-            false,
-            types::ResponseBody {
-                signed: types::Signed {
-                    kind: SignResponseKind::Signatures.value(),
-                    value: types::SignedValue {
-                        signatures: list_view(&entries),
-                    },
-                },
-            },
-        );
+        let view = signatures_view(&entries);
         assert_eq!(encode_failure(&view), Error::UnknownTag.info_owned());
+    }
+}
+
+fn sp_share_view(input_index: u32, global: u8) -> types::Signature {
+    types::Signature {
+        input_index,
+        kind: response::SIGNATURE_SP_ECDH_SHARE,
+        value: types::SignatureValue {
+            sp_ecdh_share: types::SpEcdhShare {
+                global,
+                scan_key: [0x02; 33],
+                share: [0x03; 33],
+            },
+        },
+    }
+}
+
+#[test]
+fn encode_rejects_a_global_entry_with_an_input_index() {
+    unsafe {
+        let entries = [sp_share_view(1, 1)];
+        let view = signatures_view(&entries);
+        assert_eq!(encode_failure(&view), Error::GlobalInputIndex.info_owned());
+    }
+}
+
+#[test]
+fn encode_rejects_a_global_byte_outside_bool() {
+    unsafe {
+        let entries = [sp_share_view(0, 2)];
+        let view = signatures_view(&entries);
+        assert_eq!(encode_failure(&view), Error::InvalidBool.info_owned());
+    }
+}
+
+#[test]
+fn encode_rejects_a_share_without_its_proof() {
+    unsafe {
+        let entries = [sp_share_view(0, 0)];
+        let view = signatures_view(&entries);
+        assert_eq!(encode_failure(&view), sp::Error::MissingProof.info_owned());
     }
 }
 
@@ -1030,18 +1130,7 @@ fn encode_rejects_an_invalid_leaf_hash_presence() {
                 },
             },
         }];
-        let view = response_view(
-            MessageType::Signing.value(),
-            false,
-            types::ResponseBody {
-                signed: types::Signed {
-                    kind: SignResponseKind::Signatures.value(),
-                    value: types::SignedValue {
-                        signatures: list_view(&entries),
-                    },
-                },
-            },
-        );
+        let view = signatures_view(&entries);
         assert_eq!(encode_failure(&view), Error::InvalidBool.info_owned());
     }
 }
@@ -1119,6 +1208,12 @@ trait InfoOwned {
 }
 
 impl InfoOwned for Error {
+    fn info_owned(&self) -> (i32, String) {
+        owned(self.info())
+    }
+}
+
+impl InfoOwned for sp::Error {
     fn info_owned(&self) -> (i32, String) {
         owned(self.info())
     }

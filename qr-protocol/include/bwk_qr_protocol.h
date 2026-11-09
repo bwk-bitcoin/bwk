@@ -27,6 +27,7 @@ extern "C" {
 #define BWK_QR_MUSIG_PUB_NONCE_LEN 66
 #define BWK_QR_MUSIG_PARTIAL_SIG_LEN 32
 #define BWK_QR_TAP_LEAF_HASH_LEN 32
+#define BWK_QR_DLEQ_PROOF_LEN 64
 #define BWK_QR_VENDOR_LEN 16
 #define BWK_QR_MODEL_LEN 16
 #define BWK_QR_ERROR_MESSAGE_LEN 32
@@ -78,13 +79,15 @@ enum bwk_qr_sign_response_kind {
     BWK_QR_SIGN_RESPONSE_SIGNATURES = 0x02
 };
 
-/* Closed: the decoder rejects any other value. */
+/* Closed: encoding a response rejects any other value. */
 enum bwk_qr_signature_kind {
     BWK_QR_SIGNATURE_ECDSA = 0x01,
     BWK_QR_SIGNATURE_TAP_KEY = 0x02,
     BWK_QR_SIGNATURE_TAP_SCRIPT = 0x03,
     BWK_QR_SIGNATURE_MUSIG_PUB_NONCE = 0x04,
-    BWK_QR_SIGNATURE_MUSIG_PARTIAL_SIG = 0x05
+    BWK_QR_SIGNATURE_MUSIG_PARTIAL_SIG = 0x05,
+    BWK_QR_SIGNATURE_SP_ECDH_SHARE = 0x06,
+    BWK_QR_SIGNATURE_SP_DLEQ_PROOF = 0x07
 };
 
 /* Open: a value outside this list is a newer flag and passes through unchanged. */
@@ -122,7 +125,8 @@ enum bwk_qr_absent {
 
 /* What the four functions return. 100..=199 come from the byte reader, 200..=299
  * from the decoder, 300..=399 from the encoder, 400..=499 from this binding,
- * and 500..=599 from shared MuSig validation on encode and decode. */
+ * 500..=599 from shared MuSig validation and 600..=699 from shared silent payment
+ * validation, both on encode and decode. */
 enum bwk_qr_status {
     BWK_QR_OK = 0,
 
@@ -144,9 +148,10 @@ enum bwk_qr_status {
     BWK_QR_ERR_UNKNOWN_MESSAGE_TYPE = 202,
     BWK_QR_ERR_ERROR_STATUS_ON_REQUEST = 203,
     BWK_QR_ERR_UNKNOWN_DESCRIPTOR_FORM = 204,
-    BWK_QR_ERR_UNKNOWN_SIGNATURE_KIND = 205,
     BWK_QR_ERR_UNKNOWN_SIGN_RESPONSE_KIND = 206,
     BWK_QR_ERR_UNKNOWN_KEY_KIND = 207,
+    BWK_QR_ERR_SIGNATURE_LENGTH = 208,
+    BWK_QR_ERR_GLOBAL_INPUT_INDEX = 209,
 
     BWK_QR_ERR_PATH_TOO_LONG = 300,
     BWK_QR_ERR_PATCH_TOO_LARGE = 301,
@@ -158,6 +163,7 @@ enum bwk_qr_status {
     BWK_QR_ERR_ENCODE_STRING_NUL = 307,
     BWK_QR_ERR_FIXED_STRING_TOO_LONG = 308,
     BWK_QR_ERR_UNREACHABLE = 309,
+    BWK_QR_ERR_DEFINED_SIGNATURE_KIND = 310,
 
     BWK_QR_ERR_NULL_POINTER = 400,
     BWK_QR_ERR_FFI_STRING_NUL = 401,
@@ -166,6 +172,7 @@ enum bwk_qr_status {
     BWK_QR_ERR_UNKNOWN_TAG = 404,
     BWK_QR_ERR_UNTERMINATED_FIXED_STRING = 405,
     BWK_QR_ERR_UNEXPECTED_RESPONSE = 406,
+    BWK_QR_ERR_FFI_GLOBAL_INPUT_INDEX = 407,
 
     BWK_QR_ERR_MUSIG_INPUT_COVERAGE = 500,
     BWK_QR_ERR_MUSIG_DERIVATION_COUNT = 501,
@@ -175,7 +182,12 @@ enum bwk_qr_status {
     BWK_QR_ERR_MUSIG_NONCE_COUNT = 505,
     BWK_QR_ERR_MUSIG_NONCE_INPUT_INDEX = 506,
     BWK_QR_ERR_MUSIG_DUPLICATE_NONCE = 507,
-    BWK_QR_ERR_MUSIG_MISSING_INPUT = 508
+    BWK_QR_ERR_MUSIG_MISSING_INPUT = 508,
+
+    BWK_QR_ERR_SP_DUPLICATE_SHARE = 600,
+    BWK_QR_ERR_SP_DUPLICATE_PROOF = 601,
+    BWK_QR_ERR_SP_MISSING_PROOF = 602,
+    BWK_QR_ERR_SP_MISSING_SHARE = 603
 };
 
 /* A borrowed run of items. A NULL ptr means the field is absent, which is distinct
@@ -373,6 +385,18 @@ typedef struct {
 } bwk_qr_musig_partial_sig;
 
 typedef struct {
+    uint8_t global; /* 0 for the input at input_index, 1 for the whole transaction */
+    uint8_t scan_key[BWK_QR_PUBLIC_KEY_LEN];
+    uint8_t share[BWK_QR_PUBLIC_KEY_LEN];
+} bwk_qr_sp_ecdh_share;
+
+typedef struct {
+    uint8_t global; /* 0 for the input at input_index, 1 for the whole transaction */
+    uint8_t scan_key[BWK_QR_PUBLIC_KEY_LEN];
+    uint8_t proof[BWK_QR_DLEQ_PROOF_LEN]; /* BIP-374 */
+} bwk_qr_sp_dleq_proof;
+
+typedef struct {
     bwk_qr_musig_derivation derivation;
     uint32_t input_index;
     uint32_t expression_index;
@@ -406,10 +430,12 @@ typedef union {
     bwk_qr_tap_script tap_script;
     bwk_qr_musig_pub_nonce musig_pub_nonce;
     bwk_qr_musig_partial_sig musig_partial_sig;
+    bwk_qr_sp_ecdh_share sp_ecdh_share;
+    bwk_qr_sp_dleq_proof sp_dleq_proof;
 } bwk_qr_signature_value;
 
 typedef struct {
-    uint32_t input_index;
+    uint32_t input_index; /* 0 for a global silent payment entry */
     uint8_t kind; /* BWK_QR_SIGNATURE_*, selects the value arm */
     bwk_qr_signature_value value;
 } bwk_qr_signature;

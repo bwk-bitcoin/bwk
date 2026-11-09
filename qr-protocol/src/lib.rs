@@ -61,6 +61,7 @@ pub mod musig;
 pub mod reader;
 pub mod request;
 pub mod response;
+pub mod sp;
 pub mod types;
 
 use alloc::vec::Vec;
