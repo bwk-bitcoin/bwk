@@ -277,8 +277,14 @@ fn write_descriptor_body(out: &mut Vec<u8>, body: &request::DescriptorBody) -> R
             write_vec(out, keys, write_string)?;
             write_string(out, policy)
         }
-        request::DescriptorBody::SpKeys(value) => write_string(out, value),
+        request::DescriptorBody::SpKeys(keys) => write_sp_keys(out, keys),
     }
+}
+
+fn write_sp_keys(out: &mut Vec<u8>, keys: &request::SpKeys) -> Result<(), Error> {
+    out.extend_from_slice(&keys.fingerprint.0);
+    write_path(out, &keys.spend_path)?;
+    write_path(out, &keys.scan_path)
 }
 
 fn write_signature(out: &mut Vec<u8>, entry: &response::SignatureEntry) -> Result<(), Error> {

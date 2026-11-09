@@ -334,45 +334,47 @@ fn every_error_message_is_terminated_and_uniquely_coded() {
     assert_eq!(reader::Error::Truncated.to_string(), "truncated field");
 }
 
-#[cfg(feature = "bitcoin")]
 mod sp_keys {
-    use bwk_qr_protocol::{request::DescriptorBody, types::SpKeys};
+    use bwk_qr_protocol::{
+        decode, encode, encode_request, reader, request, types::DerivationPath, Request,
+    };
 
-    const TEXT: &str = "73c5da0a|m/352'/1'/0'/0'/0|m/352'/1'/0'/1'/0";
+    use crate::{common::sp_keys, id};
+
+    fn verify_address_request(descriptor: request::DescriptorBody) -> Request {
+        Request {
+            id: id(),
+            body: request::Body::VerifyAddress(request::VerifyAddress {
+                descriptor_alias: "main".to_string(),
+                derivation_path: DerivationPath(vec![]),
+                address: None,
+                descriptor: Some(descriptor),
+                proof: None,
+            }),
+        }
+    }
 
     #[test]
-    fn round_trips_through_its_text() {
-        let keys: SpKeys = TEXT.parse().unwrap();
-        assert_eq!(keys.fingerprint.to_string(), "73c5da0a");
-        assert_eq!(keys.spend_path, "m/352'/1'/0'/0'/0".parse().unwrap());
-        assert_eq!(keys.scan_path, "m/352'/1'/0'/1'/0".parse().unwrap());
-        assert_eq!(keys.to_string(), TEXT);
+    fn encode_rejects_a_path_over_255_steps() {
+        let request::DescriptorBody::SpKeys(mut keys) = sp_keys() else {
+            unreachable!()
+        };
+        keys.scan_path = DerivationPath(vec![0; 256]);
+        let request = verify_address_request(request::DescriptorBody::SpKeys(keys));
         assert_eq!(
-            DescriptorBody::from(&keys),
-            DescriptorBody::SpKeys(TEXT.to_string())
+            encode_request(&request),
+            Err(encode::Error::PathTooLong(256))
         );
     }
 
     #[test]
-    fn reads_h_as_hardened() {
-        let keys: SpKeys = "73c5da0a|m/352h/1h/0h/0h/0|m/352h/1h/0h/1h/0"
-            .parse()
-            .unwrap();
-        assert_eq!(keys.to_string(), TEXT);
-    }
-
-    #[test]
-    fn refuses_malformed_text() {
-        for text in [
-            "",
-            "73c5da0a|m/352'/1'/0'/0'/0",
-            "73c5da0a|m/352'/1'/0'/0'/0|m/352'/1'/0'/1'/0|extra",
-            "73c5da0|m/352'/1'/0'/0'/0|m/352'/1'/0'/1'/0",
-            "73c5da0a|352'/1'/0'/0'/0|m/352'/1'/0'/1'/0",
-            "73c5da0a|m/352'/1'/0'/0'/0|m/x",
-        ] {
-            assert!(text.parse::<SpKeys>().is_err(), "{text:?} parsed");
-        }
+    fn decode_rejects_a_truncated_scan_path() {
+        let bytes = encode_request(&verify_address_request(sp_keys())).unwrap();
+        // drop the absent POR byte and the last byte of the scan path's last CHILD
+        assert_eq!(
+            decode(&bytes[..bytes.len() - 2]),
+            Err(decode::Error::Read(reader::Error::Truncated))
+        );
     }
 }
 

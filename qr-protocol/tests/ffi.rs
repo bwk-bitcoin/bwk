@@ -485,9 +485,15 @@ fn verify_address_view_with_silent_payment_keys() {
         assert!(body.derivation_path.as_slice().is_empty());
         let descriptor = body.descriptor;
         assert_eq!((*descriptor).tag, request::DESCRIPTOR_SP_KEYS);
+        let keys = (*descriptor).value.sp_keys;
+        assert_eq!(keys.fingerprint, [0x73, 0xc5, 0xda, 0x0a]);
         assert_eq!(
-            text((*descriptor).value.sp_keys),
-            "73c5da0a|m/352'/1'/0'/0'/0|m/352'/1'/0'/1'/0"
+            keys.spend_path.as_slice(),
+            &[0x8000_0160, 0x8000_0001, 0x8000_0000, 0x8000_0000, 0]
+        );
+        assert_eq!(
+            keys.scan_path.as_slice(),
+            &[0x8000_0160, 0x8000_0001, 0x8000_0000, 0x8000_0001, 0]
         );
         bwk_qr_request_free(view);
     }

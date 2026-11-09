@@ -306,9 +306,17 @@ fn read_descriptor_body(reader: &mut Reader<'_>) -> Result<request::DescriptorBo
             keys: reader.take_vec(Reader::take_string)?,
             policy: reader.take_string()?,
         }),
-        request::DESCRIPTOR_SP_KEYS => Ok(request::DescriptorBody::SpKeys(reader.take_string()?)),
+        request::DESCRIPTOR_SP_KEYS => Ok(request::DescriptorBody::SpKeys(read_sp_keys(reader)?)),
         value => Err(Error::UnknownDescriptorForm(value)),
     }
+}
+
+fn read_sp_keys(reader: &mut Reader<'_>) -> Result<request::SpKeys, Error> {
+    Ok(request::SpKeys {
+        fingerprint: read_fingerprint(reader)?,
+        spend_path: read_path(reader)?,
+        scan_path: read_path(reader)?,
+    })
 }
 
 fn read_signature(reader: &mut Reader<'_>) -> Result<response::SignatureEntry, Error> {

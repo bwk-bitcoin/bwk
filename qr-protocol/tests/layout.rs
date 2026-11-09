@@ -13,7 +13,7 @@ use bwk_qr_protocol::ffi::types::{
     FirmwareVersion, GetKeys, KeyRequest, Keys, List, MusigDerivation, MusigNonce, MusigPartialSig,
     MusigPrepared, MusigPubNonce, MusigSigned, Path, PrepareMusig, RegisterDescriptor,
     Registration, Request, RequestBody, Response, ResponseBody, Sign, SignMusig, Signature,
-    SignatureValue, Signed, SignedValue, TapKey, TapScript, VerifyAddress,
+    SignatureValue, Signed, SignedValue, SpKeys, TapKey, TapScript, VerifyAddress,
 };
 
 macro_rules! check {
@@ -35,8 +35,9 @@ fn the_c_mirror_matches_the_header() {
         List<*const c_char> => 16, 8;
         List<[u8; 78]> => 16, 8;
         Bip388 => 24, 8;
-        DescriptorValue => 24, 8;
-        DescriptorBody => 32, 8;
+        SpKeys => 40, 8;
+        DescriptorValue => 40, 8;
+        DescriptorBody => 48, 8;
         Descriptor => 32, 8;
         List<Descriptor> => 16, 8;
         GetKeys => 16, 8;
@@ -77,4 +78,5 @@ fn the_c_mirror_matches_the_header() {
     assert_eq!(offset_of!(PrepareMusig, derivations), 72);
     assert_eq!(offset_of!(MusigPrepared, nonces), 40);
     assert_eq!(offset_of!(MusigNonce, nonce), 115);
+    assert_eq!(offset_of!(SpKeys, spend_path), 8);
 }

@@ -224,10 +224,17 @@ typedef struct {
     const char *policy;
 } bwk_qr_bip388;
 
+/* Paths from the master key. */
+typedef struct {
+    uint8_t fingerprint[BWK_QR_FINGERPRINT_LEN];
+    bwk_qr_path spend_path;
+    bwk_qr_path scan_path;
+} bwk_qr_sp_keys;
+
 typedef union {
     const char *bip380;
     bwk_qr_bip388 bip388;
-    const char *sp_keys; /* "<fingerprint>|<spend_path>|<scan_path>" */
+    bwk_qr_sp_keys sp_keys;
 } bwk_qr_descriptor_value;
 
 typedef struct {
