@@ -174,7 +174,7 @@ pub struct DescriptorBody {
 pub union DescriptorValue {
     pub bip380: *const c_char,
     pub bip388: Bip388,
-    pub sp_keys: *const c_char,
+    pub sp_keys: SpKeys,
 }
 
 #[repr(C)]
@@ -182,6 +182,14 @@ pub union DescriptorValue {
 pub struct Bip388 {
     pub keys: List<*const c_char>,
     pub policy: *const c_char,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SpKeys {
+    pub fingerprint: [u8; FINGERPRINT_LEN],
+    pub spend_path: Path,
+    pub scan_path: Path,
 }
 
 #[repr(C)]

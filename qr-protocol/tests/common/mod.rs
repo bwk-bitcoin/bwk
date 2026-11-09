@@ -3,12 +3,12 @@
 
 #[cfg(feature = "bitcoin")]
 use bitcoin::bip32;
-use bwk_qr_protocol::{request, types::PublicKey};
-#[cfg(feature = "bitcoin")]
 use bwk_qr_protocol::{
-    response,
-    types::{DerivationPath, ExtendedKey},
+    request,
+    types::{DerivationPath, Fingerprint, PublicKey},
 };
+#[cfg(feature = "bitcoin")]
+use bwk_qr_protocol::{response, types::ExtendedKey};
 
 #[cfg(feature = "bitcoin")]
 pub fn path(path: &str) -> DerivationPath {
@@ -52,8 +52,13 @@ pub fn bip380() -> request::DescriptorBody {
     request::DescriptorBody::Bip380("wpkh([00000000/84h/1h/0h]xpub/0/*)".to_string())
 }
 
+// 73c5da0a, spend m/352'/1'/0'/0'/0, scan m/352'/1'/0'/1'/0
 pub fn sp_keys() -> request::DescriptorBody {
-    request::DescriptorBody::SpKeys("73c5da0a|m/352'/1'/0'/0'/0|m/352'/1'/0'/1'/0".to_string())
+    request::DescriptorBody::SpKeys(request::SpKeys {
+        fingerprint: Fingerprint([0x73, 0xc5, 0xda, 0x0a]),
+        spend_path: DerivationPath(vec![0x8000_0160, 0x8000_0001, 0x8000_0000, 0x8000_0000, 0]),
+        scan_path: DerivationPath(vec![0x8000_0160, 0x8000_0001, 0x8000_0000, 0x8000_0001, 0]),
+    })
 }
 
 pub fn bip388() -> request::DescriptorBody {

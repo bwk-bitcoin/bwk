@@ -1,6 +1,10 @@
 use alloc::{string::String, vec::Vec};
 
-use crate::{decode, musig, types::DerivationPath, MessageType, SignResponseKind};
+use crate::{
+    decode, musig,
+    types::{DerivationPath, Fingerprint},
+    MessageType, SignResponseKind,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Body {
@@ -151,14 +155,18 @@ pub struct SignMusig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DescriptorBody {
     Bip380(String),
-    Bip388 {
-        keys: Vec<String>,
-        policy: String,
-    },
-    /// A silent payment account's keys, as `<fingerprint>|<spend_path>|<scan_path>`
-    /// (e.g. `73c5da0a|m/352'/1'/0'/0'/0|m/352'/1'/0'/1'/0`): enough for the signer to
-    /// rebuild the account's `sp()` descriptor from its seed, with no secret on the wire.
-    SpKeys(String),
+    Bip388 { keys: Vec<String>, policy: String },
+    SpKeys(SpKeys),
+}
+
+/// Where a silent payment account's BIP-352 spend and scan keys sit under its master
+/// key. It holds no public or private key: the signer derives both keys at these paths
+/// from its own seed and rebuilds the account's BIP-392 `sp()` descriptor from them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpKeys {
+    pub fingerprint: Fingerprint,
+    pub spend_path: DerivationPath,
+    pub scan_path: DerivationPath,
 }
 
 impl DescriptorBody {

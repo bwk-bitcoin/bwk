@@ -176,7 +176,11 @@ impl Keep {
                 },
             },
             request::DescriptorBody::SpKeys(keys) => types::DescriptorValue {
-                sp_keys: self.string(keys)?,
+                sp_keys: types::SpKeys {
+                    fingerprint: keys.fingerprint.0,
+                    spend_path: self.path(&keys.spend_path),
+                    scan_path: self.path(&keys.scan_path),
+                },
             },
         };
         Ok(types::DescriptorBody {

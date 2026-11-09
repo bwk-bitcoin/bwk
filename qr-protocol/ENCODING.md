@@ -102,14 +102,34 @@ step has bit 31 set, `index | 0x80000000`).
     referenced by `@0`, `@1`, ... in `POLICY`.
   - `POLICY`: a `STRING`, the descriptor template with `@i` key placeholders.
 
-- `0x03`: a `STRING`, a silent payment account's keys as
-  `<fingerprint>|<spend_path>|<scan_path>`: the key's master fingerprint as 8
-  lowercase hex characters, then the BIP-32 paths of the BIP-352 spend and scan keys,
-  each written `m/` followed by its steps with `'` marking a hardened step. Example:
-  `73c5da0a|m/352'/1'/0'/0'/0|m/352'/1'/0'/1'/0`. It carries no key material: the
-  signer derives both keys from its own seed, which is enough to rebuild the
-  account's BIP-392 `sp()` descriptor. A signer MUST refuse it when the fingerprint
-  is not its own. Used only by Address Verification.
+- `0x03`: `FINGERPRINT` `SPEND_PATH` `SCAN_PATH`, a silent payment account's keys:
+  - `FINGERPRINT`: the `FINGERPRINT` of the master key.
+  - `SPEND_PATH`: a `DERIVATION_PATH`, the path of the BIP-352 spend key from the
+    master key.
+  - `SCAN_PATH`: a `DERIVATION_PATH`, the path of the BIP-352 scan key from the
+    master key.
+
+  The form holds no public or private key, only where to find them: the signer
+  derives the spend and scan keys at these two paths from its own seed, and from
+  them rebuilds the account's BIP-392 `sp()` descriptor. A signer MUST refuse it
+  when `FINGERPRINT` is not its own. Used only by Address Verification. Example, the
+  master fingerprint `73c5da0a` with the spend key at `m/352'/1'/0'/0'/0` and the
+  scan key at `m/352'/1'/0'/1'/0`:
+  ```
+  73 c5 da 0a          FINGERPRINT
+  05                   SPEND_PATH: CHILD_COUNT = 5
+  80 00 01 60          352'
+  80 00 00 01          1'
+  80 00 00 00          0'
+  80 00 00 00          0'
+  00 00 00 00          0
+  05                   SCAN_PATH: CHILD_COUNT = 5
+  80 00 01 60          352'
+  80 00 00 01          1'
+  80 00 00 00          0'
+  80 00 00 01          1'
+  00 00 00 00          0
+  ```
 
 Note: `KEYS` must be sorted following the `@n` order.
 
@@ -189,10 +209,6 @@ the bytes up to the first `0x00` (or all 32 bytes when none is `0x00`); every by
 after it MUST be `0x00`, and the value MUST be valid UTF-8.
 
 Global error table:
-
-This table is the wire `ERROR` field inside an error response. It is separate
-from the C binding return codes documented in `README.md` and
-`include/bwk_qr_protocol.h`.
 
 ```
 +-----------+------------------------------------------------------+
@@ -592,8 +608,7 @@ a nonce reuse.
 These rules follow Bitcoin Core, Coldcard EDGE (`shared/psbt.py`
 `musig_process_input`: strict round separation, the public nonce recomputed and
 compared with the PSBT's, the session erased after use) and Ledger (no foreign
-nonce in the round-1 PSBT, cosigners rebuilt from the registered policy). The
-reference signer is `bwk_sign::hot_signer::HotSigner` under the `musig` feature.
+nonce in the round-1 PSBT, cosigners rebuilt from the registered policy).
 
 ### MuSig Preparation
 
@@ -614,14 +629,14 @@ appear in these messages.
   Each entry is `KEYCHAIN` `INDEX`, both 4-byte big-endian unsigned integers.
   `KEYCHAIN` selects the descriptor's public derivation branch. `INDEX` MUST be
   below `0x80000000`, so no hardened child index is accepted. Uniqueness uses both
-  fields. These limits are `MAX_MUSIG_INPUTS` and `MAX_MUSIG_DERIVATIONS` in Rust.
+  fields.
 
 **Ok response:**
 
 `SESSION_ID` `MAX_INPUTS` `NONCES`
 
 `SESSION_ID` and `MAX_INPUTS` echo the request. `NONCES` is a nonempty vector with
-at most `MAX_VEC` (4096) entries. Each entry is:
+at most 4096 entries. Each entry is:
 
 `DERIVATION` `INPUT_INDEX` `EXPRESSION_INDEX` `PARTICIPANT` `AGGREGATE` `LEAF_HASH` `NONCE`
 
@@ -639,7 +654,8 @@ leaf hash MUST be unique, even if duplicate entries carry different nonce bytes.
 Both encoding and decoding reject invalid coverage, counts, hardened indices,
 duplicate attribution and missing input coverage. Matching the full descriptor's
 expected slots, derivations and participant keys is the consumer's responsibility.
-The codec carries key and nonce bytes without performing cryptographic validation.
+Key and nonce bytes are carried as they are: this encoding defines no
+cryptographic validation of them.
 
 ### MuSig Signing
 
@@ -658,7 +674,8 @@ The caller checks request ID, operation, session ID and attempt ID on responses.
 Missing, consumed, lost or mismatched sessions refuse with `ERROR` `0x0D`. A
 cached request MUST NOT fall back to ordinary signing. Durable allocation, binding
 the exact descriptor-derived slots and participant nonce transcript, and burning
-secret nonces before signing belong to the signer and coordinator, not this codec.
+secret nonces before signing belong to the signer and coordinator, not to this
+encoding.
 
 These operations use new type codes rather than appended ordinary Signing fields.
 An old parser ignores appended fields and newer version values, so neither would
@@ -759,8 +776,7 @@ The `0x83` `MSG_TYPE` byte is `DIRECTION` 1 (response) | `STATUS` 0 (ok) |
 
 ## Test Vectors
 
-Machine-checkable vectors are produced alongside the codec implementation and
-checked into `qr-protocol/tests/`:
+Machine-checkable vectors accompany this specification:
 
 - `get_keys.json`: Get Keys request/response.
 - `register_descriptor.json`: Register Descriptor request/response, each `FORM`.
