@@ -11,8 +11,8 @@ use bwk_qr_protocol::{self as protocol, request, response, types::Fingerprint, M
 use serde_json::Value;
 
 use common::{
-    bip380, bip388, key_request, musig_partial_sigs, musig_pub_nonces, path, sp_keys, xpriv, xpub,
-    xpub_key,
+    aggregate, bip380, bip388, key_request, musig_partial_sigs, musig_pub_nonces, path, sp_keys,
+    xpriv, xpub, xpub_key,
 };
 
 fn id() -> protocol::RequestId {
@@ -210,6 +210,86 @@ fn signing_messages() -> Vec<(&'static str, Message)> {
     ]
 }
 
+fn musig_derivation() -> request::MusigDerivation {
+    request::MusigDerivation {
+        keychain: 0,
+        index: 17,
+    }
+}
+
+fn musig_messages() -> Vec<(&'static str, Message)> {
+    vec![
+        (
+            "musig_preparation_request",
+            request(request::Body::PrepareMusig(request::PrepareMusig {
+                descriptor: request::Descriptor {
+                    alias: "main".to_string(),
+                    descriptor: Some(request::DescriptorBody::Bip388 {
+                        keys: vec![
+                            "[00000000/48h/1h/0h/2h]xpub".to_string(),
+                            "[11111111/48h/1h/0h/2h]xpub".to_string(),
+                        ],
+                        policy: "tr(musig(@0,@1)/**)".to_string(),
+                    }),
+                    proof: Some(vec![0x5a; 4]),
+                },
+                session_id: [0x51; 32],
+                max_inputs: 2,
+                derivations: vec![
+                    musig_derivation(),
+                    request::MusigDerivation {
+                        keychain: 1,
+                        index: 0x7fff_ffff,
+                    },
+                ],
+            })),
+        ),
+        (
+            "musig_preparation_response",
+            response(response::Body::MusigPrepared(response::MusigPrepared {
+                session_id: [0x51; 32],
+                max_inputs: 2,
+                nonces: vec![
+                    response::MusigNonce {
+                        derivation: musig_derivation(),
+                        input_index: 0,
+                        expression_index: 0,
+                        participant: xpub_key(),
+                        aggregate: aggregate(0x02, 0x11),
+                        leaf_hash: None,
+                        nonce: [0x22; 66],
+                    },
+                    response::MusigNonce {
+                        derivation: musig_derivation(),
+                        input_index: 1,
+                        expression_index: 1,
+                        participant: xpub_key(),
+                        aggregate: aggregate(0x03, 0x33),
+                        leaf_hash: Some([0x44; 32]),
+                        nonce: [0x55; 66],
+                    },
+                ],
+            })),
+        ),
+        (
+            "musig_signing_request",
+            request(request::Body::SignMusig(request::SignMusig {
+                session_id: [0x51; 32],
+                attempt_id: [0xa7; 32],
+                psbt: psbt(),
+            })),
+        ),
+        (
+            "musig_signing_response",
+            response(response::Body::MusigSigned(response::MusigSigned {
+                session_id: [0x51; 32],
+                attempt_id: [0xa7; 32],
+                psbt: psbt(),
+            })),
+        ),
+    ]
+}
+
 fn error_messages() -> Vec<(&'static str, Message)> {
     vec![
         (
@@ -341,6 +421,11 @@ fn address_verification_vectors() {
 #[test]
 fn signing_vectors() {
     check(include_str!("signing.json"), &signing_messages());
+}
+
+#[test]
+fn musig_vectors() {
+    check(include_str!("musig.json"), &musig_messages());
 }
 
 #[test]
