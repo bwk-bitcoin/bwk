@@ -480,3 +480,19 @@ fn managed_creation_refuses_untracked_external_scanners() {
     assert_eq!(account.scanners().count(), 3);
     assert_eq!(account.get_config().descriptors.len(), 2);
 }
+
+#[test]
+fn scan_start_is_the_persisted_one() {
+    let factory = Arc::new(CallerFactory::new(true));
+    let mut first = config("scan-start");
+    first.set_birthday_height(Some(150));
+    let mut account = open(first, factory.clone()).unwrap();
+    assert_eq!(account.scan_start(), 150);
+    account.try_persist().unwrap();
+    drop(account);
+    // The config's birthday only seeds a fresh store: the reopened one keeps 150.
+    let mut second = config("scan-start");
+    second.set_birthday_height(Some(300));
+    let reopened = open(second, factory).unwrap();
+    assert_eq!(reopened.scan_start(), 150);
+}
