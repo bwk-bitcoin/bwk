@@ -98,8 +98,9 @@ step has bit 31 set, `index | 0x80000000`).
 - `0x01`: a `STRING`, the BIP-380 descriptor text.
 - `0x02`: `KEYS` `POLICY`, the BIP-388 wallet policy. BIP-388 defines no byte
   encoding, so it is serialized here as its two components:
-  - `KEYS`: a vector of `STRING`, the key information, each a BIP-380 key expression
-    referenced by `@0`, `@1`, ... in `POLICY`.
+  - `KEYS`: a vector of `STRING`, the key information, each a BIP-380 key
+    expression. Entry `i` is the key that `@i` refers to in `POLICY`, so the
+    vector MUST be in `@0`, `@1`, ... order.
   - `POLICY`: a `STRING`, the descriptor template with `@i` key placeholders.
 
 - `0x03`: `FINGERPRINT` `SPEND_PATH` `SCAN_PATH`, a silent payment account's keys:
@@ -130,8 +131,6 @@ step has bit 31 set, `index | 0x80000000`).
   80 00 00 01          1'
   00 00 00 00          0
   ```
-
-Note: `KEYS` must be sorted following the `@n` order.
 
 `VENDOR`: 16 bytes, a UTF-8 device-vendor string with no `LENGTH` prefix, right-padded
 with `0x00` when shorter than 16 bytes. The value is the bytes up to the first
