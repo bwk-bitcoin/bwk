@@ -103,19 +103,35 @@ step has bit 31 set, `index | 0x80000000`).
     vector MUST be in `@0`, `@1`, ... order.
   - `POLICY`: a `STRING`, the descriptor template with `@i` key placeholders.
 
-- `0x03`: `FINGERPRINT` `SPEND_PATH` `SCAN_PATH`, a silent payment account's keys:
+- `0x03`: `FINGERPRINT` `SPEND_PATH` `SCAN_PATH` `SCAN_KEY`, a silent payment
+  account's keys:
   - `FINGERPRINT`: the `FINGERPRINT` of the master key.
   - `SPEND_PATH`: a `DERIVATION_PATH`, the path of the BIP-352 spend key from the
     master key.
-  - `SCAN_PATH`: a `DERIVATION_PATH`, the path of the BIP-352 scan key from the
-    master key.
+  - `SCAN_PATH`: OPTIONAL `DERIVATION_PATH`, the path of the BIP-352 scan key from
+    the master key, when the scan key is the signer's.
+  - `SCAN_KEY`: OPTIONAL, 32 bytes, the BIP-352 scan private key as a big-endian
+    scalar, when the scan key is not the signer's. It MUST be a valid secp256k1
+    secret key: nonzero and below the curve order
+    (`FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFE BAAEDCE6 AF48A03B BFD25E8C D0364141`).
 
-  The form holds no public or private key, only where to find them: the signer
-  derives the spend and scan keys at these two paths from its own seed, and from
-  them rebuilds the account's BIP-392 `sp()` descriptor. A signer MUST refuse it
-  when `FINGERPRINT` is not its own. Used only by Address Verification. Example, the
-  master fingerprint `73c5da0a` with the spend key at `m/352'/1'/0'/0'/0` and the
-  scan key at `m/352'/1'/0'/1'/0`:
+  Exactly one of `SCAN_PATH` and `SCAN_KEY` MUST be present: a reader MUST reject
+  the form when both or neither are, and MUST reject a `SCAN_KEY` that is not a
+  valid secret key.
+
+  The spend key is always the signer's: it derives the spend key at `SPEND_PATH`
+  from its own seed, and MUST refuse the form when `FINGERPRINT` is not its own. It
+  gets the scan private key by deriving it at `SCAN_PATH` from its own seed, or by
+  taking `SCAN_KEY` as it is. Either way it holds the scan private key, so it
+  computes the scan public key and the BIP-352 label tweak itself, and a labelled
+  address verifies the same in both cases. From the spend public key and the scan
+  private key it rebuilds the account's BIP-392 `sp()` descriptor. The scan private
+  key reveals the account's incoming silent payments but cannot spend them, so
+  sending it is a privacy matter, not a custody one. A signer SHOULD NOT keep a
+  received `SCAN_KEY` beyond the request. Used only by Address Verification.
+
+  Example, the master fingerprint `73c5da0a` with the spend key at
+  `m/352'/1'/0'/0'/0` and the signer's own scan key at `m/352'/1'/0'/1'/0`:
   ```
   73 c5 da 0a          FINGERPRINT
   05                   SPEND_PATH: CHILD_COUNT = 5
@@ -124,12 +140,29 @@ step has bit 31 set, `index | 0x80000000`).
   80 00 00 00          0'
   80 00 00 00          0'
   00 00 00 00          0
-  05                   SCAN_PATH: CHILD_COUNT = 5
+  01                   SCAN_PATH: PRESENCE = present
+  05                   CHILD_COUNT = 5
   80 00 01 60          352'
   80 00 00 01          1'
   80 00 00 00          0'
   80 00 00 01          1'
   00 00 00 00          0
+  00                   SCAN_KEY: PRESENCE = absent
+  ```
+
+  Example, the same spend key with a scan key the signer does not hold:
+  ```
+  73 c5 da 0a          FINGERPRINT
+  05                   SPEND_PATH: CHILD_COUNT = 5
+  80 00 01 60          352'
+  80 00 00 01          1'
+  80 00 00 00          0'
+  80 00 00 00          0'
+  00 00 00 00          0
+  00                   SCAN_PATH: PRESENCE = absent
+  01                   SCAN_KEY: PRESENCE = present
+  0f 69 4e 06 80 28 a7 17 f8 af 6b 94 11 f9 a1 33
+  dd 35 65 25 87 14 cc 22 65 94 b3 4d b9 0c 1f 2c
   ```
 
 `VENDOR`: 16 bytes, a UTF-8 device-vendor string with no `LENGTH` prefix, right-padded
@@ -414,7 +447,8 @@ A silent payment address is verified with a `DESCRIPTOR` of `FORM` `0x03`
   for the address labelled `m` (`m` ≥ 1, as label `0` is reserved for change).
 - `ADDRESS`: the expected silent payment address.
 
-The signer derives the spend and scan keys at the given paths, applies the label
+The signer gets the spend key and the scan private key as `FORM` `0x03` describes
+(the scan key derived at `SCAN_PATH`, or given as `SCAN_KEY`), applies the label
 tweak when `DERIV` has one, encodes the address for its network, shows it, and
 answers with a `URI` holding it, or with the error `0x08` when it differs from
 `ADDRESS`. Only a signer advertising capability bit 2 accepts it.
@@ -835,8 +869,10 @@ Rules for future versions:
 - A parser MUST reject input that ends before a required field is fully read, a
   compact-size `LENGTH`/`COUNT` that exceeds the remaining input, a `BOOL` or
   `PRESENCE` outside `{0x00, 0x01}`, a discriminant (`TYPE`, `FORM`, `KIND`)
-  outside its defined range, `STATUS` = `1` on a request, or a `STRING` that is not
-  valid UTF-8 or that contains a nul byte.
+  outside its defined range, `STATUS` = `1` on a request, a `STRING` that is not
+  valid UTF-8 or that contains a nul byte, or a `FORM` `0x03` body with both or
+  neither of `SCAN_PATH` and `SCAN_KEY`, or with a `SCAN_KEY` that is not a valid
+  secret key.
 - `SIG_KIND` is not such a discriminant: a reader skips an entry whose `SIG_KIND`
   it does not know. It MUST reject a `SIG_ENTRY` of a known `SIG_KIND` whose
   `KIND_FIELDS` do not exactly fill its `LENGTH`, a global silent payment entry
@@ -908,7 +944,9 @@ Machine-checkable vectors accompany this specification:
 
 - `get_keys.json`: Get Keys request/response.
 - `register_descriptor.json`: Register Descriptor request/response, each `FORM`.
-- `address_verification.json`: Address Verification request/response.
+- `address_verification.json`: Address Verification request/response, including a
+  silent payment address with the signer's own scan key (`SCAN_PATH`) and a
+  labelled one with a scan key it does not hold (`SCAN_KEY`).
 - `signing.json`: Signing request and both response `KIND`s, including the MuSig2
   signatures-only entries (`SIG_KIND` `0x04` and `0x05`, with and without a leaf
   hash), a silent payment send answered with a global ECDH share and DLEQ proof and

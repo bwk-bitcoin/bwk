@@ -8,7 +8,8 @@ The crate is `no_std` plus `alloc` and pulls no dependency in its default
 configuration, so a bare-metal signer can vendor it as-is. `bitcoin` types are
 deliberately absent: every one of them is a fixed-size array or an opaque blob on the
 wire, so the codec carries `ExtendedKey([u8; 78])`, `Fingerprint([u8; 4])`,
-`PublicKey([u8; 33])`, `DerivationPath(Vec<u32>)` and a plain `Vec<u8>` for the PSBT.
+`PublicKey([u8; 33])`, `SecretKey([u8; 32])`, `DerivationPath(Vec<u32>)` and a plain
+`Vec<u8>` for the PSBT.
 That keeps `secp256k1-sys` and its vendored C off the firmware build.
 
 ## Features
@@ -56,6 +57,12 @@ reject a share without its proof, a proof without its share and a duplicate of
 either; checking that every scan key and eligible input is covered needs the PSBT, so
 it is the wallet's job. An entry of a kind the codec does not know decodes to
 `SignatureEntry::Unknown` with its raw fields, and re-encodes unchanged.
+
+Address Verification of a silent payment address carries
+`request::DescriptorBody::SpKeys`, whose scan key is the signer's own at a path
+(`Scan::Path`) or a scan private key it does not hold (`Scan::Key`). Both encode and
+decode reject a scan key that is not a valid secp256k1 secret key; decode also
+rejects a body with both or neither. `SecretKey`'s `Debug` does not print the key.
 
 Get Info (`0x07`) uses `request::Body::GetInfo`, which carries no body, and
 `response::Body::Info`. Both encode and decode reject a `max_alias` above 32 and a

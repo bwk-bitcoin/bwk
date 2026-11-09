@@ -1,5 +1,5 @@
-//! Shared validation for the silent payment entries of a Signing response in both
-//! codec directions.
+//! Shared validation for the silent payment keys form and the silent payment entries
+//! of a Signing response in both codec directions.
 
 use alloc::collections::BTreeSet;
 
@@ -18,6 +18,7 @@ pub enum Error {
     DuplicateProof,
     MissingProof,
     MissingShare,
+    InvalidScanKey,
 }
 
 impl Error {
@@ -34,6 +35,9 @@ impl Error {
             }
             Self::MissingShare => {
                 error_info!(603, "silent payment DLEQ proof without its ECDH share")
+            }
+            Self::InvalidScanKey => {
+                error_info!(604, "silent payment scan key is not a valid secret key")
             }
         }
     }

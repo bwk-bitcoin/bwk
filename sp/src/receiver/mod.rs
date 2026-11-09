@@ -317,9 +317,20 @@ impl SpReceiver {
 
 #[cfg(all(test, feature = "mnemonic"))]
 mod tests {
-    use bitcoin::{bip32, secp256k1::Secp256k1, Network};
+    use bitcoin::{
+        bip32,
+        secp256k1::{Secp256k1, SecretKey},
+        Network,
+    };
+    use bwk_qr_protocol::{
+        request::{Scan, SpKeys},
+        types::DerivationPath,
+    };
 
-    use crate::receiver::{derive_spend_key, scan_path, spend_path, SpReceiver};
+    use crate::{
+        core::{receiving::Label, utils::common::SilentPaymentAddress, SpVersion},
+        receiver::{derive_spend_key, scan_path, spend_path, SpReceiver},
+    };
 
     const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
         abandon abandon abandon about";
@@ -372,8 +383,50 @@ mod tests {
     }
 
     /// The recipe a signer follows for a silent payment Address Verification request
-    /// (bwk-qr-protocol `DescriptorBody::SpKeys`): from its own seed, derive the scan
-    /// and spend keys at the paths the request names, then encode the address.
+    /// (bwk-qr-protocol `DescriptorBody::SpKeys`): from its own seed, derive the spend
+    /// key at the path the request names, derive the scan key at its path or take the
+    /// scan private key the request carries, apply the label `DERIV` names, if any,
+    /// then encode the address.
+    fn signer_address(
+        master_xpriv: &bip32::Xpriv,
+        keys: &SpKeys,
+        label: Option<u32>,
+        network: Network,
+    ) -> SilentPaymentAddress {
+        let secp = Secp256k1::new();
+        assert_eq!(
+            bip32::Fingerprint::from(&keys.fingerprint),
+            master_xpriv.fingerprint(&secp)
+        );
+        let spend_pk = master_xpriv
+            .derive_priv(&secp, &bip32::DerivationPath::from(&keys.spend_path))
+            .unwrap()
+            .private_key
+            .public_key(&secp);
+        let scan_sk = match &keys.scan {
+            Scan::Path(path) => {
+                master_xpriv
+                    .derive_priv(&secp, &bip32::DerivationPath::from(path))
+                    .unwrap()
+                    .private_key
+            }
+            Scan::Key(key) => SecretKey::try_from(key).unwrap(),
+        };
+        let m_pubkey = match label {
+            Some(m) => spend_pk
+                .add_exp_tweak(&secp, Label::new(scan_sk, m).as_inner())
+                .unwrap(),
+            None => spend_pk,
+        };
+        SilentPaymentAddress::new(
+            scan_sk.public_key(&secp),
+            m_pubkey,
+            network.into(),
+            SpVersion::V0,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn sp_keys_rebuild_the_receiving_address() {
         let secp = Secp256k1::new();
@@ -383,32 +436,71 @@ mod tests {
 
         let seed = test_mnemonic().to_seed("");
         let master_xpriv = bip32::Xpriv::new_master(network, &seed).unwrap();
-        let keys = bwk_qr_protocol::request::SpKeys {
+        let keys = SpKeys {
             fingerprint: (&master_xpriv.fingerprint(&secp)).into(),
             spend_path: (&spend_path(network, account)).into(),
-            scan_path: (&scan_path(network, account)).into(),
+            scan: Scan::Path((&scan_path(network, account)).into()),
         };
 
-        // the signer's side: only the keys' locations and its seed
         assert_eq!(
-            bip32::Fingerprint::from(&keys.fingerprint),
-            master_xpriv.fingerprint(&secp)
-        );
-        let scan_sk = master_xpriv
-            .derive_priv(&secp, &bip32::DerivationPath::from(&keys.scan_path))
-            .unwrap()
-            .private_key;
-        let spend_pk = master_xpriv
-            .derive_priv(&secp, &bip32::DerivationPath::from(&keys.spend_path))
-            .unwrap()
-            .private_key
-            .public_key(&secp);
-        let rebuilt = SpReceiver::new(scan_sk, spend_pk, network).unwrap();
-
-        assert_eq!(
-            rebuilt.get_receiving_address(),
+            signer_address(&master_xpriv, &keys, None, network),
             receiver.get_receiving_address()
         );
+    }
+
+    /// BIP-352 test vector "Receiving with labels: label with even parity": its scan
+    /// key is foreign to a signer whose master key is the vector's spend key, at the
+    /// empty spend path, and each label rebuilds the vector's address for it.
+    #[test]
+    fn sp_keys_with_a_foreign_scan_key_rebuild_the_labelled_addresses() {
+        let secp = Secp256k1::new();
+        let network = Network::Bitcoin;
+        let spend_sk: SecretKey =
+            "9d6ad855ce3417ef84e836892e5a56392bfba05fa5d97ccea30e266f540e08b3"
+                .parse()
+                .unwrap();
+        let scan_sk: SecretKey = "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c"
+            .parse()
+            .unwrap();
+        let master_xpriv = bip32::Xpriv {
+            network: network.into(),
+            depth: 0,
+            parent_fingerprint: bip32::Fingerprint::default(),
+            child_number: bip32::ChildNumber::from_normal_idx(0).unwrap(),
+            private_key: spend_sk,
+            chain_code: bip32::ChainCode::from([0; 32]),
+        };
+        let keys = SpKeys {
+            fingerprint: (&master_xpriv.fingerprint(&secp)).into(),
+            spend_path: DerivationPath(vec![]),
+            scan: Scan::Key((&scan_sk).into()),
+        };
+
+        let expected = [
+            (
+                None,
+                "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwv",
+            ),
+            (
+                Some(2),
+                "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjex54dmqmmv6rw353tsuqhs99ydvadxzrsy9nuvk74epvee55drs734pqq",
+            ),
+            (
+                Some(3),
+                "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqsg59z2rppn4qlkx0yz9sdltmjv3j8zgcqadjn4ug98m3t6plujsq9qvu5n",
+            ),
+            (
+                Some(1001337),
+                "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgq7c2zfthc6x3a5yecwc52nxa0kfd20xuz08zyrjpfw4l2j257yq6qgnkdh5",
+            ),
+        ];
+        for (label, address) in expected {
+            assert_eq!(
+                signer_address(&master_xpriv, &keys, label, network).to_string(),
+                address,
+                "label {label:?}"
+            );
+        }
     }
 
     #[test]

@@ -5,7 +5,7 @@
 use bitcoin::bip32;
 use bwk_qr_protocol::{
     request,
-    types::{DerivationPath, Fingerprint, PublicKey},
+    types::{DerivationPath, Fingerprint, PublicKey, SecretKey, SECRET_KEY_LEN},
 };
 #[cfg(feature = "bitcoin")]
 use bwk_qr_protocol::{response, types::ExtendedKey};
@@ -54,10 +54,31 @@ pub fn bip380() -> request::DescriptorBody {
 
 // 73c5da0a, spend m/352'/1'/0'/0'/0, scan m/352'/1'/0'/1'/0
 pub fn sp_keys() -> request::DescriptorBody {
+    sp_keys_with(request::Scan::Path(DerivationPath(vec![
+        0x8000_0160,
+        0x8000_0001,
+        0x8000_0000,
+        0x8000_0001,
+        0,
+    ])))
+}
+
+// the scan private key of the BIP-352 test vectors' labelled receiver
+pub const FOREIGN_SCAN_KEY: [u8; SECRET_KEY_LEN] = [
+    0x0f, 0x69, 0x4e, 0x06, 0x80, 0x28, 0xa7, 0x17, 0xf8, 0xaf, 0x6b, 0x94, 0x11, 0xf9, 0xa1, 0x33,
+    0xdd, 0x35, 0x65, 0x25, 0x87, 0x14, 0xcc, 0x22, 0x65, 0x94, 0xb3, 0x4d, 0xb9, 0x0c, 0x1f, 0x2c,
+];
+
+// 73c5da0a, spend m/352'/1'/0'/0'/0, scan key FOREIGN_SCAN_KEY
+pub fn sp_foreign_scan_keys() -> request::DescriptorBody {
+    sp_keys_with(request::Scan::Key(SecretKey(FOREIGN_SCAN_KEY)))
+}
+
+pub fn sp_keys_with(scan: request::Scan) -> request::DescriptorBody {
     request::DescriptorBody::SpKeys(request::SpKeys {
         fingerprint: Fingerprint([0x73, 0xc5, 0xda, 0x0a]),
         spend_path: DerivationPath(vec![0x8000_0160, 0x8000_0001, 0x8000_0000, 0x8000_0000, 0]),
-        scan_path: DerivationPath(vec![0x8000_0160, 0x8000_0001, 0x8000_0000, 0x8000_0001, 0]),
+        scan,
     })
 }
 

@@ -12,9 +12,9 @@ use bwk_qr_protocol::ffi::types::{
     AddressUri, Bip388, Buf, Bytes, Descriptor, DescriptorBody, DescriptorValue, Ecdsa, ErrorBody,
     FirmwareVersion, GetKeys, Info, KeyRequest, Keys, List, MusigDerivation, MusigNonce,
     MusigPartialSig, MusigPrepared, MusigPubNonce, MusigSigned, Path, PrepareMusig,
-    RegisterDescriptor, Registration, Request, RequestBody, Response, ResponseBody, Sign,
-    SignMusig, Signature, SignatureValue, Signed, SignedValue, SpDleqProof, SpEcdhShare, SpKeys,
-    TapKey, TapScript, VerifyAddress,
+    RegisterDescriptor, Registration, Request, RequestBody, Response, ResponseBody, ScanValue,
+    Sign, SignMusig, Signature, SignatureValue, Signed, SignedValue, SpDleqProof, SpEcdhShare,
+    SpKeys, TapKey, TapScript, VerifyAddress,
 };
 
 macro_rules! check {
@@ -36,9 +36,10 @@ fn the_c_mirror_matches_the_header() {
         List<*const c_char> => 16, 8;
         List<[u8; 78]> => 16, 8;
         Bip388 => 24, 8;
-        SpKeys => 40, 8;
-        DescriptorValue => 40, 8;
-        DescriptorBody => 48, 8;
+        ScanValue => 32, 8;
+        SpKeys => 64, 8;
+        DescriptorValue => 64, 8;
+        DescriptorBody => 72, 8;
         Descriptor => 32, 8;
         List<Descriptor> => 16, 8;
         GetKeys => 16, 8;
@@ -83,6 +84,8 @@ fn the_c_mirror_matches_the_header() {
     assert_eq!(offset_of!(MusigPrepared, nonces), 40);
     assert_eq!(offset_of!(MusigNonce, nonce), 115);
     assert_eq!(offset_of!(SpKeys, spend_path), 8);
+    assert_eq!(offset_of!(SpKeys, scan_kind), 24);
+    assert_eq!(offset_of!(SpKeys, scan), 32);
     assert_eq!(offset_of!(Info, version), 36);
     assert_eq!(offset_of!(Info, max_message), 56);
     assert_eq!(offset_of!(Info, slots), 62);

@@ -1,8 +1,8 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::{
-    decode, musig,
-    types::{DerivationPath, Fingerprint},
+    decode, musig, sp,
+    types::{DerivationPath, Fingerprint, SecretKey},
     MessageType, SignResponseKind,
 };
 
@@ -162,14 +162,35 @@ pub enum DescriptorBody {
     SpKeys(SpKeys),
 }
 
-/// Where a silent payment account's BIP-352 spend and scan keys sit under its master
-/// key. It holds no public or private key: the signer derives both keys at these paths
-/// from its own seed and rebuilds the account's BIP-392 `sp()` descriptor from them.
+/// A silent payment account's BIP-352 keys. The spend key is always the signer's, so
+/// only its path travels. The scan key is the signer's too, named by its path, or a
+/// scan private key the signer does not hold. Either way the signer holds the scan
+/// private key, rebuilds the account's BIP-392 `sp()` descriptor and applies labels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpKeys {
     pub fingerprint: Fingerprint,
     pub spend_path: DerivationPath,
-    pub scan_path: DerivationPath,
+    pub scan: Scan,
+}
+
+impl SpKeys {
+    pub fn validate(&self) -> Result<(), sp::Error> {
+        match &self.scan {
+            Scan::Path(_) => Ok(()),
+            Scan::Key(key) if key.is_valid() => Ok(()),
+            Scan::Key(_) => Err(sp::Error::InvalidScanKey),
+        }
+    }
+}
+
+/// Where the signer gets the scan private key of [`SpKeys`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scan {
+    /// The signer's own scan key, at this path from its master key.
+    Path(DerivationPath),
+    /// A scan private key the signer does not hold. It reveals the account's incoming
+    /// payments but cannot spend them.
+    Key(SecretKey),
 }
 
 impl DescriptorBody {

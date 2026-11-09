@@ -309,6 +309,8 @@ fn every_error_message_is_terminated_and_uniquely_coded() {
         decode::Error::UnknownKeyKind(0),
         decode::Error::SignatureLength(0),
         decode::Error::GlobalInputIndex(0),
+        decode::Error::ScanPathAndKey,
+        decode::Error::NoScan,
     ];
     let get_info_errors = [
         get_info::Error::MaxAliasTooLarge(0),
@@ -334,6 +336,7 @@ fn every_error_message_is_terminated_and_uniquely_coded() {
         sp::Error::DuplicateProof,
         sp::Error::MissingProof,
         sp::Error::MissingShare,
+        sp::Error::InvalidScanKey,
     ];
 
     let mut infos = Vec::new();
@@ -365,11 +368,26 @@ fn every_error_message_is_terminated_and_uniquely_coded() {
 }
 
 mod sp_keys {
+    use bitcoin::secp256k1;
     use bwk_qr_protocol::{
-        decode, encode, encode_request, reader, request, types::DerivationPath, Request,
+        decode, encode, encode_request, reader, request, sp,
+        types::{DerivationPath, SecretKey, SECRET_KEY_LEN},
+        Message, Request,
     };
 
-    use crate::{common::sp_keys, id};
+    use crate::{
+        common::{sp_foreign_scan_keys, sp_keys, sp_keys_with, FOREIGN_SCAN_KEY},
+        id,
+    };
+
+    // the secp256k1 curve order, the first scalar that is not a valid secret key
+    const CURVE_ORDER: [u8; SECRET_KEY_LEN] = [
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36,
+        0x41, 0x41,
+    ];
+    // the scan key, then the absent POR, close a request with a foreign scan key
+    const SCAN_KEY_TAIL_LEN: usize = SECRET_KEY_LEN + 1;
 
     fn verify_address_request(descriptor: request::DescriptorBody) -> Request {
         Request {
@@ -384,13 +402,31 @@ mod sp_keys {
         }
     }
 
+    fn foreign_scan_request(key: [u8; SECRET_KEY_LEN]) -> Request {
+        verify_address_request(sp_keys_with(request::Scan::Key(SecretKey(key))))
+    }
+
+    // a valid request with a foreign scan key, whose scan key bytes are then replaced
+    fn foreign_scan_bytes(key: [u8; SECRET_KEY_LEN]) -> Vec<u8> {
+        let mut bytes = encode_request(&verify_address_request(sp_foreign_scan_keys())).unwrap();
+        let start = bytes.len() - SCAN_KEY_TAIL_LEN;
+        bytes[start..start + SECRET_KEY_LEN].copy_from_slice(&key);
+        bytes
+    }
+
+    fn below_curve_order() -> [u8; SECRET_KEY_LEN] {
+        let mut key = CURVE_ORDER;
+        key[SECRET_KEY_LEN - 1] -= 1;
+        key
+    }
+
     #[test]
     fn encode_rejects_a_path_over_255_steps() {
-        let request::DescriptorBody::SpKeys(mut keys) = sp_keys() else {
-            unreachable!()
-        };
-        keys.scan_path = DerivationPath(vec![0; 256]);
-        let request = verify_address_request(request::DescriptorBody::SpKeys(keys));
+        let request =
+            verify_address_request(sp_keys_with(request::Scan::Path(DerivationPath(vec![
+                0;
+                256
+            ]))));
         assert_eq!(
             encode_request(&request),
             Err(encode::Error::PathTooLong(256))
@@ -400,10 +436,84 @@ mod sp_keys {
     #[test]
     fn decode_rejects_a_truncated_scan_path() {
         let bytes = encode_request(&verify_address_request(sp_keys())).unwrap();
-        // drop the absent POR byte and the last byte of the scan path's last CHILD
+        // drop the absent POR and SCAN_KEY bytes and the last byte of the scan path
         assert_eq!(
-            decode(&bytes[..bytes.len() - 2]),
+            decode(&bytes[..bytes.len() - 3]),
             Err(decode::Error::Read(reader::Error::Truncated))
+        );
+    }
+
+    #[test]
+    fn decode_rejects_both_a_scan_path_and_a_scan_key() {
+        let bytes = encode_request(&verify_address_request(sp_keys())).unwrap();
+        // replace the absent SCAN_KEY and POR with a present SCAN_KEY and an absent POR
+        let mut both = bytes[..bytes.len() - 2].to_vec();
+        both.push(1);
+        both.extend_from_slice(&FOREIGN_SCAN_KEY);
+        both.push(0);
+        assert_eq!(decode(&both), Err(decode::Error::ScanPathAndKey));
+    }
+
+    #[test]
+    fn decode_rejects_neither_a_scan_path_nor_a_scan_key() {
+        let bytes = encode_request(&verify_address_request(sp_foreign_scan_keys())).unwrap();
+        // turn the present SCAN_KEY into an absent one, followed by the absent POR
+        let mut neither = bytes[..bytes.len() - SCAN_KEY_TAIL_LEN - 1].to_vec();
+        neither.extend_from_slice(&[0, 0]);
+        assert_eq!(neither[neither.len() - 3], 0, "SCAN_PATH is absent");
+        assert_eq!(decode(&neither), Err(decode::Error::NoScan));
+    }
+
+    #[test]
+    fn decode_reads_a_scan_key_below_the_curve_order() {
+        let bytes = foreign_scan_bytes(below_curve_order());
+        assert_eq!(
+            decode(&bytes),
+            Ok(Message::Request(foreign_scan_request(below_curve_order())))
+        );
+    }
+
+    #[test]
+    fn decode_rejects_an_invalid_scan_key() {
+        for key in [[0; SECRET_KEY_LEN], CURVE_ORDER, [0xff; SECRET_KEY_LEN]] {
+            assert_eq!(
+                decode(&foreign_scan_bytes(key)),
+                Err(decode::Error::Sp(sp::Error::InvalidScanKey))
+            );
+        }
+    }
+
+    #[test]
+    fn encode_rejects_an_invalid_scan_key() {
+        for key in [[0; SECRET_KEY_LEN], CURVE_ORDER, [0xff; SECRET_KEY_LEN]] {
+            assert_eq!(
+                encode_request(&foreign_scan_request(key)),
+                Err(encode::Error::Sp(sp::Error::InvalidScanKey))
+            );
+        }
+    }
+
+    #[test]
+    fn the_curve_order_matches_secp256k1() {
+        assert!(secp256k1::SecretKey::from_slice(&below_curve_order()).is_ok());
+        assert!(secp256k1::SecretKey::from_slice(&CURVE_ORDER).is_err());
+    }
+
+    #[test]
+    fn a_scan_key_round_trips_through_bitcoin() {
+        let key = secp256k1::SecretKey::from_slice(&FOREIGN_SCAN_KEY).unwrap();
+        let wire = SecretKey::from(&key);
+        assert_eq!(wire.0, FOREIGN_SCAN_KEY);
+        assert_eq!(secp256k1::SecretKey::try_from(&wire), Ok(key));
+    }
+
+    #[test]
+    fn debug_does_not_print_the_scan_key() {
+        let printed = format!("{:?}", sp_foreign_scan_keys());
+        assert!(printed.contains("SecretKey(\"[redacted]\")"), "{printed}");
+        assert!(
+            !printed.contains(&format!("{FOREIGN_SCAN_KEY:?}")),
+            "{printed}"
         );
     }
 }

@@ -21,7 +21,7 @@ use bwk_qr_protocol::{
     ERROR_MESSAGE_LEN, MODEL_LEN, REQUEST_ID_LEN,
 };
 
-use common::{bip380, bip388, sp_keys};
+use common::{bip380, bip388, sp_foreign_scan_keys, sp_keys, FOREIGN_SCAN_KEY};
 
 const ID: [u8; REQUEST_ID_LEN] = [42; REQUEST_ID_LEN];
 
@@ -508,10 +508,38 @@ fn verify_address_view_with_silent_payment_keys() {
             keys.spend_path.as_slice(),
             &[0x8000_0160, 0x8000_0001, 0x8000_0000, 0x8000_0000, 0]
         );
+        assert_eq!(keys.scan_kind, types::SCAN_PATH);
         assert_eq!(
-            keys.scan_path.as_slice(),
+            keys.scan.path.as_slice(),
             &[0x8000_0160, 0x8000_0001, 0x8000_0000, 0x8000_0001, 0]
         );
+        bwk_qr_request_free(view);
+    }
+}
+
+#[test]
+fn verify_address_view_with_a_foreign_scan_key() {
+    unsafe {
+        let request = request(request::Body::VerifyAddress(request::VerifyAddress {
+            descriptor_alias: "main".to_string(),
+            derivation_path: DerivationPath(vec![2]),
+            address: Some("sp1qxyz".to_string()),
+            descriptor: Some(sp_foreign_scan_keys()),
+            proof: None,
+        }));
+        let view = view(&request);
+        let body = (*view).body.verify_address;
+        assert_eq!(body.derivation_path.as_slice(), &[2]);
+        let descriptor = body.descriptor;
+        assert_eq!((*descriptor).tag, request::DESCRIPTOR_SP_KEYS);
+        let keys = (*descriptor).value.sp_keys;
+        assert_eq!(keys.fingerprint, [0x73, 0xc5, 0xda, 0x0a]);
+        assert_eq!(
+            keys.spend_path.as_slice(),
+            &[0x8000_0160, 0x8000_0001, 0x8000_0000, 0x8000_0000, 0]
+        );
+        assert_eq!(keys.scan_kind, types::SCAN_KEY);
+        assert_eq!(keys.scan.key, FOREIGN_SCAN_KEY);
         bwk_qr_request_free(view);
     }
 }

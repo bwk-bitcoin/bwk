@@ -4,7 +4,7 @@ use crate::{
     get_info, musig,
     reader::{self, Reader},
     request, response, sp,
-    types::{DerivationPath, ExtendedKey, Fingerprint, PublicKey},
+    types::{DerivationPath, ExtendedKey, Fingerprint, PublicKey, SecretKey},
     ErrorInfo, Message, MessageType, Request, RequestId, Response, SignResponseKind,
     DIRECTION_RESPONSE, ERROR_MESSAGE_LEN, MAGIC, MAX_DESCRIPTOR_ALIAS, MAX_MUSIG_DERIVATIONS,
     MAX_VEC, MODEL_LEN, STATUS_ERROR, TYPE_MASK, VENDOR_LEN,
@@ -22,6 +22,8 @@ pub enum Error {
     UnknownKeyKind(u8),
     SignatureLength(u8),
     GlobalInputIndex(u32),
+    ScanPathAndKey,
+    NoScan,
     Sp(sp::Error),
     GetInfo(get_info::Error),
     Read(reader::Error),
@@ -43,6 +45,18 @@ impl Error {
             }
             Self::GlobalInputIndex(_) => {
                 error_info!(209, "global silent payment entry has a nonzero input index")
+            }
+            Self::ScanPathAndKey => {
+                error_info!(
+                    210,
+                    "silent payment keys carry both a scan path and a scan key"
+                )
+            }
+            Self::NoScan => {
+                error_info!(
+                    211,
+                    "silent payment keys carry neither a scan path nor a scan key"
+                )
             }
             Self::Sp(error) => error.info(),
             Self::GetInfo(error) => error.info(),
@@ -362,11 +376,24 @@ fn read_descriptor_body(reader: &mut Reader<'_>) -> Result<request::DescriptorBo
 }
 
 fn read_sp_keys(reader: &mut Reader<'_>) -> Result<request::SpKeys, Error> {
-    Ok(request::SpKeys {
+    let keys = request::SpKeys {
         fingerprint: read_fingerprint(reader)?,
         spend_path: read_path(reader)?,
-        scan_path: read_path(reader)?,
-    })
+        scan: read_scan(reader)?,
+    };
+    keys.validate()?;
+    Ok(keys)
+}
+
+fn read_scan(reader: &mut Reader<'_>) -> Result<request::Scan, Error> {
+    let path = reader.take_option(read_path)?;
+    let key = reader.take_option(read_secret_key)?;
+    match (path, key) {
+        (Some(path), None) => Ok(request::Scan::Path(path)),
+        (None, Some(key)) => Ok(request::Scan::Key(key)),
+        (Some(_), Some(_)) => Err(Error::ScanPathAndKey),
+        (None, None) => Err(Error::NoScan),
+    }
 }
 
 fn read_signature(reader: &mut Reader<'_>) -> Result<response::SignatureEntry, Error> {
@@ -477,6 +504,10 @@ fn read_capabilites(reader: &mut Reader<'_>) -> Result<response::Capabilities, E
 
 fn read_pubkey(reader: &mut Reader<'_>) -> Result<PublicKey, Error> {
     Ok(PublicKey(reader.take_array()?))
+}
+
+fn read_secret_key(reader: &mut Reader<'_>) -> Result<SecretKey, Error> {
+    Ok(SecretKey(reader.take_array()?))
 }
 
 fn read_version(reader: &mut Reader<'_>) -> Result<response::FirmwareVersion, Error> {
