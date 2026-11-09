@@ -19,7 +19,6 @@ pub enum Error {
     StringTooLarge(usize),
     BytesTooLarge(usize),
     VecTooLarge(usize),
-    InvalidFixedStringPadding,
     InvalidUtf8(FromUtf8Error),
     StringNul,
 }
@@ -38,7 +37,6 @@ impl Error {
             Self::StringTooLarge(_) => error_info!(106, "string exceeds the maximum length"),
             Self::BytesTooLarge(_) => error_info!(107, "byte field exceeds the maximum length"),
             Self::VecTooLarge(_) => error_info!(108, "vector exceeds the maximum item count"),
-            Self::InvalidFixedStringPadding => error_info!(109, "invalid fixed string padding"),
             Self::InvalidUtf8(_) => error_info!(110, "invalid utf-8 string"),
             Self::StringNul => error_info!(111, "string contains a nul byte"),
         }
@@ -109,15 +107,6 @@ impl<'a> Reader<'a> {
             return Err(Error::StringNul);
         }
         Ok(String::from_utf8(bytes.to_vec())?)
-    }
-
-    pub fn take_fixed_string(&mut self, len: usize) -> Result<String, Error> {
-        let bytes = self.take_slice(len)?;
-        let nul = bytes.iter().position(|b| *b == 0).unwrap_or(len);
-        if bytes[nul..].iter().any(|b| *b != 0) {
-            return Err(Error::InvalidFixedStringPadding);
-        }
-        Ok(String::from_utf8(bytes[..nul].to_vec())?)
     }
 
     // Generic over the item error so a protocol-level reader can be passed in.

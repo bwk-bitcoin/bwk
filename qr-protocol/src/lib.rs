@@ -62,6 +62,7 @@ pub mod musig;
 pub mod reader;
 pub mod request;
 pub mod response;
+pub mod signature;
 pub mod sp;
 pub mod types;
 
@@ -74,15 +75,10 @@ const DIRECTION_REQUEST: u8 = 0x0;
 const STATUS_ERROR: u8 = 0x40;
 const STATUS_OK: u8 = 0x0;
 const TYPE_MASK: u8 = 0x3f;
-pub const VENDOR_LEN: usize = 16;
-pub const MODEL_LEN: usize = 16;
-pub const ERROR_MESSAGE_LEN: usize = 32;
 pub const REQUEST_ID_LEN: usize = 2;
 pub const MAX_DESCRIPTOR_ALIAS: usize = 32;
 pub const MAX_BYTES: usize = 512 * 1024;
 pub const MAX_VEC: usize = 4096;
-pub const MAX_MUSIG_INPUTS: u8 = 8;
-pub const MAX_MUSIG_DERIVATIONS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestId(pub [u8; REQUEST_ID_LEN]);
@@ -107,13 +103,13 @@ pub enum Message {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageType {
+    GetInfo,
     GetKeys,
     RegisterDescriptor,
     AddressVerification,
     Signing,
     MusigPreparation,
     MusigSigning,
-    GetInfo,
 }
 
 impl MessageType {
@@ -125,13 +121,13 @@ impl MessageType {
 impl From<MessageType> for u8 {
     fn from(message_type: MessageType) -> Self {
         match message_type {
-            MessageType::GetKeys => 0x01,
-            MessageType::RegisterDescriptor => 0x02,
-            MessageType::AddressVerification => 0x03,
-            MessageType::Signing => 0x04,
-            MessageType::MusigPreparation => 0x05,
-            MessageType::MusigSigning => 0x06,
-            MessageType::GetInfo => 0x07,
+            MessageType::GetInfo => 0x01,
+            MessageType::GetKeys => 0x02,
+            MessageType::RegisterDescriptor => 0x03,
+            MessageType::AddressVerification => 0x04,
+            MessageType::Signing => 0x05,
+            MessageType::MusigPreparation => 0x06,
+            MessageType::MusigSigning => 0x07,
         }
     }
 }
@@ -141,13 +137,13 @@ impl TryFrom<u8> for MessageType {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0x01 => Ok(Self::GetKeys),
-            0x02 => Ok(Self::RegisterDescriptor),
-            0x03 => Ok(Self::AddressVerification),
-            0x04 => Ok(Self::Signing),
-            0x05 => Ok(Self::MusigPreparation),
-            0x06 => Ok(Self::MusigSigning),
-            0x07 => Ok(Self::GetInfo),
+            0x01 => Ok(Self::GetInfo),
+            0x02 => Ok(Self::GetKeys),
+            0x03 => Ok(Self::RegisterDescriptor),
+            0x04 => Ok(Self::AddressVerification),
+            0x05 => Ok(Self::Signing),
+            0x06 => Ok(Self::MusigPreparation),
+            0x07 => Ok(Self::MusigSigning),
             _ => Err(decode::Error::UnknownMessageType(value)),
         }
     }

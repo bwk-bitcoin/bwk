@@ -96,6 +96,10 @@ fn register_descriptor_messages() -> Vec<(&'static str, Message)> {
             register_descriptor_request(Some(bip388())),
         ),
         (
+            "register_descriptor_request_sp_keys",
+            register_descriptor_request(Some(sp_keys())),
+        ),
+        (
             "register_descriptor_request_status_query",
             register_descriptor_request(None),
         ),
@@ -140,6 +144,16 @@ fn address_verification_messages() -> Vec<(&'static str, Message)> {
                 address: Some("sp1qxyz".to_string()),
                 descriptor: Some(sp_keys()),
                 proof: None,
+            })),
+        ),
+        (
+            "address_verification_sp_request_with_por",
+            request(request::Body::VerifyAddress(request::VerifyAddress {
+                descriptor_alias: "main".to_string(),
+                derivation_path: path("m"),
+                address: Some("sp1qxyz".to_string()),
+                descriptor: Some(sp_keys()),
+                proof: Some(vec![0x5a; 4]),
             })),
         ),
         (
@@ -278,6 +292,19 @@ fn musig_messages() -> Vec<(&'static str, Message)> {
                         index: 0x7fff_ffff,
                     },
                 ],
+            })),
+        ),
+        (
+            "musig_preparation_request_alias_only",
+            request(request::Body::PrepareMusig(request::PrepareMusig {
+                descriptor: request::Descriptor {
+                    alias: "main".to_string(),
+                    descriptor: None,
+                    proof: None,
+                },
+                session_id: [0x51; 32],
+                max_inputs: 1,
+                derivations: vec![musig_derivation()],
             })),
         ),
         (

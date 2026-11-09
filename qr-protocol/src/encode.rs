@@ -1,11 +1,11 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::{
-    get_info, musig, request, response, sp,
+    get_info, musig, request, response, signature, sp,
     types::{DerivationPath, ExtendedKey, PublicKey, TAP_LEAF_HASH_LEN},
     ErrorInfo, MessageType, Request, RequestId, Response, SignResponseKind, DIRECTION_REQUEST,
-    DIRECTION_RESPONSE, ERROR_MESSAGE_LEN, MAGIC, MAX_BYTES, MAX_DESCRIPTOR_ALIAS, MAX_VEC,
-    MODEL_LEN, REQUEST_ID_LEN, STATUS_ERROR, STATUS_OK, VENDOR_LEN, VERSION,
+    DIRECTION_RESPONSE, MAGIC, MAX_BYTES, MAX_DESCRIPTOR_ALIAS, MAX_VEC, REQUEST_ID_LEN,
+    STATUS_ERROR, STATUS_OK, VERSION,
 };
 
 pub const MAX_PATH: usize = 255;
@@ -23,6 +23,7 @@ pub enum Error {
     Musig(musig::Error),
     Sp(sp::Error),
     GetInfo(get_info::Error),
+    Signature(signature::Error),
     PathTooLong(usize),
     PatchTooLarge(u32),
     ReservedCapabilityBits(u32),
@@ -31,7 +32,6 @@ pub enum Error {
     BytesTooLarge(usize),
     StringTooLong { len: usize, max: usize },
     StringNul,
-    FixedStringTooLong { len: usize, max: usize },
     Unreachable,
     DefinedSignatureKind(u8),
     ReservedNetworkBits(u8),
@@ -44,6 +44,7 @@ impl Error {
             Self::Musig(error) => error.info(),
             Self::Sp(error) => error.info(),
             Self::GetInfo(error) => error.info(),
+            Self::Signature(error) => error.info(),
             Self::PathTooLong(_) => error_info!(300, "derivation path exceeds the maximum depth"),
             Self::PatchTooLarge(_) => error_info!(301, "firmware patch version is too large"),
             Self::ReservedCapabilityBits(_) => error_info!(302, "reserved capability bits are set"),
@@ -54,9 +55,6 @@ impl Error {
             Self::BytesTooLarge(_) => error_info!(305, "byte field exceeds the maximum length"),
             Self::StringTooLong { .. } => error_info!(306, "string exceeds the maximum length"),
             Self::StringNul => error_info!(307, "string contains a nul byte"),
-            Self::FixedStringTooLong { .. } => {
-                error_info!(308, "string does not fit its fixed field")
-            }
             Self::Unreachable => error_info!(309, "unreachable encoder branch"),
             Self::DefinedSignatureKind(_) => {
                 error_info!(
@@ -87,6 +85,12 @@ impl From<sp::Error> for Error {
 impl From<get_info::Error> for Error {
     fn from(error: get_info::Error) -> Self {
         Self::GetInfo(error)
+    }
+}
+
+impl From<signature::Error> for Error {
+    fn from(error: signature::Error) -> Self {
+        Self::Signature(error)
     }
 }
 
@@ -238,16 +242,16 @@ fn encode_musig_signed(out: &mut Vec<u8>, response: &response::MusigSigned) -> R
 fn encode_keys_response(out: &mut Vec<u8>, response: &response::Keys) -> Result<(), Error> {
     write_vec(out, &response.keys, write_extended_key)?;
     out.extend_from_slice(&response.fingerprint.0);
-    write_fixed_string(out, &response.vendor, VENDOR_LEN)?;
-    write_fixed_string(out, &response.model, MODEL_LEN)?;
+    write_string(out, &response.vendor)?;
+    write_string(out, &response.model)?;
     write_version(out, &response.version)?;
     write_capabilities(out, &response.capabilities)
 }
 
 fn encode_info_response(out: &mut Vec<u8>, response: &response::Info) -> Result<(), Error> {
     response.validate()?;
-    write_fixed_string(out, &response.vendor, VENDOR_LEN)?;
-    write_fixed_string(out, &response.model, MODEL_LEN)?;
+    write_string(out, &response.vendor)?;
+    write_string(out, &response.model)?;
     write_version(out, &response.version)?;
     write_capabilities(out, &response.capabilities)?;
     write_state(out, response.state)?;
@@ -306,7 +310,7 @@ fn encode_signed_signatures_response(
 
 fn encode_error_response(out: &mut Vec<u8>, response: &response::ErrorBody) -> Result<(), Error> {
     write_error_code(out, response.error)?;
-    write_fixed_string(out, &response.message, ERROR_MESSAGE_LEN)
+    write_string(out, &response.message)
 }
 
 fn write_descriptor(out: &mut Vec<u8>, descriptor: &request::Descriptor) -> Result<(), Error> {
@@ -348,6 +352,7 @@ fn write_sp_keys(out: &mut Vec<u8>, keys: &request::SpKeys) -> Result<(), Error>
 }
 
 fn write_signature(out: &mut Vec<u8>, entry: &response::SignatureEntry) -> Result<(), Error> {
+    entry.validate()?;
     let mut fields = Vec::new();
     match entry {
         response::SignatureEntry::Ecdsa { .. } => write_ecdsa_signature(&mut fields, entry),
@@ -640,21 +645,6 @@ fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), Error> {
     }
     write_compact(out, bytes.len() as u64);
     out.extend_from_slice(bytes);
-    Ok(())
-}
-
-fn write_fixed_string(out: &mut Vec<u8>, s: &str, len: usize) -> Result<(), Error> {
-    if s.as_bytes().contains(&0) {
-        return Err(Error::StringNul);
-    }
-    if s.len() > len {
-        return Err(Error::FixedStringTooLong {
-            len: s.len(),
-            max: len,
-        });
-    }
-    out.extend_from_slice(s.as_bytes());
-    out.resize(out.len() + len - s.len(), 0);
     Ok(())
 }
 

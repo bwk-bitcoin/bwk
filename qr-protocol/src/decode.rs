@@ -3,11 +3,10 @@ use alloc::{string::String, vec::Vec};
 use crate::{
     get_info, musig,
     reader::{self, Reader},
-    request, response, sp,
+    request, response, signature, sp,
     types::{DerivationPath, ExtendedKey, Fingerprint, PublicKey, SecretKey},
     ErrorInfo, Message, MessageType, Request, RequestId, Response, SignResponseKind,
-    DIRECTION_RESPONSE, ERROR_MESSAGE_LEN, MAGIC, MAX_DESCRIPTOR_ALIAS, MAX_MUSIG_DERIVATIONS,
-    MAX_VEC, MODEL_LEN, STATUS_ERROR, TYPE_MASK, VENDOR_LEN,
+    DIRECTION_RESPONSE, MAGIC, MAX_DESCRIPTOR_ALIAS, MAX_VEC, STATUS_ERROR, TYPE_MASK,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +25,7 @@ pub enum Error {
     NoScan,
     Sp(sp::Error),
     GetInfo(get_info::Error),
+    Signature(signature::Error),
     Read(reader::Error),
 }
 
@@ -60,6 +60,7 @@ impl Error {
             }
             Self::Sp(error) => error.info(),
             Self::GetInfo(error) => error.info(),
+            Self::Signature(error) => error.info(),
             Self::Read(inner) => inner.info(),
         }
     }
@@ -82,6 +83,12 @@ impl From<sp::Error> for Error {
 impl From<get_info::Error> for Error {
     fn from(error: get_info::Error) -> Self {
         Self::GetInfo(error)
+    }
+}
+
+impl From<signature::Error> for Error {
+    fn from(error: signature::Error) -> Self {
+        Self::Signature(error)
     }
 }
 
@@ -215,14 +222,7 @@ fn read_prepare_musig(reader: &mut Reader<'_>) -> Result<request::PrepareMusig, 
     let session_id = reader.take_array()?;
     let max_inputs = reader.take_u8()?;
     musig::validate_input_coverage(max_inputs)?;
-    let count = reader.take_compact()?;
-    if count == 0 || count > MAX_MUSIG_DERIVATIONS {
-        return Err(musig::Error::DerivationCount.into());
-    }
-    let mut derivations = Vec::new();
-    for _ in 0..count {
-        derivations.push(read_musig_derivation(reader)?);
-    }
+    let derivations = reader.take_vec(read_musig_derivation)?;
     let request = request::PrepareMusig {
         descriptor,
         session_id,
@@ -293,8 +293,8 @@ fn read_keys_response(reader: &mut Reader<'_>) -> Result<response::Keys, Error> 
     Ok(response::Keys {
         keys: reader.take_vec(read_extended_key)?,
         fingerprint: read_fingerprint(reader)?,
-        vendor: reader.take_fixed_string(VENDOR_LEN)?,
-        model: reader.take_fixed_string(MODEL_LEN)?,
+        vendor: reader.take_string()?,
+        model: reader.take_string()?,
         version: read_version(reader)?,
         capabilities: read_capabilites(reader)?,
     })
@@ -302,8 +302,8 @@ fn read_keys_response(reader: &mut Reader<'_>) -> Result<response::Keys, Error> 
 
 fn read_info_response(reader: &mut Reader<'_>) -> Result<response::Info, Error> {
     let response = response::Info {
-        vendor: reader.take_fixed_string(VENDOR_LEN)?,
-        model: reader.take_fixed_string(MODEL_LEN)?,
+        vendor: reader.take_string()?,
+        model: reader.take_string()?,
         version: read_version(reader)?,
         capabilities: read_capabilites(reader)?,
         state: reader.take_u8()?.into(),
@@ -351,7 +351,7 @@ fn read_error_response(
     Ok(response::ErrorBody {
         message_type,
         error: reader.take_u8()?.into(),
-        message: reader.take_fixed_string(ERROR_MESSAGE_LEN)?,
+        message: reader.take_string()?,
     })
 }
 
@@ -407,6 +407,7 @@ fn read_signature(reader: &mut Reader<'_>) -> Result<response::SignatureEntry, E
     if !fields.is_empty() {
         return Err(Error::SignatureLength(kind));
     }
+    entry.validate()?;
     Ok(entry)
 }
 

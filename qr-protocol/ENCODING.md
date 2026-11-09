@@ -1,5 +1,5 @@
 ```
-  Title: Signing-flow message encoding for miniscript wallets
+  Title: Signing-flow message encoding in miniscript context
   Authors: Pyth <pythcoiner@wizardsardine.com>
   Status: Draft
   Type: Specification
@@ -11,18 +11,12 @@
 ### Abstract
 
 This document defines the byte encoding of the signing-flow messages exchanged
-between a **wallet** (online software) and a **signer** (offline device) in the
-miniscript context: Get Keys, Register Descriptor, Address Verification, Signing,
-MuSig Preparation, MuSig Signing and Get Info and their exact byte layout. It is
-the authoritative byte-level contract two implementations must agree on.
+between a **wallet** (online software) and a **signer** (signing device) in the
+miniscript context.
 
 The encoding is **transport agnostic**: a `MESSAGE` is a self-contained byte
-string, and how it is delivered (animated QR via BBQR, NFC, a file, a socket) is
+string, and how it is delivered (animated QR, USB, NFC, a file, a socket) is
 out of scope.
-
-### Scope
-
-The encoding is independent of any third-party serialization format.
 
 ## Specification
 
@@ -51,10 +45,7 @@ be rejected.
 `BYTES`: a `LENGTH` (compact size) followed by `LENGTH` raw bytes.
 
 `STRING`: a `BYTES` (`LENGTH` followed by `LENGTH` raw bytes) whose content MUST be
-valid UTF-8 and MUST NOT contain a nul byte. Every `STRING` in this format is an
-alias, an address, a descriptor, a key expression, a policy or a URI, so nothing
-legitimate carries one, and forbidding it lets a consumer hand the value straight to
-a language whose strings are nul-terminated without silently truncating it.
+valid UTF-8 and MUST NOT contain a nul byte.
 
 `DESCRIPTOR_ALIAS`: a `STRING` whose encoded length MUST be at most 32 bytes.
 
@@ -115,50 +106,9 @@ step has bit 31 set, `index | 0x80000000`).
   Exactly one of `SCAN_PATH` and `SCAN_KEY` MUST be present: a reader MUST reject
   the form when both or neither are.
 
-  Used only by Address Verification.
+`VENDOR`: `STRING`, the device vendor.
 
-  Example, the master fingerprint `73c5da0a` with the spend key at
-  `m/352'/1'/0'/0'/0` and the signer's own scan key at `m/352'/1'/0'/1'/0`:
-  ```
-  73 c5 da 0a          FINGERPRINT
-  05                   SPEND_PATH: CHILD_COUNT = 5
-  80 00 01 60          352'
-  80 00 00 01          1'
-  80 00 00 00          0'
-  80 00 00 00          0'
-  00 00 00 00          0
-  01                   SCAN_PATH: PRESENCE = present
-  05                   CHILD_COUNT = 5
-  80 00 01 60          352'
-  80 00 00 01          1'
-  80 00 00 00          0'
-  80 00 00 01          1'
-  00 00 00 00          0
-  00                   SCAN_KEY: PRESENCE = absent
-  ```
-
-  Example, the same spend key with a scan key the signer does not hold:
-  ```
-  73 c5 da 0a          FINGERPRINT
-  05                   SPEND_PATH: CHILD_COUNT = 5
-  80 00 01 60          352'
-  80 00 00 01          1'
-  80 00 00 00          0'
-  80 00 00 00          0'
-  00 00 00 00          0
-  00                   SCAN_PATH: PRESENCE = absent
-  01                   SCAN_KEY: PRESENCE = present
-  0f 69 4e 06 80 28 a7 17 f8 af 6b 94 11 f9 a1 33
-  dd 35 65 25 87 14 cc 22 65 94 b3 4d b9 0c 1f 2c
-  ```
-
-`VENDOR`: 16 bytes, a UTF-8 device-vendor string with no `LENGTH` prefix, right-padded
-with `0x00` when shorter than 16 bytes. The value is the bytes up to the first
-`0x00` (or all 16 bytes when none is `0x00`); every byte after it MUST be `0x00`.
-
-`MODEL`: 16 bytes, a UTF-8 device-model string with no `LENGTH` prefix, right-padded
-with `0x00` when shorter than 16 bytes. The value is the bytes up to the first
-`0x00` (or all 16 bytes when none is `0x00`); every byte after it MUST be `0x00`.
+`MODEL`: `STRING`, the device model.
 
 `VERSION`: in a response body, 8 bytes of device firmware version, `MAJOR` `MINOR`
 `PATCH` `FLAG` (the message's protocol `VERSION` is defined under Encoding). `MAJOR`
@@ -250,13 +200,13 @@ Bits (bit 7 is the MSB):
 | Value | Type                 |
 +-------+----------------------+
 | 0x00  | Reserved             |
-| 0x01  | Get Keys             |
-| 0x02  | Register Descriptor  |
-| 0x03  | Address Verification |
-| 0x04  | Signing              |
-| 0x05  | MuSig Preparation    |
-| 0x06  | MuSig Signing        |
-| 0x07  | Get Info             |
+| 0x01  | Get Info             |
+| 0x02  | Get Keys             |
+| 0x03  | Register Descriptor  |
+| 0x04  | Address Verification |
+| 0x05  | Signing              |
+| 0x06  | MuSig Preparation    |
+| 0x07  | MuSig Signing        |
 +-------+----------------------+
 ```
 
@@ -280,9 +230,7 @@ in place of the type's normal (ok) response body:
 
 `ERROR`: 1-byte unsigned integer selecting an entry from the global error table
 below.
-`ERROR_MESSAGE`: 32 bytes, a UTF-8 string right-padded with `0x00`. The value is
-the bytes up to the first `0x00` (or all 32 bytes when none is `0x00`); every byte
-after it MUST be `0x00`, and the value MUST be valid UTF-8.
+`ERROR_MESSAGE`: `STRING`, the error description.
 
 Global error table:
 
@@ -324,9 +272,76 @@ introduced (see Versioning); within a version they appear in listed order.
 The message definitions below give each type's request body and ok response
 body.
 
-### Get Keys
+### Get Info
 
 **Request** (`TYPE` = `0x01`, request):
+
+The body is empty.
+
+A signer answers it without user interaction, also when locked or without a seed.
+
+**Ok response** (`TYPE` = `0x01`, response):
+
+`VENDOR` `MODEL` `VERSION` `CAPABILITIES` `STATE` `NETWORKS` `MAX_MESSAGE` `MAX_ALIAS`
+`MAX_KEYS` `SLOTS` `FINGERPRINT`
+
+`VENDOR`, `MODEL`, `VERSION`, `CAPABILITIES`: the device fields defined in Common
+Field Encodings.
+`STATE`: 1-byte unsigned integer, whether the signer can serve a request now.
+
+```
++-----------+---------------------------------------+
+| Value     | State                                 |
++-----------+---------------------------------------+
+| 0x00      | Ready: seed present, signer unlocked  |
+| 0x01      | Locked: seed present, signer locked   |
+| 0x02      | Uninitialized: no seed                |
+| 0x03–0xFF | Reserved                              |
++-----------+---------------------------------------+
+```
+
+Values `0x03`–`0xFF` are reserved. A reader MUST treat an unknown `STATE` as not
+ready rather than reject, so a newer signer can report a state an older wallet does
+not know.
+
+`NETWORKS`: 1-byte bitfield of the networks the signer signs for. Bit 0 is the LSB.
+
+```
++-----+----------+
+| Bit | Network  |
++-----+----------+
+| 0   | Reserved |
+| 1   | Mainnet  |
+| 2   | Testnet  |
+| 3   | Signet   |
+| 4   | Regtest  |
+| 5–7 | Reserved |
++-----+----------+
+```
+
+Bits 0 and 5–7 are reserved: they MUST be `0` when written, and a reader MUST
+ignore them.
+
+`MAX_MESSAGE`: 4-byte big-endian unsigned integer, the size in bytes of the largest
+complete `MESSAGE` the signer accepts.
+`MAX_ALIAS`: 1-byte unsigned integer, the length in bytes of the longest
+`DESCRIPTOR_ALIAS` the signer stores. It MUST be at most 32, the `DESCRIPTOR_ALIAS`
+bound, and a reader MUST reject a larger value.
+`MAX_KEYS`: 1-byte unsigned integer, the most keys one descriptor or wallet policy
+may hold on this signer.
+`SLOTS`: 2-byte big-endian unsigned integer, the number of registrations the signer
+can store. `0` means it stores none and relies on the proof of registration (`POR`)
+alone.
+`FINGERPRINT`: OPTIONAL, the `FINGERPRINT` of the master key. It is present only
+when `STATE` is `0x00` (ready) and MUST be absent otherwise; a reader MUST reject a
+response carrying it with any other `STATE`.
+
+Fields added to this response later are appended after `FINGERPRINT`, so an older
+reader ignores them as trailing bytes (see Versioning).
+
+### Get Keys
+
+**Request** (`TYPE` = `0x02`, request):
 
 `KEYS`
 
@@ -355,7 +370,7 @@ Note: a silent payment wallet needs the BIP-352 scan private key to scan. When t
 scan key is the signer's, the wallet fetches it with `KIND` `0x01` at the scan key's
 path. The spend key never needs to leave the signer.
 
-**Ok response** (`TYPE` = `0x01`, response):
+**Ok response** (`TYPE` = `0x02`, response):
 
 `KEYS` `FINGERPRINT` `VENDOR` `MODEL` `VERSION` `CAPABILITIES`
 
@@ -367,7 +382,7 @@ Field Encodings. Mandatory.
 
 ### Register Descriptor
 
-**Request** (`TYPE` = `0x02`, request):
+**Request** (`TYPE` = `0x03`, request):
 
 `DESCRIPTOR_ALIAS` `DESCRIPTOR`
 
@@ -376,7 +391,7 @@ Mandatory.
 `DESCRIPTOR`: OPTIONAL `DESCRIPTOR_BODY`. When absent, the request only queries the
 registration status of `DESCRIPTOR_ALIAS`. At most one descriptor per request.
 
-**Ok response** (`TYPE` = `0x02`, response):
+**Ok response** (`TYPE` = `0x03`, response):
 
 `DESCRIPTOR_ALIAS` `REGISTERED` `STORED` `POR`
 
@@ -394,7 +409,7 @@ body field.
 
 ### Address Verification
 
-**Request** (`TYPE` = `0x03`, request):
+**Request** (`TYPE` = `0x04`, request):
 
 `DESCRIPTOR_ALIAS` `DERIV` `ADDRESS` `DESCRIPTOR` `POR`
 
@@ -406,8 +421,9 @@ stateless devices).
 `POR`: OPTIONAL `BYTES`, a proof of registration (for stateless devices).
 
 A silent payment address is verified with a `DESCRIPTOR` of `FORM` `0x03`
-(silent payment keys) instead of a descriptor, and no `POR`:
-- `DESCRIPTOR_ALIAS`: the account's alias, for display only; nothing is registered.
+(silent payment keys) instead of a descriptor, with an optional `POR`:
+- `DESCRIPTOR_ALIAS`: the alias the keys are registered under, or a display alias
+  when they are not registered.
 - `DERIV`: the BIP-352 label. Empty for the account's base address; one step `m`
   for the address labelled `m` (`m` ≥ 1, as label `0` is reserved for change).
 - `ADDRESS`: the expected silent payment address.
@@ -415,7 +431,7 @@ A silent payment address is verified with a `DESCRIPTOR` of `FORM` `0x03`
 The answer is a `URI` holding the address, or the error `0x08` when the address
 differs from `ADDRESS`. It requires capability bit 2.
 
-**Ok response** (`TYPE` = `0x03`, response):
+**Ok response** (`TYPE` = `0x04`, response):
 
 `URI`
 
@@ -423,7 +439,7 @@ differs from `ADDRESS`. It requires capability bit 2.
 
 ### Signing
 
-**Request** (`TYPE` = `0x04`, request):
+**Request** (`TYPE` = `0x05`, request):
 
 `DESCRIPTORS` `PSBT` `WANT_KIND`
 
@@ -443,7 +459,7 @@ requires `0x01`.
 `DESCRIPTOR`: OPTIONAL `DESCRIPTOR_BODY`: the descriptor / wallet policy itself.
 `POR`: OPTIONAL `BYTES`, a proof of registration (for stateless devices).
 
-**Ok response** (`TYPE` = `0x04`, response):
+**Ok response** (`TYPE` = `0x05`, response):
 
 `KIND` `DATA`
 
@@ -460,18 +476,15 @@ requires `0x01`.
 ```
 
 `DATA` depends on `KIND`:
-- `0x01`: a `PSBT`. A silent payment send carries its BIP-375 fields in the PSBT
-  itself (`PSBT_GLOBAL_SP_ECDH_SHARE` and `PSBT_GLOBAL_SP_DLEQ`, or
-  `PSBT_IN_SP_ECDH_SHARE` and `PSBT_IN_SP_DLEQ`), so nothing extra is encoded here.
-- `0x02`: `SIGS`, a vector of `SIG_ENTRY`. A silent payment send carries its
-  BIP-375 ECDH shares and DLEQ proofs as `SIG_KIND` `0x06` and `0x07` entries next
-  to the signatures.
+- `0x01`: a `PSBT`.
+- `0x02`: `SIGS`, a vector of `SIG_ENTRY`.
 
 When the transaction has silent payment outputs, a `KIND` `0x02` answer MUST
-contain, for every scan key of those outputs, an ECDH share (`SIG_KIND` `0x06`) and
-its BIP-374 DLEQ proof (`SIG_KIND` `0x07`), either global or one per eligible input
-the signer signs, as BIP-375 lays them out, plus the usual signatures. A signer that
-cannot provide them answers with `KIND` `0x01`. Output scripts are not carried.
+contain, for each distinct scan key among those outputs, an ECDH share (`SIG_KIND`
+`0x06`) and its BIP-374 DLEQ proof (`SIG_KIND` `0x07`), either global or one per
+eligible input the signer signs, as BIP-375 lays them out, plus the usual
+signatures. A signer that cannot provide them answers with `KIND` `0x01`. Output
+scripts are not carried.
 
 `SIG_ENTRY` follows this format:
 
@@ -506,15 +519,20 @@ reject the message otherwise.
 `KIND_FIELDS` depends on `SIG_KIND`:
 - `0x01` segwit: `PUBLIC_KEY` `SIGNATURE`.
   - `PUBLIC_KEY`: 33 bytes, the compressed public key that produced the
-    signature, i.e. the key of the PSBT `partial_sigs` entry.
-  - `SIGNATURE`: `BYTES`, the signature.
+    signature.
+  - `SIGNATURE`: `BYTES`, the value of the input's `PSBT_IN_PARTIAL_SIG` (`0x02`)
+    entry keyed by `PUBLIC_KEY`: a DER-encoded ECDSA signature followed by its
+    sighash type byte.
 - `0x02` tapkey: `SIGNATURE`.
-  - `SIGNATURE`: `BYTES`, a taproot key-path Schnorr signature.
+  - `SIGNATURE`: `BYTES`, the value of the input's `PSBT_IN_TAP_KEY_SIG` (`0x13`)
+    field: a 64-byte BIP-340 signature, or 65 bytes with a sighash type byte. A
+    reader MUST reject any other length.
 - `0x03` taptree: `XONLY_PUBLIC_KEY` `TAP_LEAF_HASH` `SIGNATURE`.
   - `XONLY_PUBLIC_KEY`: 32 bytes.
-  - `TAP_LEAF_HASH`: 32 bytes. Together with `XONLY_PUBLIC_KEY` it is the key of
-    the PSBT `tap_script_sigs` map.
-  - `SIGNATURE`: `BYTES`, the signature.
+  - `TAP_LEAF_HASH`: 32 bytes.
+  - `SIGNATURE`: `BYTES`, the value of the input's `PSBT_IN_TAP_SCRIPT_SIG`
+    (`0x14`) entry keyed by `XONLY_PUBLIC_KEY` and `TAP_LEAF_HASH`: 64 or 65 bytes
+    as for `0x02`.
 - `0x04` musig pubnonce: `PARTICIPANT` `AGGREGATE` `LEAF_HASH` `PUB_NONCE`.
   - `PARTICIPANT`: 33 bytes, the compressed participant key.
   - `AGGREGATE`: 33 bytes, the compressed key signed for (BIP-373: the taproot
@@ -569,7 +587,7 @@ on the second exchange is refused with `ERROR` `0x0D`.
 
 ### MuSig Preparation
 
-This operation requires capability bit 4 and has `TYPE` `0x05`. It prepares public
+This operation requires capability bit 4 and has `TYPE` `0x06`. It prepares public
 nonces without a transaction, PSBT, sighash or attempt ID. It does not change the
 ordinary Signing operation. No secret nonce, root or encrypted secret export may
 appear in these messages.
@@ -579,10 +597,10 @@ appear in these messages.
 `DESCRIPTOR` `SESSION_ID` `MAX_INPUTS` `DERIVATIONS`
 
 - `DESCRIPTOR`: the single `DESCRIPTOR` entry defined under Signing, including its
-  alias, optional descriptor body and optional proof. The body MUST be present.
+  alias, optional descriptor body and optional proof.
 - `SESSION_ID`: 32 opaque bytes chosen by the caller, with no length prefix.
-- `MAX_INPUTS`: one byte, absolute input coverage from 1 through 8 inclusive.
-- `DERIVATIONS`: a vector of 1 through 32 distinct `MUSIG_DERIVATION` entries.
+- `MAX_INPUTS`: one byte, the absolute input coverage, at least 1.
+- `DERIVATIONS`: a non-empty vector of distinct `MUSIG_DERIVATION` entries.
   Each entry is `KEYCHAIN` `INDEX`, both 4-byte big-endian unsigned integers.
   `KEYCHAIN` selects the descriptor's public derivation branch. `INDEX` MUST be
   below `0x80000000`, so no hardened child index is accepted. Uniqueness uses both
@@ -606,17 +624,12 @@ at most 4096 entries. Each entry is:
   leaf hash defined for ordinary MuSig public nonces.
 - `NONCE`: 66 public nonce bytes, without a length prefix.
 
-The tuple of derivation, input index, expression index, participant, aggregate and
-leaf hash MUST be unique, even if duplicate entries carry different nonce bytes.
-Both encoding and decoding reject invalid coverage, counts, hardened indices,
-duplicate attribution and missing input coverage. Matching the full descriptor's
-expected slots, derivations and participant keys is the consumer's responsibility.
-Key and nonce bytes are carried as they are: this encoding defines no
-cryptographic validation of them.
+Entries MUST be unique by derivation, input index, expression index, participant,
+aggregate and leaf hash.
 
 ### MuSig Signing
 
-This operation requires capability bit 4 and has `TYPE` `0x06`.
+This operation requires capability bit 4 and has `TYPE` `0x07`.
 
 **Request and ok response:**
 
@@ -628,76 +641,6 @@ response echoes both. `PSBT` is a bounded `BYTES` field, carried without parsing
 and may contain serialized PSBT v0 or v2. There is no response-kind selector.
 
 Missing, consumed, lost or mismatched sessions refuse with `ERROR` `0x0D`.
-
-These operations use new type codes rather than appended ordinary Signing fields.
-An old parser ignores appended fields and newer version values, so neither would
-prevent it from interpreting a cached request as ordinary signing. Unknown type
-codes instead force rejection before the body is read. `VERSION` remains 1.
-
-### Get Info
-
-**Request** (`TYPE` = `0x07`, request):
-
-The body is empty.
-
-A signer answers it without user interaction, also when locked or without a seed.
-
-**Ok response** (`TYPE` = `0x07`, response):
-
-`VENDOR` `MODEL` `VERSION` `CAPABILITIES` `STATE` `NETWORKS` `MAX_MESSAGE` `MAX_ALIAS`
-`MAX_KEYS` `SLOTS` `FINGERPRINT`
-
-`VENDOR`, `MODEL`, `VERSION`, `CAPABILITIES`: the device fields defined in Common
-Field Encodings.
-`STATE`: 1-byte unsigned integer, whether the signer can serve a request now.
-
-```
-+-----------+---------------------------------------+
-| Value     | State                                 |
-+-----------+---------------------------------------+
-| 0x00      | Ready: seed present, signer unlocked  |
-| 0x01      | Locked: seed present, signer locked   |
-| 0x02      | Uninitialized: no seed                |
-| 0x03–0xFF | Reserved                              |
-+-----------+---------------------------------------+
-```
-
-Values `0x03`–`0xFF` are reserved. A reader MUST treat an unknown `STATE` as not
-ready rather than reject, so a newer signer can report a state an older wallet does
-not know.
-
-`NETWORKS`: 1-byte bitfield of the networks the signer signs for. Bit 0 is the LSB.
-
-```
-+-----+----------+
-| Bit | Network  |
-+-----+----------+
-| 0   | Mainnet  |
-| 1   | Testnet  |
-| 2   | Signet   |
-| 3   | Regtest  |
-| 4–7 | Reserved |
-+-----+----------+
-```
-
-Bits 4–7 are reserved: they MUST be `0` when written, and a reader MUST ignore them.
-
-`MAX_MESSAGE`: 4-byte big-endian unsigned integer, the size in bytes of the largest
-complete `MESSAGE` the signer accepts.
-`MAX_ALIAS`: 1-byte unsigned integer, the length in bytes of the longest
-`DESCRIPTOR_ALIAS` the signer stores. It MUST be at most 32, the `DESCRIPTOR_ALIAS`
-bound, and a reader MUST reject a larger value.
-`MAX_KEYS`: 1-byte unsigned integer, the most keys one descriptor or wallet policy
-may hold on this signer.
-`SLOTS`: 2-byte big-endian unsigned integer, the number of registrations the signer
-can store. `0` means it stores none and relies on the proof of registration (`POR`)
-alone.
-`FINGERPRINT`: OPTIONAL, the `FINGERPRINT` of the master key. It is present only
-when `STATE` is `0x00` (ready) and MUST be absent otherwise; a reader MUST reject a
-response carrying it with any other `STATE`.
-
-Fields added to this response later are appended after `FINGERPRINT`, so an older
-reader ignores them as trailing bytes (see Versioning).
 
 ### Versioning
 
@@ -738,9 +681,10 @@ Rules for future versions:
   neither of `SCAN_PATH` and `SCAN_KEY`.
 - `SIG_KIND` is not such a discriminant: a reader skips an entry whose `SIG_KIND`
   it does not know. It MUST reject a `SIG_ENTRY` of a known `SIG_KIND` whose
-  `KIND_FIELDS` do not exactly fill its `LENGTH`, a global silent payment entry
-  whose `INPUT_INDEX` is not `0`, and an ECDH share and DLEQ proof that do not pair
-  up (Signing).
+  `KIND_FIELDS` do not exactly fill its `LENGTH`, a `SIG_KIND` `0x02` or `0x03`
+  `SIGNATURE` that is not 64 or 65 bytes, a global silent payment entry whose
+  `INPUT_INDEX` is not `0`, and an ECDH share and DLEQ proof that do not pair up
+  (Signing).
 - `STATE` is not such a discriminant either: a reader treats an unknown `STATE` as
   not ready. It MUST reject a Get Info response whose `MAX_ALIAS` is above 32, or
   that carries `FINGERPRINT` while `STATE` is not `0x00` (Get Info).
@@ -752,70 +696,37 @@ Rules for future versions:
 Recommended bounds for a parser:
 
 ```
-+-------------------+---------------+
-| Field             | Bound         |
-+-------------------+---------------+
-| `BYTES`           | 512 KiB       |
-| `STRING`          | 64 KiB        |
-| vector `COUNT`    | 4096 elements |
-| `DERIVATION_PATH` | 255 children  |
-+-------------------+---------------+
++----------------+---------------+
+| Field          | Bound         |
++----------------+---------------+
+| `BYTES`        | 512 KiB       |
+| `STRING`       | 64 KiB        |
+| vector `COUNT` | 4096 elements |
++----------------+---------------+
 ```
 
 The `BYTES` bound also applies to the `LENGTH` of a `SIG_ENTRY`. A parser MAY use
 different bounds.
 
-### Worked examples
-
-Bytes are shown space-separated in hex.
-
-Get Keys request, the public key at `m/48'/0'/0'/2'`:
-```
-42 49 50 58 58 58    MAGIC "BIPXXX"
-01                   VERSION = 1
-01                   MSG_TYPE: request, ok, TYPE 0x01 (Get Keys)
-00 01                REQUEST_ID (2 bytes)
-01                   KEYS: vector count = 1
-04                   CHILD_COUNT = 4
-80 00 00 30          48' = 0x80000030 (big-endian)
-80 00 00 00          0'  = 0x80000000
-80 00 00 00          0'  = 0x80000000
-80 00 00 02          2'  = 0x80000002
-00                   KIND = 0x00 (public)
-```
-
-Address Verification response, `URI = "bitcoin:bc1qxyz"`:
-```
-42 49 50 58 58 58    MAGIC "BIPXXX"
-01                   VERSION = 1
-83                   MSG_TYPE: response, ok, TYPE 0x03 (Addr Verif)
-00 01                REQUEST_ID, echoed
-01                   URI: PRESENCE = present
-0f                   LENGTH = 15
-62 69 74 63 6f 69 6e 3a 62 63 31 71 78 79 7a   "bitcoin:bc1qxyz"
-```
-
-The `0x83` `MSG_TYPE` byte is `DIRECTION` 1 (response) | `STATUS` 0 (ok) |
-`TYPE` `0x03`, i.e. `0b1000_0011`.
-
 ## Test Vectors
 
 Machine-checkable vectors accompany this specification:
 
+- `get_info.json`: Get Info request, an ok response from a ready signer with its
+  `FINGERPRINT`, and one from a locked signer without it.
 - `get_keys.json`: Get Keys request/response.
 - `register_descriptor.json`: Register Descriptor request/response, each `FORM`.
 - `address_verification.json`: Address Verification request/response, including a
-  silent payment address with the signer's own scan key (`SCAN_PATH`) and a
-  labelled one with a scan key it does not hold (`SCAN_KEY`).
+  silent payment address with the signer's own scan key (`SCAN_PATH`), the same
+  with a `POR`, and a labelled one with a scan key it does not hold (`SCAN_KEY`).
 - `signing.json`: Signing request and both response `KIND`s, including the MuSig2
   signatures-only entries (`SIG_KIND` `0x04` and `0x05`, with and without a leaf
   hash), a silent payment send answered with a global ECDH share and DLEQ proof and
   one answered with per-input ones (`SIG_KIND` `0x06` and `0x07`), and an entry of
   an unknown `SIG_KIND` that a reader skips.
-- `musig.json`: MuSig Preparation and MuSig Signing request/response, including
-  nonce entries with and without a leaf hash.
-- `get_info.json`: Get Info request, an ok response from a ready signer with its
-  `FINGERPRINT`, and one from a locked signer without it.
+- `musig.json`: MuSig Preparation and MuSig Signing request/response, including a
+  preparation request with only an alias and nonce entries with and without a leaf
+  hash.
 - `errors.json`: error responses (`STATUS` = `1`), standard and vendor codes,
   including `0x0D` (MuSig2 session).
 - `versioning.json`: forward compatibility, a message whose `VERSION` is above 1
@@ -828,9 +739,9 @@ Every file holds one JSON object with a single `vectors` array:
   "vectors": [
     {
       "name": "get_keys_request_one_path",
-      "description": "Get Keys request for the extended public key at m/48'/0'/0'/2', so a single KEY_REQUEST whose KIND is 0x00 (public). This is the worked example of the spec.",
+      "description": "Get Keys request for the extended public key at m/48'/0'/0'/2', so a single KEY_REQUEST whose KIND is 0x00 (public).",
       "direction": "request",
-      "hex": "4249505858580101000101048000003080000000800000008000000200",
+      "hex": "4249505858580102000101048000003080000000800000008000000200",
       "decode_only": false
     }
   ]
@@ -850,13 +761,3 @@ All five fields are mandatory:
   When `true`, only the decoding direction holds, because an encoder writes the
   version it implements and cannot produce these bytes. The `versioning.json`
   vectors are the only ones that set it.
-
-## Rationale
-
-See footnotes for design rationale.
-
-### Future extensions
-
-Candidates for version 2+, added as appended fields:
-- Per-input spend-path selection for multi-path miniscript policies in Signing.
-- Registering multiple descriptors in one Register exchange.

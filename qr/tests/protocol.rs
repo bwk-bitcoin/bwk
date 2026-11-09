@@ -384,7 +384,7 @@ fn decoder_handles_two_messages_without_reset() {
     let request_frames = encoder.encode_request(&request).unwrap();
     let response_frames = encoder.encode_response(&response).unwrap();
     assert_eq!(request_frames.len(), 5);
-    assert_eq!(response_frames.len(), 14);
+    assert_eq!(response_frames.len(), 13);
 
     let mut decoder = decoder();
     assert_eq!(

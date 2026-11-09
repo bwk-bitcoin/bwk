@@ -128,7 +128,7 @@ impl MusigDerivation {
     }
 }
 
-/// Transaction-independent preparation. The descriptor body must be present.
+/// Transaction-independent preparation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrepareMusig {
     pub descriptor: Descriptor,
@@ -140,9 +140,6 @@ pub struct PrepareMusig {
 impl PrepareMusig {
     pub fn validate(&self) -> Result<(), musig::Error> {
         musig::validate_input_coverage(self.max_inputs)?;
-        if self.descriptor.descriptor.is_none() {
-            return Err(musig::Error::MissingDescriptor);
-        }
         musig::validate_derivations(&self.derivations)
     }
 }

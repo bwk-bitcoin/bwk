@@ -32,11 +32,12 @@ let bytes = encode_response(&response)?;
 ```
 
 Cached MuSig uses `request::Body::{PrepareMusig, SignMusig}` and
-`response::Body::{MusigPrepared, MusigSigned}`. Preparation contains a full
-descriptor, a session ID, input coverage and public derivation points, but no
-transaction. Public nonces identify their derivation, input, descriptor expression,
-participant, aggregate and optional leaf. Signing carries the session ID, a separate
-attempt ID and an opaque PSBT v0 or v2. No secret roots travel over this protocol.
+`response::Body::{MusigPrepared, MusigSigned}`. Preparation contains a descriptor
+entry (its body optional), a session ID, input coverage and public derivation
+points, but no transaction. Public nonces identify their derivation, input,
+descriptor expression, participant, aggregate and optional leaf. Signing carries the
+session ID, a separate attempt ID and an opaque PSBT v0 or v2. No secret roots travel
+over this protocol.
 
 Check `response::Capabilities::supports_musig_cache()` before using these operations;
 `Capabilities::MUSIG_CACHE` is bit 4, separate from ordinary MuSig support. Both
@@ -46,24 +47,25 @@ consumer must still validate a prepared response before use. The codec does
 not allocate or persist signing sessions, burn secret nonces, validate cryptography,
 or check response correlation. Those remain the consumer's responsibility.
 
-The new message codes are `0x05` and `0x06`. Version 1 and ordinary Signing (`0x04`)
+The new message codes are `0x06` and `0x07`. Version 1 and ordinary Signing (`0x05`)
 are unchanged. Old peers reject the new codes instead of ignoring a cached selector
 appended to an ordinary signing request.
 
 A signatures-only Signing response carries the BIP-375 ECDH shares and BIP-374 DLEQ
 proofs of a silent payment send as `SignatureEntry::{SpEcdhShare, SpDleqProof}`, each
 scoped to one input or to the whole transaction by `SpScope`. Both encode and decode
-reject a share without its proof, a proof without its share and a duplicate of
-either; checking that every scan key and eligible input is covered needs the PSBT, so
-it is the wallet's job. An entry of a kind the codec does not know decodes to
-`SignatureEntry::Unknown` with its raw fields, and re-encodes unchanged.
+reject a taproot signature that is not 64 or 65 bytes, a share without its proof, a
+proof without its share and a duplicate of either; checking that every scan key and
+eligible input is covered needs the PSBT, so it is the wallet's job. An entry of a
+kind the codec does not know decodes to `SignatureEntry::Unknown` with its raw
+fields, and re-encodes unchanged.
 
-Address Verification of a silent payment address carries
+Register Descriptor and Address Verification of silent payment keys carry
 `request::DescriptorBody::SpKeys`, whose scan key is the signer's own at a path
 (`Scan::Path`) or a scan private key it does not hold (`Scan::Key`). Decode rejects
 a body with both or neither. `SecretKey`'s `Debug` does not print the key.
 
-Get Info (`0x07`) uses `request::Body::GetInfo`, which carries no body, and
+Get Info (`0x01`) uses `request::Body::GetInfo`, which carries no body, and
 `response::Body::Info`. Both encode and decode reject a `max_alias` above 32 and a
 `fingerprint` when `state` is not `State::Ready`; an unknown state decodes to
 `State::Unknown` and counts as not ready. Encode also rejects reserved `Networks`
@@ -107,12 +109,14 @@ field from `ENCODING.md`; they report local decode, encode, or FFI failures.
 | 500..599          | MuSig validation |
 | 600..699          | Silent payments  |
 | 700..799          | Get Info         |
+| 800..899          | Signatures       |
 +-------------------+------------------+
 ```
 
-MuSig validation codes `500` through `508` are shared by encode and decode and
-exposed as `musig::Error`, and Get Info validation codes `700` and `701` as
-`get_info::Error`. The C request union includes `prepare_musig` and `sign_musig`; a
+MuSig validation codes `500` through `508` (`504` unused) are shared by encode and
+decode and exposed as `musig::Error`, Get Info validation codes `700` and `701` as
+`get_info::Error`, and the taproot signature length code `800` as
+`signature::Error`. The C request union includes `prepare_musig` and `sign_musig`; a
 Get Info request has no body and leaves it unused. The response union includes
 `musig_prepared`, `musig_signed` and `info`.
 These additions grow the C unions, so consumers must rebuild against the updated

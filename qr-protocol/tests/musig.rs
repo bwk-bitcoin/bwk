@@ -1,8 +1,7 @@
 use bwk_qr_protocol::{
     decode, encode, encode_request, encode_response, musig, reader, request, response,
     types::{Fingerprint, PublicKey},
-    Message, MessageType, Request, RequestId, Response, MAX_BYTES, MAX_MUSIG_DERIVATIONS,
-    MAX_MUSIG_INPUTS, MAX_VEC,
+    Message, MessageType, Request, RequestId, Response, MAX_BYTES, MAX_VEC,
 };
 
 const ID: RequestId = RequestId([0x12, 0x34]);
@@ -74,7 +73,7 @@ fn raw_preparation(body: &request::PrepareMusig) -> Vec<u8> {
         want_kind: None,
     })))
     .unwrap();
-    let mut bytes = b"BIPXXX\x01\x05\x12\x34".to_vec();
+    let mut bytes = b"BIPXXX\x01\x06\x12\x34".to_vec();
     bytes.extend_from_slice(&ordinary[11..ordinary.len() - 2]);
     bytes.extend_from_slice(&body.session_id);
     bytes.push(body.max_inputs);
@@ -87,7 +86,7 @@ fn raw_preparation(body: &request::PrepareMusig) -> Vec<u8> {
 }
 
 fn raw_prepared(body: &response::MusigPrepared) -> Vec<u8> {
-    let mut bytes = b"BIPXXX\x01\x85\x12\x34".to_vec();
+    let mut bytes = b"BIPXXX\x01\x86\x12\x34".to_vec();
     bytes.extend_from_slice(&body.session_id);
     bytes.push(body.max_inputs);
     compact(&mut bytes, body.nonces.len());
@@ -145,14 +144,14 @@ fn all_cached_messages_round_trip_every_field() {
     let request = request(request::Body::PrepareMusig(body.clone()));
     let bytes = encode_request(&request).unwrap();
     assert_eq!(bytes, raw_preparation(&body));
-    assert_eq!(bytes[6..10], [1, 0x05, 0x12, 0x34]);
+    assert_eq!(bytes[6..10], [1, 0x06, 0x12, 0x34]);
     assert_eq!(decode(&bytes).unwrap(), Message::Request(request));
 
     let body = prepared();
     let response = response(response::Body::MusigPrepared(body.clone()));
     let bytes = encode_response(&response).unwrap();
     assert_eq!(bytes, raw_prepared(&body));
-    assert_eq!(bytes[6..10], [1, 0x85, 0x12, 0x34]);
+    assert_eq!(bytes[6..10], [1, 0x86, 0x12, 0x34]);
     assert_eq!(decode(&bytes).unwrap(), Message::Response(response));
 }
 
@@ -169,34 +168,35 @@ fn signing_ids_and_opaque_psbt_have_exact_layout() {
         attempt_id: ATTEMPT,
         psbt,
     }));
-    let mut expected = b"BIPXXX\x01\x06\x12\x34".to_vec();
+    let mut expected = b"BIPXXX\x01\x07\x12\x34".to_vec();
     expected.extend_from_slice(&SESSION);
     expected.extend_from_slice(&ATTEMPT);
     expected.extend_from_slice(b"\x05psbt\xff");
     assert_eq!(encode_request(&request).unwrap(), expected);
     assert_eq!(decode(&expected).unwrap(), Message::Request(request));
-    expected[7] = 0x86;
+    expected[7] = 0x87;
     assert_eq!(encode_response(&response).unwrap(), expected);
     assert_eq!(decode(&expected).unwrap(), Message::Response(response));
 }
 
 #[test]
 fn preparation_rejects_invalid_coverage_and_derivations_in_both_directions() {
-    for max_inputs in [0, MAX_MUSIG_INPUTS + 1, u8::MAX] {
-        let mut body = preparation();
-        body.max_inputs = max_inputs;
-        reject_preparation(body, musig::Error::InputCoverage);
-    }
-    for count in [0, MAX_MUSIG_DERIVATIONS + 1] {
-        let mut body = preparation();
-        body.derivations = (0..count)
-            .map(|index| request::MusigDerivation {
-                keychain: 0,
-                index: index as u32,
-            })
-            .collect();
-        reject_preparation(body, musig::Error::DerivationCount);
-    }
+    let mut body = preparation();
+    body.max_inputs = 0;
+    reject_preparation(body, musig::Error::InputCoverage);
+    let mut body = preparation();
+    body.derivations = vec![];
+    reject_preparation(body, musig::Error::DerivationCount);
+    let mut body = preparation();
+    body.derivations = derivations(MAX_VEC + 1);
+    assert_eq!(
+        decode(&raw_preparation(&body)),
+        Err(decode::Error::Read(reader::Error::VecTooLarge(MAX_VEC + 1)))
+    );
+    assert_eq!(
+        encode_request(&request(request::Body::PrepareMusig(body))),
+        Err(encode::Error::VecTooLarge(MAX_VEC + 1))
+    );
     let mut body = preparation();
     body.derivations[1] = body.derivations[0];
     reject_preparation(body, musig::Error::DuplicateDerivation);
@@ -205,23 +205,39 @@ fn preparation_rejects_invalid_coverage_and_derivations_in_both_directions() {
         body.derivations[0].index = index;
         reject_preparation(body, musig::Error::HardenedIndex);
     }
-    let mut body = preparation();
-    body.descriptor.descriptor = None;
-    reject_preparation(body, musig::Error::MissingDescriptor);
 }
 
 #[test]
-fn preparation_accepts_both_limit_boundaries() {
-    for max_inputs in [1, MAX_MUSIG_INPUTS] {
-        for count in [1, MAX_MUSIG_DERIVATIONS] {
+fn preparation_with_only_an_alias_round_trips() {
+    let mut body = preparation();
+    body.descriptor.descriptor = None;
+    body.descriptor.proof = None;
+    let request = request(request::Body::PrepareMusig(body.clone()));
+    let bytes = encode_request(&request).unwrap();
+    assert_eq!(bytes, raw_preparation(&body));
+    // the alias "policy", then the absent descriptor body and the absent proof
+    assert_eq!(bytes[10..19], *b"\x06policy\x00\x00");
+    assert_eq!(decode(&bytes).unwrap(), Message::Request(request));
+}
+
+fn derivations(count: usize) -> Vec<request::MusigDerivation> {
+    (0..count)
+        .map(|keychain| request::MusigDerivation {
+            keychain: keychain as u32,
+            index: 0x7fff_ffff,
+        })
+        .collect()
+}
+
+// Coverage and derivation counts have no cap of their own: a device limit is not
+// an encoding bound, and the derivations only meet the generic vector bound.
+#[test]
+fn preparation_accepts_any_coverage_and_derivation_count() {
+    for max_inputs in [1, 9, u8::MAX] {
+        for count in [1, 33, MAX_VEC] {
             let mut body = preparation();
             body.max_inputs = max_inputs;
-            body.derivations = (0..count)
-                .map(|keychain| request::MusigDerivation {
-                    keychain: keychain as u32,
-                    index: 0x7fff_ffff,
-                })
-                .collect();
+            body.derivations = derivations(count);
             let request = request(request::Body::PrepareMusig(body));
             assert_eq!(
                 decode(&encode_request(&request).unwrap()).unwrap(),
@@ -233,11 +249,9 @@ fn preparation_accepts_both_limit_boundaries() {
 
 #[test]
 fn preparation_response_rejects_invalid_nonces_in_both_directions() {
-    for max_inputs in [0, MAX_MUSIG_INPUTS + 1, u8::MAX] {
-        let mut body = prepared();
-        body.max_inputs = max_inputs;
-        reject_prepared(body, musig::Error::InputCoverage);
-    }
+    let mut body = prepared();
+    body.max_inputs = 0;
+    reject_prepared(body, musig::Error::InputCoverage);
     for count in [0, MAX_VEC + 1] {
         let mut body = prepared();
         body.nonces = vec![body.nonces[0].clone(); count];
@@ -285,11 +299,11 @@ fn nonce_attribution_includes_every_field_but_not_nonce_bytes() {
 #[test]
 fn nonce_count_accepts_max_vec_with_full_input_coverage() {
     let mut body = prepared();
-    body.max_inputs = MAX_MUSIG_INPUTS;
+    body.max_inputs = u8::MAX;
     let base = body.nonces[0].clone();
     body.nonces = (0..MAX_VEC)
         .map(|index| response::MusigNonce {
-            input_index: index as u32 % u32::from(MAX_MUSIG_INPUTS),
+            input_index: index as u32 % u32::from(u8::MAX),
             expression_index: index as u32,
             ..base.clone()
         })
@@ -341,8 +355,8 @@ fn signing_psbt_limits_apply_to_both_directions() {
         encode_response(&response),
         Err(encode::Error::BytesTooLarge(MAX_BYTES + 1))
     );
-    for code in [0x06, 0x86] {
-        let mut bytes = b"BIPXXX\x01\x06\x12\x34".to_vec();
+    for code in [0x07, 0x87] {
+        let mut bytes = b"BIPXXX\x01\x07\x12\x34".to_vec();
         bytes[7] = code;
         bytes.extend_from_slice(&SESSION);
         bytes.extend_from_slice(&ATTEMPT);
@@ -383,10 +397,10 @@ fn cache_capability_is_separate_and_encodes() {
     }
 }
 
-// The old dispatch accepts only these four types, before reading any body.
+// The old dispatch accepts only these five types, before reading any body.
 fn old_message_type(bytes: &[u8]) -> Result<u8, decode::Error> {
     match bytes[7] & 0x3f {
-        code @ 0x01..=0x04 => Ok(code),
+        code @ 0x01..=0x05 => Ok(code),
         code => Err(decode::Error::UnknownMessageType(code)),
     }
 }
@@ -428,9 +442,9 @@ fn old_dispatch_rejects_cached_operations_even_with_a_newer_version() {
             );
         }
     }
-    assert_eq!(MessageType::MusigPreparation.value(), 0x05);
-    assert_eq!(MessageType::MusigSigning.value(), 0x06);
-    assert_eq!(MessageType::Signing.value(), 0x04);
+    assert_eq!(MessageType::MusigPreparation.value(), 0x06);
+    assert_eq!(MessageType::MusigSigning.value(), 0x07);
+    assert_eq!(MessageType::Signing.value(), 0x05);
 }
 
 #[test]
@@ -441,7 +455,7 @@ fn ordinary_signing_still_ignores_newer_fields_so_cache_requires_new_codes() {
         want_kind: None,
     }));
     let mut bytes = encode_request(&ordinary).unwrap();
-    assert_eq!(old_message_type(&bytes), Ok(0x04));
+    assert_eq!(old_message_type(&bytes), Ok(0x05));
     bytes[6] = 2;
     bytes.extend_from_slice(&SESSION);
     bytes.extend_from_slice(&ATTEMPT);
@@ -484,17 +498,16 @@ fn cached_errors_keep_operation_and_request_attribution() {
 #[test]
 fn musig_validation_errors_have_distinct_codes() {
     let errors = [
-        musig::Error::InputCoverage,
-        musig::Error::DerivationCount,
-        musig::Error::DuplicateDerivation,
-        musig::Error::HardenedIndex,
-        musig::Error::MissingDescriptor,
-        musig::Error::NonceCount,
-        musig::Error::NonceInputIndex,
-        musig::Error::DuplicateNonce,
-        musig::Error::MissingInput,
+        (musig::Error::InputCoverage, 500),
+        (musig::Error::DerivationCount, 501),
+        (musig::Error::DuplicateDerivation, 502),
+        (musig::Error::HardenedIndex, 503),
+        (musig::Error::NonceCount, 505),
+        (musig::Error::NonceInputIndex, 506),
+        (musig::Error::DuplicateNonce, 507),
+        (musig::Error::MissingInput, 508),
     ];
-    for (error, code) in errors.into_iter().zip(500..=508) {
+    for (error, code) in errors {
         assert_eq!(error.info().code, code);
         assert_eq!(encode::Error::Musig(error).info(), error.info());
         assert_eq!(decode::Error::Musig(error).info(), error.info());

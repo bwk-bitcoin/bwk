@@ -1,10 +1,10 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::{
-    get_info, musig, request, sp,
+    get_info, musig, request, signature, sp,
     types::{
         ExtendedKey, Fingerprint, PublicKey, DLEQ_PROOF_LEN, MUSIG_PARTIAL_SIG_LEN,
-        MUSIG_PUB_NONCE_LEN,
+        MUSIG_PUB_NONCE_LEN, SCHNORR_SIGNATURE_LEN,
     },
     MessageType, MAX_DESCRIPTOR_ALIAS,
 };
@@ -184,10 +184,10 @@ pub const STATE_UNINITIALIZED: u8 = 0x02;
 pub struct Networks(pub u8);
 
 impl Networks {
-    pub const MAINNET: u8 = 1 << 0;
-    pub const TESTNET: u8 = 1 << 1;
-    pub const SIGNET: u8 = 1 << 2;
-    pub const REGTEST: u8 = 1 << 3;
+    pub const MAINNET: u8 = 1 << 1;
+    pub const TESTNET: u8 = 1 << 2;
+    pub const SIGNET: u8 = 1 << 3;
+    pub const REGTEST: u8 = 1 << 4;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -322,6 +322,17 @@ impl SignatureEntry {
                 scope.input_index()
             }
         }
+    }
+
+    /// A taproot signature is 64 bytes, or 65 with a sighash type byte.
+    pub fn validate(&self) -> Result<(), signature::Error> {
+        let (Self::TapKey { signature, .. } | Self::TapScript { signature, .. }) = self else {
+            return Ok(());
+        };
+        if !(SCHNORR_SIGNATURE_LEN..=SCHNORR_SIGNATURE_LEN + 1).contains(&signature.len()) {
+            return Err(signature::Error::TaprootLength(signature.len()));
+        }
+        Ok(())
     }
 }
 
