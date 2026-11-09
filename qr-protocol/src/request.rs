@@ -1,7 +1,7 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::{
-    decode, musig, sp,
+    decode, musig,
     types::{DerivationPath, Fingerprint, SecretKey},
     MessageType, SignResponseKind,
 };
@@ -171,16 +171,6 @@ pub struct SpKeys {
     pub fingerprint: Fingerprint,
     pub spend_path: DerivationPath,
     pub scan: Scan,
-}
-
-impl SpKeys {
-    pub fn validate(&self) -> Result<(), sp::Error> {
-        match &self.scan {
-            Scan::Path(_) => Ok(()),
-            Scan::Key(key) if key.is_valid() => Ok(()),
-            Scan::Key(_) => Err(sp::Error::InvalidScanKey),
-        }
-    }
 }
 
 /// Where the signer gets the scan private key of [`SpKeys`].

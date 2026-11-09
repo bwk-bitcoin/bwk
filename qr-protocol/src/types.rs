@@ -9,11 +9,6 @@ pub const MUSIG_PARTIAL_SIG_LEN: usize = 32;
 pub const TAP_LEAF_HASH_LEN: usize = 32;
 /// A BIP-374 DLEQ proof, `e || s`.
 pub const DLEQ_PROOF_LEN: usize = 64;
-/// The secp256k1 curve order, big-endian, so a byte-wise comparison is a numeric one.
-const CURVE_ORDER: [u8; SECRET_KEY_LEN] = [
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
-    0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
-];
 
 /// BIP-32 child numbers with the hardened bit set, exactly as they sit on the wire.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -35,13 +30,6 @@ pub struct PublicKey(pub [u8; PUBLIC_KEY_LEN]);
 /// A secp256k1 secret key as a 32-byte big-endian scalar.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SecretKey(pub [u8; SECRET_KEY_LEN]);
-
-impl SecretKey {
-    /// Nonzero and below the curve order.
-    pub fn is_valid(&self) -> bool {
-        self.0 != [0; SECRET_KEY_LEN] && self.0 < CURVE_ORDER
-    }
-}
 
 impl core::fmt::Debug for SecretKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

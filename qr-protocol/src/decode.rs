@@ -376,13 +376,11 @@ fn read_descriptor_body(reader: &mut Reader<'_>) -> Result<request::DescriptorBo
 }
 
 fn read_sp_keys(reader: &mut Reader<'_>) -> Result<request::SpKeys, Error> {
-    let keys = request::SpKeys {
+    Ok(request::SpKeys {
         fingerprint: read_fingerprint(reader)?,
         spend_path: read_path(reader)?,
         scan: read_scan(reader)?,
-    };
-    keys.validate()?;
-    Ok(keys)
+    })
 }
 
 fn read_scan(reader: &mut Reader<'_>) -> Result<request::Scan, Error> {

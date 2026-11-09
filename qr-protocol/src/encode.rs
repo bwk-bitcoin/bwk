@@ -334,7 +334,6 @@ fn write_descriptor_body(out: &mut Vec<u8>, body: &request::DescriptorBody) -> R
 }
 
 fn write_sp_keys(out: &mut Vec<u8>, keys: &request::SpKeys) -> Result<(), Error> {
-    keys.validate()?;
     out.extend_from_slice(&keys.fingerprint.0);
     write_path(out, &keys.spend_path)?;
     let (path, key) = match &keys.scan {

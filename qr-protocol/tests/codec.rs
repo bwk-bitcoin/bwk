@@ -336,7 +336,6 @@ fn every_error_message_is_terminated_and_uniquely_coded() {
         sp::Error::DuplicateProof,
         sp::Error::MissingProof,
         sp::Error::MissingShare,
-        sp::Error::InvalidScanKey,
     ];
 
     let mut infos = Vec::new();
@@ -370,7 +369,7 @@ fn every_error_message_is_terminated_and_uniquely_coded() {
 mod sp_keys {
     use bitcoin::secp256k1;
     use bwk_qr_protocol::{
-        decode, encode, encode_request, reader, request, sp,
+        decode, encode, encode_request, reader, request,
         types::{DerivationPath, SecretKey, SECRET_KEY_LEN},
         Message, Request,
     };
@@ -380,12 +379,6 @@ mod sp_keys {
         id,
     };
 
-    // the secp256k1 curve order, the first scalar that is not a valid secret key
-    const CURVE_ORDER: [u8; SECRET_KEY_LEN] = [
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36,
-        0x41, 0x41,
-    ];
     // the scan key, then the absent POR, close a request with a foreign scan key
     const SCAN_KEY_TAIL_LEN: usize = SECRET_KEY_LEN + 1;
 
@@ -412,12 +405,6 @@ mod sp_keys {
         let start = bytes.len() - SCAN_KEY_TAIL_LEN;
         bytes[start..start + SECRET_KEY_LEN].copy_from_slice(&key);
         bytes
-    }
-
-    fn below_curve_order() -> [u8; SECRET_KEY_LEN] {
-        let mut key = CURVE_ORDER;
-        key[SECRET_KEY_LEN - 1] -= 1;
-        key
     }
 
     #[test]
@@ -464,39 +451,17 @@ mod sp_keys {
         assert_eq!(decode(&neither), Err(decode::Error::NoScan));
     }
 
+    // the codec carries the scan key as opaque bytes, whatever they are
     #[test]
-    fn decode_reads_a_scan_key_below_the_curve_order() {
-        let bytes = foreign_scan_bytes(below_curve_order());
-        assert_eq!(
-            decode(&bytes),
-            Ok(Message::Request(foreign_scan_request(below_curve_order())))
-        );
-    }
-
-    #[test]
-    fn decode_rejects_an_invalid_scan_key() {
-        for key in [[0; SECRET_KEY_LEN], CURVE_ORDER, [0xff; SECRET_KEY_LEN]] {
+    fn any_scan_key_bytes_round_trip() {
+        for key in [[0; SECRET_KEY_LEN], [0xff; SECRET_KEY_LEN]] {
+            let bytes = foreign_scan_bytes(key);
+            assert_eq!(encode_request(&foreign_scan_request(key)).unwrap(), bytes);
             assert_eq!(
-                decode(&foreign_scan_bytes(key)),
-                Err(decode::Error::Sp(sp::Error::InvalidScanKey))
+                decode(&bytes),
+                Ok(Message::Request(foreign_scan_request(key)))
             );
         }
-    }
-
-    #[test]
-    fn encode_rejects_an_invalid_scan_key() {
-        for key in [[0; SECRET_KEY_LEN], CURVE_ORDER, [0xff; SECRET_KEY_LEN]] {
-            assert_eq!(
-                encode_request(&foreign_scan_request(key)),
-                Err(encode::Error::Sp(sp::Error::InvalidScanKey))
-            );
-        }
-    }
-
-    #[test]
-    fn the_curve_order_matches_secp256k1() {
-        assert!(secp256k1::SecretKey::from_slice(&below_curve_order()).is_ok());
-        assert!(secp256k1::SecretKey::from_slice(&CURVE_ORDER).is_err());
     }
 
     #[test]
