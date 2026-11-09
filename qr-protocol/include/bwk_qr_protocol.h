@@ -24,6 +24,7 @@ extern "C" {
 #define BWK_QR_EXTENDED_KEY_LEN 78
 #define BWK_QR_FINGERPRINT_LEN 4
 #define BWK_QR_PUBLIC_KEY_LEN 33
+#define BWK_QR_SECRET_KEY_LEN 32
 #define BWK_QR_MUSIG_PUB_NONCE_LEN 66
 #define BWK_QR_MUSIG_PARTIAL_SIG_LEN 32
 #define BWK_QR_TAP_LEAF_HASH_LEN 32
@@ -134,6 +135,13 @@ enum bwk_qr_response_error {
     BWK_QR_RESPONSE_ERROR_VENDOR = 0xff
 };
 
+/* Selects the scan arm of bwk_qr_sp_keys. Not a wire value: the wire carries the
+ * scan path and the scan key as two optional fields, exactly one present. */
+enum bwk_qr_scan_kind {
+    BWK_QR_SCAN_PATH = 0x00, /* the signer's own scan key, at scan.path */
+    BWK_QR_SCAN_KEY = 0x01   /* a scan private key the signer does not hold */
+};
+
 /* Absent markers for the tri-state fields. */
 enum bwk_qr_absent {
     BWK_QR_ABSENT_BOOL = -1,
@@ -170,6 +178,8 @@ enum bwk_qr_status {
     BWK_QR_ERR_UNKNOWN_KEY_KIND = 207,
     BWK_QR_ERR_SIGNATURE_LENGTH = 208,
     BWK_QR_ERR_GLOBAL_INPUT_INDEX = 209,
+    BWK_QR_ERR_SCAN_PATH_AND_KEY = 210,
+    BWK_QR_ERR_NO_SCAN = 211,
 
     BWK_QR_ERR_PATH_TOO_LONG = 300,
     BWK_QR_ERR_PATCH_TOO_LARGE = 301,
@@ -208,6 +218,7 @@ enum bwk_qr_status {
     BWK_QR_ERR_SP_DUPLICATE_PROOF = 601,
     BWK_QR_ERR_SP_MISSING_PROOF = 602,
     BWK_QR_ERR_SP_MISSING_SHARE = 603,
+    BWK_QR_ERR_SP_INVALID_SCAN_KEY = 604,
 
     BWK_QR_ERR_GET_INFO_MAX_ALIAS_TOO_LARGE = 700,
     BWK_QR_ERR_GET_INFO_FINGERPRINT_WHEN_NOT_READY = 701
@@ -259,11 +270,16 @@ typedef struct {
     const char *policy;
 } bwk_qr_bip388;
 
-/* Paths from the master key. */
+typedef union {
+    bwk_qr_path path;                     /* from the master key */
+    uint8_t key[BWK_QR_SECRET_KEY_LEN];   /* big-endian scalar, a valid secret key */
+} bwk_qr_scan_value;
+
 typedef struct {
     uint8_t fingerprint[BWK_QR_FINGERPRINT_LEN];
-    bwk_qr_path spend_path;
-    bwk_qr_path scan_path;
+    bwk_qr_path spend_path; /* from the master key */
+    uint8_t scan_kind;      /* BWK_QR_SCAN_*, selects the scan arm */
+    bwk_qr_scan_value scan;
 } bwk_qr_sp_keys;
 
 typedef union {

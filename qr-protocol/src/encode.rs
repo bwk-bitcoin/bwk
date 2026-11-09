@@ -334,9 +334,18 @@ fn write_descriptor_body(out: &mut Vec<u8>, body: &request::DescriptorBody) -> R
 }
 
 fn write_sp_keys(out: &mut Vec<u8>, keys: &request::SpKeys) -> Result<(), Error> {
+    keys.validate()?;
     out.extend_from_slice(&keys.fingerprint.0);
     write_path(out, &keys.spend_path)?;
-    write_path(out, &keys.scan_path)
+    let (path, key) = match &keys.scan {
+        request::Scan::Path(path) => (Some(path), None),
+        request::Scan::Key(key) => (None, Some(key)),
+    };
+    write_option(out, path, write_path)?;
+    write_option(out, key, |out, key| {
+        out.extend_from_slice(&key.0);
+        Ok(())
+    })
 }
 
 fn write_signature(out: &mut Vec<u8>, entry: &response::SignatureEntry) -> Result<(), Error> {

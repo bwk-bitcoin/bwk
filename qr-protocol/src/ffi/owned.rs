@@ -179,17 +179,31 @@ impl Keep {
                 },
             },
             request::DescriptorBody::SpKeys(keys) => types::DescriptorValue {
-                sp_keys: types::SpKeys {
-                    fingerprint: keys.fingerprint.0,
-                    spend_path: self.path(&keys.spend_path),
-                    scan_path: self.path(&keys.scan_path),
-                },
+                sp_keys: self.sp_keys(keys),
             },
         };
         Ok(types::DescriptorBody {
             tag: body.value(),
             value,
         })
+    }
+
+    fn sp_keys(&mut self, keys: &request::SpKeys) -> types::SpKeys {
+        let (scan_kind, scan) = match &keys.scan {
+            request::Scan::Path(path) => (
+                types::SCAN_PATH,
+                types::ScanValue {
+                    path: self.path(path),
+                },
+            ),
+            request::Scan::Key(key) => (types::SCAN_KEY, types::ScanValue { key: key.0 }),
+        };
+        types::SpKeys {
+            fingerprint: keys.fingerprint.0,
+            spend_path: self.path(&keys.spend_path),
+            scan_kind,
+            scan,
+        }
     }
 
     fn key_list(&mut self, keys: &[String]) -> Result<types::List<*const c_char>, Error> {

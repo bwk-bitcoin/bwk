@@ -6,7 +6,7 @@ use core::{ffi::c_char, ptr};
 use crate::{
     types::{
         DLEQ_PROOF_LEN, EXTENDED_KEY_LEN, FINGERPRINT_LEN, MUSIG_PARTIAL_SIG_LEN,
-        MUSIG_PUB_NONCE_LEN, PUBLIC_KEY_LEN, TAP_LEAF_HASH_LEN,
+        MUSIG_PUB_NONCE_LEN, PUBLIC_KEY_LEN, SECRET_KEY_LEN, TAP_LEAF_HASH_LEN,
     },
     ERROR_MESSAGE_LEN, MODEL_LEN, REQUEST_ID_LEN, VENDOR_LEN,
 };
@@ -69,6 +69,10 @@ impl Path {
 pub const ABSENT_BOOL: i8 = -1;
 /// Absent for the `int16_t` signing response kind.
 pub const ABSENT_KIND: i16 = -1;
+/// `SpKeys::scan_kind` when the scan key is the signer's, at `scan.path`.
+pub const SCAN_PATH: u8 = 0x00;
+/// `SpKeys::scan_kind` when the request carries the scan private key in `scan.key`.
+pub const SCAN_KEY: u8 = 0x01;
 
 #[repr(C)]
 pub struct Request {
@@ -189,7 +193,16 @@ pub struct Bip388 {
 pub struct SpKeys {
     pub fingerprint: [u8; FINGERPRINT_LEN],
     pub spend_path: Path,
-    pub scan_path: Path,
+    /// `SCAN_PATH` or `SCAN_KEY`, which selects the `scan` arm.
+    pub scan_kind: u8,
+    pub scan: ScanValue,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union ScanValue {
+    pub path: Path,
+    pub key: [u8; SECRET_KEY_LEN],
 }
 
 #[repr(C)]

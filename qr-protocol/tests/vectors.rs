@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use common::{
     aggregate, bip380, bip388, key_request, musig_partial_sigs, musig_pub_nonces, path,
-    sp_global_send, sp_keys, sp_per_input_send, xpriv, xpub, xpub_key,
+    sp_foreign_scan_keys, sp_global_send, sp_keys, sp_per_input_send, xpriv, xpub, xpub_key,
 };
 
 fn id() -> protocol::RequestId {
@@ -139,6 +139,16 @@ fn address_verification_messages() -> Vec<(&'static str, Message)> {
                 derivation_path: path("m"),
                 address: Some("sp1qxyz".to_string()),
                 descriptor: Some(sp_keys()),
+                proof: None,
+            })),
+        ),
+        (
+            "address_verification_sp_foreign_scan_request",
+            request(request::Body::VerifyAddress(request::VerifyAddress {
+                descriptor_alias: "main".to_string(),
+                derivation_path: path("m/2"),
+                address: Some("sp1qxyz".to_string()),
+                descriptor: Some(sp_foreign_scan_keys()),
                 proof: None,
             })),
         ),
