@@ -31,11 +31,13 @@ pub enum KeyChain {
     Custom(u32),
 }
 
+/// The multipath branch of `value`: 0 receive, 1 change, the inverse of
+/// `From<u32> for KeyChain`.
 impl From<KeyChain> for u32 {
     fn from(value: KeyChain) -> Self {
         match value {
             KeyChain::Receive => 0,
-            KeyChain::Change => 0,
+            KeyChain::Change => 1,
             KeyChain::Custom(c) => c,
         }
     }
@@ -127,6 +129,14 @@ impl Coin {
 
     pub fn value(&self) -> bitcoin::Amount {
         self.txout.value
+    }
+
+    /// The (keychain, index) the coin derives at, none for a silent payment coin.
+    pub fn coin_path(&self) -> Option<(KeyChain, u32)> {
+        match &self.spend_info {
+            CoinSpendInfo::Bip32 { coin_path, .. } => Some(*coin_path),
+            CoinSpendInfo::Sp { .. } => None,
+        }
     }
 
     pub fn is_bip32(&self) -> bool {
@@ -373,6 +383,29 @@ mod tests {
         assert_eq!(bip32_coin(p2wpkh).source(), CoinSourceKind::Segwit);
         assert_eq!(bip32_coin(p2tr).source(), CoinSourceKind::Taproot);
         assert_eq!(bip32_coin(ScriptBuf::new()).source(), CoinSourceKind::Other);
+    }
+
+    #[test]
+    fn keychain_branch_round_trips() {
+        assert_eq!(u32::from(KeyChain::Receive), 0);
+        assert_eq!(u32::from(KeyChain::Change), 1);
+        assert_eq!(u32::from(KeyChain::Custom(7)), 7);
+        for branch in [0, 1, 7] {
+            assert_eq!(u32::from(KeyChain::from(branch)), branch);
+        }
+    }
+
+    #[test]
+    fn coin_path_of_bip32_and_silent_payment_coins() {
+        assert_eq!(
+            bip32_coin(ScriptBuf::new()).coin_path(),
+            Some((KeyChain::Receive, 0))
+        );
+        let sp = Coin {
+            spend_info: CoinSpendInfo::Sp { tweak: [0u8; 32] },
+            ..bip32_coin(ScriptBuf::new())
+        };
+        assert_eq!(sp.coin_path(), None);
     }
 
     #[test]

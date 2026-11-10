@@ -228,6 +228,12 @@ A spend runs as follows:
    (`aggregate_musig`), runs the miniscript finalizer and extracts the
    transaction. Without `musig` it only finalizes and extracts.
 
+Steps 2 and 3 read the coins from the scanner and the tip from its header chain.
+A consumer tracking the account's coins from another blockchain source passes
+them itself: `spend_leaves_for(&coins, tip)` and
+`restrict_spend_path_for(&mut psbt, path, &coins)` do the same on the given
+`Coin`s, of which only the derivation and height are read, and the given tip.
+
 ## Features
 
 All off by default. `logger` installs `env_logger` as the global logger; leave
