@@ -42,7 +42,7 @@ use crossbeam::channel;
 
 #[cfg(feature = "musig")]
 use bwk_coin::{
-    derive_descriptor, max_input_satisfaction_size, Coin, CoinSpendInfo, KeyChain,
+    derive_descriptor, max_input_satisfaction_size, Coin, KeyChain,
     TAPROOT_KEYSPEND_SATISFACTION_WU,
 };
 #[cfg(feature = "musig")]
@@ -1230,21 +1230,55 @@ impl<P: ScanProfile> Account<P> {
     /// Every spend path of the descriptor, key path first then leaves in DFS order,
     /// `spendable` evaluated for `outpoints` against the current tip.
     ///
+    /// The coins are the scanner's and the tip its validated header chain's, through
+    /// [`Account::spend_leaves_for`].
+    #[cfg(feature = "musig")]
+    pub fn spend_leaves(&self, outpoints: &[OutPoint]) -> Result<Vec<SpendLeaf>, Error> {
+        let coins = outpoints
+            .iter()
+            .map(|outpoint| {
+                self.scanner
+                    .get_coin(outpoint)
+                    .ok_or_else(|| Error::Musig(format!("unknown coin {outpoint}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // Without a header scanner there is no validated tip: a timelocked leaf is
+        // then reported unspendable.
+        let tip = self
+            .header_scanner
+            .as_ref()
+            .and_then(|header_scanner| header_scanner.headers.store().tip());
+        self.spend_leaves_for(&coins, tip)
+    }
+
+    /// Every spend path of the descriptor, key path first then leaves in DFS order,
+    /// `spendable` evaluated for `coins` against `tip`: coins of this account's
+    /// descriptor the caller tracks itself, e.g. from another blockchain source than
+    /// the scanner. Only their derivation and height are read. A `tip` of `None`
+    /// reports every timelocked leaf unspendable.
+    ///
     /// A tr() whose internal key is the BIP-341 NUMS point has no key path: it is
     /// left out rather than listed as not spendable, as no signer can ever spend it.
     /// So is a leaf whose keys are all that point, like bwk-bup's padding leaf.
     ///
     /// A leaf hash depends on the derivation index, so each leaf's hash is computed
-    /// at the derivation of the first outpoint (receive index 0 when `outpoints` is
-    /// empty); [`Account::restrict_spend_path`] resolves it by its position.
+    /// at the derivation of the first coin (receive index 0 when `coins` is empty);
+    /// [`Account::restrict_spend_path_for`] resolves it by its position.
+    ///
+    /// A silent payment coin is an error.
     #[cfg(feature = "musig")]
-    pub fn spend_leaves(&self, outpoints: &[OutPoint]) -> Result<Vec<SpendLeaf>, Error> {
+    pub fn spend_leaves_for(
+        &self,
+        coins: &[Coin],
+        tip: Option<u32>,
+    ) -> Result<Vec<SpendLeaf>, Error> {
         let descriptor = self.scanner.descriptor();
-        let coins = outpoints
+        let coin_paths = coins
             .iter()
-            .map(|outpoint| {
-                self.bip32_coin(outpoint)
-                    .ok_or_else(|| Error::Musig(format!("unknown coin {outpoint}")))
+            .map(|coin| {
+                coin.coin_path().ok_or_else(|| {
+                    Error::Musig(format!("{} is not a descriptor coin", coin.outpoint))
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let miniscript::Descriptor::Tr(template) = &descriptor else {
@@ -1261,21 +1295,16 @@ impl<P: ScanProfile> Account<P> {
                 satisfaction_wu: max_input_satisfaction_size(&descriptor) as u64,
             }]);
         };
-        let (keychain, index) = coins
+        let (keychain, index) = coin_paths
             .first()
-            .map_or((KeyChain::Receive, 0), |(_, coin_path)| *coin_path);
+            .copied()
+            .unwrap_or((KeyChain::Receive, 0));
         let miniscript::Descriptor::Tr(definite) =
             derive_descriptor(&descriptor, keychain, index).map_err(to_musig)?
         else {
             return Err(Error::Musig("derived descriptor is not tr()".into()));
         };
-        let heights: Vec<Option<u64>> = coins.iter().map(|(coin, _)| coin.height).collect();
-        // Without a header scanner there is no validated tip: a timelocked leaf is
-        // then reported unspendable.
-        let tip = self
-            .header_scanner
-            .as_ref()
-            .and_then(|header_scanner| header_scanner.headers.store().tip());
+        let heights: Vec<Option<u64>> = coins.iter().map(|coin| coin.height).collect();
         let mut leaves = Vec::new();
         if !is_nums(template.internal_key()) {
             leaves.push(SpendLeaf {
@@ -1306,6 +1335,23 @@ impl<P: ScanProfile> Account<P> {
         Ok(leaves)
     }
 
+    /// Keeps only `path` in every input spending a coin of the scanner, through
+    /// [`Account::restrict_spend_path_for`].
+    #[cfg(feature = "musig")]
+    pub fn restrict_spend_path(
+        &self,
+        psbt: &mut bitcoin::Psbt,
+        path: SpendPath,
+    ) -> Result<(), Error> {
+        let coins: Vec<Coin> = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .filter_map(|txin| self.scanner.get_coin(&txin.previous_output))
+            .collect();
+        self.restrict_spend_path_for(psbt, path, &coins)
+    }
+
     /// Keeps only `path` in every input: drops the other leaves' `tap_scripts`, their
     /// leaf hashes in `tap_key_origins`, and the 0x1a entries of aggregates `path`
     /// does not use. Called on the prepared PSBT before round 1.
@@ -1314,9 +1360,13 @@ impl<P: ScanProfile> Account<P> {
     /// for a key outside the leaf: a Coldcard skips an input whose origins do not
     /// list every key of its enrolled wallet (`bwk_descriptor::restrict`).
     ///
-    /// Only inputs spending a coin of this account are touched. A `Leaf` hash is
-    /// resolved to its depth-first position through any owned input holding it,
-    /// then every owned input keeps its own leaf at that position: inputs at
+    /// Only inputs spending one of `coins` are touched: coins of this account's
+    /// descriptor the caller tracks itself, e.g. from another blockchain source than
+    /// the scanner, of which only the derivation is read. A silent payment coin is
+    /// left alone.
+    ///
+    /// A `Leaf` hash is resolved to its depth-first position through any owned input
+    /// holding it, then every owned input keeps its own leaf at that position: inputs at
     /// different indexes share one tree shape but not the leaf hashes.
     /// `Error::UnknownSpendPath` when no owned input holds it, the PSBT unchanged.
     /// `KeyPath` on a tr() whose internal key is the BIP-341 NUMS point is
@@ -1330,10 +1380,11 @@ impl<P: ScanProfile> Account<P> {
     /// single-leaf tree: restricted to its leaf it is the unrestricted PSBT, so a
     /// holder of a plain internal key may still sign the key path.
     #[cfg(feature = "musig")]
-    pub fn restrict_spend_path(
+    pub fn restrict_spend_path_for(
         &self,
         psbt: &mut bitcoin::Psbt,
         path: SpendPath,
+        coins: &[Coin],
     ) -> Result<(), Error> {
         let descriptor = self.scanner.descriptor();
         if let miniscript::Descriptor::Tr(tr) = &descriptor {
@@ -1343,7 +1394,11 @@ impl<P: ScanProfile> Account<P> {
         }
         let mut owned: BTreeMap<usize, Tr<WalletDefiniteKey>> = BTreeMap::new();
         for (input_index, txin) in psbt.unsigned_tx.input.iter().enumerate() {
-            let Some((_, (keychain, index))) = self.bip32_coin(&txin.previous_output) else {
+            let Some((keychain, index)) = coins
+                .iter()
+                .find(|coin| coin.outpoint == txin.previous_output)
+                .and_then(Coin::coin_path)
+            else {
                 continue;
             };
             match derive_descriptor(&descriptor, keychain, index).map_err(to_musig)? {
@@ -1401,10 +1456,8 @@ impl<P: ScanProfile> Account<P> {
     #[cfg(feature = "musig")]
     fn bip32_coin(&self, outpoint: &OutPoint) -> Option<(Coin, (KeyChain, u32))> {
         let coin = self.scanner.get_coin(outpoint)?;
-        match coin.spend_info {
-            CoinSpendInfo::Bip32 { coin_path, .. } => Some((coin, coin_path)),
-            CoinSpendInfo::Sp { .. } => None,
-        }
+        let coin_path = coin.coin_path()?;
+        Some((coin, coin_path))
     }
 
     /// The account's descriptor (standard text through Display).
@@ -2715,6 +2768,8 @@ mod integration_tests {
     #[cfg(feature = "musig")]
     use bwk_bup::{Locktime, OXpub, Path, Policy, PolicyType, Semantic, TapPosition};
     #[cfg(feature = "musig")]
+    use bwk_coin::{derive_descriptor, Coin, CoinSpendInfo, KeyChain};
+    #[cfg(feature = "musig")]
     use bwk_descriptor::{musig::musig_descriptor_to_string, wallet::WalletKey};
     #[cfg(feature = "musig")]
     use bwk_keys::nums::bip341_nums;
@@ -3683,11 +3738,7 @@ mod integration_tests {
         fn psbt(&self) -> Psbt {
             let mut builder = self.account.tx_builder();
             builder.new_template();
-            builder.tx_template.inputs = self
-                .coins
-                .iter()
-                .map(|outpoint| self.account.scanner().get_coin(outpoint).unwrap())
-                .collect();
+            builder.tx_template.inputs = scanner_coins(self);
             builder.dummy_external_output(50_000);
             builder.generate().unwrap()
         }
@@ -4255,6 +4306,166 @@ mod integration_tests {
                 assert!(fingerprints.contains(&wallet.fingerprint(cosigner)));
             }
         }
+    }
+
+    /// The scanner's coins of `wallet`.
+    #[cfg(feature = "musig")]
+    fn scanner_coins(wallet: &MusigWallet) -> Vec<Coin> {
+        wallet
+            .coins
+            .iter()
+            .map(|outpoint| wallet.account.scanner().get_coin(outpoint).unwrap())
+            .collect()
+    }
+
+    /// `spend_leaves_for` and `restrict_spend_path_for` on the scanner's coins and tip
+    /// give what `spend_leaves` and `restrict_spend_path` give, on a wallet of `policy`
+    /// over `n` cosigners and two coins.
+    #[cfg(feature = "musig")]
+    fn assert_explicit_coins_match_the_scanner(n: usize, policy: fn(&[Cosigner]) -> String) {
+        let wallet = MusigWallet::new(n, policy, 2);
+        wait_tip(&wallet.account, &wallet.bitcoind);
+        let tip = wallet.account.header_store().unwrap().tip();
+        let coins = scanner_coins(&wallet);
+        let leaves = wallet.account.spend_leaves(&wallet.coins).unwrap();
+        assert_eq!(
+            wallet.account.spend_leaves_for(&coins, tip).unwrap(),
+            leaves
+        );
+        assert_eq!(
+            wallet.account.spend_leaves_for(&[], tip).unwrap(),
+            wallet.account.spend_leaves(&[]).unwrap()
+        );
+        let before = wallet.psbt();
+        for leaf in &leaves {
+            let mut scanner = before.clone();
+            wallet
+                .account
+                .restrict_spend_path(&mut scanner, leaf.path)
+                .unwrap();
+            let mut explicit = before.clone();
+            wallet
+                .account
+                .restrict_spend_path_for(&mut explicit, leaf.path, &coins)
+                .unwrap();
+            assert_eq!(explicit, scanner);
+        }
+    }
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn explicit_coins_match_the_scanner() {
+        assert_explicit_coins_match_the_scanner(2, two_of_two);
+        assert_explicit_coins_match_the_scanner(4, two_of_three);
+        assert_explicit_coins_match_the_scanner(4, musig_or_timelocked);
+        assert_explicit_coins_match_the_scanner(3, bup_primary_only_two_of_three);
+    }
+
+    /// Index of a change address past the scanner's look-ahead of 20.
+    #[cfg(feature = "musig")]
+    const UNSCANNED_INDEX: u32 = 50;
+
+    #[cfg(feature = "musig")]
+    #[test]
+    fn spend_a_coin_the_scanner_does_not_know() {
+        let wallet = MusigWallet::new(4, musig_or_timelocked, 1);
+        let descriptor = wallet.account.scanner().descriptor();
+        let script = derive_descriptor(&descriptor, KeyChain::Change, UNSCANNED_INDEX)
+            .unwrap()
+            .script_pubkey();
+        let address = Address::from_script(&script, Network::Regtest).unwrap();
+        let txid = send_to_address(&wallet.bitcoind, &address, Amount::from_sat(100_000));
+        let funding = get_tx(&wallet.bitcoind, txid);
+        generate(&wallet.bitcoind, 1);
+        let height = get_block_height(&wallet.bitcoind);
+        let vout = funding
+            .output
+            .iter()
+            .position(|txout| txout.script_pubkey == script)
+            .unwrap();
+        let outpoint = OutPoint::new(txid, vout as u32);
+        let coin = Coin {
+            txout: funding.output[vout].clone(),
+            outpoint,
+            height: Some(u64::from(height)),
+            spend_info: CoinSpendInfo::Bip32 {
+                coin_path: (KeyChain::Change, UNSCANNED_INDEX),
+                descriptor: descriptor.clone(),
+            },
+            ..scanner_coins(&wallet).remove(0)
+        };
+        wait_tip(&wallet.account, &wallet.bitcoind);
+        assert!(wallet.account.scanner().get_coin(&outpoint).is_none());
+        assert!(matches!(
+            wallet.account.spend_leaves(&[outpoint]),
+            Err(Error::Musig(_))
+        ));
+
+        // Confirmed at `height`: the older(10) leaf is spendable from tip height + 9.
+        let ab = vec![wallet.fingerprint(0), wallet.fingerprint(1)];
+        for (tip, timelocked) in [
+            (None, false),
+            (Some(height + 8), false),
+            (Some(height + 9), true),
+        ] {
+            let leaves = wallet
+                .account
+                .spend_leaves_for(std::slice::from_ref(&coin), tip)
+                .unwrap();
+            assert_eq!(leaves.len(), 3);
+            assert_eq!(leaves[1].signers, ab);
+            assert!(leaves[1].spendable);
+            assert_eq!(leaves[2].relative, Some(10));
+            assert_eq!(leaves[2].spendable, timelocked);
+        }
+        let leaves = wallet
+            .account
+            .spend_leaves_for(std::slice::from_ref(&coin), Some(height))
+            .unwrap();
+
+        let silent_payment = Coin {
+            spend_info: CoinSpendInfo::Sp { tweak: [0; 32] },
+            ..coin.clone()
+        };
+        assert!(matches!(
+            wallet
+                .account
+                .spend_leaves_for(std::slice::from_ref(&silent_payment), Some(height)),
+            Err(Error::Musig(_))
+        ));
+
+        let mut builder = wallet.account.tx_builder();
+        builder.new_template();
+        builder.tx_template.inputs = vec![coin.clone()];
+        builder.dummy_external_output(50_000);
+        let mut psbt = builder.generate().unwrap();
+        let before = psbt.clone();
+        assert!(matches!(
+            wallet
+                .account
+                .restrict_spend_path(&mut psbt, leaves[1].path),
+            Err(Error::UnknownSpendPath)
+        ));
+        assert!(matches!(
+            wallet.account.restrict_spend_path_for(
+                &mut psbt,
+                leaves[1].path,
+                std::slice::from_ref(&silent_payment)
+            ),
+            Err(Error::UnknownSpendPath)
+        ));
+        assert_eq!(psbt, before);
+
+        wallet
+            .account
+            .restrict_spend_path_for(&mut psbt, leaves[1].path, std::slice::from_ref(&coin))
+            .unwrap();
+        assert_eq!(psbt.inputs[0].tap_scripts.len(), 1);
+        wallet.round(&mut psbt, &[0, 1]);
+        wallet.round(&mut psbt, &[0, 1]);
+        assert_eq!(wallet.status(&psbt), MusigRound::Ready);
+        let tx = wallet.account.finalize(&mut psbt).unwrap();
+        wallet.mine(&tx);
     }
 
     #[cfg(feature = "musig")]
