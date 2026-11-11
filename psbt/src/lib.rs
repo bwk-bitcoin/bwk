@@ -2,6 +2,7 @@
 
 #[cfg(feature = "musig")]
 pub mod musig;
+pub mod nonce_cache;
 pub mod sp;
 pub mod taproot;
 
