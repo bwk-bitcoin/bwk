@@ -252,13 +252,14 @@ Global error table:
 | 0x0B      | Internal device error                                |
 | 0x0C      | Private key export refused (Get Keys)                |
 | 0x0D      | Session missing, consumed or mismatched              |
-| 0x0E–0xFE | Reserved for future standard codes                   |
+| 0x0E      | Descriptor alias already registered                  |
+| 0x0F–0xFE | Reserved for future standard codes                   |
 | 0xFF      | Vendor-specific (meaning carried by `ERROR_MESSAGE`) |
 +-----------+------------------------------------------------------+
 ```
 
-`0x00` is reserved and MUST NOT be sent. `0x01`–`0x0D` are the standard codes above;
-`0x0E`–`0xFE` are reserved for future standard codes. `0xFF` is vendor-specific: the
+`0x00` is reserved and MUST NOT be sent. `0x01`–`0x0E` are the standard codes above;
+`0x0F`–`0xFE` are reserved for future standard codes. `0xFF` is vendor-specific: the
 code alone is not meaningful, so `ERROR_MESSAGE` carries the description. A receiver
 MUST NOT reject an unrecognized `ERROR`; `STATUS` = `1` already denotes an error,
 and it SHOULD fall back to `ERROR_MESSAGE`.
@@ -719,7 +720,7 @@ Machine-checkable vectors accompany this specification:
   an unknown `SIG_KIND` that a reader skips.
 - `nonce_cache.json`: Nonce Preparation request/response.
 - `errors.json`: error responses (`STATUS` = `1`), standard and vendor codes,
-  including `0x0D` (session).
+  including `0x0D` (session) and `0x0E` (alias already registered).
 - `versioning.json`: forward compatibility, a message whose `VERSION` is above 1
   and which carries trailing bytes a version-1 parser does not know.
 

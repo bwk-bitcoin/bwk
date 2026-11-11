@@ -113,7 +113,7 @@ enum bwk_qr_release_flag {
 };
 
 /* Open: a value outside this list passes through as an unknown code, and must sit in
- * 0x0e..=0xfe to encode. */
+ * 0x0f..=0xfe to encode. */
 enum bwk_qr_response_error {
     BWK_QR_RESPONSE_ERROR_USER_DECLINED = 0x01,
     BWK_QR_RESPONSE_ERROR_UNSUPPORTED_VERSION = 0x02,
@@ -128,6 +128,7 @@ enum bwk_qr_response_error {
     BWK_QR_RESPONSE_ERROR_INTERNAL = 0x0b,
     BWK_QR_RESPONSE_ERROR_PRIVATE_KEY_EXPORT_REFUSED = 0x0c,
     BWK_QR_RESPONSE_ERROR_MUSIG_SESSION = 0x0d,
+    BWK_QR_RESPONSE_ERROR_ALREADY_REGISTERED = 0x0e,
     BWK_QR_RESPONSE_ERROR_VENDOR = 0xff
 };
 
