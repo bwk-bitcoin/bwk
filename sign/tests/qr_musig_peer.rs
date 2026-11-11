@@ -24,9 +24,12 @@ use bwk_psbt::{
 };
 use bwk_qr_protocol::{
     encode_response,
-    request::{self, Descriptor as QrDescriptor, DescriptorBody, PrepareNonces, Sign},
-    response, types, Message, Request as QrRequest, RequestId as QrRequestId,
-    Response as QrResponse, SignResponseKind,
+    request::{
+        self, Descriptor as QrDescriptor, DescriptorBody, PrepareNonces, RegisterDescriptor, Sign,
+    },
+    response::{self, Registration},
+    types, Message, Request as QrRequest, RequestId as QrRequestId, Response as QrResponse,
+    SignResponseKind,
 };
 use bwk_sign::{
     error::Error as SignError,
@@ -34,7 +37,10 @@ use bwk_sign::{
     identity::SignerId,
     musig::{aggregate_partial_sigs, slot_infos},
     protocol::{Request, RequestId, Response},
-    qr_musig::{decode_record, encode_record, Error, QrMusigPeer, QrMusigPeerRecord, MAX_SESSIONS},
+    qr_musig::{
+        decode_record, decode_registered, encode_record, encode_registered, Error, QrMusigPeer,
+        QrMusigPeerRecord, MAX_SESSIONS,
+    },
     qr_musig_host::{Issuance, QrMusigHost, QrMusigHostRecord, QrMusigHostResponse},
 };
 use miniscript::bitcoin::{
@@ -45,13 +51,13 @@ use miniscript::bitcoin::{
     Amount, Network, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
 
-struct Persistence<V> {
-    committed: BTreeMap<[u8; 4], V>,
+struct Persistence<K, V> {
+    committed: BTreeMap<K, V>,
     flushes: usize,
     fail_at: BTreeSet<usize>,
 }
 
-impl<V> Default for Persistence<V> {
+impl<K, V> Default for Persistence<K, V> {
     fn default() -> Self {
         Self {
             committed: BTreeMap::new(),
@@ -61,13 +67,13 @@ impl<V> Default for Persistence<V> {
     }
 }
 
-struct TestStore<V> {
-    ram: BTreeMap<[u8; 4], V>,
-    persistence: Arc<Mutex<Persistence<V>>>,
+struct TestStore<K, V> {
+    ram: BTreeMap<K, V>,
+    persistence: Arc<Mutex<Persistence<K, V>>>,
 }
 
-impl<V: Clone> TestStore<V> {
-    fn open(persistence: &Arc<Mutex<Persistence<V>>>) -> Self {
+impl<K: Ord + Clone, V: Clone> TestStore<K, V> {
+    fn open(persistence: &Arc<Mutex<Persistence<K, V>>>) -> Self {
         let ram = persistence.lock().unwrap().committed.clone();
         Self {
             ram,
@@ -76,8 +82,8 @@ impl<V: Clone> TestStore<V> {
     }
 }
 
-impl<V: Clone> Store for TestStore<V> {
-    type Key = [u8; 4];
+impl<K: Ord + Clone, V: Clone> Store for TestStore<K, V> {
+    type Key = K;
     type Value = V;
 
     fn get(&self, key: &Self::Key) -> Result<Option<Self::Value>, PersistError> {
@@ -92,7 +98,9 @@ impl<V: Clone> Store for TestStore<V> {
         &self,
     ) -> Result<Box<dyn Iterator<Item = (Self::Key, Self::Value)> + '_>, PersistError> {
         Ok(Box::new(
-            self.ram.iter().map(|(key, value)| (*key, value.clone())),
+            self.ram
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
         ))
     }
 
@@ -134,14 +142,17 @@ impl<V: Clone> Store for TestStore<V> {
     }
 }
 
-type PeerPersistence = Arc<Mutex<Persistence<QrMusigPeerRecord>>>;
+type PeerPersistence = Arc<Mutex<Persistence<[u8; 4], QrMusigPeerRecord>>>;
+type RegistryPersistence = Arc<Mutex<Persistence<String, WalletDescriptor>>>;
+type Peer = QrMusigPeer<TestStore<[u8; 4], QrMusigPeerRecord>, TestStore<String, WalletDescriptor>>;
 
 /// `tr(musig(a2,b2)/<0;1>/*,pk(musig(a3,b3)/<0;1>/*))`: the peer signs for `a`,
 /// whose key expression index is 0 at the role 2 path and 1 at the role 3 path.
 struct Fixture {
-    peer: QrMusigPeer<TestStore<QrMusigPeerRecord>>,
+    peer: Peer,
     persistence: PeerPersistence,
-    host: QrMusigHost<TestStore<QrMusigHostRecord>>,
+    registry: RegistryPersistence,
+    host: QrMusigHost<TestStore<[u8; 4], QrMusigHostRecord>>,
     a: HotSigner,
     b: HotSigner,
     text: String,
@@ -259,8 +270,12 @@ fn signer(seed: u8) -> HotSigner {
     )
 }
 
-fn peer(persistence: &PeerPersistence) -> QrMusigPeer<TestStore<QrMusigPeerRecord>> {
-    QrMusigPeer::from_store(signer(1), TestStore::open(persistence))
+fn peer(persistence: &PeerPersistence, registry: &RegistryPersistence) -> Peer {
+    QrMusigPeer::from_store(
+        signer(1),
+        TestStore::open(persistence),
+        TestStore::open(registry),
+    )
 }
 
 fn fixture() -> Fixture {
@@ -279,9 +294,11 @@ fn fixture() -> Fixture {
         .into_miniscript()
         .unwrap();
     let persistence = PeerPersistence::default();
+    let registry = RegistryPersistence::default();
     Fixture {
-        peer: peer(&persistence),
+        peer: peer(&persistence, &registry),
         persistence,
+        registry,
         host: QrMusigHost::from_store(TestStore::open(&Default::default())),
         a,
         b,
@@ -375,7 +392,7 @@ fn preparation_retries_return_the_same_nonces_and_reference() {
         prepared
     );
     assert_eq!(f.committed().len(), 1);
-    f.peer = peer(&f.persistence);
+    f.peer = peer(&f.persistence, &f.registry);
     assert_eq!(f.peer.prepare(preparation([1; 4], None)).unwrap(), prepared);
 
     let other = f.peer.prepare(preparation([2; 4], None)).unwrap();
@@ -429,7 +446,7 @@ fn issuance_flush_failure_releases_nothing_and_retries() {
     assert!(f.committed().is_empty());
     let prepared = f.peer.prepare(preparation([1; 4], None)).unwrap();
     assert_eq!(f.committed().len(), 1);
-    f.peer = peer(&f.persistence);
+    f.peer = peer(&f.persistence, &f.registry);
     assert_eq!(f.peer.prepare(preparation([1; 4], None)).unwrap(), prepared);
 }
 
@@ -476,7 +493,7 @@ fn signed_session_is_deleted_and_refuses_a_replay() {
     f.peer.sign(signing.clone()).unwrap();
     assert!(f.committed().is_empty());
     assert_session_refusal(f.peer.sign(signing.clone()));
-    f.peer = peer(&f.persistence);
+    f.peer = peer(&f.persistence, &f.registry);
     assert_session_refusal(f.peer.sign(signing));
 }
 
@@ -740,6 +757,131 @@ fn host_rejects_a_reply_failing_partial_signature_verification() {
     assert!(f.host.record(&session_id).unwrap().is_none());
 }
 
+fn registration(alias: &str, descriptor: Option<DescriptorBody>) -> RegisterDescriptor {
+    RegisterDescriptor {
+        descriptor_alias: alias.to_string(),
+        descriptor,
+    }
+}
+
+fn bip380_body(f: &Fixture) -> DescriptorBody {
+    DescriptorBody::Bip380(f.text.clone())
+}
+
+fn bip388_body(f: &Fixture, policy: &str) -> DescriptorBody {
+    bip388_descriptors(f, policy).remove(0).descriptor.unwrap()
+}
+
+fn assert_registration(registration: Registration, alias: &str, registered: bool) {
+    assert_eq!(
+        registration,
+        Registration {
+            descriptor_alias: alias.to_string(),
+            registered: Some(registered),
+            stored: Some(registered),
+            proof: None,
+        }
+    );
+}
+
+#[test]
+fn register_stores_the_alias_and_answers_its_status() {
+    let mut f = fixture();
+    assert_registration(
+        f.peer.register(registration("peer", None)).unwrap(),
+        "peer",
+        false,
+    );
+    assert!(f.registry.lock().unwrap().committed.is_empty());
+
+    let body = bip380_body(&f);
+    assert_registration(
+        f.peer
+            .register(registration("peer", Some(body.clone())))
+            .unwrap(),
+        "peer",
+        true,
+    );
+    assert_eq!(f.registry.lock().unwrap().committed["peer"], f.descriptor);
+    assert_registration(
+        f.peer.register(registration("peer", Some(body))).unwrap(),
+        "peer",
+        true,
+    );
+    let same = bip388_body(&f, "tr(musig(@0,@1)/**,pk(musig(@2,@3)/**))");
+    assert_registration(
+        f.peer.register(registration("peer", Some(same))).unwrap(),
+        "peer",
+        true,
+    );
+    let other = bip388_body(&f, "tr(musig(@2,@3)/**,pk(musig(@0,@1)/**))");
+    assert!(matches!(
+        f.peer.register(registration("peer", Some(other.clone()))),
+        Err(Error::AlreadyRegistered(alias)) if alias == "peer"
+    ));
+    assert_eq!(f.registry.lock().unwrap().committed["peer"], f.descriptor);
+    assert_registration(
+        f.peer.register(registration("other", Some(other))).unwrap(),
+        "other",
+        true,
+    );
+
+    f.peer = peer(&f.persistence, &f.registry);
+    assert_registration(
+        f.peer.register(registration("peer", None)).unwrap(),
+        "peer",
+        true,
+    );
+    assert_registration(
+        f.peer.register(registration("unknown", None)).unwrap(),
+        "unknown",
+        false,
+    );
+}
+
+#[test]
+fn another_descriptor_under_a_registered_alias_is_the_already_registered_error() {
+    let mut f = fixture();
+    f.peer
+        .register(registration("peer", Some(bip380_body(&f))))
+        .unwrap();
+    let refused = f.peer.handle(QrRequest {
+        id: QrRequestId([4, 4]),
+        body: request::Body::RegisterDescriptor(registration(
+            "peer",
+            Some(bip388_body(&f, "tr(musig(@2,@3)/**,pk(musig(@0,@1)/**))")),
+        )),
+    });
+    assert_eq!(refused.id, QrRequestId([4, 4]));
+    assert!(matches!(
+        refused.body,
+        response::Body::Error(response::ErrorBody {
+            error: response::Error::AlreadyRegistered,
+            ..
+        })
+    ));
+    let status = f.peer.handle(QrRequest {
+        id: QrRequestId([4, 5]),
+        body: request::Body::RegisterDescriptor(registration("peer", None)),
+    });
+    assert!(matches!(
+        status.body,
+        response::Body::Registration(Registration {
+            registered: Some(true),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn registered_descriptor_codec_roundtrips() {
+    let f = fixture();
+    let bytes = encode_registered(&f.descriptor);
+    assert_eq!(decode_registered(&bytes).unwrap(), f.descriptor);
+    assert!(decode_registered(&bytes[..bytes.len() - 1]).is_err());
+    assert!(decode_registered(&[0xff]).is_err());
+}
+
 #[test]
 fn signing_refusals_keep_the_session() {
     let mut f = fixture();
@@ -817,7 +959,7 @@ fn failed_deletion_releases_nothing() {
     assert_session_refusal(f.peer.sign(signing.clone()));
     // No signature left, so the session the disk still holds is safe to use.
     assert!(f.committed().contains_key(&session_id));
-    f.peer = peer(&f.persistence);
+    f.peer = peer(&f.persistence, &f.registry);
     let signed = signed_psbt(f.peer.sign(signing).unwrap());
     assert_eq!(
         musig_input_partial_sigs(&signed.inputs[0]).unwrap().len(),
