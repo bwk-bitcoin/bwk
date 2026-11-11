@@ -237,6 +237,30 @@ impl Fixture {
         psbt
     }
 
+    /// A Signing request for `psbt` without a nonce cache session.
+    fn two_round(&self, psbt: &Psbt) -> Sign {
+        Sign {
+            descriptors: self.descriptors(),
+            psbt: psbt.serialize(),
+            want_kind: None,
+        }
+    }
+
+    /// Replaces the descriptor with `tr(musig(a2,b2)/<0;1>/*,pk(a4/<0;1>/*))`: `a`
+    /// also has an ordinary key.
+    fn with_plain_leaf(&mut self) {
+        self.text = format!(
+            "tr(musig({},{})/<0;1>/*,pk({}/<0;1>/*))",
+            self.a.xpub(&role_path(2)),
+            self.b.xpub(&role_path(2)),
+            self.a.xpub(&role_path(4))
+        );
+        self.descriptor = Descriptor::from_str(&self.text)
+            .unwrap()
+            .into_miniscript()
+            .unwrap();
+    }
+
     fn committed(&self) -> BTreeMap<[u8; 4], QrMusigPeerRecord> {
         self.persistence.lock().unwrap().committed.clone()
     }
@@ -757,6 +781,152 @@ fn host_rejects_a_reply_failing_partial_signature_verification() {
     assert!(f.host.record(&session_id).unwrap().is_none());
 }
 
+fn has_signature(psbt: &Psbt) -> bool {
+    psbt.inputs.iter().any(|input| {
+        !musig_input_partial_sigs(input).unwrap().is_empty()
+            || input.tap_key_sig.is_some()
+            || !input.tap_script_sigs.is_empty()
+            || !input.partial_sigs.is_empty()
+    })
+}
+
+#[test]
+fn two_rounds_return_nonces_then_partial_signatures() {
+    let mut f = fixture();
+    let psbt = f.psbt();
+    let round_one = signed_psbt(f.peer.sign(f.two_round(&psbt)).unwrap());
+    assert!(!has_signature(&round_one));
+    for (input, sent) in round_one.inputs.iter().zip(&psbt.inputs) {
+        assert_eq!(
+            musig_input_pub_nonces(input).unwrap().len(),
+            musig_input_pub_nonces(sent).unwrap().len() + 2
+        );
+    }
+    assert_eq!(f.committed().len(), 1);
+
+    f.peer = peer(&f.persistence, &f.registry);
+    let mut signed = signed_psbt(f.peer.sign(f.two_round(&round_one)).unwrap());
+    assert!(f.committed().is_empty());
+    for (input, sent) in signed.inputs.iter().zip(&round_one.inputs) {
+        assert_eq!(musig_input_partial_sigs(input).unwrap().len(), 2);
+        assert_eq!(
+            musig_input_pub_nonces(input).unwrap(),
+            musig_input_pub_nonces(sent).unwrap()
+        );
+    }
+    f.b.inner_sign(&mut signed, &f.descriptor).unwrap();
+    assert_eq!(
+        aggregate_partial_sigs(&mut signed, &f.descriptor).unwrap(),
+        4
+    );
+    assert_session_refusal(f.peer.sign(f.two_round(&round_one)));
+}
+
+#[test]
+fn two_rounds_sign_psbt_v2_and_answer_as_v2() {
+    let mut f = fixture();
+    let psbt = f.psbt();
+    let v2 = PsbtV2::from_bitcoin_psbt(psbt.clone()).unwrap();
+    let base = f.two_round(&psbt);
+    let request = |psbt: &PsbtV2| Sign {
+        psbt: psbt.serialize().unwrap(),
+        ..base.clone()
+    };
+    let response::Signed::Psbt(bytes) = f.peer.sign(request(&v2)).unwrap() else {
+        panic!("not a PSBT");
+    };
+    let round_one = PsbtV2::deserialize(&bytes).unwrap();
+    let response::Signed::Psbt(bytes) = f.peer.sign(request(&round_one)).unwrap() else {
+        panic!("not a PSBT");
+    };
+    let signed = PsbtV2::deserialize(&bytes).unwrap();
+    for input in &signed.inputs {
+        assert_eq!(musig_input_partial_sigs(&input.psbt).unwrap().len(), 2);
+    }
+    assert!(f.committed().is_empty());
+}
+
+#[test]
+fn answer_with_a_nonce_carries_no_ordinary_signature() {
+    let mut f = fixture();
+    f.with_plain_leaf();
+    let mut psbt = spend(&f.descriptor, &[3, 3]);
+    f.b.inner_sign(&mut psbt, &f.descriptor).unwrap();
+    let round_one = signed_psbt(f.peer.sign(f.two_round(&psbt)).unwrap());
+    assert!(!has_signature(&round_one));
+    assert!(musig_input_pub_nonces(&round_one.inputs[0]).unwrap().len() > 1);
+
+    let signed = signed_psbt(f.peer.sign(f.two_round(&round_one)).unwrap());
+    for input in &signed.inputs {
+        assert_eq!(musig_input_partial_sigs(input).unwrap().len(), 1);
+        assert_eq!(input.tap_script_sigs.len(), 1);
+    }
+}
+
+#[test]
+fn own_nonce_without_every_participant_gets_nothing() {
+    let mut f = fixture();
+    let psbt = spend(&f.descriptor, &[3, 3]);
+    let round_one = signed_psbt(f.peer.sign(f.two_round(&psbt)).unwrap());
+    let session = f.committed();
+    assert_eq!(session.len(), 1);
+    let nothing = signed_psbt(f.peer.sign(f.two_round(&round_one)).unwrap());
+    assert_eq!(nothing, round_one);
+    assert_eq!(f.committed(), session);
+
+    let mut ready = round_one;
+    f.b.inner_sign(&mut ready, &f.descriptor).unwrap();
+    let signed = signed_psbt(f.peer.sign(f.two_round(&ready)).unwrap());
+    for input in &signed.inputs {
+        assert_eq!(musig_input_partial_sigs(input).unwrap().len(), 2);
+    }
+    assert!(f.committed().is_empty());
+}
+
+#[test]
+fn round_two_refuses_a_missing_or_replaced_session() {
+    let mut f = fixture();
+    let psbt = f.psbt();
+    let first = signed_psbt(f.peer.sign(f.two_round(&psbt)).unwrap());
+    let second = signed_psbt(f.peer.sign(f.two_round(&psbt)).unwrap());
+    assert_ne!(first, second);
+    assert_eq!(f.committed().len(), 1);
+
+    assert_session_refusal(f.peer.sign(f.two_round(&first)));
+    let refused = f.peer.handle(QrRequest {
+        id: QrRequestId([8, 8]),
+        body: request::Body::Sign(f.two_round(&first)),
+    });
+    assert!(matches!(
+        refused.body,
+        response::Body::Error(response::ErrorBody {
+            error: response::Error::MusigSession,
+            ..
+        })
+    ));
+    assert_eq!(f.committed().len(), 1);
+
+    let empty = PeerPersistence::default();
+    let mut fresh = peer(&empty, &f.registry);
+    assert_session_refusal(fresh.sign(f.two_round(&second)));
+
+    signed_psbt(f.peer.sign(f.two_round(&second)).unwrap());
+    assert!(f.committed().is_empty());
+}
+
+#[test]
+fn two_round_session_sits_beside_issued_sessions() {
+    let mut f = fixture();
+    let session_id = f.issue(2);
+    let round_one = signed_psbt(f.peer.sign(f.two_round(&f.psbt())).unwrap());
+    assert_eq!(f.committed().len(), 2);
+    signed_psbt(f.peer.sign(f.two_round(&round_one)).unwrap());
+    assert_eq!(f.committed().keys().collect::<Vec<_>>(), vec![&session_id]);
+    let signing = f.signing(session_id, &f.psbt());
+    signed_psbt(f.peer.sign(signing).unwrap());
+    assert!(f.committed().is_empty());
+}
+
 fn registration(alias: &str, descriptor: Option<DescriptorBody>) -> RegisterDescriptor {
     RegisterDescriptor {
         descriptor_alias: alias.to_string(),
@@ -975,12 +1145,10 @@ fn signing_refusals_keep_the_session() {
         ..signing.clone()
     };
 
+    // Without the field, it is a round 2 of no two-round session.
     let mut unnamed = psbt.clone();
     unnamed.unknown.clear();
-    assert!(matches!(
-        f.peer.sign(with(&unnamed)),
-        Err(Error::Request(_))
-    ));
+    assert_session_refusal(f.peer.sign(with(&unnamed)));
 
     let mut wrong_ref = psbt.clone();
     set_nonce_cache_session(

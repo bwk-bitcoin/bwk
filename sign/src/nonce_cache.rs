@@ -93,7 +93,7 @@ impl Drop for SessionSecret {
 }
 
 /// The BIP-340 tagged hash of the concatenation of `parts`.
-fn tagged_hash(tag: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+pub(crate) fn tagged_hash(tag: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     let tag = sha256::Hash::hash(tag);
     let mut engine = sha256::Hash::engine();
     engine.input(tag.as_byte_array());

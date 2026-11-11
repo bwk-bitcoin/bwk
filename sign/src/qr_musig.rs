@@ -1,12 +1,14 @@
 //! Hot QR MuSig peer on nonce cache sessions (`bip-nonce-cache/BIP-DRAFT.md`): it
 //! issues public nonces with Nonce Preparation, and signs in one round a Signing
-//! PSBT that names one of its sessions in `PSBT_GLOBAL_NONCE_CACHE_SESSION`.
+//! PSBT that names one of its sessions in `PSBT_GLOBAL_NONCE_CACHE_SESSION`. A
+//! Signing PSBT without that field runs two rounds on a session the peer keys from
+//! the descriptors it signs for.
 //!
 //! The session secrets live only in the caller's session store, and registered
 //! descriptors in its registry store. The peer must own both exclusively, and their
 //! successful flush must be durable.
 
-use std::str::FromStr;
+use std::{collections::BTreeSet, str::FromStr};
 
 use bwk_descriptor::{
     descriptor::Descriptor,
@@ -28,7 +30,8 @@ use miniscript::bitcoin::{bip32::DerivationPath, Psbt};
 use crate::{
     error::Error as SignError,
     hot_signer::{wipe, HotSigner},
-    nonce_cache::{SessionSecret, SECRET_LEN, SESSION_ID_LEN},
+    musig::TwoRoundStep,
+    nonce_cache::{tagged_hash, SessionSecret, SECRET_LEN, SESSION_ID_LEN},
     protocol::{Request, Response},
 };
 
@@ -36,6 +39,7 @@ use crate::{
 pub const MAX_SESSIONS: usize = 16;
 const SEQUENCE_LEN: usize = 8;
 const RECORD_LEN: usize = SEQUENCE_LEN + SECRET_LEN;
+const TWO_ROUND_SESSION_TAG: &[u8] = b"bwk/qr-musig/two-round-session";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -163,6 +167,8 @@ where
         }
     }
 
+    /// Stores a new session under `session_id`, replacing the one held there, or
+    /// evicting the oldest when the store is full.
     fn create_session(&mut self, session_id: [u8; SESSION_ID_LEN]) -> Result<SessionSecret, Error> {
         let records: Vec<_> = self.store.iter()?.collect();
         let sequence = records
@@ -170,7 +176,8 @@ where
             .map(|(_, record)| record.sequence + 1)
             .max()
             .unwrap_or(0);
-        if records.len() >= MAX_SESSIONS {
+        let replaced = records.iter().any(|(held, _)| *held == session_id);
+        if !replaced && records.len() >= MAX_SESSIONS {
             if let Some((oldest, _)) = records.iter().min_by_key(|(_, record)| record.sequence) {
                 self.store.remove(oldest)?;
             }
@@ -186,16 +193,32 @@ where
         Ok(secret)
     }
 
-    /// Signs with the session the PSBT names, then deletes it durably before the
-    /// signed PSBT leaves: a failed deletion releases nothing.
+    /// Signs in one round with the session the PSBT names, or runs the two rounds
+    /// without it.
     pub fn sign(&mut self, request: Sign) -> Result<Signed, Error> {
-        let mut psbt = SigningPsbt::deserialize(&request.psbt)?;
-        let session = psbt
-            .session()?
-            .ok_or_else(|| Error::Request("no nonce cache session".to_string()))?;
+        let psbt = SigningPsbt::deserialize(&request.psbt)?;
         if request.descriptors.is_empty() {
             return Err(Error::Request("no descriptor".to_string()));
         }
+        let descriptors = request
+            .descriptors
+            .iter()
+            .map(|descriptor| self.signing_descriptor(descriptor))
+            .collect::<Result<Vec<_>, _>>()?;
+        match psbt.session()? {
+            Some(session) => self.sign_one_round(psbt, &descriptors, session),
+            None => self.sign_two_rounds(psbt, &descriptors),
+        }
+    }
+
+    /// Signs with the session the PSBT names, then deletes it durably before the
+    /// signed PSBT leaves: a failed deletion releases nothing.
+    fn sign_one_round(
+        &mut self,
+        mut psbt: SigningPsbt,
+        descriptors: &[WalletDescriptor],
+        session: NonceCacheSession,
+    ) -> Result<Signed, Error> {
         let record = self
             .store
             .get(&session.session_id)?
@@ -203,12 +226,76 @@ where
         if record.secret.session_ref() != session.session_ref {
             return Err(SignError::MusigSession.into());
         }
-        for descriptor in &request.descriptors {
-            let descriptor = self.signing_descriptor(descriptor)?;
-            psbt.sign(&self.signer, &descriptor, &record.secret)?;
+        for descriptor in descriptors {
+            psbt.sign(&self.signer, descriptor, &record.secret)?;
         }
+        self.release(psbt, session.session_id)
+    }
+
+    /// The step the PSBT asks across `descriptors`: round 1, round 2, or nothing,
+    /// on the session keyed from `descriptors`.
+    fn sign_two_rounds(
+        &mut self,
+        psbt: SigningPsbt,
+        descriptors: &[WalletDescriptor],
+    ) -> Result<Signed, Error> {
+        let mut step = TwoRoundStep::NotOwned;
+        for descriptor in descriptors {
+            step = step.max(psbt.two_round_step(&self.signer, descriptor)?);
+        }
+        let session_id = two_round_session_id(descriptors);
+        match step {
+            TwoRoundStep::NotOwned => Err(SignError::InputNotOwned.into()),
+            TwoRoundStep::Nothing => Ok(Signed::Psbt(psbt.serialize()?)),
+            TwoRoundStep::PartialSigs => self.round_two(psbt, descriptors, session_id),
+            TwoRoundStep::PubNonces => self.round_one(psbt, descriptors, session_id),
+        }
+    }
+
+    /// Draws a new session under `session_id`, replacing the one held there, and
+    /// stores it durably before the public nonces leave.
+    fn round_one(
+        &mut self,
+        mut psbt: SigningPsbt,
+        descriptors: &[WalletDescriptor],
+        session_id: [u8; SESSION_ID_LEN],
+    ) -> Result<Signed, Error> {
+        let secret = self.create_session(session_id)?;
+        for descriptor in descriptors {
+            psbt.round_one(&self.signer, descriptor, &secret)?;
+        }
+        let nonces = psbt.serialize()?;
+        self.store.flush()?;
+        Ok(Signed::Psbt(nonces))
+    }
+
+    /// Signs with the session held under `session_id`, then deletes it durably
+    /// before the signed PSBT leaves.
+    fn round_two(
+        &mut self,
+        mut psbt: SigningPsbt,
+        descriptors: &[WalletDescriptor],
+        session_id: [u8; SESSION_ID_LEN],
+    ) -> Result<Signed, Error> {
+        let record = self
+            .store
+            .get(&session_id)?
+            .ok_or(SignError::MusigSession)?;
+        for descriptor in descriptors {
+            psbt.round_two(&self.signer, descriptor, &record.secret)?;
+        }
+        self.release(psbt, session_id)
+    }
+
+    /// Deletes the session durably, then releases the signed PSBT: a failed
+    /// deletion releases nothing.
+    fn release(
+        &mut self,
+        psbt: SigningPsbt,
+        session_id: [u8; SESSION_ID_LEN],
+    ) -> Result<Signed, Error> {
         let signed = psbt.serialize()?;
-        self.store.remove(&session.session_id)?;
+        self.store.remove(&session_id)?;
         self.store.flush()?;
         Ok(Signed::Psbt(signed))
     }
@@ -330,12 +417,66 @@ impl SigningPsbt {
         }
     }
 
+    fn two_round_step(
+        &self,
+        signer: &HotSigner,
+        descriptor: &WalletDescriptor,
+    ) -> Result<TwoRoundStep, SignError> {
+        match self {
+            Self::V0(psbt) => signer.two_round_step(psbt, descriptor),
+            Self::V2(psbt) => signer.two_round_step_v2(psbt, descriptor),
+        }
+    }
+
+    fn round_one(
+        &mut self,
+        signer: &HotSigner,
+        descriptor: &WalletDescriptor,
+        secret: &SessionSecret,
+    ) -> Result<(), SignError> {
+        match self {
+            Self::V0(psbt) => signer.nonce_cache_round_one(psbt, descriptor, secret),
+            Self::V2(psbt) => signer.nonce_cache_round_one_v2(psbt, descriptor, secret),
+        }
+    }
+
+    fn round_two(
+        &mut self,
+        signer: &HotSigner,
+        descriptor: &WalletDescriptor,
+        secret: &SessionSecret,
+    ) -> Result<(), SignError> {
+        match self {
+            Self::V0(psbt) => signer.nonce_cache_round_two(psbt, descriptor, secret),
+            Self::V2(psbt) => signer.nonce_cache_round_two_v2(psbt, descriptor, secret),
+        }
+    }
+
     fn serialize(&self) -> Result<Vec<u8>, SignError> {
         match self {
             Self::V0(psbt) => Ok(psbt.serialize()),
             Self::V2(psbt) => psbt.serialize().map_err(|_| SignError::PsbtV2),
         }
     }
+}
+
+/// The session of a PSBT without a nonce cache session field, from the set of
+/// descriptors it is signed for. An issuance under the same `session_id` shares the
+/// session: it can only replace or consume it, and every session still signs once.
+fn two_round_session_id(descriptors: &[WalletDescriptor]) -> [u8; SESSION_ID_LEN] {
+    let texts: BTreeSet<String> = descriptors
+        .iter()
+        .map(|descriptor| musig_descriptor_to_string(descriptor, false))
+        .collect();
+    let mut data = Vec::new();
+    for text in &texts {
+        data.extend_from_slice(&(text.len() as u64).to_le_bytes());
+        data.extend_from_slice(text.as_bytes());
+    }
+    let hash = tagged_hash(TWO_ROUND_SESSION_TAG, &[&data]);
+    let mut session_id = [0; SESSION_ID_LEN];
+    session_id.copy_from_slice(&hash[..SESSION_ID_LEN]);
+    session_id
 }
 
 fn wire_error(error: &Error) -> response::Error {

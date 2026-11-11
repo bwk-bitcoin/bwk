@@ -215,9 +215,10 @@ With `musig`, `qr_musig::QrMusigPeer` and `qr_musig_host::QrMusigHost` sign MuSi
 in one round over the QR protocol, with the nonce cache sessions of
 `bip-nonce-cache/BIP-DRAFT.md`: nonces are issued with Nonce Preparation before
 any transaction exists, and signing is an ordinary Signing exchange whose PSBT
-names the session in `PSBT_GLOBAL_NONCE_CACHE_SESSION`. Only aggregate then
-derive, as in `musig(A,B)/<0;1>/*`, is in scope: the participant key is then the
-same at every input.
+names the session in `PSBT_GLOBAL_NONCE_CACHE_SESSION`. A Signing PSBT without
+that field runs the two rounds of BIP-327 on a session the peer keys itself.
+Only aggregate then derive, as in `musig(A,B)/<0;1>/*`, is in scope: the
+participant key is then the same at every input.
 
 ### Peer
 
@@ -251,16 +252,36 @@ key expression index of the range and every input below `max_inputs`, ordered by
 key expression index then input. The store is flushed before the answer leaves.
 
 `sign(Sign)` takes a PSBT v0 or v2 and answers in the same version. It refuses a
-PSBT that names no session, and a session it does not hold with that reference.
-A descriptor entry carries a BIP-380 body or a BIP-388 wallet policy (`/**`
-expands to `/<0;1>/*`, `@i` to the i-th key, and every key must be used), or only
-an alias. With a registered alias, a body must be the registered descriptor
-(`ERROR` `0x0E` otherwise) and an alias alone uses it; with an unknown alias, the
-body is used without registering it, and an alias alone is refused with `ERROR`
-`0x04`. A proof of registration is ignored. The signer signs each through
-`HotSigner::sign_nonce_cache` (`sign_nonce_cache_v2` for a PSBTv2), which refuses
-a slot whose 0x1b is not the nonce it derives. The session is then removed and the
-store flushed before the signed PSBT leaves: a failed flush releases nothing.
+PSBT naming a session it does not hold with that reference. A descriptor entry
+carries a BIP-380 body or a BIP-388 wallet policy (`/**` expands to `/<0;1>/*`,
+`@i` to the i-th key, and every key must be used), or only an alias. With a
+registered alias, a body must be the registered descriptor (`ERROR` `0x0E`
+otherwise) and an alias alone uses it; with an unknown alias, the body is used
+without registering it, and an alias alone is refused with `ERROR` `0x04`. A
+proof of registration is ignored. The signer signs each through
+`HotSigner::sign_nonce_cache` (`sign_nonce_cache_v2` for a PSBTv2), which
+refuses a slot whose 0x1b is not the nonce it derives. The session is then
+removed and the store flushed before the signed PSBT leaves: a failed flush
+releases nothing.
+
+Without the field, the session is the one held under a `session_id` the peer
+derives from the descriptors it signs for: the first 4 bytes of a tagged hash
+(`bwk/qr-musig/two-round-session`) over their BIP-390 texts without checksum,
+sorted and each prefixed by its length (8 bytes, little endian). It never leaves
+the peer, and lives in the same store as issued sessions: an issuance under the
+same `session_id` only replaces or consumes it, and every session still signs a
+single PSBT. The highest `HotSigner::two_round_step` across the descriptors
+selects the answer:
+
+- `PubNonces`, round 1: a new session replaces the one held under `session_id`
+  (or is stored as any new session), the store is flushed, then the PSBT leaves
+  with the peer's 0x1b on every own slot without one, and no signature of any
+  kind.
+- `PartialSigs`, round 2: refused with `ERROR` `0x0D` without a session under
+  `session_id`, otherwise `HotSigner::nonce_cache_round_two` signs and the
+  session is removed and flushed before the PSBT leaves, as in one round.
+- `Nothing`: the PSBT comes back unchanged and the session is kept.
+- `NotOwned`: refused with nothing to sign.
 
 `handle(QrRequest)` preserves the inner request ID and answers a refused session
 with the session `ERROR` `0x0D`, an input it does not own with nothing to sign,
