@@ -274,15 +274,48 @@ fn wire_error(error: &Error) -> response::Error {
 }
 
 fn signing_descriptor(descriptor: &request::Descriptor) -> Result<WalletDescriptor, Error> {
-    match &descriptor.descriptor {
-        Some(DescriptorBody::Bip380(text)) => Descriptor::from_str(text)
-            .map_err(|error| Error::Request(error.to_string()))?
-            .into_miniscript()
-            .map_err(|error| Error::Request(error.to_string())),
-        _ => Err(Error::Request(
-            "full BIP380 descriptor required".to_string(),
-        )),
+    let text = match &descriptor.descriptor {
+        Some(DescriptorBody::Bip380(text)) => text.clone(),
+        Some(DescriptorBody::Bip388 { keys, policy }) => bip388_descriptor(keys, policy)?,
+        _ => {
+            return Err(Error::Request(
+                "a BIP-380 or BIP-388 descriptor body is required".to_string(),
+            ))
+        }
+    };
+    Descriptor::from_str(&text)
+        .map_err(|error| Error::Request(error.to_string()))?
+        .into_miniscript()
+        .map_err(|error| Error::Request(error.to_string()))
+}
+
+/// The BIP-380 text of a BIP-388 wallet policy: `/**` expands to `/<0;1>/*`, and
+/// each `@i` becomes `keys[i]`. Every key must be used.
+fn bip388_descriptor(keys: &[String], policy: &str) -> Result<String, Error> {
+    let policy = policy.replace("/**", "/<0;1>/*");
+    let mut used = vec![false; keys.len()];
+    let mut text = String::with_capacity(policy.len());
+    let mut rest = policy.as_str();
+    while let Some(at) = rest.find('@') {
+        text.push_str(&rest[..at]);
+        rest = &rest[at + 1..];
+        let digits = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        let key = rest[..digits]
+            .parse::<usize>()
+            .ok()
+            .filter(|index| *index < keys.len())
+            .ok_or_else(|| Error::Request("invalid BIP-388 key placeholder".to_string()))?;
+        used[key] = true;
+        text.push_str(&keys[key]);
+        rest = &rest[digits..];
     }
+    text.push_str(rest);
+    if used.contains(&false) {
+        return Err(Error::Request("unused BIP-388 key".to_string()));
+    }
+    Ok(text)
 }
 
 /// Value encoder for a caller's RamStore: the creation order (8 bytes little

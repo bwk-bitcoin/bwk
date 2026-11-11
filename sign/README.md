@@ -229,7 +229,9 @@ key expression index then input. The store is flushed before the answer leaves.
 
 `sign(Sign)` takes a PSBT v0 or v2 and answers in the same version. It refuses a
 PSBT that names no session, and a session it does not hold with that reference.
-Every descriptor carries a full BIP-380 body, and the signer signs each through
+Every descriptor carries a full BIP-380 body or a BIP-388 wallet policy (`/**`
+expands to `/<0;1>/*`, `@i` to the i-th key, and every key must be used), and the
+signer signs each through
 `HotSigner::sign_nonce_cache` (`sign_nonce_cache_v2` for a PSBTv2), which refuses
 a slot whose 0x1b is not the nonce it derives. The session is then removed and the
 store flushed before the signed PSBT leaves: a failed flush releases nothing.

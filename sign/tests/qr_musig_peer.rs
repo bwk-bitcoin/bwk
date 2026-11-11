@@ -503,6 +503,51 @@ fn psbt_v2_is_signed_and_answered_as_v2() {
     assert!(!f.committed().contains_key(&session_id));
 }
 
+/// The fixture descriptor as a BIP-388 wallet policy.
+fn bip388_descriptors(f: &Fixture, policy: &str) -> Vec<QrDescriptor> {
+    let keys = [(&f.a, 2), (&f.b, 2), (&f.a, 3), (&f.b, 3)]
+        .into_iter()
+        .map(|(signer, role)| signer.xpub(&role_path(role)).to_string())
+        .collect();
+    vec![QrDescriptor {
+        alias: "peer".to_string(),
+        descriptor: Some(DescriptorBody::Bip388 {
+            keys,
+            policy: policy.to_string(),
+        }),
+        proof: None,
+    }]
+}
+
+#[test]
+fn bip388_body_resolves_to_the_bip380_descriptor() {
+    let mut f = fixture();
+    let session_id = f.issue(2);
+    let signing = f.signing(session_id, &f.psbt());
+    for policy in [
+        "tr(musig(@0,@1)/**,pk(musig(@2,@4)/**))",
+        "tr(musig(@0,@1)/**,pk(musig(@2,@2)/**))",
+    ] {
+        let refused = f.peer.sign(Sign {
+            descriptors: bip388_descriptors(&f, policy),
+            ..signing.clone()
+        });
+        assert!(matches!(refused, Err(Error::Request(_))), "{policy}");
+    }
+    assert!(f.committed().contains_key(&session_id));
+    let signed = signed_psbt(
+        f.peer
+            .sign(Sign {
+                descriptors: bip388_descriptors(&f, "tr(musig(@0,@1)/**,pk(musig(@2,@3)/<0;1>/*))"),
+                ..signing
+            })
+            .unwrap(),
+    );
+    for input in &signed.inputs {
+        assert_eq!(musig_input_partial_sigs(input).unwrap().len(), 2);
+    }
+}
+
 #[test]
 fn signing_refusals_keep_the_session() {
     let mut f = fixture();
