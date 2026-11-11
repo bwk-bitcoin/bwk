@@ -125,11 +125,9 @@ impl std::fmt::Debug for MusigSessionStore {
 /// A slot with what signing or aggregating it needs.
 pub struct SlotInfo {
     pub slot: MusigSlot,
-    /// Internal key first, then DFS leaf keys; plain and foreign keys count too.
-    pub expression_index: usize,
     /// The nonce cache key expression index of the participant's signer: the
     /// position among the key expressions holding a key of `signer`'s fingerprint,
-    /// in the same order.
+    /// the internal key first, then the leaf keys in DFS order.
     pub key_expression_index: usize,
     pub agg: DefiniteMusigAggregate,
     /// The descriptor's merkle root, for the key path taptweak.
@@ -382,7 +380,6 @@ fn push_slots(
             .filter(|(key, _)| holds_key_of(key, signer.0))
             .count();
         infos.push(SlotInfo {
-            expression_index: previous.len(),
             key_expression_index,
             slot: MusigSlot {
                 input_index,
