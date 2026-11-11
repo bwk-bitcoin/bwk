@@ -1,7 +1,7 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::{
-    get_info, musig, request, signature, sp,
+    get_info, musig, nonce_cache, request, signature, sp,
     types::{
         ExtendedKey, Fingerprint, PublicKey, DLEQ_PROOF_LEN, MUSIG_PARTIAL_SIG_LEN,
         MUSIG_PUB_NONCE_LEN, SCHNORR_SIGNATURE_LEN,
@@ -17,6 +17,7 @@ pub enum Body {
     Signed(Signed),
     MusigPrepared(MusigPrepared),
     MusigSigned(MusigSigned),
+    NoncesPrepared(NoncesPrepared),
     Info(Info),
     Error(ErrorBody),
 }
@@ -36,6 +37,7 @@ impl From<&Body> for MessageType {
             Body::Signed(_) => Self::Signing,
             Body::MusigPrepared(_) => Self::MusigPreparation,
             Body::MusigSigned(_) => Self::MusigSigning,
+            Body::NoncesPrepared(_) => Self::NoncePreparation,
             Body::Info(_) => Self::GetInfo,
             Body::Error(e) => e.message_type,
         }
@@ -104,9 +106,14 @@ pub struct Capabilities(pub u32);
 
 impl Capabilities {
     pub const MUSIG_CACHE: u32 = 1 << 4;
+    pub const NONCE_CACHE: u32 = 1 << 5;
 
     pub fn supports_musig_cache(self) -> bool {
         self.0 & Self::MUSIG_CACHE != 0
+    }
+
+    pub fn supports_nonce_cache(self) -> bool {
+        self.0 & Self::NONCE_CACHE != 0
     }
 }
 
@@ -221,6 +228,24 @@ pub struct MusigSigned {
     pub attempt_id: [u8; 32],
     /// A serialized PSBT v0 or v2, carried without being parsed.
     pub psbt: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoncesPrepared {
+    pub session_id: [u8; 4],
+    pub session_ref: [u8; 4],
+    pub max_inputs: u8,
+    pub start: u32,
+    pub end: u32,
+    /// The entry for key expression index `j` and input `i` is at
+    /// `(j - start) * max_inputs + i`.
+    pub nonces: Vec<[u8; MUSIG_PUB_NONCE_LEN]>,
+}
+
+impl NoncesPrepared {
+    pub fn validate(&self) -> Result<(), nonce_cache::Error> {
+        nonce_cache::validate_nonce_count(self.nonces.len(), self.max_inputs, self.start, self.end)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

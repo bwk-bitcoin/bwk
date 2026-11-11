@@ -59,6 +59,7 @@ pub mod encode;
 pub mod ffi;
 pub mod get_info;
 pub mod musig;
+pub mod nonce_cache;
 pub mod reader;
 pub mod request;
 pub mod response;
@@ -79,6 +80,7 @@ pub const REQUEST_ID_LEN: usize = 2;
 pub const MAX_DESCRIPTOR_ALIAS: usize = 32;
 pub const MAX_BYTES: usize = 512 * 1024;
 pub const MAX_VEC: usize = 4096;
+pub const MAX_NONCE_EXPRESSIONS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestId(pub [u8; REQUEST_ID_LEN]);
@@ -110,6 +112,7 @@ pub enum MessageType {
     Signing,
     MusigPreparation,
     MusigSigning,
+    NoncePreparation,
 }
 
 impl MessageType {
@@ -128,6 +131,7 @@ impl From<MessageType> for u8 {
             MessageType::Signing => 0x05,
             MessageType::MusigPreparation => 0x06,
             MessageType::MusigSigning => 0x07,
+            MessageType::NoncePreparation => 0x08,
         }
     }
 }
@@ -144,6 +148,7 @@ impl TryFrom<u8> for MessageType {
             0x05 => Ok(Self::Signing),
             0x06 => Ok(Self::MusigPreparation),
             0x07 => Ok(Self::MusigSigning),
+            0x08 => Ok(Self::NoncePreparation),
             _ => Err(decode::Error::UnknownMessageType(value)),
         }
     }

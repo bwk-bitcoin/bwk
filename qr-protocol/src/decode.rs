@@ -1,7 +1,7 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::{
-    get_info, musig,
+    get_info, musig, nonce_cache,
     reader::{self, Reader},
     request, response, signature, sp,
     types::{DerivationPath, ExtendedKey, Fingerprint, PublicKey, SecretKey},
@@ -26,6 +26,7 @@ pub enum Error {
     Sp(sp::Error),
     GetInfo(get_info::Error),
     Signature(signature::Error),
+    NonceCache(nonce_cache::Error),
     Read(reader::Error),
 }
 
@@ -61,6 +62,7 @@ impl Error {
             Self::Sp(error) => error.info(),
             Self::GetInfo(error) => error.info(),
             Self::Signature(error) => error.info(),
+            Self::NonceCache(error) => error.info(),
             Self::Read(inner) => inner.info(),
         }
     }
@@ -89,6 +91,12 @@ impl From<get_info::Error> for Error {
 impl From<signature::Error> for Error {
     fn from(error: signature::Error) -> Self {
         Self::Signature(error)
+    }
+}
+
+impl From<nonce_cache::Error> for Error {
+    fn from(error: nonce_cache::Error) -> Self {
+        Self::NonceCache(error)
     }
 }
 
@@ -139,6 +147,10 @@ pub fn decode(bytes: &[u8]) -> Result<Message, Error> {
             id,
             body: request::Body::SignMusig(read_sign_musig(&mut reader)?),
         }),
+        (false, _, MessageType::NoncePreparation) => Message::Request(Request {
+            id,
+            body: request::Body::PrepareNonces(read_prepare_nonces(&mut reader)?),
+        }),
         (false, _, MessageType::GetInfo) => Message::Request(Request {
             id,
             body: request::Body::GetInfo,
@@ -170,6 +182,10 @@ pub fn decode(bytes: &[u8]) -> Result<Message, Error> {
         (true, false, MessageType::MusigSigning) => Message::Response(Response {
             id,
             body: response::Body::MusigSigned(read_musig_signed(&mut reader)?),
+        }),
+        (true, false, MessageType::NoncePreparation) => Message::Response(Response {
+            id,
+            body: response::Body::NoncesPrepared(read_nonces_prepared(&mut reader)?),
         }),
         (true, false, MessageType::GetInfo) => Message::Response(Response {
             id,
@@ -286,6 +302,41 @@ fn read_musig_signed(reader: &mut Reader<'_>) -> Result<response::MusigSigned, E
         session_id: reader.take_array()?,
         attempt_id: reader.take_array()?,
         psbt: reader.take_bytes()?,
+    })
+}
+
+fn read_prepare_nonces(reader: &mut Reader<'_>) -> Result<request::PrepareNonces, Error> {
+    let request = request::PrepareNonces {
+        session_id: reader.take_array()?,
+        session_ref: reader.take_option(|r| r.take_array())?,
+        max_inputs: reader.take_u8()?,
+        derivation_path: read_path(reader)?,
+        start: reader.take_u32_be()?,
+        end: reader.take_u32_be()?,
+    };
+    request.validate()?;
+    Ok(request)
+}
+
+fn read_nonces_prepared(reader: &mut Reader<'_>) -> Result<response::NoncesPrepared, Error> {
+    let session_id = reader.take_array()?;
+    let session_ref = reader.take_array()?;
+    let max_inputs = reader.take_u8()?;
+    let start = reader.take_u32_be()?;
+    let end = reader.take_u32_be()?;
+    let count = reader.take_compact()?;
+    nonce_cache::validate_nonce_count(count, max_inputs, start, end)?;
+    let mut nonces = Vec::new();
+    for _ in 0..count {
+        nonces.push(reader.take_array()?);
+    }
+    Ok(response::NoncesPrepared {
+        session_id,
+        session_ref,
+        max_inputs,
+        start,
+        end,
+        nonces,
     })
 }
 

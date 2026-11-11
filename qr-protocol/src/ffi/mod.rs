@@ -14,14 +14,15 @@ pub mod types;
 use alloc::boxed::Box;
 use core::{ffi::c_char, ptr, slice};
 
-use crate::{musig, ErrorInfo, Message};
+use crate::{musig, nonce_cache, ErrorInfo, Message};
 
 pub const OK: i32 = 0;
 
-/// C boundary failures and shared MuSig validation failures.
+/// C boundary failures and shared MuSig and nonce cache validation failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     Musig(musig::Error),
+    NonceCache(nonce_cache::Error),
     NullPointer,
     StringNul,
     InvalidUtf8,
@@ -35,6 +36,7 @@ impl Error {
     pub fn info(&self) -> ErrorInfo {
         match self {
             Self::Musig(error) => error.info(),
+            Self::NonceCache(error) => error.info(),
             Self::NullPointer => error_info!(400, "null pointer"),
             Self::StringNul => error_info!(401, "string contains a nul byte"),
             Self::InvalidUtf8 => error_info!(402, "invalid utf-8 string"),

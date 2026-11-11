@@ -1,8 +1,8 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::{
-    get_info, musig, request, response, signature, sp,
-    types::{DerivationPath, ExtendedKey, PublicKey, TAP_LEAF_HASH_LEN},
+    get_info, musig, nonce_cache, request, response, signature, sp,
+    types::{DerivationPath, ExtendedKey, PublicKey, MUSIG_PUB_NONCE_LEN, TAP_LEAF_HASH_LEN},
     ErrorInfo, MessageType, Request, RequestId, Response, SignResponseKind, DIRECTION_REQUEST,
     DIRECTION_RESPONSE, MAGIC, MAX_BYTES, MAX_DESCRIPTOR_ALIAS, MAX_VEC, REQUEST_ID_LEN,
     STATUS_ERROR, STATUS_OK, VERSION,
@@ -12,7 +12,8 @@ pub const MAX_PATH: usize = 255;
 pub const MAX_PATCH: u32 = 0x00ff_ffff;
 const ERROR_CODE_FUTURE_MIN: u8 = 0x0e;
 const ERROR_CODE_FUTURE_MAX: u8 = 0xfe;
-const CAPABILITIES_MASK: u32 = 0x0000_000f | response::Capabilities::MUSIG_CACHE;
+const CAPABILITIES_MASK: u32 =
+    0x0000_000f | response::Capabilities::MUSIG_CACHE | response::Capabilities::NONCE_CACHE;
 const NETWORKS_MASK: u8 = response::Networks::MAINNET
     | response::Networks::TESTNET
     | response::Networks::SIGNET
@@ -24,6 +25,7 @@ pub enum Error {
     Sp(sp::Error),
     GetInfo(get_info::Error),
     Signature(signature::Error),
+    NonceCache(nonce_cache::Error),
     PathTooLong(usize),
     PatchTooLarge(u32),
     ReservedCapabilityBits(u32),
@@ -45,6 +47,7 @@ impl Error {
             Self::Sp(error) => error.info(),
             Self::GetInfo(error) => error.info(),
             Self::Signature(error) => error.info(),
+            Self::NonceCache(error) => error.info(),
             Self::PathTooLong(_) => error_info!(300, "derivation path exceeds the maximum depth"),
             Self::PatchTooLarge(_) => error_info!(301, "firmware patch version is too large"),
             Self::ReservedCapabilityBits(_) => error_info!(302, "reserved capability bits are set"),
@@ -94,6 +97,12 @@ impl From<signature::Error> for Error {
     }
 }
 
+impl From<nonce_cache::Error> for Error {
+    fn from(error: nonce_cache::Error) -> Self {
+        Self::NonceCache(error)
+    }
+}
+
 pub fn encode_request(request: &Request) -> Result<Vec<u8>, Error> {
     let mut out = envelope(request.body.message_type(), false, false, request.id);
     encode_request_body(&mut out, &request.body)?;
@@ -135,6 +144,7 @@ fn encode_request_body(out: &mut Vec<u8>, body: &request::Body) -> Result<(), Er
         request::Body::Sign(request) => encode_sign_request(out, request),
         request::Body::PrepareMusig(request) => encode_prepare_musig(out, request),
         request::Body::SignMusig(request) => encode_sign_musig(out, request),
+        request::Body::PrepareNonces(request) => encode_prepare_nonces(out, request),
         request::Body::GetInfo => Ok(()),
     }
 }
@@ -147,6 +157,7 @@ fn encode_response_body(out: &mut Vec<u8>, body: &response::Body) -> Result<(), 
         response::Body::Signed(response) => encode_signed_response(out, response),
         response::Body::MusigPrepared(response) => encode_musig_prepared(out, response),
         response::Body::MusigSigned(response) => encode_musig_signed(out, response),
+        response::Body::NoncesPrepared(response) => encode_nonces_prepared(out, response),
         response::Body::Info(response) => encode_info_response(out, response),
         response::Body::Error(response) => encode_error_response(out, response),
     }
@@ -237,6 +248,38 @@ fn encode_musig_signed(out: &mut Vec<u8>, response: &response::MusigSigned) -> R
     out.extend_from_slice(&response.session_id);
     out.extend_from_slice(&response.attempt_id);
     write_bytes(out, &response.psbt)
+}
+
+fn encode_prepare_nonces(out: &mut Vec<u8>, request: &request::PrepareNonces) -> Result<(), Error> {
+    request.validate()?;
+    out.extend_from_slice(&request.session_id);
+    write_option(out, request.session_ref.as_ref(), |out, session_ref| {
+        out.extend_from_slice(session_ref);
+        Ok(())
+    })?;
+    out.push(request.max_inputs);
+    write_path(out, &request.derivation_path)?;
+    out.extend_from_slice(&request.start.to_be_bytes());
+    out.extend_from_slice(&request.end.to_be_bytes());
+    Ok(())
+}
+
+fn encode_nonces_prepared(
+    out: &mut Vec<u8>,
+    response: &response::NoncesPrepared,
+) -> Result<(), Error> {
+    response.validate()?;
+    out.extend_from_slice(&response.session_id);
+    out.extend_from_slice(&response.session_ref);
+    out.push(response.max_inputs);
+    out.extend_from_slice(&response.start.to_be_bytes());
+    out.extend_from_slice(&response.end.to_be_bytes());
+    write_vec(out, &response.nonces, write_pub_nonce)
+}
+
+fn write_pub_nonce(out: &mut Vec<u8>, nonce: &[u8; MUSIG_PUB_NONCE_LEN]) -> Result<(), Error> {
+    out.extend_from_slice(nonce);
+    Ok(())
 }
 
 fn encode_keys_response(out: &mut Vec<u8>, response: &response::Keys) -> Result<(), Error> {

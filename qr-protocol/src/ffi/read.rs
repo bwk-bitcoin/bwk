@@ -9,7 +9,7 @@ use core::ffi::{c_char, CStr};
 
 use crate::{
     ffi::{types, Error},
-    musig, request, response,
+    musig, nonce_cache, request, response,
     types::{ExtendedKey, Fingerprint, PublicKey},
     MessageType, RequestId, Response, SignResponseKind, MAX_VEC,
 };
@@ -35,6 +35,9 @@ pub unsafe fn response(view: &types::Response) -> Result<Response, Error> {
             }
             MessageType::MusigSigning => {
                 response::Body::MusigSigned(musig_signed(&view.body.musig_signed)?)
+            }
+            MessageType::NoncePreparation => {
+                response::Body::NoncesPrepared(nonces_prepared(&view.body.nonces_prepared)?)
             }
             MessageType::GetInfo => response::Body::Info(info(&view.body.info)?),
         }
@@ -80,6 +83,22 @@ unsafe fn musig_signed(view: &types::MusigSigned) -> Result<response::MusigSigne
         session_id: view.session_id,
         attempt_id: view.attempt_id,
         psbt: bytes(view.psbt)?,
+    })
+}
+
+unsafe fn nonces_prepared(view: &types::NoncesPrepared) -> Result<response::NoncesPrepared, Error> {
+    nonce_cache::validate_nonce_count(view.nonces.len, view.max_inputs, view.start, view.end)
+        .map_err(Error::NonceCache)?;
+    if view.nonces.is_absent() {
+        return Err(Error::NullPointer);
+    }
+    Ok(response::NoncesPrepared {
+        session_id: view.session_id,
+        session_ref: view.session_ref,
+        max_inputs: view.max_inputs,
+        start: view.start,
+        end: view.end,
+        nonces: view.nonces.as_slice().to_vec(),
     })
 }
 
