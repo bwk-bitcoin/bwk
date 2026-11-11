@@ -2,20 +2,25 @@
 //! issues public nonces with Nonce Preparation, and signs in one round a Signing
 //! PSBT that names one of its sessions in `PSBT_GLOBAL_NONCE_CACHE_SESSION`.
 //!
-//! The session secrets live only in the caller's store, which the peer must own
-//! exclusively and whose successful flush must be durable.
+//! The session secrets live only in the caller's session store, and registered
+//! descriptors in its registry store. The peer must own both exclusively, and their
+//! successful flush must be durable.
 
 use std::str::FromStr;
 
-use bwk_descriptor::{descriptor::Descriptor, wallet::WalletDescriptor};
+use bwk_descriptor::{
+    descriptor::Descriptor,
+    musig::{musig_descriptor_to_string, parse_musig_descriptor},
+    wallet::WalletDescriptor,
+};
 use bwk_persist::{storage::Store, PersistError};
 use bwk_psbt::{
     nonce_cache::{nonce_cache_session, nonce_cache_session_v2, NonceCacheSession},
     PsbtV2,
 };
 use bwk_qr_protocol::{
-    request::{self, DescriptorBody, PrepareNonces, Sign},
-    response::{self, NoncesPrepared, Signed},
+    request::{self, DescriptorBody, PrepareNonces, RegisterDescriptor, Sign},
+    response::{self, NoncesPrepared, Registration, Signed},
     Message, Request as QrRequest, Response as QrResponse,
 };
 use miniscript::bitcoin::{bip32::DerivationPath, Psbt};
@@ -40,6 +45,8 @@ pub enum Error {
     Persist(#[from] PersistError),
     #[error("invalid or unsupported QR request: {0}")]
     Request(String),
+    #[error("descriptor alias {0} is registered with another descriptor")]
+    AlreadyRegistered(String),
 }
 
 /// A session, stored under its `session_id`.
@@ -50,15 +57,59 @@ pub struct QrMusigPeerRecord {
     secret: SessionSecret,
 }
 
-/// Owns the signer and the exclusively held, caller-selected typed store.
-pub struct QrMusigPeer<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigPeerRecord>> {
+/// Owns the signer and the exclusively held, caller-selected typed stores: the
+/// sessions by `session_id`, and the registered descriptors by alias, with no limit
+/// on their count.
+pub struct QrMusigPeer<S, R>
+where
+    S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigPeerRecord>,
+    R: Store<Key = String, Value = WalletDescriptor>,
+{
     signer: HotSigner,
     store: S,
+    registry: R,
 }
 
-impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigPeerRecord>> QrMusigPeer<S> {
-    pub fn from_store(signer: HotSigner, store: S) -> Self {
-        Self { signer, store }
+impl<S, R> QrMusigPeer<S, R>
+where
+    S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigPeerRecord>,
+    R: Store<Key = String, Value = WalletDescriptor>,
+{
+    pub fn from_store(signer: HotSigner, store: S, registry: R) -> Self {
+        Self {
+            signer,
+            store,
+            registry,
+        }
+    }
+
+    /// Stores the body under its alias, or only reports whether the alias is
+    /// registered when there is no body. The same descriptor again succeeds, another
+    /// one under a registered alias is refused. No proof of registration is issued.
+    pub fn register(&mut self, request: RegisterDescriptor) -> Result<Registration, Error> {
+        let alias = request.descriptor_alias;
+        let registered = match &request.descriptor {
+            None => self.registry.get(&alias)?.is_some(),
+            Some(body) => {
+                let descriptor = body_descriptor(body)?;
+                match self.registry.get(&alias)? {
+                    Some(stored) if stored == descriptor => {}
+                    Some(_) => return Err(Error::AlreadyRegistered(alias)),
+                    None => {
+                        self.registry.insert(alias.clone(), descriptor)?;
+                    }
+                }
+                // Also retries a flush an earlier call failed.
+                self.registry.flush()?;
+                true
+            }
+        };
+        Ok(Registration {
+            descriptor_alias: alias,
+            registered: Some(registered),
+            stored: Some(registered),
+            proof: None,
+        })
     }
 
     /// Issues the nonces of the session holding `session_id`, creating it when
@@ -168,6 +219,9 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigPeerRecord>> QrMusigPee
                 self.prepare(body).map(response::Body::NoncesPrepared)
             }
             request::Body::Sign(body) => self.sign(body).map(response::Body::Signed),
+            request::Body::RegisterDescriptor(body) => {
+                self.register(body).map(response::Body::Registration)
+            }
             _ => Err(Error::Request("unsupported operation".to_string())),
         };
         let body = match result {
@@ -270,14 +324,25 @@ fn wire_error(error: &Error) -> response::Error {
         Error::Sign(SignError::MusigSession) => response::Error::MusigSession,
         Error::Sign(SignError::InputNotOwned) => response::Error::NothingToSign,
         Error::Sign(_) => response::Error::InvalidPsbt,
+        Error::AlreadyRegistered(_) => response::Error::AlreadyRegistered,
     }
 }
 
 fn signing_descriptor(descriptor: &request::Descriptor) -> Result<WalletDescriptor, Error> {
-    let text = match &descriptor.descriptor {
-        Some(DescriptorBody::Bip380(text)) => text.clone(),
-        Some(DescriptorBody::Bip388 { keys, policy }) => bip388_descriptor(keys, policy)?,
-        _ => {
+    let body = descriptor
+        .descriptor
+        .as_ref()
+        .ok_or_else(|| Error::Request("a descriptor body is required".to_string()))?;
+    body_descriptor(body)
+}
+
+/// The wallet descriptor of a BIP-380 or BIP-388 body: both forms of one
+/// descriptor give equal values.
+fn body_descriptor(body: &DescriptorBody) -> Result<WalletDescriptor, Error> {
+    let text = match body {
+        DescriptorBody::Bip380(text) => text.clone(),
+        DescriptorBody::Bip388 { keys, policy } => bip388_descriptor(keys, policy)?,
+        DescriptorBody::SpKeys(_) => {
             return Err(Error::Request(
                 "a BIP-380 or BIP-388 descriptor body is required".to_string(),
             ))
@@ -316,6 +381,18 @@ fn bip388_descriptor(keys: &[String], policy: &str) -> Result<String, Error> {
         return Err(Error::Request("unused BIP-388 key".to_string()));
     }
     Ok(text)
+}
+
+/// Registry value encoder for a caller's RamStore: the BIP-390 text with its
+/// checksum.
+pub fn encode_registered(descriptor: &WalletDescriptor) -> Vec<u8> {
+    musig_descriptor_to_string(descriptor, true).into_bytes()
+}
+
+pub fn decode_registered(bytes: &[u8]) -> Result<WalletDescriptor, PersistError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| PersistError::Serde("invalid registered descriptor".to_string()))?;
+    parse_musig_descriptor(text).map_err(|error| PersistError::Serde(error.to_string()))
 }
 
 /// Value encoder for a caller's RamStore: the creation order (8 bytes little

@@ -210,14 +210,26 @@ same at every input.
 
 ### Peer
 
-`QrMusigPeer::from_store(signer, store)` owns a `HotSigner` and a caller-selected
-`Store<Key = [u8; 4], Value = QrMusigPeerRecord>` holding the sessions by
-`session_id`. A session is a random secret (see Nonce cache sessions above) and
-its creation order; the secret lives only in this store, which the peer must own
-exclusively and whose successful `flush` must be durable.
+`QrMusigPeer::from_store(signer, store, registry)` owns a `HotSigner` and two
+caller-selected stores: a `Store<Key = [u8; 4], Value = QrMusigPeerRecord>`
+holding the sessions by `session_id`, and a
+`Store<Key = String, Value = WalletDescriptor>` holding the registered
+descriptors by alias. A session is a random secret (see Nonce cache sessions
+above) and its creation order; the secret lives only in its store. The peer must
+own both stores exclusively, and their successful `flush` must be durable.
 `qr_musig::{encode_record, decode_record}` are value codecs for a caller-owned
-`RamStore`: the creation order (8 bytes, little endian) then the secret (32
-bytes).
+`RamStore` of sessions: the creation order (8 bytes, little endian) then the
+secret (32 bytes). `qr_musig::{encode_registered, decode_registered}` are the
+registry's: the BIP-390 text with its checksum.
+
+`register(RegisterDescriptor)` stores a BIP-380 or BIP-388 body under its alias
+and answers `REGISTERED` and `STORED` true, with no proof of registration. The
+same descriptor again succeeds without change; another one under a registered
+alias is refused with `ERROR` `0x0E` and the stored one is kept. Two bodies are
+the same when they resolve to equal wallet descriptors, so the BIP-380 and
+BIP-388 forms of one descriptor match. Without a body, the request only asks the
+status: `REGISTERED` and `STORED` are true for a registered alias and false
+otherwise. The registry has no size limit.
 
 `prepare(PrepareNonces)` answers from the session holding `session_id`, and
 creates it when there is none and the request carries no reference. A reference
