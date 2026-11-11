@@ -125,3 +125,12 @@ use bwk_psbt::musig::{musig_input_pub_nonces, set_musig_input_participants};
 set_musig_input_participants(&mut psbt.inputs[0], aggregate, &participants);
 let nonces = musig_input_pub_nonces(&psbt_v2.inputs[0].psbt)?;
 ```
+
+## Nonce cache session field
+
+The `nonce_cache` module holds `PSBT_GLOBAL_NONCE_CACHE_SESSION` (0x09), the global
+field of the nonce cache BIP (`bip-nonce-cache/BIP-DRAFT.md`) naming the signer
+session whose cached nonces sign the PSBT. It has no keydata; its value is the
+4-byte `session_id` followed by the 4-byte session reference. The getters refuse a
+value of any other length. Like the silent payment globals, the getter and setter
+come in a PSBTv0 and a PSBTv2 flavour.
