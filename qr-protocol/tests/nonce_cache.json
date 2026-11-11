@@ -1,0 +1,25 @@
+{
+  "vectors": [
+    {
+      "name": "nonce_preparation_request",
+      "description": "Nonce Preparation request for a new or recomputed session: SESSION_ID of 4 bytes of 0x51 without a LENGTH prefix, SESSION_REF absent (PRESENCE 0x00), MAX_INPUTS 2, DERIVATION_PATH m/86'/1'/0'/0/3 (CHILD_COUNT 5 and five 4-byte big-endian children), START 0 and END 1, each 4 bytes big-endian.",
+      "direction": "request",
+      "hex": "424950585858010800015151515100020580000056800000018000000000000000000000030000000000000001",
+      "decode_only": false
+    },
+    {
+      "name": "nonce_preparation_request_with_session_ref",
+      "description": "Nonce Preparation request extending a held session: SESSION_ID of 4 bytes of 0x51, SESSION_REF present (PRESENCE 0x01 then 4 bytes of 0x52), MAX_INPUTS 2, DERIVATION_PATH m/86'/1'/0'/0/3, START 2 and END 3.",
+      "direction": "request",
+      "hex": "42495058585801080001515151510152525252020580000056800000018000000000000000000000030000000200000003",
+      "decode_only": false
+    },
+    {
+      "name": "nonce_preparation_response",
+      "description": "Nonce Preparation ok response: SESSION_ID (4 bytes of 0x51), SESSION_REF (4 bytes of 0x52, no PRESENCE byte), MAX_INPUTS 2, START 2 and END 3, then NONCES with COUNT 4 (two key expressions times two inputs), each a 66-byte NONCE without a LENGTH prefix, ordered by key expression index then input index: expression 2 input 0 with NONCE of 0x22, expression 2 input 1 with NONCE of 0x55, expression 3 input 0 with NONCE of 0x66, and expression 3 input 1 with NONCE of 0x77.",
+      "direction": "response",
+      "hex": "42495058585801880001515151515252525202000000020000000304222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777",
+      "decode_only": false
+    }
+  ]
+}

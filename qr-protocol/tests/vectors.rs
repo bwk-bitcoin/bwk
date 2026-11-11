@@ -353,6 +353,44 @@ fn musig_messages() -> Vec<(&'static str, Message)> {
     ]
 }
 
+fn nonce_cache_messages() -> Vec<(&'static str, Message)> {
+    vec![
+        (
+            "nonce_preparation_request",
+            request(request::Body::PrepareNonces(request::PrepareNonces {
+                session_id: [0x51; 4],
+                session_ref: None,
+                max_inputs: 2,
+                derivation_path: path("m/86'/1'/0'/0/3"),
+                start: 0,
+                end: 1,
+            })),
+        ),
+        (
+            "nonce_preparation_request_with_session_ref",
+            request(request::Body::PrepareNonces(request::PrepareNonces {
+                session_id: [0x51; 4],
+                session_ref: Some([0x52; 4]),
+                max_inputs: 2,
+                derivation_path: path("m/86'/1'/0'/0/3"),
+                start: 2,
+                end: 3,
+            })),
+        ),
+        (
+            "nonce_preparation_response",
+            response(response::Body::NoncesPrepared(response::NoncesPrepared {
+                session_id: [0x51; 4],
+                session_ref: [0x52; 4],
+                max_inputs: 2,
+                start: 2,
+                end: 3,
+                nonces: vec![[0x22; 66], [0x55; 66], [0x66; 66], [0x77; 66]],
+            })),
+        ),
+    ]
+}
+
 fn info(state: response::State) -> response::Info {
     response::Info {
         vendor: "bwk".to_string(),
@@ -544,6 +582,11 @@ fn signing_vectors() {
 #[test]
 fn musig_vectors() {
     check(include_str!("musig.json"), &musig_messages());
+}
+
+#[test]
+fn nonce_cache_vectors() {
+    check(include_str!("nonce_cache.json"), &nonce_cache_messages());
 }
 
 #[test]
