@@ -29,10 +29,17 @@
       "decode_only": false
     },
     {
-      "name": "error_response_reserved_code",
-      "description": "Error response to a Get Keys request with ERROR 0x0e, taken from the range reserved for future standard codes. A version 1 parser does not know it and must still accept the message and fall back to ERROR_MESSAGE.",
+      "name": "error_response_already_registered",
+      "description": "Error response to a Register Descriptor request: MSG_TYPE 0xc3 is response, error, TYPE 0x03. ERROR is 0x0e (descriptor alias already registered) and ERROR_MESSAGE is \"alias already registered\".",
       "direction": "response",
-      "hex": "42495058585801c200010e1a636f64652061646465642061667465722076657273696f6e2031",
+      "hex": "42495058585801c300010e18616c69617320616c72656164792072656769737465726564",
+      "decode_only": false
+    },
+    {
+      "name": "error_response_reserved_code",
+      "description": "Error response to a Get Keys request with ERROR 0x0f, taken from the range reserved for future standard codes. A version 1 parser does not know it and must still accept the message and fall back to ERROR_MESSAGE.",
+      "direction": "response",
+      "hex": "42495058585801c200010f1a636f64652061646465642061667465722076657273696f6e2031",
       "decode_only": false
     }
   ]

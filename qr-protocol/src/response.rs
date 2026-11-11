@@ -376,6 +376,7 @@ pub enum Error {
     InternalError,
     PrivateKeyExportRefused,
     MusigSession,
+    AlreadyRegistered,
     Vendor,
     Unknown(u8),
 }
@@ -402,6 +403,7 @@ impl From<Error> for u8 {
             Error::InternalError => 0x0b,
             Error::PrivateKeyExportRefused => 0x0c,
             Error::MusigSession => 0x0d,
+            Error::AlreadyRegistered => 0x0e,
             Error::Vendor => 0xff,
             Error::Unknown(value) => value,
         }
@@ -424,6 +426,7 @@ impl From<u8> for Error {
             0x0b => Self::InternalError,
             0x0c => Self::PrivateKeyExportRefused,
             0x0d => Self::MusigSession,
+            0x0e => Self::AlreadyRegistered,
             0xff => Self::Vendor,
             value => Self::Unknown(value),
         }

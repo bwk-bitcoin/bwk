@@ -388,10 +388,18 @@ fn error_messages() -> Vec<(&'static str, Message)> {
             })),
         ),
         (
+            "error_response_already_registered",
+            response(response::Body::Error(response::ErrorBody {
+                message_type: protocol::MessageType::RegisterDescriptor,
+                error: response::Error::AlreadyRegistered,
+                message: "alias already registered".to_string(),
+            })),
+        ),
+        (
             "error_response_reserved_code",
             response(response::Body::Error(response::ErrorBody {
                 message_type: protocol::MessageType::GetKeys,
-                error: response::Error::Unknown(0x0e),
+                error: response::Error::Unknown(0x0f),
                 message: "code added after version 1".to_string(),
             })),
         ),

@@ -604,9 +604,22 @@ fn musig_session_error_code_round_trips() {
         encode_response(&error_response(response::Error::Unknown(0x0d))),
         Err(encode::Error::ErrorCodeOutOfRange(0x0d))
     );
-    let response = error_response(response::Error::Unknown(0x0e));
+    let response = error_response(response::Error::Unknown(0x0f));
     let bytes = encode_response(&response).unwrap();
     assert_eq!(decode(&bytes), Ok(Message::Response(response)));
+}
+
+#[test]
+fn already_registered_error_code_round_trips() {
+    assert_eq!(u8::from(response::Error::AlreadyRegistered), 0x0e);
+    assert_eq!(
+        response::Error::from(0x0e),
+        response::Error::AlreadyRegistered
+    );
+    assert_eq!(
+        encode_response(&error_response(response::Error::Unknown(0x0e))),
+        Err(encode::Error::ErrorCodeOutOfRange(0x0e))
+    );
 }
 
 fn tap_key_response() -> Response {
