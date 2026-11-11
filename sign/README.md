@@ -258,13 +258,17 @@ caller-owned `RamStore`.
   secret after an eviction.
 - `sign_request` sets, for every slot of the signer in the PSBT, the issued nonce
   at the slot's participant path, `SlotInfo::key_expression_index` and input
-  index as its 0x1b, names the session and builds the Signing request.
+  index as its 0x1b, names the session and builds the Signing request with the
+  caller's `want_kind`, a preference only: either reply kind is accepted.
 
 Each returns the wire bytes. `submit_pending` sends them through
 `SigningManager::raw`, or `bind_outer_request` binds an outer ID when the caller
 sends them itself, and `accept_response` checks both request IDs and the signer.
-A signed PSBT, or a refusal for the session, drops the session; other refusals
-keep it.
+A signatures-only reply is merged into the PSBT it sent: ordinary signatures,
+and MuSig2 partial signatures as 0x1c. A public nonce entry must be the 0x1b it
+placed, a silent payment entry is refused and an entry of an unknown kind is
+skipped. A signed reply, or a refusal for the session, drops the session; other
+refusals keep it.
 
 ## HotManager
 
