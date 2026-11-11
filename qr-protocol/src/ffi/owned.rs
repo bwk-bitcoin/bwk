@@ -113,6 +113,17 @@ impl Keep {
                     psbt: self.bytes(&body.psbt),
                 },
             },
+            request::Body::PrepareNonces(body) => types::RequestBody {
+                prepare_nonces: types::PrepareNonces {
+                    session_id: body.session_id,
+                    has_session_ref: body.session_ref.is_some().into(),
+                    session_ref: body.session_ref.unwrap_or_default(),
+                    max_inputs: body.max_inputs,
+                    derivation_path: self.path(&body.derivation_path),
+                    start: body.start,
+                    end: body.end,
+                },
+            },
             // no arm describes an empty body, so C never reads the union
             // SAFETY: every arm is plain data or raw pointers, valid when zeroed
             request::Body::GetInfo => unsafe { core::mem::zeroed() },

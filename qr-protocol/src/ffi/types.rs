@@ -90,6 +90,7 @@ pub union RequestBody {
     pub sign: Sign,
     pub prepare_musig: PrepareMusig,
     pub sign_musig: SignMusig,
+    pub prepare_nonces: PrepareNonces,
 }
 
 #[repr(C)]
@@ -166,6 +167,19 @@ pub struct SignMusig {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+pub struct PrepareNonces {
+    pub session_id: [u8; 4],
+    /// 0 or 1.
+    pub has_session_ref: u8,
+    pub session_ref: [u8; 4],
+    pub max_inputs: u8,
+    pub derivation_path: Path,
+    pub start: u32,
+    pub end: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub struct DescriptorBody {
     /// `DESCRIPTOR_BIP380`, `DESCRIPTOR_BIP388` or `DESCRIPTOR_SP_KEYS`, which selects
     /// the `value` arm.
@@ -222,6 +236,7 @@ pub union ResponseBody {
     pub signed: Signed,
     pub musig_prepared: MusigPrepared,
     pub musig_signed: MusigSigned,
+    pub nonces_prepared: NoncesPrepared,
     pub info: Info,
     pub error: ErrorBody,
 }
@@ -411,6 +426,17 @@ pub struct MusigSigned {
     pub session_id: [u8; 32],
     pub attempt_id: [u8; 32],
     pub psbt: Bytes,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NoncesPrepared {
+    pub session_id: [u8; 4],
+    pub session_ref: [u8; 4],
+    pub max_inputs: u8,
+    pub start: u32,
+    pub end: u32,
+    pub nonces: List<[u8; MUSIG_PUB_NONCE_LEN]>,
 }
 
 #[repr(C)]

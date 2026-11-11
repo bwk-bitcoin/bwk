@@ -1,7 +1,7 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::{
-    decode, musig,
+    decode, musig, nonce_cache,
     types::{DerivationPath, Fingerprint, SecretKey},
     MessageType, SignResponseKind,
 };
@@ -14,6 +14,7 @@ pub enum Body {
     Sign(Sign),
     PrepareMusig(PrepareMusig),
     SignMusig(SignMusig),
+    PrepareNonces(PrepareNonces),
     /// Get Info carries no body.
     GetInfo,
 }
@@ -33,6 +34,7 @@ impl From<&Body> for MessageType {
             Body::Sign(_) => Self::Signing,
             Body::PrepareMusig(_) => Self::MusigPreparation,
             Body::SignMusig(_) => Self::MusigSigning,
+            Body::PrepareNonces(_) => Self::NoncePreparation,
             Body::GetInfo => Self::GetInfo,
         }
     }
@@ -150,6 +152,27 @@ pub struct SignMusig {
     pub attempt_id: [u8; 32],
     /// A serialized PSBT v0 or v2, carried without being parsed.
     pub psbt: Vec<u8>,
+}
+
+/// Preparation of a cached nonce session, bound to no descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrepareNonces {
+    pub session_id: [u8; 4],
+    /// When present, the signer refuses unless its session holding `session_id` has
+    /// this reference, and never creates a new one.
+    pub session_ref: Option<[u8; 4]>,
+    pub max_inputs: u8,
+    pub derivation_path: DerivationPath,
+    /// First key expression index, inclusive.
+    pub start: u32,
+    /// Last key expression index, inclusive.
+    pub end: u32,
+}
+
+impl PrepareNonces {
+    pub fn validate(&self) -> Result<(), nonce_cache::Error> {
+        nonce_cache::validate_coverage(self.max_inputs, self.start, self.end)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

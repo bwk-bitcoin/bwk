@@ -141,7 +141,8 @@ Bit 0 is the LSB.
 | 2    | Silent Payments (v0)             |
 | 3    | MuSig2                           |
 | 4    | MuSig cache                      |
-| 5–30 | Reserved for future capabilities |
+| 5    | Nonce cache                      |
+| 6–30 | Reserved for future capabilities |
 | 31   | Upgrade signal (MSB)             |
 +------+----------------------------------+
 ```
@@ -152,7 +153,11 @@ and MAY answer with `SIG_KIND` `0x04` / `0x05` (see Signing).
 Bit 4 advertises the separate MuSig Preparation and MuSig Signing operations below.
 It is not implied by bit 3.
 
-Bits 5–30 are reserved for future capabilities and MUST be `0` in this version; a
+Bit 5 advertises the Nonce Preparation operation below, and that a Signing `PSBT`
+may name a cached nonce session for MuSig2, as the nonce cache BIP
+(`bip-nonce-cache/BIP-DRAFT.md`) defines.
+
+Bits 6–30 are reserved for future capabilities and MUST be `0` in this version; a
 reader MUST ignore an unknown capability bit rather than reject, so a newer signer
 can advertise capabilities an older wallet does not know. Bit 31 (the MSB) MUST be
 `0` in this version; a `1` signals that the signer exposes capabilities beyond this
@@ -207,10 +212,11 @@ Bits (bit 7 is the MSB):
 | 0x05  | Signing              |
 | 0x06  | MuSig Preparation    |
 | 0x07  | MuSig Signing        |
+| 0x08  | Nonce Preparation    |
 +-------+----------------------+
 ```
 
-Values `0x08`–`0x3F` are reserved. A parser MUST reject an unknown `TYPE`, and
+Values `0x09`–`0x3F` are reserved. A parser MUST reject an unknown `TYPE`, and
 MUST reject `STATUS` = `1` on a request (`DIRECTION` = `0`).
 
 #### Request Id
@@ -251,7 +257,7 @@ Global error table:
 | 0x0A      | Invalid or unparsable PSBT                           |
 | 0x0B      | Internal device error                                |
 | 0x0C      | Private key export refused (Get Keys)                |
-| 0x0D      | MuSig2 session missing, consumed or mismatched       |
+| 0x0D      | Session missing, consumed or mismatched              |
 | 0x0E–0xFE | Reserved for future standard codes                   |
 | 0xFF      | Vendor-specific (meaning carried by `ERROR_MESSAGE`) |
 +-----------+------------------------------------------------------+
@@ -585,6 +591,14 @@ its partial signatures (`SIG_KIND` `0x05` entries, or in the PSBT) and its ordin
 signatures (`SIG_KIND` `0x01` to `0x03`). A session missing, consumed or mismatched
 on the second exchange is refused with `ERROR` `0x0D`.
 
+#### Nonce cache
+
+For a signer advertising capability bit 5, a Signing `PSBT` MAY name a cached nonce
+session as the nonce cache BIP (`bip-nonce-cache/BIP-DRAFT.md`) defines. There is no
+separate signing `TYPE`: the resulting partial signatures are ordinary `SIG_KIND`
+`0x05` entries, or partial signatures in the PSBT. A session missing, consumed or
+mismatched is refused with `ERROR` `0x0D`.
+
 ### MuSig Preparation
 
 This operation requires capability bit 4 and has `TYPE` `0x06`. It prepares public
@@ -641,6 +655,48 @@ response echoes both. `PSBT` is a bounded `BYTES` field, carried without parsing
 and may contain serialized PSBT v0 or v2. There is no response-kind selector.
 
 Missing, consumed, lost or mismatched sessions refuse with `ERROR` `0x0D`.
+
+### Nonce Preparation
+
+This operation requires capability bit 5 and has `TYPE` `0x08`. It prepares public
+nonces for a cached nonce session, bound to no descriptor, for use by later Signing
+exchanges as the nonce cache BIP (`bip-nonce-cache/BIP-DRAFT.md`) defines. No root,
+secret nonce or other secret material may appear in these messages.
+
+`MAX_NONCE_EXPRESSIONS` is 16.
+
+**Request:**
+
+`SESSION_ID` `SESSION_REF` `MAX_INPUTS` `DERIVATION_PATH` `START` `END`
+
+- `SESSION_ID`: 4 opaque bytes chosen by the caller, with no length prefix.
+- `SESSION_REF`: OPTIONAL, 4 bytes, the session reference the nonce cache BIP
+  defines, from an earlier answer for this `SESSION_ID`.
+- `MAX_INPUTS`: one byte, the absolute input coverage, at least 1.
+- `DERIVATION_PATH`: the key's path from the master key.
+- `START`: a 4-byte big-endian unsigned integer, the first key expression index.
+- `END`: a 4-byte big-endian unsigned integer, the last key expression index.
+
+`START` MUST NOT exceed `END`, and the range `START` through `END` MUST hold at most
+`MAX_NONCE_EXPRESSIONS` indexes. The range lets the wallet fetch a session in
+chunks.
+
+A signer MUST refuse a request whose `SESSION_REF` does not match its stored session
+for `SESSION_ID`, or names a session it does not hold, with `ERROR` `0x0D`, and MUST
+NOT create a new session for it.
+
+**Ok response:**
+
+`SESSION_ID` `SESSION_REF` `MAX_INPUTS` `START` `END` `NONCES`
+
+`SESSION_ID`, `MAX_INPUTS`, `START` and `END` echo the request, with the same
+bounds. `SESSION_REF` is 4 bytes, always present, the reference of the session that
+issued the nonces. `NONCES` is a vector of exactly (`END` minus `START` plus 1) times
+`MAX_INPUTS` entries, each a 66-byte BIP-327 public nonce without a length prefix.
+
+Entries are positional, ordered by key expression index then by input index: the
+nonce for key expression index `j` and input index `i` is entry
+(`j` minus `START`) times `MAX_INPUTS` plus `i`.
 
 ### Versioning
 
@@ -727,8 +783,9 @@ Machine-checkable vectors accompany this specification:
 - `musig.json`: MuSig Preparation and MuSig Signing request/response, including a
   preparation request with only an alias and nonce entries with and without a leaf
   hash.
+- `nonce_cache.json`: Nonce Preparation request/response.
 - `errors.json`: error responses (`STATUS` = `1`), standard and vendor codes,
-  including `0x0D` (MuSig2 session).
+  including `0x0D` (session).
 - `versioning.json`: forward compatibility, a message whose `VERSION` is above 1
   and which carries trailing bytes a version-1 parser does not know.
 

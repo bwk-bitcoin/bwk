@@ -32,6 +32,7 @@ extern "C" {
 #define BWK_QR_SCHNORR_SIGNATURE_LEN 64 /* 65 with a sighash type byte */
 #define BWK_QR_MAX_PATH 255
 #define BWK_QR_MAX_VEC 4096
+#define BWK_QR_MAX_NONCE_EXPRESSIONS 16
 #define BWK_QR_MAX_STRING (64 * 1024)
 #define BWK_QR_MAX_BYTES (512 * 1024)
 
@@ -51,11 +52,13 @@ enum bwk_qr_message_type {
     BWK_QR_MESSAGE_ADDRESS_VERIFICATION = 0x04,
     BWK_QR_MESSAGE_SIGNING = 0x05,
     BWK_QR_MESSAGE_MUSIG_PREPARATION = 0x06,
-    BWK_QR_MESSAGE_MUSIG_SIGNING = 0x07
+    BWK_QR_MESSAGE_MUSIG_SIGNING = 0x07,
+    BWK_QR_MESSAGE_NONCE_PREPARATION = 0x08
 };
 
 enum bwk_qr_capability {
-    BWK_QR_CAPABILITY_MUSIG_CACHE = 1u << 4
+    BWK_QR_CAPABILITY_MUSIG_CACHE = 1u << 4,
+    BWK_QR_CAPABILITY_NONCE_CACHE = 1u << 5
 };
 
 /* Open: a value outside this list is a newer state, which counts as not ready. To
@@ -147,8 +150,9 @@ enum bwk_qr_absent {
 /* What the four functions return. 100..=199 come from the byte reader, 200..=299
  * from the decoder, 300..=399 from the encoder, 400..=499 from this binding,
  * 500..=599 from shared MuSig validation, 600..=699 from shared silent payment
- * validation, 700..=799 from shared Get Info validation and 800..=899 from shared
- * signature validation, the last four both on encode and decode. */
+ * validation, 700..=799 from shared Get Info validation, 800..=899 from shared
+ * signature validation and 900..=999 from shared nonce cache validation, the last
+ * five both on encode and decode. */
 enum bwk_qr_status {
     BWK_QR_OK = 0,
 
@@ -214,7 +218,11 @@ enum bwk_qr_status {
     BWK_QR_ERR_GET_INFO_MAX_ALIAS_TOO_LARGE = 700,
     BWK_QR_ERR_GET_INFO_FINGERPRINT_WHEN_NOT_READY = 701,
 
-    BWK_QR_ERR_TAPROOT_SIGNATURE_LENGTH = 800
+    BWK_QR_ERR_TAPROOT_SIGNATURE_LENGTH = 800,
+
+    BWK_QR_ERR_NONCE_CACHE_INPUT_COVERAGE = 900,
+    BWK_QR_ERR_NONCE_CACHE_EXPRESSION_RANGE = 901,
+    BWK_QR_ERR_NONCE_CACHE_NONCE_COUNT = 902
 };
 
 /* A borrowed run of items. A NULL ptr means the field is absent, which is distinct
@@ -343,6 +351,17 @@ typedef struct {
     bwk_qr_bytes psbt;
 } bwk_qr_sign_musig;
 
+/* start..=end: key expression indexes, at most BWK_QR_MAX_NONCE_EXPRESSIONS of them. */
+typedef struct {
+    uint8_t session_id[4];
+    uint8_t has_session_ref; /* 0 or 1 */
+    uint8_t session_ref[4];
+    uint8_t max_inputs;
+    bwk_qr_path derivation_path; /* from the master key */
+    uint32_t start;
+    uint32_t end;
+} bwk_qr_prepare_nonces;
+
 typedef union {
     bwk_qr_get_keys get_keys;
     bwk_qr_register_descriptor register_descriptor;
@@ -350,6 +369,7 @@ typedef union {
     bwk_qr_sign sign;
     bwk_qr_prepare_musig prepare_musig;
     bwk_qr_sign_musig sign_musig;
+    bwk_qr_prepare_nonces prepare_nonces;
 } bwk_qr_request_body;
 
 typedef struct {
@@ -371,14 +391,14 @@ typedef struct {
     const char *vendor;
     const char *model;
     bwk_qr_firmware_version version;
-    uint32_t capabilities; /* only the low five bits may be set */
+    uint32_t capabilities; /* only the low six bits may be set */
 } bwk_qr_keys;
 
 typedef struct {
     const char *vendor;
     const char *model;
     bwk_qr_firmware_version version;
-    uint32_t capabilities;   /* only the low five bits may be set */
+    uint32_t capabilities;   /* only the low six bits may be set */
     uint8_t state;           /* BWK_QR_STATE_* */
     uint8_t networks;        /* BWK_QR_NETWORK_* bits */
     uint32_t max_message;    /* bytes */
@@ -471,6 +491,26 @@ typedef struct {
     bwk_qr_bytes psbt;
 } bwk_qr_musig_signed;
 
+typedef struct {
+    uint8_t bytes[BWK_QR_MUSIG_PUB_NONCE_LEN];
+} bwk_qr_pub_nonce;
+
+typedef struct {
+    const bwk_qr_pub_nonce *ptr;
+    size_t len;
+} bwk_qr_pub_nonce_list;
+
+/* nonces: (end - start + 1) * max_inputs entries, the one for key expression index j
+ * and input i at (j - start) * max_inputs + i. */
+typedef struct {
+    uint8_t session_id[4];
+    uint8_t session_ref[4];
+    uint8_t max_inputs;
+    uint32_t start;
+    uint32_t end;
+    bwk_qr_pub_nonce_list nonces;
+} bwk_qr_nonces_prepared;
+
 typedef union {
     bwk_qr_ecdsa ecdsa;
     bwk_qr_tap_key tap_key;
@@ -514,6 +554,7 @@ typedef union {
     bwk_qr_signed signed_body;
     bwk_qr_musig_prepared musig_prepared;
     bwk_qr_musig_signed musig_signed;
+    bwk_qr_nonces_prepared nonces_prepared;
     bwk_qr_info info;
     bwk_qr_error_body error;
 } bwk_qr_response_body;
