@@ -1,32 +1,33 @@
-//! Durable hot QR MuSig peer. The caller must exclusively own the supplied store,
-//! whose successful flush must be durable. No NoopBackend, rollback, backup restore,
-//! concurrent writer or copied live store is safe. Keep burned IDs permanently.
-//! The cipher must provide authenticated encryption, not an identity transform.
+//! Hot QR MuSig peer on nonce cache sessions (`bip-nonce-cache/BIP-DRAFT.md`): it
+//! issues public nonces with Nonce Preparation, and signs in one round a Signing
+//! PSBT that names one of its sessions in `PSBT_GLOBAL_NONCE_CACHE_SESSION`.
+//!
+//! The session secrets live only in the caller's store, which the peer must own
+//! exclusively and whose successful flush must be durable.
 
-use std::{collections::BTreeSet, str::FromStr, sync::Arc};
+use std::str::FromStr;
 
 use bwk_descriptor::{descriptor::Descriptor, wallet::WalletDescriptor};
-use bwk_persist::{cipher::Cipher, storage::Store, PersistError};
+use bwk_persist::{storage::Store, PersistError};
+use bwk_psbt::nonce_cache::nonce_cache_session;
 use bwk_qr_protocol::{
-    request::{self, DescriptorBody, PrepareMusig, SignMusig},
-    response::{self, MusigNonce, MusigPrepared, MusigSigned},
-    types::PublicKey,
-    Message, Request as QrRequest, RequestId as QrRequestId, Response as QrResponse,
-    REQUEST_ID_LEN,
+    request::{self, DescriptorBody, PrepareNonces, Sign},
+    response::{self, NoncesPrepared, Signed},
+    Message, Request as QrRequest, Response as QrResponse,
 };
-use miniscript::bitcoin::{
-    bip32::Fingerprint,
-    hashes::{sha256, Hash, HashEngine},
-    Psbt,
-};
+use miniscript::bitcoin::{bip32::DerivationPath, Psbt};
 
 use crate::{
     error::Error as SignError,
-    hot_musig::{HotMusigSession, HotMusigSessionBytes},
-    hot_signer::HotSigner,
-    musig::{session_id, slot_infos, slot_sighash, MusigSessionId, SlotInfo},
+    hot_signer::{wipe, HotSigner},
+    nonce_cache::{SessionSecret, SECRET_LEN, SESSION_ID_LEN},
     protocol::{Request, Response},
 };
+
+/// The most sessions the peer keeps: storing one more evicts the oldest.
+pub const MAX_SESSIONS: usize = 16;
+const SEQUENCE_LEN: usize = 8;
+const RECORD_LEN: usize = SEQUENCE_LEN + SECRET_LEN;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -38,207 +39,140 @@ pub enum Error {
     Request(String),
 }
 
-/// Cloneable store values contain only encrypted secret exports and public data.
+/// A session, stored under its `session_id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum QrMusigPeerRecord {
-    Prepared {
-        request: PrepareMusig,
-        encrypted_export: Vec<u8>,
-    },
-    Allocated {
-        request: PrepareMusig,
-        encrypted_export: Vec<u8>,
-        binding: [u8; 32],
-        transcript: Option<[u8; 32]>,
-    },
-    Burned,
+pub struct QrMusigPeerRecord {
+    /// Creation order, to evict the oldest session.
+    sequence: u64,
+    secret: SessionSecret,
 }
 
 /// Owns the signer and the exclusively held, caller-selected typed store.
-/// Neither the peer nor its live store may be cloned or restored to older state.
-pub struct QrMusigPeer<S: Store<Key = [u8; 32], Value = QrMusigPeerRecord>> {
+pub struct QrMusigPeer<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigPeerRecord>> {
     signer: HotSigner,
     store: S,
-    cipher: Arc<dyn Cipher>,
-    failed_burn: Option<[u8; 32]>,
 }
 
-impl<S: Store<Key = [u8; 32], Value = QrMusigPeerRecord>> QrMusigPeer<S> {
-    pub fn from_store(signer: HotSigner, store: S, cipher: Arc<dyn Cipher>) -> Self {
-        Self {
-            signer,
-            store,
-            cipher,
-            failed_burn: None,
-        }
+impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigPeerRecord>> QrMusigPeer<S> {
+    pub fn from_store(signer: HotSigner, store: S) -> Self {
+        Self { signer, store }
     }
 
-    pub fn prepare(&mut self, request: PrepareMusig) -> Result<MusigPrepared, Error> {
-        self.available()?;
-        let descriptor = preparation_descriptor(&request)?;
-        let session = match self.store.get(&request.session_id)? {
-            None => self.prepare_record(&request, &descriptor)?,
-            Some(QrMusigPeerRecord::Prepared {
-                request: previous,
-                encrypted_export,
-            }) if previous == request => {
-                self.open_session(&request, &descriptor, &encrypted_export)?
-            }
-            Some(_) => return Err(SignError::MusigSession.into()),
-        };
-        let response = prepared_response(&session, &request, &descriptor)?;
-        // RAM may already contain a write from an earlier failed flush.
+    /// Issues the nonces of the session holding `session_id`, creating it when
+    /// absent and the request carries no reference. The session is durable before
+    /// the nonces are returned.
+    pub fn prepare(&mut self, request: PrepareNonces) -> Result<NoncesPrepared, Error> {
+        request
+            .validate()
+            .map_err(|error| Error::Request(error.to_string()))?;
+        let secret = self.session(request.session_id, request.session_ref)?;
+        let path = DerivationPath::from(&request.derivation_path);
+        let public_key = self.signer.public_key_at(&path).serialize();
+        let mut sk = self.signer.private_key_at(&path);
+        let mut secret_key = sk.secret_bytes();
+        sk.non_secure_erase();
+        let nonces = (request.start..=request.end)
+            .flat_map(|j| (0..u32::from(request.max_inputs)).map(move |i| (i, j)))
+            .map(|(i, j)| {
+                let (_, pubnonce) = secret.nonce(i, j, &secret_key, &public_key)?;
+                Ok(pubnonce)
+            })
+            .collect::<Result<Vec<_>, SignError>>();
+        wipe(&mut secret_key);
+        let nonces = nonces?;
+        // Also retries a flush an earlier call failed.
         self.store.flush()?;
-        Ok(response)
-    }
-
-    fn prepare_record(
-        &mut self,
-        request: &PrepareMusig,
-        descriptor: &WalletDescriptor,
-    ) -> Result<HotMusigSession, Error> {
-        let session = self.signer.create_musig_session(
-            descriptor,
-            MusigSessionId(request.session_id),
-            request.max_inputs,
-        )?;
-        // Validate every requested derivation before reserving the ID.
-        prepared_response(&session, request, descriptor)?;
-        let plain = session.encode();
-        let encrypted_export = self.cipher.seal(plain.as_bytes())?;
-        let session = HotMusigSession::decode(plain, descriptor, self.signer.fingerprint())?;
-        self.store.insert(
-            request.session_id,
-            QrMusigPeerRecord::Prepared {
-                request: request.clone(),
-                encrypted_export,
-            },
-        )?;
-        Ok(session)
-    }
-
-    fn open_session(
-        &self,
-        request: &PrepareMusig,
-        descriptor: &WalletDescriptor,
-        encrypted_export: &[u8],
-    ) -> Result<HotMusigSession, Error> {
-        let plain = HotMusigSessionBytes::from_bytes(self.cipher.open(encrypted_export)?);
-        let session = HotMusigSession::decode(plain, descriptor, self.signer.fingerprint())?;
-        if session.id().0 != request.session_id || session.max_inputs() != request.max_inputs {
-            return Err(SignError::MusigSession.into());
-        }
-        Ok(session)
-    }
-
-    /// Incomplete transcripts return only nonces. A complete transcript consumes
-    /// the entire root after a durable tombstone; even identical retries refuse.
-    pub fn sign(&mut self, request: SignMusig) -> Result<MusigSigned, Error> {
-        self.available()?;
-        let mut psbt =
-            Psbt::deserialize(&request.psbt).map_err(|error| Error::Request(error.to_string()))?;
-        let record = self.store.get(&request.session_id)?;
-        let (preparation, encrypted_export, previous_binding, previous_transcript) = match record {
-            Some(QrMusigPeerRecord::Prepared {
-                request,
-                encrypted_export,
-            }) => (request, encrypted_export, None, None),
-            Some(QrMusigPeerRecord::Allocated {
-                request,
-                encrypted_export,
-                binding,
-                transcript,
-            }) => (request, encrypted_export, Some(binding), transcript),
-            _ => return Err(SignError::MusigSession.into()),
-        };
-        if preparation.session_id != request.session_id {
-            return Err(SignError::MusigSession.into());
-        }
-        let descriptor = preparation_descriptor(&preparation)?;
-        let binding = allocation_binding(
-            &psbt,
-            &descriptor,
-            self.signer.fingerprint(),
-            request.attempt_id,
-        )?;
-        if previous_binding.is_some_and(|previous| previous != binding) {
-            return Err(SignError::MusigSession.into());
-        }
-        let session = self.open_session(&preparation, &descriptor, &encrypted_export)?;
-        validate_advertised_slots(&session, &preparation, &descriptor, &psbt)?;
-        self.store.insert(
-            request.session_id,
-            QrMusigPeerRecord::Allocated {
-                request: preparation.clone(),
-                encrypted_export: encrypted_export.clone(),
-                binding,
-                transcript: previous_transcript,
-            },
-        )?;
-        self.store.flush()?;
-        session.publish_nonces(&mut psbt, &descriptor)?;
-        let transcript = participant_transcript(&session.slot_infos(&psbt, &descriptor)?, &psbt)?;
-        if previous_transcript.is_some() && previous_transcript != transcript {
-            return Err(SignError::MusigSession.into());
-        }
-        if let Some(transcript) = transcript {
-            self.store.insert(
-                request.session_id,
-                QrMusigPeerRecord::Allocated {
-                    request: preparation,
-                    encrypted_export,
-                    binding,
-                    transcript: Some(transcript),
-                },
-            )?;
-            self.store.flush()?;
-            // A failed burn must never leave this instance able to sign again.
-            self.failed_burn = Some(request.session_id);
-            self.store
-                .insert(request.session_id, QrMusigPeerRecord::Burned)?;
-            self.store.flush()?;
-            self.failed_burn = None;
-            self.signer
-                .sign_musig_session(&mut psbt, &descriptor, session)?;
-        }
-        self.store.flush()?;
-        Ok(MusigSigned {
+        Ok(NoncesPrepared {
             session_id: request.session_id,
-            attempt_id: request.attempt_id,
-            psbt: psbt.serialize(),
+            session_ref: secret.session_ref(),
+            max_inputs: request.max_inputs,
+            start: request.start,
+            end: request.end,
+            nonces,
         })
     }
 
-    fn available(&mut self) -> Result<(), Error> {
-        if let Some(id) = self.failed_burn {
-            self.store.insert(id, QrMusigPeerRecord::Burned)?;
-            self.store.flush()?;
+    fn session(
+        &mut self,
+        session_id: [u8; SESSION_ID_LEN],
+        session_ref: Option<[u8; SESSION_ID_LEN]>,
+    ) -> Result<SessionSecret, Error> {
+        match (self.store.get(&session_id)?, session_ref) {
+            (Some(record), None) => Ok(record.secret),
+            (Some(record), Some(session_ref)) if record.secret.session_ref() == session_ref => {
+                Ok(record.secret)
+            }
+            (None, None) => self.create_session(session_id),
+            _ => Err(SignError::MusigSession.into()),
+        }
+    }
+
+    fn create_session(&mut self, session_id: [u8; SESSION_ID_LEN]) -> Result<SessionSecret, Error> {
+        let records: Vec<_> = self.store.iter()?.collect();
+        let sequence = records
+            .iter()
+            .map(|(_, record)| record.sequence + 1)
+            .max()
+            .unwrap_or(0);
+        if records.len() >= MAX_SESSIONS {
+            if let Some((oldest, _)) = records.iter().min_by_key(|(_, record)| record.sequence) {
+                self.store.remove(oldest)?;
+            }
+        }
+        let secret = SessionSecret::random()?;
+        self.store.insert(
+            session_id,
+            QrMusigPeerRecord {
+                sequence,
+                secret: secret.clone(),
+            },
+        )?;
+        Ok(secret)
+    }
+
+    /// Signs with the session the PSBT names, then deletes it durably before the
+    /// signed PSBT leaves: a failed deletion releases nothing.
+    pub fn sign(&mut self, request: Sign) -> Result<Signed, Error> {
+        let mut psbt =
+            Psbt::deserialize(&request.psbt).map_err(|error| Error::Request(error.to_string()))?;
+        let session = nonce_cache_session(&psbt)
+            .map_err(|error| Error::Request(error.to_string()))?
+            .ok_or_else(|| Error::Request("no nonce cache session".to_string()))?;
+        if request.descriptors.is_empty() {
+            return Err(Error::Request("no descriptor".to_string()));
+        }
+        let record = self
+            .store
+            .get(&session.session_id)?
+            .ok_or(SignError::MusigSession)?;
+        if record.secret.session_ref() != session.session_ref {
             return Err(SignError::MusigSession.into());
         }
-        Ok(())
+        for descriptor in &request.descriptors {
+            let descriptor = signing_descriptor(descriptor)?;
+            self.signer
+                .sign_nonce_cache(&mut psbt, &descriptor, &record.secret)?;
+        }
+        self.store.remove(&session.session_id)?;
+        self.store.flush()?;
+        Ok(Signed::Psbt(psbt.serialize()))
     }
 
     /// Unsupported operations return explicit wire errors, never ordinary signing.
     pub fn handle(&mut self, request: QrRequest) -> QrResponse {
         let message_type = request.body.message_type();
         let result = match request.body {
-            request::Body::PrepareMusig(body) => {
-                self.prepare(body).map(response::Body::MusigPrepared)
+            request::Body::PrepareNonces(body) => {
+                self.prepare(body).map(response::Body::NoncesPrepared)
             }
-            request::Body::SignMusig(body) => self.sign(body).map(response::Body::MusigSigned),
+            request::Body::Sign(body) => self.sign(body).map(response::Body::Signed),
             _ => Err(Error::Request("unsupported operation".to_string())),
         };
         let body = match result {
             Ok(body) => body,
             Err(error) => response::Body::Error(response::ErrorBody {
                 message_type,
-                error: match &error {
-                    Error::Request(_) => response::Error::MalformedRequest,
-                    // Persistence is retryable and does not consume the session:
-                    // 0x0D would tell the caller to restart the whole attempt.
-                    Error::Persist(_) => response::Error::InternalError,
-                    Error::Sign(_) => response::Error::MusigSession,
-                },
+                error: wire_error(&error),
                 message: error.to_string(),
             }),
         };
@@ -282,9 +216,19 @@ impl<S: Store<Key = [u8; 32], Value = QrMusigPeerRecord>> QrMusigPeer<S> {
     }
 }
 
-fn preparation_descriptor(request: &PrepareMusig) -> Result<WalletDescriptor, Error> {
-    request.validate().map_err(|_| SignError::MusigSession)?;
-    match &request.descriptor.descriptor {
+fn wire_error(error: &Error) -> response::Error {
+    match error {
+        Error::Request(_) => response::Error::MalformedRequest,
+        // Persistence is retryable and does not consume the session.
+        Error::Persist(_) => response::Error::InternalError,
+        Error::Sign(SignError::MusigSession) => response::Error::MusigSession,
+        Error::Sign(SignError::InputNotOwned) => response::Error::NothingToSign,
+        Error::Sign(_) => response::Error::InvalidPsbt,
+    }
+}
+
+fn signing_descriptor(descriptor: &request::Descriptor) -> Result<WalletDescriptor, Error> {
+    match &descriptor.descriptor {
         Some(DescriptorBody::Bip380(text)) => Descriptor::from_str(text)
             .map_err(|error| Error::Request(error.to_string()))?
             .into_miniscript()
@@ -295,261 +239,30 @@ fn preparation_descriptor(request: &PrepareMusig) -> Result<WalletDescriptor, Er
     }
 }
 
-fn prepared_response(
-    session: &HotMusigSession,
-    request: &PrepareMusig,
-    descriptor: &WalletDescriptor,
-) -> Result<MusigPrepared, Error> {
-    let mut nonces = Vec::new();
-    for derivation in &request.derivations {
-        for nonce in
-            session.public_nonces(descriptor, derivation.keychain as usize, derivation.index)?
-        {
-            nonces.push(MusigNonce {
-                derivation: *derivation,
-                input_index: u32::try_from(nonce.input_index)
-                    .map_err(|_| SignError::MusigSession)?,
-                expression_index: u32::try_from(nonce.expression_index)
-                    .map_err(|_| SignError::MusigSession)?,
-                participant: PublicKey(nonce.nonce.participant.serialize()),
-                aggregate: PublicKey(nonce.nonce.aggregate.serialize()),
-                leaf_hash: nonce.nonce.leaf_hash.map(|hash| hash.to_byte_array()),
-                nonce: nonce.nonce.nonce,
-            });
-        }
+/// Value encoder for a caller's RamStore: the creation order (8 bytes little
+/// endian) then the secret (32 bytes).
+pub fn encode_record(record: &QrMusigPeerRecord) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(RECORD_LEN);
+    bytes.extend_from_slice(&record.sequence.to_le_bytes());
+    bytes.extend_from_slice(record.secret.as_bytes());
+    bytes
+}
+
+pub fn decode_record(bytes: &[u8]) -> Result<QrMusigPeerRecord, PersistError> {
+    if bytes.len() != RECORD_LEN {
+        return Err(PersistError::Serde(
+            "invalid QR MuSig peer record".to_string(),
+        ));
     }
-    let prepared = MusigPrepared {
-        session_id: request.session_id,
-        max_inputs: request.max_inputs,
-        nonces,
+    let (sequence, secret) = bytes.split_at(SEQUENCE_LEN);
+    let mut sequence_bytes = [0; SEQUENCE_LEN];
+    sequence_bytes.copy_from_slice(sequence);
+    let mut secret_bytes = [0; SECRET_LEN];
+    secret_bytes.copy_from_slice(secret);
+    let record = QrMusigPeerRecord {
+        sequence: u64::from_le_bytes(sequence_bytes),
+        secret: SessionSecret::from_bytes(secret_bytes),
     };
-    prepared.validate().map_err(|_| SignError::MusigSession)?;
-    Ok(prepared)
-}
-
-fn validate_advertised_slots(
-    session: &HotMusigSession,
-    request: &PrepareMusig,
-    descriptor: &WalletDescriptor,
-    psbt: &Psbt,
-) -> Result<(), Error> {
-    let advertised = prepared_response(session, request, descriptor)?;
-    for info in session.slot_infos(psbt, descriptor)? {
-        if !advertised.nonces.iter().any(|nonce| {
-            nonce.input_index as usize == info.slot.input_index
-                && nonce.expression_index as usize == info.expression_index
-                && nonce.participant.0 == info.slot.participant.serialize()
-                && nonce.aggregate.0 == info.slot.aggregate.serialize()
-                && nonce.leaf_hash == info.slot.leaf_hash.map(|hash| hash.to_byte_array())
-        }) {
-            return Err(SignError::MusigSession.into());
-        }
-    }
-    Ok(())
-}
-
-/// Binds the transaction plus canonical selected own slots, not PSBT nonce fields.
-/// Shared with the host so both sides allocate exactly the same attempt.
-pub(crate) fn allocation_binding(
-    psbt: &Psbt,
-    descriptor: &WalletDescriptor,
-    fingerprint: Fingerprint,
-    attempt_id: [u8; 32],
-) -> Result<[u8; 32], SignError> {
-    let mut own: Vec<_> = slot_infos(psbt, descriptor)?
-        .into_iter()
-        .filter(|info| info.signer.0 == fingerprint)
-        .collect();
-    own.sort_by_key(|info| (info.slot, info.expression_index));
-    if own.is_empty() {
-        return Err(SignError::MusigSession);
-    }
-    let mut engine = sha256::Hash::engine();
-    engine.input(b"bwk/qr-musig/allocation/v1");
-    engine.input(&session_id(psbt, descriptor, fingerprint)?.0);
-    engine.input(&attempt_id);
-    engine.input(&(own.len() as u64).to_le_bytes());
-    let mut unique = BTreeSet::new();
-    for info in own {
-        if !unique.insert(info.slot) {
-            return Err(SignError::MusigSession);
-        }
-        hash_slot(&mut engine, &info);
-        engine.input(&slot_sighash(psbt, &info.slot)?);
-        engine.input(info.signer.0.as_bytes());
-        engine.input(&(info.signer.1.len() as u64).to_le_bytes());
-        for child in info.signer.1.as_ref() {
-            engine.input(&u32::from(*child).to_le_bytes());
-        }
-        engine.input(&(info.agg.participants().len() as u64).to_le_bytes());
-        for participant in info.agg.participants() {
-            engine.input(&participant.serialize());
-        }
-    }
-    Ok(sha256::Hash::from_engine(engine).to_byte_array())
-}
-
-fn hash_slot(engine: &mut sha256::HashEngine, info: &SlotInfo) {
-    engine.input(&(info.slot.input_index as u64).to_le_bytes());
-    engine.input(&(info.expression_index as u64).to_le_bytes());
-    engine.input(&info.slot.participant.serialize());
-    engine.input(&info.slot.aggregate.serialize());
-    match info.slot.leaf_hash {
-        Some(hash) => {
-            engine.input(&[1]);
-            engine.input(hash.as_byte_array());
-        }
-        None => engine.input(&[0]),
-    }
-    match info.merkle_root {
-        Some(hash) => {
-            engine.input(&[1]);
-            engine.input(hash.as_byte_array());
-        }
-        None => engine.input(&[0]),
-    }
-}
-
-fn participant_transcript(own: &[SlotInfo], psbt: &Psbt) -> Result<Option<[u8; 32]>, SignError> {
-    let mut ordered: Vec<_> = own.iter().collect();
-    ordered.sort_by_key(|info| (info.slot, info.expression_index));
-    let mut engine = sha256::Hash::engine();
-    engine.input(b"bwk/qr-musig/transcript/v1");
-    engine.input(&(ordered.len() as u64).to_le_bytes());
-    let mut complete = true;
-    for info in ordered {
-        hash_slot(&mut engine, info);
-        engine.input(&(info.agg.participants().len() as u64).to_le_bytes());
-        for participant in info.agg.participants() {
-            engine.input(&participant.serialize());
-            match info.participant_nonce(&psbt.inputs[info.slot.input_index], *participant)? {
-                Some(nonce) => engine.input(&nonce),
-                None => complete = false,
-            }
-        }
-    }
-    Ok(complete.then(|| sha256::Hash::from_engine(engine).to_byte_array()))
-}
-
-/// Value encoder for a caller's RamStore. Only the already encrypted export is encoded.
-pub fn encode_record(record: &QrMusigPeerRecord) -> Result<Vec<u8>, PersistError> {
-    let (tag, request, encrypted_export, allocation) = match record {
-        QrMusigPeerRecord::Prepared {
-            request,
-            encrypted_export,
-        } => (1, request, encrypted_export, None),
-        QrMusigPeerRecord::Allocated {
-            request,
-            encrypted_export,
-            binding,
-            transcript,
-        } => (2, request, encrypted_export, Some((binding, transcript))),
-        QrMusigPeerRecord::Burned => return Ok(vec![1, 3]),
-    };
-    preparation_descriptor(request).map_err(|_| corrupt_record())?;
-    if encrypted_export.is_empty() {
-        return Err(corrupt_record());
-    }
-    let wire = bwk_qr_protocol::encode_request(&QrRequest {
-        id: QrRequestId([0; REQUEST_ID_LEN]),
-        body: request::Body::PrepareMusig(request.clone()),
-    })
-    .map_err(|error| PersistError::Serde(format!("{error:?}")))?;
-    let mut bytes = vec![1, tag];
-    put_bytes(&mut bytes, &wire)?;
-    put_bytes(&mut bytes, encrypted_export)?;
-    if let Some((binding, transcript)) = allocation {
-        bytes.extend_from_slice(binding);
-        match transcript {
-            Some(hash) => {
-                bytes.push(1);
-                bytes.extend_from_slice(hash);
-            }
-            None => bytes.push(0),
-        }
-    }
-    Ok(bytes)
-}
-
-/// Rejects corrupt records instead of treating them as missing, reusable IDs.
-pub fn decode_record(mut bytes: &[u8]) -> Result<QrMusigPeerRecord, PersistError> {
-    if take(&mut bytes, 1)? != [1] {
-        return Err(corrupt_record());
-    }
-    let tag = take(&mut bytes, 1)?[0];
-    if tag == 3 {
-        if !bytes.is_empty() {
-            return Err(corrupt_record());
-        }
-        return Ok(QrMusigPeerRecord::Burned);
-    }
-    let wire = take_bytes(&mut bytes)?;
-    let request = match bwk_qr_protocol::decode(wire).map_err(|_| corrupt_record())? {
-        Message::Request(QrRequest {
-            body: request::Body::PrepareMusig(request),
-            ..
-        }) => request,
-        _ => return Err(corrupt_record()),
-    };
-    preparation_descriptor(&request).map_err(|_| corrupt_record())?;
-    let encrypted_export = take_bytes(&mut bytes)?.to_vec();
-    if encrypted_export.is_empty() {
-        return Err(corrupt_record());
-    }
-    let record = match tag {
-        1 => QrMusigPeerRecord::Prepared {
-            request,
-            encrypted_export,
-        },
-        2 => {
-            let binding = take(&mut bytes, 32)?
-                .try_into()
-                .map_err(|_| corrupt_record())?;
-            let transcript = match take(&mut bytes, 1)?[0] {
-                0 => None,
-                1 => Some(
-                    take(&mut bytes, 32)?
-                        .try_into()
-                        .map_err(|_| corrupt_record())?,
-                ),
-                _ => return Err(corrupt_record()),
-            };
-            QrMusigPeerRecord::Allocated {
-                request,
-                encrypted_export,
-                binding,
-                transcript,
-            }
-        }
-        _ => return Err(corrupt_record()),
-    };
-    if !bytes.is_empty() {
-        return Err(corrupt_record());
-    }
+    wipe(&mut secret_bytes);
     Ok(record)
-}
-
-fn put_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), PersistError> {
-    let len = u32::try_from(bytes.len()).map_err(|_| corrupt_record())?;
-    output.extend_from_slice(&len.to_le_bytes());
-    output.extend_from_slice(bytes);
-    Ok(())
-}
-
-fn take<'a>(bytes: &mut &'a [u8], len: usize) -> Result<&'a [u8], PersistError> {
-    if bytes.len() < len {
-        return Err(corrupt_record());
-    }
-    let (value, rest) = bytes.split_at(len);
-    *bytes = rest;
-    Ok(value)
-}
-
-fn take_bytes<'a>(bytes: &mut &'a [u8]) -> Result<&'a [u8], PersistError> {
-    let len = u32::from_le_bytes(take(bytes, 4)?.try_into().map_err(|_| corrupt_record())?);
-    take(bytes, len as usize)
-}
-
-fn corrupt_record() -> PersistError {
-    PersistError::Serde("invalid QR MuSig peer record".to_string())
 }

@@ -7,49 +7,57 @@ use std::{
 
 use bwk_descriptor::{
     musig::parse_musig_descriptor,
+    updater::update_input,
     wallet::{WalletDescriptor, WalletDescriptorExt},
 };
 use bwk_persist::{storage::Store, PersistError};
-use bwk_psbt::musig::{set_musig_input_participants, set_musig_input_pub_nonce, MusigPubNonce};
+use bwk_psbt::{
+    musig::{musig_input_pub_nonce, set_musig_input_pub_nonce, MusigPubNonce},
+    nonce_cache::{nonce_cache_session, NonceCacheSession},
+};
 use bwk_qr_protocol::{
-    encode_response, request, response, types, RequestId as QrRequestId, Response as QrResponse,
+    decode, encode_response, request, response, Message, Request as QrRequest,
+    RequestId as QrRequestId, Response as QrResponse, SignResponseKind,
 };
 use crossbeam::channel;
 use miniscript::bitcoin::{
     absolute::LockTime,
     bip32::{DerivationPath, Fingerprint},
-    secp256k1::{PublicKey, Secp256k1, SecretKey},
     transaction::Version,
-    Amount, Network, Psbt, Transaction, TxIn, TxOut,
+    Amount, Network, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
 
 use crate::{
     hot_signer::HotSigner,
     identity::SignerId,
     manager::SigningManager,
-    musig::expression_slots,
+    musig::{slot_infos, SlotInfo},
+    nonce_cache::SessionSecret,
     protocol::{Request, RequestId, Response},
-    qr_musig_host::{QrMusigHost, QrMusigHostRecord, QrMusigHostResponse, QrMusigHostState},
+    qr_musig_host::{
+        Error, Issuance, NoncePosition, QrMusigHost, QrMusigHostRecord, QrMusigHostResponse,
+    },
     remote_manager::RemoteManager,
 };
 
 const ORDINARY_MUSIG_CAPABILITY: u32 = 1 << 3;
+const COSIGNER_PATH: &str = "m/87'/1'/0'/2";
 
 #[derive(Default)]
 struct Disk {
-    rows: BTreeMap<[u8; 32], QrMusigHostRecord>,
+    rows: BTreeMap<[u8; 4], QrMusigHostRecord>,
     fail: bool,
     flushes: usize,
 }
 
 #[derive(Default)]
 struct TestStore {
-    ram: BTreeMap<[u8; 32], QrMusigHostRecord>,
+    ram: BTreeMap<[u8; 4], QrMusigHostRecord>,
     disk: Arc<Mutex<Disk>>,
 }
 
 impl Store for TestStore {
-    type Key = [u8; 32];
+    type Key = [u8; 4];
     type Value = QrMusigHostRecord;
 
     fn get(&self, key: &Self::Key) -> Result<Option<Self::Value>, PersistError> {
@@ -105,135 +113,204 @@ impl Store for TestStore {
     }
 }
 
+/// `tr(musig(first,second)/<0;1>/*)`, with the first signer as the device.
 struct Fixture {
+    device: HotSigner,
+    secret: SessionSecret,
+    descriptor_text: String,
     descriptor: WalletDescriptor,
-    fingerprint: Fingerprint,
-    preparation: request::PrepareMusig,
-    prepared: response::MusigPrepared,
-    psbt: Psbt,
+}
+
+impl Fixture {
+    fn fingerprint(&self) -> Fingerprint {
+        self.device.fingerprint()
+    }
+
+    fn descriptors(&self) -> Vec<request::Descriptor> {
+        vec![request::Descriptor {
+            alias: "fixture".into(),
+            descriptor: Some(request::DescriptorBody::Bip380(
+                self.descriptor_text.clone(),
+            )),
+            proof: None,
+        }]
+    }
+
+    /// The nonces the device issues for `issuance`, in wire order.
+    fn nonces(&self, issuance: &Issuance) -> Vec<[u8; 66]> {
+        let secret_key = self.device.private_key_at(&issuance.path).secret_bytes();
+        let public_key = self.device.public_key_at(&issuance.path).serialize();
+        let mut nonces = Vec::new();
+        for j in issuance.start..=issuance.end {
+            for i in 0..u32::from(issuance.max_inputs) {
+                let (_, nonce) = self.secret.nonce(i, j, &secret_key, &public_key).unwrap();
+                nonces.push(nonce);
+            }
+        }
+        nonces
+    }
+
+    fn prepared(&self, session_id: [u8; 4], issuance: &Issuance) -> response::NoncesPrepared {
+        response::NoncesPrepared {
+            session_id,
+            session_ref: self.secret.session_ref(),
+            max_inputs: issuance.max_inputs,
+            start: issuance.start,
+            end: issuance.end,
+            nonces: self.nonces(issuance),
+        }
+    }
+
+    /// The slots of the device in `psbt`.
+    fn own_slots(&self, psbt: &Psbt) -> Vec<SlotInfo> {
+        slot_infos(psbt, &self.descriptor)
+            .unwrap()
+            .into_iter()
+            .filter(|info| info.signer.0 == self.fingerprint())
+            .collect()
+    }
 }
 
 fn fixture() -> Fixture {
-    let first = HotSigner::new_from_mnemonics(Network::Regtest,
+    let device = HotSigner::new_from_mnemonics(Network::Regtest,
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about").unwrap();
     let second = HotSigner::new_from_mnemonics(
         Network::Regtest,
         "legal winner thank year wave sausage worth useful legal winner thank yellow",
     )
     .unwrap();
-    let path = DerivationPath::from_str("m/87'/1'/0'/2").unwrap();
-    let text = format!(
-        "tr(musig({}/<0;1>/*,{}/<0;1>/*))",
-        first.xpub(&path),
+    let path = DerivationPath::from_str(COSIGNER_PATH).unwrap();
+    let descriptor_text = format!(
+        "tr(musig({},{})/<0;1>/*)",
+        device.xpub(&path),
         second.xpub(&path)
     );
-    let descriptor = parse_musig_descriptor(&text).unwrap();
-    let definite = descriptor.single_paths().unwrap()[0].derive_at(0).unwrap();
-    let infos = expression_slots(0, &definite).unwrap();
-    let own = infos
-        .iter()
-        .find(|info| info.signer.0 == first.fingerprint())
-        .unwrap();
-    let key =
-        PublicKey::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[3; 32]).unwrap());
-    let mut nonce = [0; 66];
-    nonce[..33].copy_from_slice(&key.serialize());
-    nonce[33..].copy_from_slice(&key.serialize());
-    let derivation = request::MusigDerivation {
-        keychain: 0,
-        index: 0,
-    };
-    let preparation = request::PrepareMusig {
-        descriptor: request::Descriptor {
-            alias: "fixture".into(),
-            descriptor: Some(request::DescriptorBody::Bip380(text)),
-            proof: None,
-        },
-        session_id: [1; 32],
-        max_inputs: 1,
-        derivations: vec![derivation],
-    };
-    let prepared = response::MusigPrepared {
-        session_id: preparation.session_id,
-        max_inputs: 1,
-        nonces: vec![response::MusigNonce {
-            derivation,
-            input_index: 0,
-            expression_index: own.expression_index as u32,
-            participant: types::PublicKey(own.slot.participant.serialize()),
-            aggregate: types::PublicKey(own.slot.aggregate.serialize()),
-            leaf_hash: None,
-            nonce,
-        }],
-    };
-    let mut psbt = Psbt::from_unsigned_tx(Transaction {
-        version: Version::TWO,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn::default()],
-        output: vec![],
-    })
-    .unwrap();
-    psbt.inputs[0].witness_utxo = Some(TxOut {
-        value: Amount::from_sat(100_000),
-        script_pubkey: definite.script_pubkey(),
-    });
-    psbt.inputs[0].tap_key_origins.insert(
-        own.slot.participant.x_only_public_key().0,
-        (vec![], own.signer.clone()),
-    );
-    set_musig_input_participants(
-        &mut psbt.inputs[0],
-        own.agg.aggregate(),
-        own.agg.participants(),
-    );
+    let descriptor = parse_musig_descriptor(&descriptor_text).unwrap();
     Fixture {
+        device,
+        secret: SessionSecret::from_bytes([5; 32]),
+        descriptor_text,
         descriptor,
-        fingerprint: first.fingerprint(),
-        preparation,
-        prepared,
-        psbt,
     }
 }
 
-fn prepare(host: &mut QrMusigHost<TestStore>, fixture: &Fixture) -> Vec<u8> {
-    host.prepare_request(
+fn issuance(max_inputs: u8) -> Issuance {
+    Issuance {
+        path: DerivationPath::from_str(COSIGNER_PATH).unwrap(),
+        max_inputs,
+        start: 0,
+        end: 0,
+    }
+}
+
+/// Spends the receive coins at `indexes`.
+fn spend(descriptor: &WalletDescriptor, indexes: &[u32]) -> Psbt {
+    let receive = descriptor.single_paths().unwrap()[0].clone();
+    let tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: (0..indexes.len())
+            .map(|vout| TxIn {
+                previous_output: OutPoint {
+                    vout: vout as u32,
+                    ..OutPoint::null()
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ZERO,
+                witness: Witness::new(),
+            })
+            .collect(),
+        output: vec![TxOut {
+            value: Amount::from_sat(150_000),
+            script_pubkey: ScriptBuf::new(),
+        }],
+    };
+    let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+    for (position, index) in indexes.iter().enumerate() {
+        let definite = receive.derive_at(*index).unwrap();
+        psbt.inputs[position].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: definite.script_pubkey(),
+        });
+        update_input(&mut psbt, position, &definite).unwrap();
+    }
+    psbt
+}
+
+fn capabilities() -> response::Capabilities {
+    response::Capabilities(response::Capabilities::NONCE_CACHE)
+}
+
+fn raw_response(outer: RequestId, id: QrRequestId, body: response::Body) -> Response {
+    Response::Raw {
+        request: outer,
+        signer: SignerId::new("qr"),
+        payload: encode_response(&QrResponse { id, body }).unwrap(),
+    }
+}
+
+fn issue(
+    host: &mut QrMusigHost<TestStore>,
+    fixture: &Fixture,
+    max_inputs: u8,
+) -> ([u8; 4], Vec<u8>) {
+    host.issue_request(
         SignerId::new("qr"),
-        response::Capabilities(response::Capabilities::MUSIG_CACHE),
+        capabilities(),
         QrRequestId([1, 2]),
-        &fixture.descriptor,
-        fixture.fingerprint,
-        fixture.preparation.clone(),
+        fixture.fingerprint(),
+        issuance(max_inputs),
     )
     .unwrap()
 }
 
-fn prepared_response(fixture: &Fixture, outer: RequestId) -> Response {
-    Response::Raw {
-        request: outer,
-        signer: SignerId::new("qr"),
-        payload: encode_response(&QrResponse {
-            id: QrRequestId([1, 2]),
-            body: response::Body::MusigPrepared(fixture.prepared.clone()),
-        })
-        .unwrap(),
-    }
-}
-
-fn prepare_complete(host: &mut QrMusigHost<TestStore>, fixture: &Fixture) {
-    prepare(host, fixture);
+/// Issues a session of `max_inputs` inputs and accepts the device's answer.
+fn issued(host: &mut QrMusigHost<TestStore>, fixture: &Fixture, max_inputs: u8) -> [u8; 4] {
+    let (session_id, _) = issue(host, fixture, max_inputs);
     host.bind_outer_request(RequestId::new(7)).unwrap();
+    let prepared = fixture.prepared(session_id, &issuance(max_inputs));
     assert!(matches!(
-        host.accept_response(&prepared_response(fixture, RequestId::new(7)))
-            .unwrap(),
+        host.accept_response(&raw_response(
+            RequestId::new(7),
+            QrRequestId([1, 2]),
+            response::Body::NoncesPrepared(prepared)
+        ))
+        .unwrap(),
         QrMusigHostResponse::Prepared(_)
     ));
+    session_id
+}
+
+/// The Signing request the host built.
+fn sent_signing(bytes: &[u8]) -> request::Sign {
+    let Ok(Message::Request(QrRequest {
+        body: request::Body::Sign(signing),
+        ..
+    })) = decode(bytes)
+    else {
+        panic!("not a Signing request");
+    };
+    signing
 }
 
 #[test]
 fn raw_manager_attribution_and_record_roundtrip() {
     let fixture = fixture();
-    let mut host = QrMusigHost::from_store(TestStore::default()).unwrap();
-    let bytes = prepare(&mut host, &fixture);
+    let mut host = QrMusigHost::from_store(TestStore::default());
+    let (session_id, bytes) = issue(&mut host, &fixture, 1);
+    let Ok(Message::Request(QrRequest {
+        body: request::Body::PrepareNonces(preparation),
+        ..
+    })) = decode(&bytes)
+    else {
+        panic!("not a Nonce Preparation request");
+    };
+    assert_eq!(preparation.session_id, session_id);
+    assert_eq!(preparation.session_ref, None);
+    assert_eq!(
+        DerivationPath::from(&preparation.derivation_path),
+        DerivationPath::from_str(COSIGNER_PATH).unwrap()
+    );
     let (mut manager, outbound, inbound) = RemoteManager::pair();
     let (sender, receiver) = channel::unbounded();
     manager.subscribe(sender);
@@ -250,7 +327,11 @@ fn raw_manager_attribution_and_record_roundtrip() {
             payload: bytes,
         }
     );
-    let response = prepared_response(&fixture, outer);
+    let response = raw_response(
+        outer,
+        QrRequestId([1, 2]),
+        response::Body::NoncesPrepared(fixture.prepared(session_id, &issuance(1))),
+    );
     let mut wrong = response.clone();
     if let Response::Raw { request, .. } = &mut wrong {
         *request = RequestId::new(999);
@@ -267,289 +348,284 @@ fn raw_manager_attribution_and_record_roundtrip() {
         host.accept_response(&delivered).unwrap(),
         QrMusigHostResponse::Prepared(_)
     ));
-    let record = host.record(&[1; 32]).unwrap().unwrap();
+    let record = host.record(&session_id).unwrap().unwrap();
+    assert_eq!(record.session_ref(), Some(fixture.secret.session_ref()));
+    assert_eq!(
+        record.nonces().keys().cloned().collect::<Vec<_>>(),
+        vec![NoncePosition {
+            path: DerivationPath::from_str(COSIGNER_PATH).unwrap(),
+            key_expression_index: 0,
+            input_index: 0,
+        }]
+    );
     let bytes = record.encode().unwrap();
     let decoded = QrMusigHostRecord::decode(&bytes).unwrap();
-    assert_eq!(decoded.encode().unwrap(), bytes);
-    assert_eq!(decoded.state(), &QrMusigHostState::Prepared);
+    assert_eq!(decoded, record);
+    for len in 0..bytes.len() {
+        assert!(QrMusigHostRecord::decode(&bytes[..len]).is_err());
+    }
     let mut corrupt = bytes;
     corrupt.push(0);
     assert!(QrMusigHostRecord::decode(&corrupt).is_err());
 }
 
 #[test]
-fn failed_preparation_flush_requires_successful_retry_barrier() {
+fn generic_musig_capability_does_not_enable_the_cache() {
     let fixture = fixture();
-    let store = TestStore::default();
-    let disk = store.disk.clone();
-    let mut host = QrMusigHost::from_store(store).unwrap();
-    disk.lock().unwrap().fail = true;
-    let attempt = |host: &mut QrMusigHost<TestStore>| {
-        host.prepare_request(
-            SignerId::new("qr"),
-            response::Capabilities(response::Capabilities::MUSIG_CACHE),
-            QrRequestId([1, 2]),
-            &fixture.descriptor,
-            fixture.fingerprint,
-            fixture.preparation.clone(),
-        )
-    };
-    assert!(attempt(&mut host).is_err());
-    assert!(disk.lock().unwrap().rows.is_empty());
-    assert!(attempt(&mut host).is_err());
-    assert_eq!(disk.lock().unwrap().flushes, 2);
-    disk.lock().unwrap().fail = false;
-    assert!(attempt(&mut host).is_ok());
-    assert_eq!(disk.lock().unwrap().flushes, 3);
-    assert!(matches!(
-        disk.lock().unwrap().rows[&[1; 32]].state(),
-        QrMusigHostState::Preparing
-    ));
-}
-
-#[test]
-fn first_sign_request_allocates_even_when_flush_fails() {
-    let fixture = fixture();
-    let store = TestStore::default();
-    let disk = store.disk.clone();
-    let mut host = QrMusigHost::from_store(store).unwrap();
-    prepare_complete(&mut host, &fixture);
-    let allocate = |host: &mut QrMusigHost<TestStore>, attempt_id| {
-        host.allocate_sign_request(
-            SignerId::new("qr"),
-            response::Capabilities(response::Capabilities::MUSIG_CACHE),
-            QrRequestId([3, 4]),
-            [1; 32],
-            attempt_id,
-            &fixture.psbt,
-        )
-    };
-    disk.lock().unwrap().fail = true;
-    assert!(allocate(&mut host, [2; 32]).is_err());
-    assert!(matches!(
-        host.record(&[1; 32]).unwrap().unwrap().state(),
-        QrMusigHostState::Allocated { .. }
-    ));
-    assert!(matches!(
-        disk.lock().unwrap().rows[&[1; 32]].state(),
-        QrMusigHostState::Prepared
-    ));
-    assert!(allocate(&mut host, [3; 32]).is_err());
-    assert!(allocate(&mut host, [2; 32]).is_err());
-    disk.lock().unwrap().fail = false;
-    assert!(allocate(&mut host, [2; 32]).is_ok());
-    assert!(matches!(
-        disk.lock().unwrap().rows[&[1; 32]].state(),
-        QrMusigHostState::Allocated { .. }
-    ));
-    host.cancel_pending();
-    assert!(allocate(&mut host, [3; 32]).is_err());
-    let restored = TestStore {
-        ram: disk.lock().unwrap().rows.clone(),
-        disk: disk.clone(),
-    };
-    let mut host = QrMusigHost::from_store(restored).unwrap();
-    assert!(allocate(&mut host, [3; 32]).is_err());
-    assert!(allocate(&mut host, [2; 32]).is_ok());
-}
-
-#[test]
-fn generic_musig_capability_does_not_enable_cache() {
-    let fixture = fixture();
-    let mut host = QrMusigHost::from_store(TestStore::default()).unwrap();
+    let mut host = QrMusigHost::from_store(TestStore::default());
     assert!(host
-        .prepare_request(
+        .issue_request(
             SignerId::new("qr"),
             response::Capabilities(ORDINARY_MUSIG_CAPABILITY),
             QrRequestId([1, 2]),
-            &fixture.descriptor,
-            fixture.fingerprint,
-            fixture.preparation
+            fixture.fingerprint(),
+            issuance(1),
         )
         .is_err());
-    assert!(host.record(&[1; 32]).unwrap().is_none());
+    assert!(host.store.ram.is_empty());
 }
 
-fn round_one_response(fixture: &Fixture, psbt: &Psbt) -> Response {
-    let mut returned = psbt.clone();
-    let nonce = &fixture.prepared.nonces[0];
-    set_musig_input_pub_nonce(
-        &mut returned.inputs[0],
-        &MusigPubNonce {
-            participant: PublicKey::from_slice(&nonce.participant.0).unwrap(),
-            aggregate: PublicKey::from_slice(&nonce.aggregate.0).unwrap(),
-            leaf_hash: None,
-            nonce: nonce.nonce,
-        },
-    );
-    Response::Raw {
-        request: RequestId::new(8),
-        signer: SignerId::new("qr"),
-        payload: encode_response(&QrResponse {
-            id: QrRequestId([3, 4]),
-            body: response::Body::MusigSigned(response::MusigSigned {
-                session_id: [1; 32],
-                attempt_id: [2; 32],
-                psbt: returned.serialize(),
-            }),
+#[test]
+fn extension_sends_the_session_reference_and_keeps_issued_nonces() {
+    let fixture = fixture();
+    let mut host = QrMusigHost::from_store(TestStore::default());
+    let session_id = issued(&mut host, &fixture, 1);
+    let wider = issuance(2);
+    let bytes = host
+        .extend_request(
+            capabilities(),
+            QrRequestId([3, 4]),
+            session_id,
+            wider.clone(),
+        )
+        .unwrap();
+    let Ok(Message::Request(QrRequest {
+        body: request::Body::PrepareNonces(preparation),
+        ..
+    })) = decode(&bytes)
+    else {
+        panic!("not a Nonce Preparation request");
+    };
+    assert_eq!(preparation.session_ref, Some(fixture.secret.session_ref()));
+    host.bind_outer_request(RequestId::new(8)).unwrap();
+
+    let mut changed = fixture.prepared(session_id, &wider);
+    changed.nonces.swap(0, 1);
+    assert!(host
+        .accept_response(&raw_response(
+            RequestId::new(8),
+            QrRequestId([3, 4]),
+            response::Body::NoncesPrepared(changed)
+        ))
+        .is_err());
+    let mut other_session = fixture.prepared(session_id, &wider);
+    other_session.session_ref = [0; 4];
+    assert!(host
+        .accept_response(&raw_response(
+            RequestId::new(8),
+            QrRequestId([3, 4]),
+            response::Body::NoncesPrepared(other_session)
+        ))
+        .is_err());
+    let mut wrong_echo = fixture.prepared(session_id, &wider);
+    wrong_echo.max_inputs = 1;
+    wrong_echo.nonces.truncate(1);
+    assert!(host
+        .accept_response(&raw_response(
+            RequestId::new(8),
+            QrRequestId([3, 4]),
+            response::Body::NoncesPrepared(wrong_echo)
+        ))
+        .is_err());
+    assert!(host
+        .accept_response(&raw_response(
+            RequestId::new(8),
+            QrRequestId([9, 9]),
+            response::Body::NoncesPrepared(fixture.prepared(session_id, &wider))
+        ))
+        .is_err());
+    assert_eq!(host.record(&session_id).unwrap().unwrap().nonces().len(), 1);
+
+    host.accept_response(&raw_response(
+        RequestId::new(8),
+        QrRequestId([3, 4]),
+        response::Body::NoncesPrepared(fixture.prepared(session_id, &wider)),
+    ))
+    .unwrap();
+    assert_eq!(host.record(&session_id).unwrap().unwrap().nonces().len(), 2);
+}
+
+#[test]
+fn sign_request_places_nonces_at_their_positions_and_names_the_session() {
+    let fixture = fixture();
+    let mut host = QrMusigHost::from_store(TestStore::default());
+    let session_id = issued(&mut host, &fixture, 2);
+    let psbt = spend(&fixture.descriptor, &[3, 4]);
+    let bytes = host
+        .sign_request(
+            capabilities(),
+            QrRequestId([5, 6]),
+            session_id,
+            fixture.descriptors(),
+            &psbt,
+        )
+        .unwrap();
+    let signing = sent_signing(&bytes);
+    assert_eq!(signing.descriptors, fixture.descriptors());
+    assert_eq!(signing.want_kind, Some(SignResponseKind::Psbt));
+    let sent = Psbt::deserialize(&signing.psbt).unwrap();
+    assert_eq!(sent.unsigned_tx, psbt.unsigned_tx);
+    assert_eq!(
+        nonce_cache_session(&sent).unwrap(),
+        Some(NonceCacheSession {
+            session_id,
+            session_ref: fixture.secret.session_ref(),
         })
-        .unwrap(),
+    );
+    let issued = fixture.nonces(&issuance(2));
+    let own = fixture.own_slots(&sent);
+    assert_eq!(own.len(), 2);
+    for info in own {
+        assert_eq!(info.key_expression_index, 0);
+        assert_eq!(
+            info.pub_nonce(&sent.inputs[info.slot.input_index]).unwrap(),
+            Some(issued[info.slot.input_index])
+        );
     }
 }
 
 #[test]
-fn round_one_response_keeps_allocation_and_rejects_metadata_changes() {
+fn sign_request_refuses_unissued_slots_and_other_nonces() {
     let fixture = fixture();
-    let mut host = QrMusigHost::from_store(TestStore::default()).unwrap();
-    prepare_complete(&mut host, &fixture);
-    host.allocate_sign_request(
-        SignerId::new("qr"),
-        response::Capabilities(response::Capabilities::MUSIG_CACHE),
-        QrRequestId([3, 4]),
-        [1; 32],
-        [2; 32],
-        &fixture.psbt,
-    )
-    .unwrap();
-    host.bind_outer_request(RequestId::new(8)).unwrap();
-    let mut modified = fixture.psbt.clone();
-    modified.version = 1;
-    assert!(host
-        .accept_response(&round_one_response(&fixture, &modified))
-        .is_err());
-    let mut modified = fixture.psbt.clone();
-    modified.unsigned_tx.version = Version::ONE;
-    assert!(host
-        .accept_response(&round_one_response(&fixture, &modified))
-        .is_err());
-    let response = round_one_response(&fixture, &fixture.psbt);
-    assert!(matches!(
-        host.accept_response(&response).unwrap(),
-        QrMusigHostResponse::Signed(_)
-    ));
-    assert!(matches!(
-        host.record(&[1; 32]).unwrap().unwrap().state(),
-        QrMusigHostState::Allocated {
-            transcript: None,
-            ..
-        }
-    ));
-    assert!(host.accept_response(&response).is_err());
-}
-
-#[test]
-fn prepared_response_rejects_inner_id_and_incomplete_or_foreign_attribution() {
-    let fixture = fixture();
-    let mut host = QrMusigHost::from_store(TestStore::default()).unwrap();
-    prepare(&mut host, &fixture);
-    host.bind_outer_request(RequestId::new(7)).unwrap();
-    let wrong_inner = Response::Raw {
-        request: RequestId::new(7),
-        signer: SignerId::new("qr"),
-        payload: encode_response(&QrResponse {
-            id: QrRequestId([9, 9]),
-            body: response::Body::MusigPrepared(fixture.prepared.clone()),
-        })
-        .unwrap(),
-    };
-    assert!(host.accept_response(&wrong_inner).is_err());
-    let mut foreign = fixture.prepared.clone();
-    foreign.nonces[0].expression_index += 1;
-    let wrong_expression = Response::Raw {
-        request: RequestId::new(7),
-        signer: SignerId::new("qr"),
-        payload: encode_response(&QrResponse {
-            id: QrRequestId([1, 2]),
-            body: response::Body::MusigPrepared(foreign),
-        })
-        .unwrap(),
-    };
-    assert!(host.accept_response(&wrong_expression).is_err());
-    assert!(host
-        .accept_response(&Response::Signed {
-            request: RequestId::new(7),
-            signer: SignerId::new("qr"),
-            psbt: fixture.psbt.serialize(),
-        })
-        .is_err());
-    assert!(host
-        .accept_response(&Response::error(
-            RequestId::new(7),
-            SignerId::new("qr"),
-            "refused"
-        ))
-        .is_err());
-    assert!(matches!(
-        host.record(&[1; 32]).unwrap().unwrap().state(),
-        QrMusigHostState::Preparing
-    ));
-    assert!(host
-        .accept_response(&prepared_response(&fixture, RequestId::new(7)))
-        .is_ok());
-}
-
-#[test]
-fn first_complete_transcript_is_pinned_before_dispatch() {
-    let fixture = fixture();
-    let store = TestStore::default();
-    let disk = store.disk.clone();
-    let mut host = QrMusigHost::from_store(store).unwrap();
-    prepare_complete(&mut host, &fixture);
-    let definite = fixture.descriptor.single_paths().unwrap()[0]
-        .derive_at(0)
-        .unwrap();
-    let infos = expression_slots(0, &definite).unwrap();
-    let foreign = infos
-        .iter()
-        .find(|info| info.signer.0 != fixture.fingerprint)
-        .unwrap();
-    let nonce = fixture.prepared.nonces[0].nonce;
-    let mut complete = fixture.psbt.clone();
-    set_musig_input_pub_nonce(
-        &mut complete.inputs[0],
-        &MusigPubNonce {
-            participant: foreign.slot.participant,
-            aggregate: foreign.slot.aggregate,
-            leaf_hash: None,
-            nonce,
-        },
-    );
-    let allocate = |host: &mut QrMusigHost<TestStore>, psbt: &Psbt| {
-        host.allocate_sign_request(
-            SignerId::new("qr"),
-            response::Capabilities(response::Capabilities::MUSIG_CACHE),
-            QrRequestId([3, 4]),
-            [1; 32],
-            [2; 32],
+    let mut host = QrMusigHost::from_store(TestStore::default());
+    let (pending, _) = issue(&mut host, &fixture, 1);
+    host.cancel_pending();
+    let psbt = spend(&fixture.descriptor, &[3]);
+    let sign = |host: &mut QrMusigHost<TestStore>, session_id, psbt: &Psbt| {
+        host.sign_request(
+            capabilities(),
+            QrRequestId([5, 6]),
+            session_id,
+            fixture.descriptors(),
             psbt,
         )
     };
-    allocate(&mut host, &complete).unwrap();
-    assert!(matches!(
-        disk.lock().unwrap().rows[&[1; 32]].state(),
-        QrMusigHostState::Allocated {
-            transcript: Some(_),
-            ..
-        }
-    ));
-    host.cancel_pending();
-    assert!(allocate(&mut host, &fixture.psbt).is_err());
-    let key =
-        PublicKey::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[4; 32]).unwrap());
-    let mut changed = nonce;
-    changed[..33].copy_from_slice(&key.serialize());
-    let mut changed_psbt = complete.clone();
+    assert!(sign(&mut host, pending, &psbt).is_err());
+    let session_id = issued(&mut host, &fixture, 1);
+    assert!(sign(&mut host, [0xee; 4], &psbt).is_err());
+    assert!(sign(&mut host, session_id, &spend(&fixture.descriptor, &[3, 4])).is_err());
+
+    let mut other = psbt.clone();
+    let info = &fixture.own_slots(&psbt)[0];
+    let mut nonce = fixture.nonces(&issuance(1))[0];
+    nonce.swap(1, 34);
     set_musig_input_pub_nonce(
-        &mut changed_psbt.inputs[0],
+        &mut other.inputs[0],
         &MusigPubNonce {
-            participant: foreign.slot.participant,
-            aggregate: foreign.slot.aggregate,
-            leaf_hash: None,
-            nonce: changed,
+            participant: info.slot.participant,
+            aggregate: info.slot.aggregate,
+            leaf_hash: info.slot.leaf_hash,
+            nonce,
         },
     );
-    assert!(allocate(&mut host, &changed_psbt).is_err());
-    assert!(allocate(&mut host, &complete).is_ok());
+    assert!(sign(&mut host, session_id, &other).is_err());
+    assert!(host.pending.is_none());
+    assert!(sign(&mut host, session_id, &psbt).is_ok());
+}
+
+#[test]
+fn signed_response_drops_the_session_and_must_spend_the_same_transaction() {
+    let fixture = fixture();
+    let mut host = QrMusigHost::from_store(TestStore::default());
+    let session_id = issued(&mut host, &fixture, 1);
+    let psbt = spend(&fixture.descriptor, &[3]);
+    let bytes = host
+        .sign_request(
+            capabilities(),
+            QrRequestId([5, 6]),
+            session_id,
+            fixture.descriptors(),
+            &psbt,
+        )
+        .unwrap();
+    host.bind_outer_request(RequestId::new(9)).unwrap();
+    let sent = Psbt::deserialize(&sent_signing(&bytes).psbt).unwrap();
+    let mut other = sent.clone();
+    other.unsigned_tx.output[0].value = Amount::from_sat(1);
+    assert!(host
+        .accept_response(&raw_response(
+            RequestId::new(9),
+            QrRequestId([5, 6]),
+            response::Body::Signed(response::Signed::Psbt(other.serialize()))
+        ))
+        .is_err());
+    assert!(host
+        .accept_response(&raw_response(
+            RequestId::new(9),
+            QrRequestId([5, 6]),
+            response::Body::Signed(response::Signed::Signatures(Vec::new()))
+        ))
+        .is_err());
+    assert!(host.record(&session_id).unwrap().is_some());
+    let QrMusigHostResponse::Signed(returned) = host
+        .accept_response(&raw_response(
+            RequestId::new(9),
+            QrRequestId([5, 6]),
+            response::Body::Signed(response::Signed::Psbt(sent.serialize())),
+        ))
+        .unwrap()
+    else {
+        panic!("not a signed response");
+    };
+    assert_eq!(returned, sent);
+    assert!(host.record(&session_id).unwrap().is_none());
+    assert!(host.store.disk.lock().unwrap().rows.is_empty());
+}
+
+#[test]
+fn session_refusal_drops_the_session_and_other_refusals_keep_it() {
+    let fixture = fixture();
+    let mut host = QrMusigHost::from_store(TestStore::default());
+    let session_id = issued(&mut host, &fixture, 1);
+    let psbt = spend(&fixture.descriptor, &[3]);
+    let refuse = |host: &mut QrMusigHost<TestStore>, error| {
+        host.sign_request(
+            capabilities(),
+            QrRequestId([5, 6]),
+            session_id,
+            fixture.descriptors(),
+            &psbt,
+        )
+        .unwrap();
+        host.bind_outer_request(RequestId::new(9)).unwrap();
+        host.accept_response(&raw_response(
+            RequestId::new(9),
+            QrRequestId([5, 6]),
+            response::Body::Error(response::ErrorBody {
+                message_type: bwk_qr_protocol::MessageType::Signing,
+                error,
+                message: "refused".into(),
+            }),
+        ))
+    };
+    assert!(matches!(
+        refuse(&mut host, response::Error::UserDeclined),
+        Err(Error::Peer(_))
+    ));
+    assert!(host.pending.is_none());
+    assert!(host.record(&session_id).unwrap().is_some());
+    assert!(matches!(
+        refuse(&mut host, response::Error::MusigSession),
+        Err(Error::Peer(_))
+    ));
+    assert!(host.record(&session_id).unwrap().is_none());
+    assert!(!host
+        .store
+        .disk
+        .lock()
+        .unwrap()
+        .rows
+        .contains_key(&session_id));
 }
 
 #[test]
@@ -557,27 +633,64 @@ fn response_acceptance_retry_flushes_changed_ram_again() {
     let fixture = fixture();
     let store = TestStore::default();
     let disk = store.disk.clone();
-    let mut host = QrMusigHost::from_store(store).unwrap();
-    prepare(&mut host, &fixture);
+    let mut host = QrMusigHost::from_store(store);
+    let (session_id, _) = issue(&mut host, &fixture, 1);
     host.bind_outer_request(RequestId::new(7)).unwrap();
-    let response = prepared_response(&fixture, RequestId::new(7));
+    let response = raw_response(
+        RequestId::new(7),
+        QrRequestId([1, 2]),
+        response::Body::NoncesPrepared(fixture.prepared(session_id, &issuance(1))),
+    );
     disk.lock().unwrap().fail = true;
     assert!(host.accept_response(&response).is_err());
-    assert!(matches!(
-        host.record(&[1; 32]).unwrap().unwrap().state(),
-        QrMusigHostState::Prepared
-    ));
-    assert!(matches!(
-        disk.lock().unwrap().rows[&[1; 32]].state(),
-        QrMusigHostState::Preparing
-    ));
+    assert!(host
+        .record(&session_id)
+        .unwrap()
+        .unwrap()
+        .session_ref()
+        .is_some());
+    assert_eq!(disk.lock().unwrap().rows[&session_id].session_ref(), None);
     let flushes = disk.lock().unwrap().flushes;
     assert!(host.accept_response(&response).is_err());
     assert_eq!(disk.lock().unwrap().flushes, flushes + 1);
     disk.lock().unwrap().fail = false;
     assert!(host.accept_response(&response).is_ok());
-    assert!(matches!(
-        disk.lock().unwrap().rows[&[1; 32]].state(),
-        QrMusigHostState::Prepared
-    ));
+    assert_eq!(
+        disk.lock().unwrap().rows[&session_id].session_ref(),
+        Some(fixture.secret.session_ref())
+    );
+}
+
+#[test]
+fn placed_nonce_matches_the_device_nonce_for_the_slot() {
+    let fixture = fixture();
+    let mut host = QrMusigHost::from_store(TestStore::default());
+    let session_id = issued(&mut host, &fixture, 1);
+    let psbt = spend(&fixture.descriptor, &[3]);
+    let bytes = host
+        .sign_request(
+            capabilities(),
+            QrRequestId([5, 6]),
+            session_id,
+            fixture.descriptors(),
+            &psbt,
+        )
+        .unwrap();
+    let sent = Psbt::deserialize(&sent_signing(&bytes).psbt).unwrap();
+    let info = &fixture.own_slots(&sent)[0];
+    let secret_key = fixture.device.private_key_at(&info.signer.1).secret_bytes();
+    let (_, expected) = fixture
+        .secret
+        .nonce(0, 0, &secret_key, &info.slot.participant.serialize())
+        .unwrap();
+    assert_eq!(
+        musig_input_pub_nonce(
+            &sent.inputs[0],
+            info.slot.participant,
+            info.slot.aggregate,
+            info.slot.leaf_hash
+        )
+        .unwrap(),
+        Some(expected)
+    );
 }
