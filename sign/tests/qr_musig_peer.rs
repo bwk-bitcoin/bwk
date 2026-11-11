@@ -16,7 +16,10 @@ use bwk_psbt::{
     musig::{
         musig_input_partial_sigs, musig_input_pub_nonce, set_musig_input_pub_nonce, MusigPubNonce,
     },
-    nonce_cache::{set_nonce_cache_session, NonceCacheSession},
+    nonce_cache::{
+        nonce_cache_session, nonce_cache_session_v2, set_nonce_cache_session, NonceCacheSession,
+    },
+    PsbtV2,
 };
 use bwk_qr_protocol::{
     request::{self, Descriptor as QrDescriptor, DescriptorBody, PrepareNonces, Sign},
@@ -469,6 +472,35 @@ fn signed_session_is_deleted_and_refuses_a_replay() {
     assert_session_refusal(f.peer.sign(signing.clone()));
     f.peer = peer(&f.persistence);
     assert_session_refusal(f.peer.sign(signing));
+}
+
+#[test]
+fn psbt_v2_is_signed_and_answered_as_v2() {
+    let mut f = fixture();
+    let session_id = f.issue(2);
+    let signing = f.signing(session_id, &f.psbt());
+    let v0 = Psbt::deserialize(&signing.psbt).unwrap();
+    let v2 = PsbtV2::from_bitcoin_psbt(v0.clone()).unwrap();
+    assert_eq!(
+        nonce_cache_session_v2(&v2).unwrap(),
+        nonce_cache_session(&v0).unwrap()
+    );
+    let signed = f
+        .peer
+        .sign(Sign {
+            psbt: v2.serialize().unwrap(),
+            ..signing
+        })
+        .unwrap();
+    let response::Signed::Psbt(bytes) = signed else {
+        panic!("not a signed PSBT");
+    };
+    let signed = PsbtV2::deserialize(&bytes).unwrap();
+    assert_eq!(signed.unsigned_tx().unwrap(), v2.unsigned_tx().unwrap());
+    for input in &signed.inputs {
+        assert_eq!(musig_input_partial_sigs(&input.psbt).unwrap().len(), 2);
+    }
+    assert!(!f.committed().contains_key(&session_id));
 }
 
 #[test]
