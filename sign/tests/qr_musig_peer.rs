@@ -882,6 +882,88 @@ fn registered_descriptor_codec_roundtrips() {
     assert!(decode_registered(&[0xff]).is_err());
 }
 
+fn with_descriptors(signing: &Sign, descriptors: Vec<QrDescriptor>) -> Sign {
+    Sign {
+        descriptors,
+        ..signing.clone()
+    }
+}
+
+fn entry(alias: &str, descriptor: Option<DescriptorBody>) -> QrDescriptor {
+    QrDescriptor {
+        alias: alias.to_string(),
+        descriptor,
+        proof: Some(vec![0xde, 0xad]),
+    }
+}
+
+#[test]
+fn signing_resolves_registered_aliases_and_ignores_proofs() {
+    let mut f = fixture();
+    let session_id = f.issue(2);
+    let signing = f.signing(session_id, &f.psbt());
+
+    let unknown = with_descriptors(&signing, vec![entry("peer", None)]);
+    assert!(matches!(
+        f.peer.sign(unknown.clone()),
+        Err(Error::UnknownAlias(alias)) if alias == "peer"
+    ));
+    let refused = f.peer.handle(QrRequest {
+        id: QrRequestId([6, 6]),
+        body: request::Body::Sign(unknown),
+    });
+    assert!(matches!(
+        refused.body,
+        response::Body::Error(response::ErrorBody {
+            error: response::Error::UnknownDescriptorAlias,
+            ..
+        })
+    ));
+
+    f.peer
+        .register(registration("peer", Some(bip380_body(&f))))
+        .unwrap();
+    let other = bip388_body(&f, "tr(musig(@2,@3)/**,pk(musig(@0,@1)/**))");
+    let mismatch = with_descriptors(&signing, vec![entry("peer", Some(other))]);
+    assert!(matches!(
+        f.peer.sign(mismatch),
+        Err(Error::AlreadyRegistered(alias)) if alias == "peer"
+    ));
+    assert!(f.committed().contains_key(&session_id));
+
+    let same = bip388_body(&f, "tr(musig(@0,@1)/**,pk(musig(@2,@3)/**))");
+    let matching = with_descriptors(&signing, vec![entry("peer", Some(same))]);
+    let signed = signed_psbt(f.peer.sign(matching).unwrap());
+    assert_eq!(
+        musig_input_partial_sigs(&signed.inputs[0]).unwrap().len(),
+        2
+    );
+
+    let session_id = f.issue(2);
+    let signing = f.signing(session_id, &f.psbt());
+    let alias_only = with_descriptors(&signing, vec![entry("peer", None)]);
+    let signed = signed_psbt(f.peer.sign(alias_only).unwrap());
+    assert_eq!(
+        musig_input_partial_sigs(&signed.inputs[0]).unwrap().len(),
+        2
+    );
+
+    let session_id = f.issue(2);
+    let signing = f.signing(session_id, &f.psbt());
+    let body_only = with_descriptors(&signing, vec![entry("unregistered", Some(bip380_body(&f)))]);
+    let signed = signed_psbt(f.peer.sign(body_only).unwrap());
+    assert_eq!(
+        musig_input_partial_sigs(&signed.inputs[0]).unwrap().len(),
+        2
+    );
+    assert!(!f
+        .registry
+        .lock()
+        .unwrap()
+        .committed
+        .contains_key("unregistered"));
+}
+
 #[test]
 fn signing_refusals_keep_the_session() {
     let mut f = fixture();

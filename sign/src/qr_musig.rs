@@ -47,6 +47,8 @@ pub enum Error {
     Request(String),
     #[error("descriptor alias {0} is registered with another descriptor")]
     AlreadyRegistered(String),
+    #[error("unknown descriptor alias {0}")]
+    UnknownAlias(String),
 }
 
 /// A session, stored under its `session_id`.
@@ -202,13 +204,33 @@ where
             return Err(SignError::MusigSession.into());
         }
         for descriptor in &request.descriptors {
-            let descriptor = signing_descriptor(descriptor)?;
+            let descriptor = self.signing_descriptor(descriptor)?;
             psbt.sign(&self.signer, &descriptor, &record.secret)?;
         }
         let signed = psbt.serialize()?;
         self.store.remove(&session.session_id)?;
         self.store.flush()?;
         Ok(Signed::Psbt(signed))
+    }
+
+    /// The descriptor a Signing entry names: its body, which must be the registered
+    /// descriptor when the alias is registered, or the registered descriptor when it
+    /// has no body. A body does not register its alias, and a proof of registration
+    /// is ignored.
+    fn signing_descriptor(&self, entry: &request::Descriptor) -> Result<WalletDescriptor, Error> {
+        let stored = self.registry.get(&entry.alias)?;
+        match (&entry.descriptor, stored) {
+            (Some(body), Some(stored)) => {
+                let descriptor = body_descriptor(body)?;
+                if descriptor != stored {
+                    return Err(Error::AlreadyRegistered(entry.alias.clone()));
+                }
+                Ok(descriptor)
+            }
+            (Some(body), None) => body_descriptor(body),
+            (None, Some(stored)) => Ok(stored),
+            (None, None) => Err(Error::UnknownAlias(entry.alias.clone())),
+        }
     }
 
     /// Unsupported operations return explicit wire errors, never ordinary signing.
@@ -325,15 +347,8 @@ fn wire_error(error: &Error) -> response::Error {
         Error::Sign(SignError::InputNotOwned) => response::Error::NothingToSign,
         Error::Sign(_) => response::Error::InvalidPsbt,
         Error::AlreadyRegistered(_) => response::Error::AlreadyRegistered,
+        Error::UnknownAlias(_) => response::Error::UnknownDescriptorAlias,
     }
-}
-
-fn signing_descriptor(descriptor: &request::Descriptor) -> Result<WalletDescriptor, Error> {
-    let body = descriptor
-        .descriptor
-        .as_ref()
-        .ok_or_else(|| Error::Request("a descriptor body is required".to_string()))?;
-    body_descriptor(body)
 }
 
 /// The wallet descriptor of a BIP-380 or BIP-388 body: both forms of one
