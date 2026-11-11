@@ -60,7 +60,6 @@ struct Keep {
     key_request_lists: Vec<Vec<types::KeyRequest>>,
     key_lists: Vec<Vec<*const c_char>>,
     descriptor_lists: Vec<Vec<types::Descriptor>>,
-    musig_derivation_lists: Vec<Vec<types::MusigDerivation>>,
     // C holds a pointer to each body, so it must not move when the list grows
     #[allow(clippy::vec_box)]
     descriptor_bodies: Vec<Box<types::DescriptorBody>>,
@@ -98,21 +97,6 @@ impl Keep {
                         .map_or(types::ABSENT_KIND, |kind| kind.value() as i16),
                 },
             },
-            request::Body::PrepareMusig(body) => types::RequestBody {
-                prepare_musig: types::PrepareMusig {
-                    descriptor: self.descriptor(&body.descriptor)?,
-                    session_id: body.session_id,
-                    max_inputs: body.max_inputs,
-                    derivations: self.musig_derivation_list(&body.derivations),
-                },
-            },
-            request::Body::SignMusig(body) => types::RequestBody {
-                sign_musig: types::SignMusig {
-                    session_id: body.session_id,
-                    attempt_id: body.attempt_id,
-                    psbt: self.bytes(&body.psbt),
-                },
-            },
             request::Body::PrepareNonces(body) => types::RequestBody {
                 prepare_nonces: types::PrepareNonces {
                     session_id: body.session_id,
@@ -147,20 +131,6 @@ impl Keep {
             body: self.optional_descriptor_body(descriptor.descriptor.as_ref())?,
             proof: self.optional_bytes(descriptor.proof.as_deref()),
         })
-    }
-
-    fn musig_derivation_list(
-        &mut self,
-        derivations: &[request::MusigDerivation],
-    ) -> types::List<types::MusigDerivation> {
-        let items = derivations
-            .iter()
-            .map(|derivation| types::MusigDerivation {
-                keychain: derivation.keychain,
-                index: derivation.index,
-            })
-            .collect();
-        keep_list(&mut self.musig_derivation_lists, items)
     }
 
     fn optional_descriptor_body(

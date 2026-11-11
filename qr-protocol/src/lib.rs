@@ -58,7 +58,6 @@ pub mod encode;
 #[cfg(feature = "ffi")]
 pub mod ffi;
 pub mod get_info;
-pub mod musig;
 pub mod nonce_cache;
 pub mod reader;
 pub mod request;
@@ -110,8 +109,6 @@ pub enum MessageType {
     RegisterDescriptor,
     AddressVerification,
     Signing,
-    MusigPreparation,
-    MusigSigning,
     NoncePreparation,
 }
 
@@ -129,9 +126,7 @@ impl From<MessageType> for u8 {
             MessageType::RegisterDescriptor => 0x03,
             MessageType::AddressVerification => 0x04,
             MessageType::Signing => 0x05,
-            MessageType::MusigPreparation => 0x06,
-            MessageType::MusigSigning => 0x07,
-            MessageType::NoncePreparation => 0x08,
+            MessageType::NoncePreparation => 0x06,
         }
     }
 }
@@ -146,9 +141,7 @@ impl TryFrom<u8> for MessageType {
             0x03 => Ok(Self::RegisterDescriptor),
             0x04 => Ok(Self::AddressVerification),
             0x05 => Ok(Self::Signing),
-            0x06 => Ok(Self::MusigPreparation),
-            0x07 => Ok(Self::MusigSigning),
-            0x08 => Ok(Self::NoncePreparation),
+            0x06 => Ok(Self::NoncePreparation),
             _ => Err(decode::Error::UnknownMessageType(value)),
         }
     }

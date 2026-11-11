@@ -31,38 +31,17 @@ match decode(bytes)? {
 let bytes = encode_response(&response)?;
 ```
 
-Cached MuSig uses `request::Body::{PrepareMusig, SignMusig}` and
-`response::Body::{MusigPrepared, MusigSigned}`. Preparation contains a descriptor
-entry (its body optional), a session ID, input coverage and public derivation
-points, but no transaction. Public nonces identify their derivation, input,
-descriptor expression, participant, aggregate and optional leaf. Signing carries the
-session ID, a separate attempt ID and an opaque PSBT v0 or v2. No secret roots travel
-over this protocol.
-
-Check `response::Capabilities::supports_musig_cache()` before using these operations;
-`Capabilities::MUSIG_CACHE` is bit 4, separate from ordinary MuSig support. Both
-encode and decode validate preparation bounds and nonce attribution, including
-duplicate attribution. The raw C read path checks bounds and presence only; a C
-consumer must still validate a prepared response before use. The codec does
-not allocate or persist signing sessions, burn secret nonces, validate cryptography,
-or check response correlation. Those remain the consumer's responsibility.
-
-The new message codes are `0x06` and `0x07`. Version 1 and ordinary Signing (`0x05`)
-are unchanged. Old peers reject the new codes instead of ignoring a cached selector
-appended to an ordinary signing request.
-
 Nonce preparation uses `request::Body::PrepareNonces` and
-`response::Body::NoncesPrepared` (message code `0x08`). It is bound to no descriptor
-and serves both MuSig2 and anti-exfil. The request carries a session ID, an optional
+`response::Body::NoncesPrepared` (message code `0x06`). It is bound to no descriptor
+and prepares MuSig2 nonces. The request carries a session ID, an optional
 session reference, input coverage, one derivation path and an inclusive range of key
 expression indexes spanning 1 to `MAX_NONCE_EXPRESSIONS`; the response echoes the
 session ID, coverage and range, and carries the session reference and the 66-byte
 public nonces in order, by key expression index then input index. Check
-`Capabilities::supports_nonce_cache()` (bit 5) first. Both encode and decode
+`Capabilities::supports_nonce_cache()` (bit 4) first. Both encode and decode
 validate those bounds and that the nonce count is exactly the range span times the
 input coverage. Signing with a cached session is ordinary Signing,
-named inside the PSBT; the signer-side rules live in `bip-nonce-cache/BIP-DRAFT.md`
-and `bip-anti-exfil/BIP-DRAFT.md`.
+named inside the PSBT; the signer-side rules live in `bip-nonce-cache/BIP-DRAFT.md`.
 
 A signatures-only Signing response carries the BIP-375 ECDH shares and BIP-374 DLEQ
 proofs of a silent payment send as `SignatureEntry::{SpEcdhShare, SpDleqProof}`, each
@@ -119,7 +98,6 @@ field from `ENCODING.md`; they report local decode, encode, or FFI failures.
 | 200..299          | Protocol decoder       |
 | 300..399          | Protocol encoder       |
 | 400..499          | C binding              |
-| 500..599          | MuSig validation       |
 | 600..699          | Silent payments        |
 | 700..799          | Get Info               |
 | 800..899          | Signatures             |
@@ -127,15 +105,13 @@ field from `ENCODING.md`; they report local decode, encode, or FFI failures.
 +-------------------+------------------------+
 ```
 
-MuSig validation codes `500` through `508` (`504` unused) are shared by encode and
-decode and exposed as `musig::Error`, Get Info validation codes `700` and `701` as
-`get_info::Error`, the taproot signature length code `800` as
+Get Info validation codes `700` and `701` are shared by encode and decode and
+exposed as `get_info::Error`, the taproot signature length code `800` as
 `signature::Error`, and nonce cache validation codes `900` through `902` as
-`nonce_cache::Error`. The C request union includes `prepare_musig`, `sign_musig` and
-`prepare_nonces`; a Get Info request has no body and leaves it unused. The response
-union includes `musig_prepared`, `musig_signed`, `nonces_prepared` and `info`.
-These additions grow the C unions, so consumers must rebuild against the updated
-header. Pointer ownership is unchanged.
+`nonce_cache::Error`. The C request union includes `prepare_nonces`; a Get Info
+request has no body and leaves it unused. The response union includes
+`nonces_prepared` and `info`. Consumers must rebuild against the updated header
+whenever the unions change. Pointer ownership is unchanged.
 
 A `staticlib` needs a global allocator and a panic handler, which a library cannot
 supply, so link this crate as an rlib from your own staticlib crate:

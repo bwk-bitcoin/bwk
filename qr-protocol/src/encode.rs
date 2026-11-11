@@ -1,7 +1,7 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::{
-    get_info, musig, nonce_cache, request, response, signature, sp,
+    get_info, nonce_cache, request, response, signature, sp,
     types::{DerivationPath, ExtendedKey, PublicKey, MUSIG_PUB_NONCE_LEN, TAP_LEAF_HASH_LEN},
     ErrorInfo, MessageType, Request, RequestId, Response, SignResponseKind, DIRECTION_REQUEST,
     DIRECTION_RESPONSE, MAGIC, MAX_BYTES, MAX_DESCRIPTOR_ALIAS, MAX_VEC, REQUEST_ID_LEN,
@@ -12,8 +12,7 @@ pub const MAX_PATH: usize = 255;
 pub const MAX_PATCH: u32 = 0x00ff_ffff;
 const ERROR_CODE_FUTURE_MIN: u8 = 0x0e;
 const ERROR_CODE_FUTURE_MAX: u8 = 0xfe;
-const CAPABILITIES_MASK: u32 =
-    0x0000_000f | response::Capabilities::MUSIG_CACHE | response::Capabilities::NONCE_CACHE;
+const CAPABILITIES_MASK: u32 = 0x0000_000f | response::Capabilities::NONCE_CACHE;
 const NETWORKS_MASK: u8 = response::Networks::MAINNET
     | response::Networks::TESTNET
     | response::Networks::SIGNET
@@ -21,7 +20,6 @@ const NETWORKS_MASK: u8 = response::Networks::MAINNET
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    Musig(musig::Error),
     Sp(sp::Error),
     GetInfo(get_info::Error),
     Signature(signature::Error),
@@ -43,7 +41,6 @@ pub enum Error {
 impl Error {
     pub fn info(&self) -> ErrorInfo {
         match self {
-            Self::Musig(error) => error.info(),
             Self::Sp(error) => error.info(),
             Self::GetInfo(error) => error.info(),
             Self::Signature(error) => error.info(),
@@ -72,12 +69,6 @@ impl Error {
 }
 
 error_display!(Error);
-
-impl From<musig::Error> for Error {
-    fn from(error: musig::Error) -> Self {
-        Self::Musig(error)
-    }
-}
 
 impl From<sp::Error> for Error {
     fn from(error: sp::Error) -> Self {
@@ -142,8 +133,6 @@ fn encode_request_body(out: &mut Vec<u8>, body: &request::Body) -> Result<(), Er
         }
         request::Body::VerifyAddress(request) => encode_verify_address_request(out, request),
         request::Body::Sign(request) => encode_sign_request(out, request),
-        request::Body::PrepareMusig(request) => encode_prepare_musig(out, request),
-        request::Body::SignMusig(request) => encode_sign_musig(out, request),
         request::Body::PrepareNonces(request) => encode_prepare_nonces(out, request),
         request::Body::GetInfo => Ok(()),
     }
@@ -155,8 +144,6 @@ fn encode_response_body(out: &mut Vec<u8>, body: &response::Body) -> Result<(), 
         response::Body::Registration(response) => encode_registration_response(out, response),
         response::Body::AddressUri(response) => encode_address_uri_response(out, response),
         response::Body::Signed(response) => encode_signed_response(out, response),
-        response::Body::MusigPrepared(response) => encode_musig_prepared(out, response),
-        response::Body::MusigSigned(response) => encode_musig_signed(out, response),
         response::Body::NoncesPrepared(response) => encode_nonces_prepared(out, response),
         response::Body::Info(response) => encode_info_response(out, response),
         response::Body::Error(response) => encode_error_response(out, response),
@@ -195,59 +182,6 @@ fn encode_sign_request(out: &mut Vec<u8>, request: &request::Sign) -> Result<(),
         out.push(kind.value());
         Ok(())
     })
-}
-
-fn encode_prepare_musig(out: &mut Vec<u8>, request: &request::PrepareMusig) -> Result<(), Error> {
-    request.validate()?;
-    write_descriptor(out, &request.descriptor)?;
-    out.extend_from_slice(&request.session_id);
-    out.push(request.max_inputs);
-    write_vec(out, &request.derivations, write_musig_derivation)
-}
-
-fn write_musig_derivation(
-    out: &mut Vec<u8>,
-    derivation: &request::MusigDerivation,
-) -> Result<(), Error> {
-    out.extend_from_slice(&derivation.keychain.to_be_bytes());
-    out.extend_from_slice(&derivation.index.to_be_bytes());
-    Ok(())
-}
-
-fn encode_sign_musig(out: &mut Vec<u8>, request: &request::SignMusig) -> Result<(), Error> {
-    out.extend_from_slice(&request.session_id);
-    out.extend_from_slice(&request.attempt_id);
-    write_bytes(out, &request.psbt)
-}
-
-fn encode_musig_prepared(
-    out: &mut Vec<u8>,
-    response: &response::MusigPrepared,
-) -> Result<(), Error> {
-    response.validate()?;
-    out.extend_from_slice(&response.session_id);
-    out.push(response.max_inputs);
-    write_vec(out, &response.nonces, write_cached_musig_nonce)
-}
-
-fn write_cached_musig_nonce(out: &mut Vec<u8>, nonce: &response::MusigNonce) -> Result<(), Error> {
-    write_musig_derivation(out, &nonce.derivation)?;
-    out.extend_from_slice(&nonce.input_index.to_be_bytes());
-    out.extend_from_slice(&nonce.expression_index.to_be_bytes());
-    write_musig_slot(
-        out,
-        &nonce.participant,
-        &nonce.aggregate,
-        nonce.leaf_hash.as_ref(),
-    )?;
-    out.extend_from_slice(&nonce.nonce);
-    Ok(())
-}
-
-fn encode_musig_signed(out: &mut Vec<u8>, response: &response::MusigSigned) -> Result<(), Error> {
-    out.extend_from_slice(&response.session_id);
-    out.extend_from_slice(&response.attempt_id);
-    write_bytes(out, &response.psbt)
 }
 
 fn encode_prepare_nonces(out: &mut Vec<u8>, request: &request::PrepareNonces) -> Result<(), Error> {

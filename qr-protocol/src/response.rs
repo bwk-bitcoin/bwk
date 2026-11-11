@@ -1,7 +1,7 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::{
-    get_info, musig, nonce_cache, request, signature, sp,
+    get_info, nonce_cache, signature, sp,
     types::{
         ExtendedKey, Fingerprint, PublicKey, DLEQ_PROOF_LEN, MUSIG_PARTIAL_SIG_LEN,
         MUSIG_PUB_NONCE_LEN, SCHNORR_SIGNATURE_LEN,
@@ -15,8 +15,6 @@ pub enum Body {
     Registration(Registration),
     AddressUri(AddressUri),
     Signed(Signed),
-    MusigPrepared(MusigPrepared),
-    MusigSigned(MusigSigned),
     NoncesPrepared(NoncesPrepared),
     Info(Info),
     Error(ErrorBody),
@@ -35,8 +33,6 @@ impl From<&Body> for MessageType {
             Body::Registration(_) => Self::RegisterDescriptor,
             Body::AddressUri(_) => Self::AddressVerification,
             Body::Signed(_) => Self::Signing,
-            Body::MusigPrepared(_) => Self::MusigPreparation,
-            Body::MusigSigned(_) => Self::MusigSigning,
             Body::NoncesPrepared(_) => Self::NoncePreparation,
             Body::Info(_) => Self::GetInfo,
             Body::Error(e) => e.message_type,
@@ -105,12 +101,7 @@ impl From<u8> for ReleaseFlag {
 pub struct Capabilities(pub u32);
 
 impl Capabilities {
-    pub const MUSIG_CACHE: u32 = 1 << 4;
-    pub const NONCE_CACHE: u32 = 1 << 5;
-
-    pub fn supports_musig_cache(self) -> bool {
-        self.0 & Self::MUSIG_CACHE != 0
-    }
+    pub const NONCE_CACHE: u32 = 1 << 4;
 
     pub fn supports_nonce_cache(self) -> bool {
         self.0 & Self::NONCE_CACHE != 0
@@ -195,39 +186,6 @@ impl Networks {
     pub const TESTNET: u8 = 1 << 2;
     pub const SIGNET: u8 = 1 << 3;
     pub const REGTEST: u8 = 1 << 4;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MusigPrepared {
-    pub session_id: [u8; 32],
-    pub max_inputs: u8,
-    pub nonces: Vec<MusigNonce>,
-}
-
-impl MusigPrepared {
-    pub fn validate(&self) -> Result<(), musig::Error> {
-        musig::validate_input_coverage(self.max_inputs)?;
-        musig::validate_nonces(&self.nonces, self.max_inputs)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MusigNonce {
-    pub derivation: request::MusigDerivation,
-    pub input_index: u32,
-    pub expression_index: u32,
-    pub participant: PublicKey,
-    pub aggregate: PublicKey,
-    pub leaf_hash: Option<[u8; 32]>,
-    pub nonce: [u8; MUSIG_PUB_NONCE_LEN],
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MusigSigned {
-    pub session_id: [u8; 32],
-    pub attempt_id: [u8; 32],
-    /// A serialized PSBT v0 or v2, carried without being parsed.
-    pub psbt: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
