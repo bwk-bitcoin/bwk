@@ -307,18 +307,29 @@ caller-owned `RamStore`.
   at the slot's participant path, `SlotInfo::key_expression_index` and input
   index as its 0x1b, names the session and builds the Signing request with the
   caller's `want_kind`, a preference only: either reply kind is accepted.
+- `two_round_request` builds a Signing request for a PSBT that names no session,
+  for a signer advertising MuSig2 (capability bit 3). The caller sends it once
+  for the signer's public nonces, then again with the same PSBT once every
+  participant's 0x1b is in, for its partial signatures.
 
 Each returns the wire bytes. `submit_pending` sends them through
 `SigningManager::raw`, or `bind_outer_request` binds an outer ID when the caller
 sends them itself, and `accept_response` checks both request IDs and the signer.
 A signatures-only reply is merged into the PSBT it sent: ordinary signatures,
-and MuSig2 partial signatures as 0x1c. A public nonce entry must be the 0x1b it
-placed, a silent payment entry is refused and an entry of an unknown kind is
-skipped. Before it stores anything, the host checks that the reply keeps every
-0x1b it sent and verifies each MuSig2 partial signature with BIP-327
-PartialSigVerify against those nonces, and rejects the whole reply on any
-failure. A signed reply, or a refusal for the session, drops the session; other
-refusals keep it.
+MuSig2 public nonces as 0x1b and partial signatures as 0x1c. A public nonce entry
+must not change a 0x1b already there, a silent payment entry is refused and an
+entry of an unknown kind is skipped. Before it stores anything, the host checks
+that the reply keeps every 0x1b it sent and verifies each MuSig2 partial
+signature with BIP-327 PartialSigVerify against those nonces, and rejects the
+whole reply on any failure. A signed reply, or a refusal for the session, drops
+the session; other refusals keep it.
+
+A reply to a two-round request adding 0x1b is round 1: each added 0x1b must be a
+valid nonce of a slot of the descriptors, and the reply must carry no signature
+of any kind, or it is rejected; `accept_response` then returns
+`QrMusigHostResponse::PubNonces`. A reply adding none is round 2, checked as a
+one-round reply, and returns `QrMusigHostResponse::Signed`. No record is kept for
+two-round requests.
 
 ## HotManager
 

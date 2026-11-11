@@ -274,6 +274,10 @@ fn capabilities() -> response::Capabilities {
     response::Capabilities(response::Capabilities::NONCE_CACHE)
 }
 
+fn musig_capabilities() -> response::Capabilities {
+    response::Capabilities(1 << 3)
+}
+
 fn role_path(role: u32) -> DerivationPath {
     DerivationPath::from_str(&format!("m/87'/1'/0'/{role}")).unwrap()
 }
@@ -925,6 +929,163 @@ fn two_round_session_sits_beside_issued_sessions() {
     let signing = f.signing(session_id, &f.psbt());
     signed_psbt(f.peer.sign(signing).unwrap());
     assert!(f.committed().is_empty());
+}
+
+#[test]
+fn host_drives_two_rounds() {
+    let mut f = fixture();
+    let psbt = f.psbt();
+    assert!(f
+        .host
+        .two_round_request(
+            signer_id(),
+            capabilities(),
+            QrRequestId([3, 1]),
+            f.descriptors(),
+            &psbt,
+            None,
+        )
+        .is_err());
+    let mut named = psbt.clone();
+    set_nonce_cache_session(
+        &mut named,
+        NonceCacheSession {
+            session_id: [1; 4],
+            session_ref: [2; 4],
+        },
+    );
+    assert!(f
+        .host
+        .two_round_request(
+            signer_id(),
+            musig_capabilities(),
+            QrRequestId([3, 1]),
+            f.descriptors(),
+            &named,
+            None,
+        )
+        .is_err());
+
+    let bytes = f
+        .host
+        .two_round_request(
+            signer_id(),
+            musig_capabilities(),
+            QrRequestId([3, 1]),
+            f.descriptors(),
+            &psbt,
+            None,
+        )
+        .unwrap();
+    let QrMusigHostResponse::PubNonces(round_one) = f.exchange(bytes) else {
+        panic!("not a public nonce response");
+    };
+    assert!(!has_signature(&round_one));
+    let bytes = f
+        .host
+        .two_round_request(
+            signer_id(),
+            musig_capabilities(),
+            QrRequestId([3, 2]),
+            f.descriptors(),
+            &round_one,
+            None,
+        )
+        .unwrap();
+    let QrMusigHostResponse::Signed(mut signed) = f.exchange(bytes) else {
+        panic!("not a signed response");
+    };
+    for input in &signed.inputs {
+        assert_eq!(musig_input_partial_sigs(input).unwrap().len(), 2);
+    }
+    f.b.inner_sign(&mut signed, &f.descriptor).unwrap();
+    assert_eq!(
+        aggregate_partial_sigs(&mut signed, &f.descriptor).unwrap(),
+        4
+    );
+}
+
+/// The entries of the 0x1b `round_one` adds to `sent`.
+fn pub_nonce_entries(sent: &Psbt, round_one: &Psbt) -> Vec<response::SignatureEntry> {
+    let mut entries = Vec::new();
+    for (input_index, (sent, input)) in sent.inputs.iter().zip(&round_one.inputs).enumerate() {
+        let sent = musig_input_pub_nonces(sent).unwrap();
+        for nonce in musig_input_pub_nonces(input).unwrap() {
+            if !sent.contains(&nonce) {
+                entries.push(response::SignatureEntry::MusigPubNonce {
+                    input_index: input_index as u32,
+                    participant: types::PublicKey(nonce.participant.serialize()),
+                    aggregate: types::PublicKey(nonce.aggregate.serialize()),
+                    leaf_hash: nonce.leaf_hash.map(|hash| hash.to_byte_array()),
+                    nonce: nonce.nonce,
+                });
+            }
+        }
+    }
+    entries
+}
+
+#[test]
+fn host_merges_a_round_one_reply_and_rejects_a_signature_beside_a_nonce() {
+    let mut f = fixture();
+    let psbt = f.psbt();
+    let round_one = signed_psbt(f.peer.sign(f.two_round(&psbt)).unwrap());
+    let entries = pub_nonce_entries(&psbt, &round_one);
+    assert_eq!(entries.len(), 4);
+    f.host
+        .two_round_request(
+            signer_id(),
+            musig_capabilities(),
+            QrRequestId([2, 1]),
+            f.descriptors(),
+            &psbt,
+            Some(SignResponseKind::Signatures),
+        )
+        .unwrap();
+    f.host.bind_outer_request(RequestId::new(1)).unwrap();
+
+    let mut with_signature = entries.clone();
+    with_signature.push(response::SignatureEntry::TapKey {
+        input_index: 0,
+        signature: vec![1; 64],
+    });
+    assert!(f
+        .host
+        .accept_response(&signatures_reply(with_signature))
+        .is_err());
+    let mut signed_too = round_one.clone();
+    signed_too.inputs[1].tap_key_sig =
+        Some(miniscript::bitcoin::taproot::Signature::from_slice(&[1; 64]).unwrap());
+    assert!(f.host.accept_response(&psbt_reply(&signed_too)).is_err());
+    let mut unknown_slot = entries.clone();
+    let response::SignatureEntry::MusigPubNonce {
+        participant,
+        aggregate,
+        leaf_hash,
+        nonce,
+        ..
+    } = entries[0].clone()
+    else {
+        panic!("not a public nonce");
+    };
+    unknown_slot[0] = response::SignatureEntry::MusigPubNonce {
+        input_index: 0,
+        participant: aggregate,
+        aggregate: participant,
+        leaf_hash,
+        nonce,
+    };
+    assert!(f
+        .host
+        .accept_response(&signatures_reply(unknown_slot))
+        .is_err());
+
+    let QrMusigHostResponse::PubNonces(merged) =
+        f.host.accept_response(&signatures_reply(entries)).unwrap()
+    else {
+        panic!("not a public nonce response");
+    };
+    assert_eq!(merged, round_one);
 }
 
 fn registration(alias: &str, descriptor: Option<DescriptorBody>) -> RegisterDescriptor {

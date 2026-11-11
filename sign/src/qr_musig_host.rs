@@ -2,7 +2,9 @@
 //! (`bip-nonce-cache/BIP-DRAFT.md`): it issues a signer's public nonces with Nonce
 //! Preparation, places them as the PSBT's 0x1b from the descriptor, names the
 //! session with `PSBT_GLOBAL_NONCE_CACHE_SESSION` and sends an ordinary Signing
-//! request.
+//! request. Without a session, it sends the same PSBT twice: once for the
+//! signer's public nonces, once every participant's nonce is in for its partial
+//! signatures.
 //!
 //! Records hold public data only. The host never accesses a backend directly;
 //! record codecs can be used with RamStore.
@@ -17,7 +19,7 @@ use bwk_psbt::{
         musig_input_partial_sigs, musig_input_pub_nonce, musig_input_pub_nonces,
         set_musig_input_partial_sig, set_musig_input_pub_nonce, MusigPartialSig, MusigPubNonce,
     },
-    nonce_cache::{set_nonce_cache_session, NonceCacheSession},
+    nonce_cache::{nonce_cache_session, set_nonce_cache_session, NonceCacheSession},
 };
 use bwk_qr_protocol::{
     decode, encode_request, request, response, types, Message, Request as QrRequest,
@@ -42,6 +44,8 @@ use crate::{
 };
 
 const RECORD_MAGIC: &[u8; 4] = b"QMH2";
+/// Get Info capability bit 3: the signer is a BIP-327 MuSig2 participant.
+const MUSIG_CAPABILITY: u32 = 1 << 3;
 const PUB_NONCE_LEN: usize = 66;
 
 #[derive(Debug, thiserror::Error)]
@@ -183,13 +187,16 @@ impl QrMusigHostRecord {
 #[derive(Clone)]
 struct Pending {
     signer: SignerId,
-    session_id: [u8; SESSION_ID_LEN],
+    /// None for a Signing request without a nonce cache session.
+    session_id: Option<[u8; SESSION_ID_LEN]>,
     outer: Option<RequestId>,
     request: QrRequest,
 }
 
 pub enum QrMusigHostResponse {
     Prepared(response::NoncesPrepared),
+    /// Round 1 without a session: the PSBT with the signer's public nonces.
+    PubNonces(Psbt),
     Signed(Psbt),
 }
 
@@ -224,7 +231,8 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigHostRecord>> QrMusigHos
         fingerprint: Fingerprint,
         issuance: Issuance,
     ) -> Result<([u8; SESSION_ID_LEN], Vec<u8>), Error> {
-        self.require_idle(capabilities)?;
+        self.require_idle()?;
+        require_capability(capabilities, response::Capabilities::NONCE_CACHE)?;
         let session_id = self.new_session_id()?;
         let record = QrMusigHostRecord {
             signer: signer.clone(),
@@ -237,7 +245,7 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigHostRecord>> QrMusigHos
             .map_err(Error::Store)?;
         let bytes = self.publish(
             signer,
-            session_id,
+            Some(session_id),
             id,
             prepare_body(session_id, None, issuance),
         )?;
@@ -253,10 +261,11 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigHostRecord>> QrMusigHos
         session_id: [u8; SESSION_ID_LEN],
         issuance: Issuance,
     ) -> Result<Vec<u8>, Error> {
-        self.require_idle(capabilities)?;
+        self.require_idle()?;
+        require_capability(capabilities, response::Capabilities::NONCE_CACHE)?;
         let record = self.existing(&session_id)?;
         let body = prepare_body(session_id, record.session_ref, issuance);
-        self.publish(record.signer, session_id, id, body)
+        self.publish(record.signer, Some(session_id), id, body)
     }
 
     /// Places the session's nonces as the 0x1b of every slot of the signer in
@@ -272,7 +281,8 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigHostRecord>> QrMusigHos
         psbt: &Psbt,
         want_kind: Option<SignResponseKind>,
     ) -> Result<Vec<u8>, Error> {
-        self.require_idle(capabilities)?;
+        self.require_idle()?;
+        require_capability(capabilities, response::Capabilities::NONCE_CACHE)?;
         let record = self.existing(&session_id)?;
         let session_ref = record
             .session_ref
@@ -297,7 +307,39 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigHostRecord>> QrMusigHos
             psbt: psbt.serialize(),
             want_kind,
         });
-        self.publish(record.signer, session_id, id, body)
+        self.publish(record.signer, Some(session_id), id, body)
+    }
+
+    /// Builds a Signing request for `psbt` without a nonce cache session: round 1
+    /// while the signer's 0x1b are missing, round 2 once every participant's are
+    /// in. `descriptors` carry full BIP-380 bodies, and either reply kind is
+    /// accepted.
+    pub fn two_round_request(
+        &mut self,
+        signer: SignerId,
+        capabilities: response::Capabilities,
+        id: QrRequestId,
+        descriptors: Vec<request::Descriptor>,
+        psbt: &Psbt,
+        want_kind: Option<SignResponseKind>,
+    ) -> Result<Vec<u8>, Error> {
+        self.require_idle()?;
+        require_capability(capabilities, MUSIG_CAPABILITY)?;
+        if nonce_cache_session(psbt)
+            .map_err(|_| Error::Invalid("invalid nonce cache session field"))?
+            .is_some()
+        {
+            return Err(Error::Invalid("PSBT names a nonce cache session"));
+        }
+        for descriptor in &descriptors {
+            wallet_descriptor(descriptor)?;
+        }
+        let body = request::Body::Sign(request::Sign {
+            descriptors,
+            psbt: psbt.serialize(),
+            want_kind,
+        });
+        self.publish(signer, None, id, body)
     }
 
     fn existing(&self, session_id: &[u8; SESSION_ID_LEN]) -> Result<QrMusigHostRecord, Error> {
@@ -318,14 +360,9 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigHostRecord>> QrMusigHos
         }
     }
 
-    fn require_idle(&self, capabilities: response::Capabilities) -> Result<(), Error> {
+    fn require_idle(&self) -> Result<(), Error> {
         if self.pending.is_some() {
             return Err(Error::Invalid("another QR request is outstanding"));
-        }
-        if !capabilities.supports_nonce_cache() {
-            return Err(Error::Invalid(
-                "peer does not advertise nonce cache support",
-            ));
         }
         Ok(())
     }
@@ -333,7 +370,7 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigHostRecord>> QrMusigHos
     fn publish(
         &mut self,
         signer: SignerId,
-        session_id: [u8; SESSION_ID_LEN],
+        session_id: Option<[u8; SESSION_ID_LEN]>,
         id: QrRequestId,
         body: request::Body,
     ) -> Result<Vec<u8>, Error> {
@@ -434,10 +471,10 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigHostRecord>> QrMusigHos
 
     fn refused(
         &mut self,
-        session_id: [u8; SESSION_ID_LEN],
+        session_id: Option<[u8; SESSION_ID_LEN]>,
         error: response::ErrorBody,
     ) -> Result<QrMusigHostResponse, Error> {
-        if error.error == response::Error::MusigSession {
+        if let (Some(session_id), response::Error::MusigSession) = (session_id, error.error) {
             self.store.remove(&session_id).map_err(Error::Store)?;
         }
         self.store.flush().map_err(Error::Store)?;
@@ -494,9 +531,10 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigHostRecord>> QrMusigHos
     }
 
     /// The signer deleted the session before answering, so the host drops it too.
+    /// Without a session, the reply is round 1 when it adds public nonces.
     fn accept_signed(
         &mut self,
-        session_id: [u8; SESSION_ID_LEN],
+        session_id: Option<[u8; SESSION_ID_LEN]>,
         signing: &request::Sign,
         signed: response::Signed,
     ) -> Result<QrMusigHostResponse, Error> {
@@ -518,15 +556,34 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigHostRecord>> QrMusigHos
             .iter()
             .map(wallet_descriptor)
             .collect::<Result<Vec<_>, _>>()?;
-        verify_partial_sigs(&original, &returned, &descriptors)?;
-        self.store.remove(&session_id).map_err(Error::Store)?;
-        Ok(QrMusigHostResponse::Signed(returned))
+        match session_id {
+            Some(session_id) => {
+                verify_partial_sigs(&original, &returned, &descriptors)?;
+                self.store.remove(&session_id).map_err(Error::Store)?;
+                Ok(QrMusigHostResponse::Signed(returned))
+            }
+            None if nonce_count(&returned)? == nonce_count(&original)? => {
+                verify_partial_sigs(&original, &returned, &descriptors)?;
+                Ok(QrMusigHostResponse::Signed(returned))
+            }
+            None => {
+                verify_pub_nonces(&original, &returned, &descriptors)?;
+                Ok(QrMusigHostResponse::PubNonces(returned))
+            }
+        }
     }
 }
 
+fn require_capability(capabilities: response::Capabilities, flag: u32) -> Result<(), Error> {
+    if capabilities.0 & flag == 0 {
+        return Err(Error::Invalid("peer does not advertise the capability"));
+    }
+    Ok(())
+}
+
 /// The PSBT sent with every entry of a signatures-only reply set: ordinary
-/// signatures, and MuSig2 partial signatures as 0x1c. A public nonce entry must be
-/// the 0x1b already there. Silent payment entries are refused (the host sends no
+/// signatures, MuSig2 public nonces as 0x1b and partial signatures as 0x1c. A
+/// public nonce entry must not change a 0x1b already there. Silent payment entries are refused (the host sends no
 /// silent payment output), and entries of an unknown kind are skipped.
 fn merge_signatures(mut psbt: Psbt, entries: &[response::SignatureEntry]) -> Result<Psbt, Error> {
     for entry in entries {
@@ -586,15 +643,28 @@ fn merge_signature(psbt: &mut Psbt, entry: &response::SignatureEntry) -> Result<
             nonce,
             ..
         } => {
+            let pub_nonce = MusigPubNonce {
+                participant: key(participant)?,
+                aggregate: key(aggregate)?,
+                leaf_hash: leaf_hash.map(TapLeafHash::from_byte_array),
+                nonce: *nonce,
+            };
             let placed = musig_input_pub_nonce(
                 input,
-                key(participant)?,
-                key(aggregate)?,
-                leaf_hash.map(TapLeafHash::from_byte_array),
+                pub_nonce.participant,
+                pub_nonce.aggregate,
+                pub_nonce.leaf_hash,
             )
             .map_err(|_| Error::Invalid("invalid public nonce field"))?;
-            if placed != Some(*nonce) {
-                return Err(Error::Invalid("returned public nonce was not placed"));
+            match placed {
+                Some(placed) if placed != *nonce => {
+                    return Err(Error::Invalid("returned public nonce changed"));
+                }
+                Some(_) => {}
+                None => {
+                    validate_nonce(nonce)?;
+                    set_musig_input_pub_nonce(input, &pub_nonce);
+                }
             }
         }
         response::SignatureEntry::MusigPartialSig {
@@ -700,6 +770,63 @@ fn wallet_descriptor(descriptor: &request::Descriptor) -> Result<WalletDescripto
     parse_musig_descriptor(text).map_err(|_| Error::Invalid("invalid descriptor"))
 }
 
+/// Every slot of `descriptors` in `psbt`.
+fn descriptor_slots(psbt: &Psbt, descriptors: &[WalletDescriptor]) -> Result<Vec<SlotInfo>, Error> {
+    let mut slots = Vec::new();
+    for descriptor in descriptors {
+        slots.extend(slot_infos(psbt, descriptor).map_err(Error::Signing)?);
+    }
+    Ok(slots)
+}
+
+fn invalid_field(_: bwk_psbt::musig::Error) -> Error {
+    Error::Invalid("invalid MuSig2 field")
+}
+
+fn nonce_count(psbt: &Psbt) -> Result<usize, Error> {
+    psbt.inputs.iter().try_fold(0, |count, input| {
+        Ok(count + musig_input_pub_nonces(input).map_err(invalid_field)?.len())
+    })
+}
+
+/// A round 1 reply: `returned` keeps every 0x1b `sent` carries, adds only valid
+/// 0x1b of slots of `descriptors`, and no signature of any kind.
+fn verify_pub_nonces(
+    sent: &Psbt,
+    returned: &Psbt,
+    descriptors: &[WalletDescriptor],
+) -> Result<(), Error> {
+    let slots = descriptor_slots(sent, descriptors)?;
+    for (input_index, (sent_input, input)) in sent.inputs.iter().zip(&returned.inputs).enumerate() {
+        let sent_nonces = musig_input_pub_nonces(sent_input).map_err(invalid_field)?;
+        let nonces = musig_input_pub_nonces(input).map_err(invalid_field)?;
+        if sent_nonces.iter().any(|nonce| !nonces.contains(nonce)) {
+            return Err(Error::Invalid("returned public nonces changed"));
+        }
+        for nonce in nonces.iter().filter(|nonce| !sent_nonces.contains(nonce)) {
+            let slot = MusigSlot {
+                input_index,
+                participant: nonce.participant,
+                aggregate: nonce.aggregate,
+                leaf_hash: nonce.leaf_hash,
+            };
+            if !slots.iter().any(|info| info.slot == slot) {
+                return Err(Error::Invalid("public nonce for an unknown slot"));
+            }
+            validate_nonce(&nonce.nonce)?;
+        }
+        if musig_input_partial_sigs(input).map_err(invalid_field)?
+            != musig_input_partial_sigs(sent_input).map_err(invalid_field)?
+            || input.partial_sigs != sent_input.partial_sigs
+            || input.tap_key_sig != sent_input.tap_key_sig
+            || input.tap_script_sigs != sent_input.tap_script_sigs
+        {
+            return Err(Error::Invalid("public nonce reply carries a signature"));
+        }
+    }
+    Ok(())
+}
+
 /// Every 0x1b of `returned` must be one `sent` carries, and every 0x1c a valid
 /// BIP-327 partial signature against them, for a slot of `descriptors`.
 fn verify_partial_sigs(
@@ -707,11 +834,7 @@ fn verify_partial_sigs(
     returned: &Psbt,
     descriptors: &[WalletDescriptor],
 ) -> Result<(), Error> {
-    let mut slots = Vec::new();
-    for descriptor in descriptors {
-        slots.extend(slot_infos(sent, descriptor).map_err(Error::Signing)?);
-    }
-    let invalid_field = |_| Error::Invalid("invalid MuSig2 field");
+    let slots = descriptor_slots(sent, descriptors)?;
     for (input_index, (sent_input, input)) in sent.inputs.iter().zip(&returned.inputs).enumerate() {
         if musig_input_pub_nonces(input).map_err(invalid_field)?
             != musig_input_pub_nonces(sent_input).map_err(invalid_field)?
