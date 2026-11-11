@@ -122,7 +122,7 @@ fn preparation_messages_round_trip_every_field() {
         let request = request(request::Body::PrepareNonces(body.clone()));
         let bytes = encode_request(&request).unwrap();
         assert_eq!(bytes, raw_preparation(&body));
-        assert_eq!(bytes[6..10], [1, 0x08, 0x12, 0x34]);
+        assert_eq!(bytes[6..10], [1, 0x06, 0x12, 0x34]);
         assert_eq!(decode(&bytes).unwrap(), Message::Request(request));
     }
 
@@ -235,9 +235,9 @@ fn decode_rejects_a_wrong_nonce_count_before_reading_entries() {
 
 #[test]
 fn nonce_cache_capability_is_separate_and_encodes() {
-    assert_eq!(response::Capabilities::NONCE_CACHE, 0x20);
-    assert!(!response::Capabilities(0x1f).supports_nonce_cache());
-    for mask in [0x20, 0x3f] {
+    assert_eq!(response::Capabilities::NONCE_CACHE, 0x10);
+    assert!(!response::Capabilities(0x0f).supports_nonce_cache());
+    for mask in [0x10, 0x1f] {
         assert!(response::Capabilities(mask).supports_nonce_cache());
         let response = response(response::Body::Keys(response::Keys {
             keys: vec![],
@@ -259,10 +259,10 @@ fn nonce_cache_capability_is_separate_and_encodes() {
     }
 }
 
-// The old dispatch accepts only these seven types, before reading any body.
+// The old dispatch accepts only these five types, before reading any body.
 fn old_message_type(bytes: &[u8]) -> Result<u8, decode::Error> {
     match bytes[7] & 0x3f {
-        code @ 0x01..=0x07 => Ok(code),
+        code @ 0x01..=0x05 => Ok(code),
         code => Err(decode::Error::UnknownMessageType(code)),
     }
 }
@@ -279,7 +279,7 @@ fn old_dispatch_rejects_preparation_even_with_a_newer_version() {
             bytes[6] = version;
             assert_eq!(
                 old_message_type(&bytes),
-                Err(decode::Error::UnknownMessageType(0x08))
+                Err(decode::Error::UnknownMessageType(0x06))
             );
             assert!(decode(&bytes).is_ok());
         }
@@ -290,7 +290,7 @@ fn old_dispatch_rejects_preparation_even_with_a_newer_version() {
             );
         }
     }
-    assert_eq!(MessageType::NoncePreparation.value(), 0x08);
+    assert_eq!(MessageType::NoncePreparation.value(), 0x06);
 }
 
 #[test]

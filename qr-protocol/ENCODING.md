@@ -141,9 +141,8 @@ Bit 0 is the LSB.
 | 1    | Miniscript, Taproot (v1)         |
 | 2    | Silent Payments (v0)             |
 | 3    | MuSig2                           |
-| 4    | MuSig cache                      |
-| 5    | Nonce cache                      |
-| 6–30 | Reserved for future capabilities |
+| 4    | Nonce cache                      |
+| 5–30 | Reserved for future capabilities |
 | 31   | Upgrade signal (MSB)             |
 +------+----------------------------------+
 ```
@@ -151,14 +150,11 @@ Bit 0 is the LSB.
 Bit 3 means the signer is a BIP-327 MuSig2 participant for BIP-390 `musig()` keys,
 and MAY answer with `SIG_KIND` `0x04` / `0x05` (see Signing).
 
-Bit 4 advertises the separate MuSig Preparation and MuSig Signing operations below.
-It is not implied by bit 3.
-
-Bit 5 advertises the Nonce Preparation operation below, and that a Signing `PSBT`
+Bit 4 advertises the Nonce Preparation operation below, and that a Signing `PSBT`
 may name a cached nonce session for MuSig2, as the nonce cache BIP
 (`bip-nonce-cache/BIP-DRAFT.md`) defines.
 
-Bits 6–30 are reserved for future capabilities and MUST be `0` in this version; a
+Bits 5–30 are reserved for future capabilities and MUST be `0` in this version; a
 reader MUST ignore an unknown capability bit rather than reject, so a newer signer
 can advertise capabilities an older wallet does not know. Bit 31 (the MSB) MUST be
 `0` in this version; a `1` signals that the signer exposes capabilities beyond this
@@ -211,13 +207,11 @@ Bits (bit 7 is the MSB):
 | 0x03  | Register Descriptor  |
 | 0x04  | Address Verification |
 | 0x05  | Signing              |
-| 0x06  | MuSig Preparation    |
-| 0x07  | MuSig Signing        |
-| 0x08  | Nonce Preparation    |
+| 0x06  | Nonce Preparation    |
 +-------+----------------------+
 ```
 
-Values `0x09`–`0x3F` are reserved. A parser MUST reject an unknown `TYPE`, and
+Values `0x07`–`0x3F` are reserved. A parser MUST reject an unknown `TYPE`, and
 MUST reject `STATUS` = `1` on a request (`DIRECTION` = `0`).
 
 #### Request Id
@@ -590,72 +584,15 @@ on the second exchange is refused with `ERROR` `0x0D`.
 
 #### Nonce cache
 
-For a signer advertising capability bit 5, a Signing `PSBT` MAY name a cached nonce
+For a signer advertising capability bit 4, a Signing `PSBT` MAY name a cached nonce
 session as the nonce cache BIP (`bip-nonce-cache/BIP-DRAFT.md`) defines. There is no
 separate signing `TYPE`: the resulting partial signatures are ordinary `SIG_KIND`
 `0x05` entries, or partial signatures in the PSBT. A session missing, consumed or
 mismatched is refused with `ERROR` `0x0D`.
 
-### MuSig Preparation
-
-This operation requires capability bit 4 and has `TYPE` `0x06`. It prepares public
-nonces without a transaction, PSBT, sighash or attempt ID. It does not change the
-ordinary Signing operation. No secret nonce, root or encrypted secret export may
-appear in these messages.
-
-**Request:**
-
-`DESCRIPTOR` `SESSION_ID` `MAX_INPUTS` `DERIVATIONS`
-
-- `DESCRIPTOR`: the single `DESCRIPTOR` entry defined under Signing, including its
-  alias, optional descriptor body and optional proof.
-- `SESSION_ID`: 32 opaque bytes chosen by the caller, with no length prefix.
-- `MAX_INPUTS`: one byte, the absolute input coverage, at least 1.
-- `DERIVATIONS`: a non-empty vector of distinct `MUSIG_DERIVATION` entries.
-  Each entry is `KEYCHAIN` `INDEX`, both 4-byte big-endian unsigned integers.
-  `KEYCHAIN` selects the descriptor's public derivation branch. `INDEX` MUST be
-  below `0x80000000`, so no hardened child index is accepted. Uniqueness uses both
-  fields.
-
-**Ok response:**
-
-`SESSION_ID` `MAX_INPUTS` `NONCES`
-
-`SESSION_ID` and `MAX_INPUTS` echo the request. `NONCES` is a nonempty vector with
-at most 4096 entries. Each entry is:
-
-`DERIVATION` `INPUT_INDEX` `EXPRESSION_INDEX` `PARTICIPANT` `AGGREGATE` `LEAF_HASH` `NONCE`
-
-- `DERIVATION`: a `MUSIG_DERIVATION` as above.
-- `INPUT_INDEX`: a 4-byte big-endian unsigned integer below `MAX_INPUTS`. The vector
-  MUST include every input index from zero through `MAX_INPUTS` minus one.
-- `EXPRESSION_INDEX`: a 4-byte big-endian unsigned integer identifying the occurrence
-  of the MuSig expression in the descriptor, not just the resulting aggregate key.
-- `PARTICIPANT`, `AGGREGATE`, `LEAF_HASH`: the compressed keys and optional 32-byte
-  leaf hash defined for ordinary MuSig public nonces.
-- `NONCE`: 66 public nonce bytes, without a length prefix.
-
-Entries MUST be unique by derivation, input index, expression index, participant,
-aggregate and leaf hash.
-
-### MuSig Signing
-
-This operation requires capability bit 4 and has `TYPE` `0x07`.
-
-**Request and ok response:**
-
-`SESSION_ID` `ATTEMPT_ID` `PSBT`
-
-`SESSION_ID` selects the prepared cache session. `ATTEMPT_ID` is an independent
-caller-chosen 32-byte opaque identifier. Both have no length prefix, and the
-response echoes both. `PSBT` is a bounded `BYTES` field, carried without parsing,
-and may contain serialized PSBT v0 or v2. There is no response-kind selector.
-
-Missing, consumed, lost or mismatched sessions refuse with `ERROR` `0x0D`.
-
 ### Nonce Preparation
 
-This operation requires capability bit 5 and has `TYPE` `0x08`. It prepares public
+This operation requires capability bit 4 and has `TYPE` `0x06`. It prepares public
 nonces for a cached nonce session, bound to no descriptor, for use by later Signing
 exchanges as the nonce cache BIP (`bip-nonce-cache/BIP-DRAFT.md`) defines. No root,
 secret nonce or other secret material may appear in these messages.
@@ -777,9 +714,6 @@ Machine-checkable vectors accompany this specification:
   hash), a silent payment send answered with a global ECDH share and DLEQ proof and
   one answered with per-input ones (`SIG_KIND` `0x06` and `0x07`), and an entry of
   an unknown `SIG_KIND` that a reader skips.
-- `musig.json`: MuSig Preparation and MuSig Signing request/response, including a
-  preparation request with only an alias and nonce entries with and without a leaf
-  hash.
 - `nonce_cache.json`: Nonce Preparation request/response.
 - `errors.json`: error responses (`STATUS` = `1`), standard and vendor codes,
   including `0x0D` (session).

@@ -10,11 +10,10 @@ use core::{
 
 use bwk_qr_protocol::ffi::types::{
     AddressUri, Bip388, Buf, Bytes, Descriptor, DescriptorBody, DescriptorValue, Ecdsa, ErrorBody,
-    FirmwareVersion, GetKeys, Info, KeyRequest, Keys, List, MusigDerivation, MusigNonce,
-    MusigPartialSig, MusigPrepared, MusigPubNonce, MusigSigned, NoncesPrepared, Path, PrepareMusig,
-    PrepareNonces, RegisterDescriptor, Registration, Request, RequestBody, Response, ResponseBody,
-    ScanValue, Sign, SignMusig, Signature, SignatureValue, Signed, SignedValue, SpDleqProof,
-    SpEcdhShare, SpKeys, TapKey, TapScript, VerifyAddress,
+    FirmwareVersion, GetKeys, Info, KeyRequest, Keys, List, MusigPartialSig, MusigPubNonce,
+    NoncesPrepared, Path, PrepareNonces, RegisterDescriptor, Registration, Request, RequestBody,
+    Response, ResponseBody, ScanValue, Sign, Signature, SignatureValue, Signed, SignedValue,
+    SpDleqProof, SpEcdhShare, SpKeys, TapKey, TapScript, VerifyAddress,
 };
 
 macro_rules! check {
@@ -46,13 +45,9 @@ fn the_c_mirror_matches_the_header() {
         RegisterDescriptor => 16, 8;
         VerifyAddress => 56, 8;
         Sign => 40, 8;
-        MusigDerivation => 8, 4;
-        List<MusigDerivation> => 16, 8;
-        PrepareMusig => 88, 8;
-        SignMusig => 80, 8;
         PrepareNonces => 40, 8;
-        RequestBody => 88, 8;
-        Request => 96, 8;
+        RequestBody => 56, 8;
+        Request => 64, 8;
         FirmwareVersion => 12, 4;
         Keys => 56, 8;
         Info => 56, 8;
@@ -65,10 +60,6 @@ fn the_c_mirror_matches_the_header() {
         MusigPartialSig => 131, 1;
         SpEcdhShare => 67, 1;
         SpDleqProof => 98, 1;
-        MusigNonce => 184, 4;
-        List<MusigNonce> => 16, 8;
-        MusigPrepared => 56, 8;
-        MusigSigned => 80, 8;
         List<[u8; 66]> => 16, 8;
         NoncesPrepared => 40, 8;
         SignatureValue => 168, 8;
@@ -77,15 +68,12 @@ fn the_c_mirror_matches_the_header() {
         SignedValue => 16, 8;
         Signed => 24, 8;
         ErrorBody => 16, 8;
-        ResponseBody => 80, 8;
-        Response => 88, 8;
+        ResponseBody => 56, 8;
+        Response => 64, 8;
         Buf => 16, 8;
     }
     assert_eq!(offset_of!(Request, body), 8);
     assert_eq!(offset_of!(Response, body), 8);
-    assert_eq!(offset_of!(PrepareMusig, derivations), 72);
-    assert_eq!(offset_of!(MusigPrepared, nonces), 40);
-    assert_eq!(offset_of!(MusigNonce, nonce), 115);
     assert_eq!(offset_of!(PrepareNonces, has_session_ref), 4);
     assert_eq!(offset_of!(PrepareNonces, session_ref), 5);
     assert_eq!(offset_of!(PrepareNonces, max_inputs), 9);
