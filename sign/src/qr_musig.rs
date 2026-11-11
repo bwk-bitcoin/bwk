@@ -9,7 +9,10 @@ use std::str::FromStr;
 
 use bwk_descriptor::{descriptor::Descriptor, wallet::WalletDescriptor};
 use bwk_persist::{storage::Store, PersistError};
-use bwk_psbt::nonce_cache::nonce_cache_session;
+use bwk_psbt::{
+    nonce_cache::{nonce_cache_session, nonce_cache_session_v2, NonceCacheSession},
+    PsbtV2,
+};
 use bwk_qr_protocol::{
     request::{self, DescriptorBody, PrepareNonces, Sign},
     response::{self, NoncesPrepared, Signed},
@@ -133,10 +136,9 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigPeerRecord>> QrMusigPee
     /// Signs with the session the PSBT names, then deletes it durably before the
     /// signed PSBT leaves: a failed deletion releases nothing.
     pub fn sign(&mut self, request: Sign) -> Result<Signed, Error> {
-        let mut psbt =
-            Psbt::deserialize(&request.psbt).map_err(|error| Error::Request(error.to_string()))?;
-        let session = nonce_cache_session(&psbt)
-            .map_err(|error| Error::Request(error.to_string()))?
+        let mut psbt = SigningPsbt::deserialize(&request.psbt)?;
+        let session = psbt
+            .session()?
             .ok_or_else(|| Error::Request("no nonce cache session".to_string()))?;
         if request.descriptors.is_empty() {
             return Err(Error::Request("no descriptor".to_string()));
@@ -150,12 +152,12 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigPeerRecord>> QrMusigPee
         }
         for descriptor in &request.descriptors {
             let descriptor = signing_descriptor(descriptor)?;
-            self.signer
-                .sign_nonce_cache(&mut psbt, &descriptor, &record.secret)?;
+            psbt.sign(&self.signer, &descriptor, &record.secret)?;
         }
+        let signed = psbt.serialize()?;
         self.store.remove(&session.session_id)?;
         self.store.flush()?;
-        Ok(Signed::Psbt(psbt.serialize()))
+        Ok(Signed::Psbt(signed))
     }
 
     /// Unsupported operations return explicit wire errors, never ordinary signing.
@@ -212,6 +214,50 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigPeerRecord>> QrMusigPee
                 payload,
             },
             Err(error) => Response::error(request, signer, format!("{error:?}")),
+        }
+    }
+}
+
+/// A Signing PSBT, kept in the version it came in so the reply uses it too.
+enum SigningPsbt {
+    V0(Psbt),
+    V2(PsbtV2),
+}
+
+impl SigningPsbt {
+    fn deserialize(bytes: &[u8]) -> Result<Self, Error> {
+        match Psbt::deserialize(bytes) {
+            Ok(psbt) => Ok(Self::V0(psbt)),
+            Err(_) => PsbtV2::deserialize(bytes)
+                .map(Self::V2)
+                .map_err(|error| Error::Request(error.to_string())),
+        }
+    }
+
+    fn session(&self) -> Result<Option<NonceCacheSession>, Error> {
+        match self {
+            Self::V0(psbt) => nonce_cache_session(psbt),
+            Self::V2(psbt) => nonce_cache_session_v2(psbt),
+        }
+        .map_err(|error| Error::Request(error.to_string()))
+    }
+
+    fn sign(
+        &mut self,
+        signer: &HotSigner,
+        descriptor: &WalletDescriptor,
+        secret: &SessionSecret,
+    ) -> Result<(), SignError> {
+        match self {
+            Self::V0(psbt) => signer.sign_nonce_cache(psbt, descriptor, secret),
+            Self::V2(psbt) => signer.sign_nonce_cache_v2(psbt, descriptor, secret),
+        }
+    }
+
+    fn serialize(&self) -> Result<Vec<u8>, SignError> {
+        match self {
+            Self::V0(psbt) => Ok(psbt.serialize()),
+            Self::V2(psbt) => psbt.serialize().map_err(|_| SignError::PsbtV2),
         }
     }
 }

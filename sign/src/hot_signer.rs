@@ -351,6 +351,21 @@ impl HotSigner {
         Ok(())
     }
 
+    /// [`HotSigner::sign_nonce_cache`] on a PSBTv2.
+    #[cfg(feature = "musig")]
+    pub fn sign_nonce_cache_v2(
+        &self,
+        psbt: &mut PsbtV2,
+        descriptor: &WalletDescriptor,
+        secret: &SessionSecret,
+    ) -> Result<(), Error> {
+        let mut v0 = validated_v0(psbt)?;
+        self.sign_nonce_cache(&mut v0, descriptor, secret)?;
+        set_v0_maps(psbt, v0);
+        psbt.tx_modifiable = Some(bwk_psbt::TxModifiable::none());
+        Ok(())
+    }
+
     /// The nonce `secret` derives for an own slot.
     #[cfg(feature = "musig")]
     fn cached_nonce(
