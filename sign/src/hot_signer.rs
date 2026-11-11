@@ -8,12 +8,16 @@ use crate::{
     signer::{Signer, SignerNotif},
 };
 #[cfg(feature = "musig")]
+use std::collections::BTreeMap;
+
+#[cfg(feature = "musig")]
 use crate::{
     hot_musig::HotMusigSession,
     musig::{
-        self, MusigSession, MusigSessionId, MusigSessionKey, MusigSessionStore, PendingNonce,
-        SlotInfo,
+        self, MusigSession, MusigSessionId, MusigSessionKey, MusigSessionStore, MusigSlot,
+        PendingNonce, SlotInfo,
     },
+    nonce_cache::SessionSecret,
 };
 use bwk_descriptor::{
     derivator::SpkDerivator,
@@ -370,12 +374,84 @@ impl HotSigner {
                 },
             );
         }
-        let partial_sigs = self.musig_partial_sigs(psbt, pending, &own)?;
+        let partial_sigs = self.musig_partial_sigs(psbt, pending.nonces, &own)?;
         for sig in partial_sigs {
             set_musig_input_partial_sig(&mut signed.inputs[sig.input_index], &sig.partial_sig);
         }
         *psbt = signed;
         Ok(())
+    }
+
+    /// Signs with the nonces of a nonce cache session (`bip-nonce-cache/BIP-DRAFT.md`):
+    /// every own MuSig2 slot must carry as its 0x1b the nonce `secret` derives for its
+    /// input and key expression index, `Error::MusigSession` otherwise. The ordinary
+    /// keys sign too, and the PSBT is only changed on success. The caller deletes the
+    /// session durably before it releases the signed PSBT.
+    #[cfg(feature = "musig")]
+    pub fn sign_nonce_cache(
+        &self,
+        psbt: &mut Psbt,
+        descriptor: &WalletDescriptor,
+        secret: &SessionSecret,
+    ) -> Result<(), Error> {
+        let own = self.own_slot_infos(musig::slot_infos(psbt, descriptor)?);
+        if own.is_empty() {
+            return Err(Error::InputNotOwned);
+        }
+        let participant_paths = KeyPaths::participants(
+            self.miniscript_descriptors().chain([descriptor]),
+            self.fingerprint(),
+        );
+        let mut signed = psbt.clone();
+        match self.sign_ordinary(&mut signed, descriptor, &participant_paths) {
+            Ok(()) | Err(Error::SigningInfo) => {}
+            Err(e) => return Err(e),
+        }
+        let mut nonces = BTreeMap::new();
+        for info in &own {
+            let (secnonce, pubnonce) = self.cached_nonce(secret, info)?;
+            if info.pub_nonce(&psbt.inputs[info.slot.input_index])? != Some(pubnonce) {
+                return Err(Error::MusigSession);
+            }
+            let sighash = musig::slot_sighash(psbt, &info.slot)?;
+            nonces.insert(
+                info.slot,
+                PendingNonce {
+                    secnonce,
+                    pubnonce,
+                    sighash,
+                },
+            );
+        }
+        let partial_sigs = self.musig_partial_sigs(psbt, nonces, &own)?;
+        for sig in partial_sigs {
+            set_musig_input_partial_sig(&mut signed.inputs[sig.input_index], &sig.partial_sig);
+        }
+        *psbt = signed;
+        Ok(())
+    }
+
+    /// The nonce `secret` derives for an own slot.
+    #[cfg(feature = "musig")]
+    fn cached_nonce(
+        &self,
+        secret: &SessionSecret,
+        info: &SlotInfo,
+    ) -> Result<(bwk_musig::SecNonce<RustBitcoin>, [u8; 66]), Error> {
+        let input_index = u32::try_from(info.slot.input_index).map_err(|_| Error::InputIndex)?;
+        let key_expression_index =
+            u32::try_from(info.key_expression_index).map_err(|_| Error::MusigSession)?;
+        let mut sk = self.private_key_at(&info.signer.1);
+        let mut secret_key = sk.secret_bytes();
+        sk.non_secure_erase();
+        let generated = secret.nonce(
+            input_index,
+            key_expression_index,
+            &secret_key,
+            &info.slot.participant.serialize(),
+        );
+        wipe(&mut secret_key);
+        generated
     }
 
     /// Registers a descriptor for the signer.
@@ -665,7 +741,7 @@ impl HotSigner {
             .musig_sessions
             .take(&key, &id)
             .ok_or(Error::MusigSession)?;
-        let partial_sigs = self.musig_partial_sigs(psbt, session, own)?;
+        let partial_sigs = self.musig_partial_sigs(psbt, session.nonces, own)?;
         for sig in &partial_sigs {
             set_musig_input_partial_sig(&mut signed.inputs[sig.input_index], &sig.partial_sig);
         }
@@ -673,22 +749,22 @@ impl HotSigner {
         Ok(())
     }
 
-    /// Checks the session against the PSBT and signs every own slot, consuming
-    /// the session's secret nonces.
+    /// Checks the nonces against the PSBT and signs every own slot, consuming
+    /// the secret nonces.
     #[cfg(feature = "musig")]
     fn musig_partial_sigs(
         &self,
         psbt: &Psbt,
-        mut session: MusigSession,
+        mut nonces: BTreeMap<MusigSlot, PendingNonce>,
         own: &[SlotInfo],
     ) -> Result<Vec<InputPartialSig>, Error> {
-        if session.nonces.len() != own.len() {
+        if nonces.len() != own.len() {
             return Err(Error::MusigSession);
         }
         let mut partial_sigs = Vec::with_capacity(own.len());
         for info in own {
             let slot = &info.slot;
-            let pending = session.nonces.remove(slot).ok_or(Error::MusigSession)?;
+            let pending = nonces.remove(slot).ok_or(Error::MusigSession)?;
             let input = &psbt.inputs[slot.input_index];
             if musig::slot_sighash(psbt, slot)? != pending.sighash
                 || info.pub_nonce(input)? != Some(pending.pubnonce)
@@ -2375,7 +2451,7 @@ mod musig_tests {
     use bwk_psbt::musig::{
         musig_input_partial_sig, musig_input_partial_sigs, musig_input_pub_nonces,
         remove_musig_input_pub_nonces, set_musig_input_partial_sig, set_musig_input_participants,
-        set_musig_input_pub_nonce, MusigPartialSig,
+        set_musig_input_pub_nonce, MusigPartialSig, MusigPubNonce,
     };
     use bwk_utils::test::{random_output, txid};
     use crossbeam::channel;
@@ -2397,7 +2473,10 @@ mod musig_tests {
         error::Error,
         hot_musig::{HotMusigSession, HotMusigSessionBytes},
         hot_signer::HotSigner,
-        musig::{aggregate_partial_sigs, musig_status, own_slots, MusigRound, MusigSessionId},
+        musig::{
+            aggregate_partial_sigs, musig_status, own_slots, slot_infos, MusigRound, MusigSessionId,
+        },
+        nonce_cache::SessionSecret,
         signer::{Signer, SignerNotif},
     };
 
@@ -2867,6 +2946,113 @@ mod musig_tests {
         let other_text = format!("tr(musig({},{})/<0;1>/*)", cosigner(&a), plain(&a));
         let other = register(&mut [&mut a], &other_text);
         assert!(b.create_musig_session(&other, id, 8).is_err());
+    }
+
+    /// Places the nonces `secret` derives for `signer` on every own slot of `psbt`,
+    /// as a coordinator does from an issuance.
+    fn place_cached_nonces(
+        psbt: &mut Psbt,
+        d: &WalletDescriptor,
+        signer: &HotSigner,
+        secret: &SessionSecret,
+    ) {
+        for info in slot_infos(psbt, d).unwrap() {
+            if info.signer.0 != signer.fingerprint() {
+                continue;
+            }
+            let secret_key = signer.private_key_at(&info.signer.1).secret_bytes();
+            let (_, nonce) = secret
+                .nonce(
+                    info.slot.input_index as u32,
+                    info.key_expression_index as u32,
+                    &secret_key,
+                    &info.slot.participant.serialize(),
+                )
+                .unwrap();
+            set_musig_input_pub_nonce(
+                &mut psbt.inputs[info.slot.input_index],
+                &MusigPubNonce {
+                    participant: info.slot.participant,
+                    aggregate: info.slot.aggregate,
+                    leaf_hash: info.slot.leaf_hash,
+                    nonce,
+                },
+            );
+        }
+    }
+
+    fn key_expression_indexes(psbt: &Psbt, d: &WalletDescriptor, signer: &HotSigner) -> Vec<usize> {
+        slot_infos(psbt, d)
+            .unwrap()
+            .into_iter()
+            .filter(|info| info.signer.0 == signer.fingerprint() && info.slot.input_index == 0)
+            .map(|info| info.key_expression_index)
+            .collect()
+    }
+
+    #[test]
+    fn nonce_cache_session_signs_in_one_round() {
+        let [mut a, mut b] = persisted_signers();
+        let d = persisted_descriptor(&mut a, &mut b);
+        let secret = SessionSecret::from_bytes([1; 32]);
+        let mut psbt = keychain_psbt(&d, 1, &[3, 4]);
+        for input in &mut psbt.unsigned_tx.input {
+            input.sequence = Sequence(1);
+        }
+        // b's plain key leaf is external to a, and counts for b.
+        assert_eq!(key_expression_indexes(&psbt, &d, &a), vec![0, 1, 2]);
+        assert_eq!(key_expression_indexes(&psbt, &d, &b), vec![0, 2, 3]);
+        place_cached_nonces(&mut psbt, &d, &a, &secret);
+        b.inner_sign(&mut psbt, &d).unwrap();
+        a.sign_nonce_cache(&mut psbt, &d, &secret).unwrap();
+        assert_eq!(partial_sig_count(&psbt), 6);
+        b.inner_sign(&mut psbt, &d).unwrap();
+        assert_eq!(partial_sig_count(&psbt), 12);
+        assert_eq!(finalize(&mut psbt, &d), 6);
+    }
+
+    #[test]
+    fn nonce_cache_session_refuses_other_nonces_without_psbt_changes() {
+        let [mut a, mut b] = persisted_signers();
+        let d = two_of_two(&mut a, &mut b);
+        let secret = SessionSecret::from_bytes([1; 32]);
+
+        let mut other = musig_psbt(&d, &[0]);
+        place_cached_nonces(&mut other, &d, &a, &SessionSecret::from_bytes([2; 32]));
+        b.inner_sign(&mut other, &d).unwrap();
+        let before = other.clone();
+        assert_eq!(
+            a.sign_nonce_cache(&mut other, &d, &secret),
+            Err(Error::MusigSession)
+        );
+        assert_eq!(other, before);
+
+        let mut missing = musig_psbt(&d, &[0]);
+        b.inner_sign(&mut missing, &d).unwrap();
+        let before = missing.clone();
+        assert_eq!(
+            a.sign_nonce_cache(&mut missing, &d, &secret),
+            Err(Error::MusigSession)
+        );
+        assert_eq!(missing, before);
+
+        let mut no_cosigner = musig_psbt(&d, &[0]);
+        place_cached_nonces(&mut no_cosigner, &d, &a, &secret);
+        let before = no_cosigner.clone();
+        assert_eq!(
+            a.sign_nonce_cache(&mut no_cosigner, &d, &secret),
+            Err(Error::MusigNonces)
+        );
+        assert_eq!(no_cosigner, before);
+
+        let stranger = HotSigner::new_from_xpriv(
+            Network::Regtest,
+            Xpriv::new_master(Network::Regtest, &[3; 32]).unwrap(),
+        );
+        assert_eq!(
+            stranger.sign_nonce_cache(&mut no_cosigner, &d, &secret),
+            Err(Error::InputNotOwned)
+        );
     }
 
     fn musig_signers(n: usize) -> Vec<HotSigner> {

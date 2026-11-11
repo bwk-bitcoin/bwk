@@ -173,6 +173,28 @@ and each cosigner's progress, and `aggregate_partial_sigs` verifies every 0x1c
 and aggregates each complete slot into `tap_key_sig` or `tap_script_sigs`,
 ready for the miniscript finalizer.
 
+### Nonce cache sessions
+
+`nonce_cache::SessionSecret` is the secret of one session of the nonce cache BIP
+(`bip-nonce-cache/BIP-DRAFT.md`): 32 bytes from the OS (`SessionSecret::random`),
+never derived from the seed, never exported. `session_ref` is its 4-byte
+reference, and `nonce(i, j, secret_key, public_key)` is BIP-327 NonceGen with
+`tagged_hash("BIPXXXX_NONCE_SEED", secret | ser32(i) | ser32(j))` as rand' and
+the aggregate key, the message and extra_in omitted. Nothing else enters the
+nonce: no policy, aggregate, cosigner set or transaction.
+
+`HotSigner::sign_nonce_cache(&mut psbt, &descriptor, &secret)` signs in one
+round: each own MuSig2 slot must already carry, as its 0x1b, the nonce the
+secret derives for its input `i` and key expression index `j`, or it refuses
+with `Error::MusigSession`. The ordinary keys sign too, and the PSBT is only
+changed on success. The caller deletes the session durably before it releases
+the signed PSBT.
+
+`musig::SlotInfo::key_expression_index` is that `j`: the position of the slot's
+key expression among the key expressions holding a key of the participant's
+signer (by fingerprint), in the order of `expression_index`. Key expressions
+holding none of its keys are not counted; a `musig()` counts once.
+
 ### Persisted hot sessions
 
 `hot_musig::HotMusigSession` is a transaction-independent secret value for an

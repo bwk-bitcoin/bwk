@@ -10,6 +10,8 @@ pub mod identity;
 pub mod manager;
 #[cfg(feature = "musig")]
 pub mod musig;
+#[cfg(feature = "musig")]
+pub mod nonce_cache;
 pub mod protocol;
 #[cfg(feature = "musig")]
 pub mod qr_musig;
