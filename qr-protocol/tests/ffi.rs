@@ -13,12 +13,12 @@ use bwk_qr_protocol::{
         bwk_qr_buf_free, bwk_qr_request_decode, bwk_qr_request_free, bwk_qr_response_encode, types,
         Error, OK,
     },
-    get_info, musig, request,
+    get_info, musig, nonce_cache, request,
     response::{self, SpScope},
     signature, sp,
     types::{DerivationPath, ExtendedKey, Fingerprint, PublicKey},
     ErrorInfo, Message, MessageType, Request, RequestId, Response, SignResponseKind,
-    REQUEST_ID_LEN,
+    MAX_NONCE_EXPRESSIONS, REQUEST_ID_LEN,
 };
 
 use common::{bip380, bip388, sp_foreign_scan_keys, sp_keys, FOREIGN_SCAN_KEY};
@@ -289,6 +289,127 @@ fn cached_response_ffi_rejects_oversized_and_absent_required_fields() {
             },
         );
         assert_eq!(encode_failure(&view), Error::NullPointer.info_owned());
+    }
+}
+
+#[test]
+fn nonce_preparation_request_exposes_session_ref_coverage_path_and_range() {
+    for (session_ref, has_session_ref, ffi_session_ref) in
+        [(None, 0, [0; 4]), (Some([0x52; 4]), 1, [0x52; 4])]
+    {
+        let request = request(request::Body::PrepareNonces(request::PrepareNonces {
+            session_id: [0x51; 4],
+            session_ref,
+            max_inputs: 3,
+            derivation_path: path(),
+            start: 2,
+            end: 9,
+        }));
+        unsafe {
+            let handle = view(&request);
+            assert_eq!((*handle).id, ID);
+            assert_eq!((*handle).message_type, 0x08);
+            let body = (*handle).body.prepare_nonces;
+            assert_eq!(body.session_id, [0x51; 4]);
+            assert_eq!(body.has_session_ref, has_session_ref);
+            assert_eq!(body.session_ref, ffi_session_ref);
+            assert_eq!(body.max_inputs, 3);
+            assert_eq!(
+                body.derivation_path.as_slice(),
+                [0x8000_0030, 0x8000_0000, 7]
+            );
+            assert_eq!(body.start, 2);
+            assert_eq!(body.end, 9);
+            bwk_qr_request_free(handle);
+        }
+    }
+}
+
+fn nonces_response_view(
+    max_inputs: u8,
+    start: u32,
+    end: u32,
+    nonces: types::List<[u8; 66]>,
+) -> types::Response {
+    response_view(
+        0x08,
+        false,
+        types::ResponseBody {
+            nonces_prepared: types::NoncesPrepared {
+                session_id: [0x51; 4],
+                session_ref: [0x52; 4],
+                max_inputs,
+                start,
+                end,
+                nonces,
+            },
+        },
+    )
+}
+
+#[test]
+fn nonces_prepared_response_converts_every_nonce_field() {
+    let nonces = [[0x22; 66], [0x55; 66], [0x66; 66], [0x77; 66]];
+    unsafe {
+        assert_eq!(
+            encoded(&nonces_response_view(2, 4, 5, list_view(&nonces))),
+            Response {
+                id: id(),
+                body: response::Body::NoncesPrepared(response::NoncesPrepared {
+                    session_id: [0x51; 4],
+                    session_ref: [0x52; 4],
+                    max_inputs: 2,
+                    start: 4,
+                    end: 5,
+                    nonces: nonces.to_vec(),
+                }),
+            }
+        );
+    }
+}
+
+#[test]
+fn nonces_prepared_ffi_rejects_invalid_coverage_range_count_and_absent_nonces() {
+    unsafe {
+        let nonces = [[0x66; 66]];
+        assert_eq!(
+            encode_failure(&nonces_response_view(0, 0, 0, list_view(&nonces))),
+            Error::NonceCache(nonce_cache::Error::InputCoverage).info_owned()
+        );
+        let range = Error::NonceCache(nonce_cache::Error::ExpressionRange).info_owned();
+        assert_eq!(
+            encode_failure(&nonces_response_view(1, 1, 0, list_view(&nonces))),
+            range
+        );
+        let nonces = vec![[0x66; 66]; MAX_NONCE_EXPRESSIONS + 1];
+        assert_eq!(
+            encode_failure(&nonces_response_view(
+                1,
+                0,
+                MAX_NONCE_EXPRESSIONS as u32,
+                list_view(&nonces)
+            )),
+            range
+        );
+        let nonce_count = Error::NonceCache(nonce_cache::Error::NonceCount).info_owned();
+        for count in [0, 1, 3, usize::MAX] {
+            let wrong = types::List {
+                ptr: nonces.as_ptr(),
+                len: count,
+            };
+            assert_eq!(
+                encode_failure(&nonces_response_view(2, 0, 0, wrong)),
+                nonce_count
+            );
+        }
+        let absent = types::List {
+            ptr: ptr::null(),
+            len: 2,
+        };
+        assert_eq!(
+            encode_failure(&nonces_response_view(2, 0, 0, absent)),
+            Error::NullPointer.info_owned()
+        );
     }
 }
 
