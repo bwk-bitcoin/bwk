@@ -14,7 +14,8 @@ use bwk_descriptor::{
 use bwk_persist::{storage::Store, PersistError};
 use bwk_psbt::{
     musig::{
-        musig_input_partial_sigs, musig_input_pub_nonce, set_musig_input_pub_nonce, MusigPubNonce,
+        musig_input_partial_sigs, musig_input_pub_nonce, musig_input_pub_nonces,
+        set_musig_input_partial_sig, set_musig_input_pub_nonce, MusigPubNonce,
     },
     nonce_cache::{
         nonce_cache_session, nonce_cache_session_v2, set_nonce_cache_session, NonceCacheSession,
@@ -655,6 +656,87 @@ fn host_merges_a_signatures_only_reply() {
         panic!("not a signed response");
     };
     assert_eq!(merged, signed);
+    assert!(f.host.record(&session_id).unwrap().is_none());
+}
+
+/// The reply of a signer answering `psbt` to the pending Signing request.
+fn psbt_reply(psbt: &Psbt) -> Response {
+    Response::Raw {
+        request: RequestId::new(1),
+        signer: signer_id(),
+        payload: encode_response(&QrResponse {
+            id: QrRequestId([2, 1]),
+            body: response::Body::Signed(response::Signed::Psbt(psbt.serialize())),
+        })
+        .unwrap(),
+    }
+}
+
+#[test]
+fn host_rejects_a_reply_failing_partial_signature_verification() {
+    let mut f = fixture();
+    let session_id = f.issue(2);
+    let psbt = f.psbt();
+    let bytes = f
+        .host
+        .sign_request(
+            capabilities(),
+            QrRequestId([2, 1]),
+            session_id,
+            f.descriptors(),
+            &psbt,
+            None,
+        )
+        .unwrap();
+    f.host.bind_outer_request(RequestId::new(1)).unwrap();
+    let Message::Request(QrRequest {
+        body: request::Body::Sign(signing),
+        ..
+    }) = bwk_qr_protocol::decode(&bytes).unwrap()
+    else {
+        panic!("not a Signing request");
+    };
+    let signed = signed_psbt(f.peer.sign(signing).unwrap());
+    let sig = musig_input_partial_sigs(&signed.inputs[1]).unwrap()[0];
+
+    let mut tampered = signed.clone();
+    let mut bad = sig;
+    bad.signature[31] ^= 1;
+    set_musig_input_partial_sig(&mut tampered.inputs[1], &bad);
+    assert!(f.host.accept_response(&psbt_reply(&tampered)).is_err());
+    assert!(f
+        .host
+        .accept_response(&signatures_reply(vec![
+            response::SignatureEntry::MusigPartialSig {
+                input_index: 1,
+                participant: types::PublicKey(bad.participant.serialize()),
+                aggregate: types::PublicKey(bad.aggregate.serialize()),
+                leaf_hash: bad.leaf_hash.map(|hash| hash.to_byte_array()),
+                signature: bad.signature,
+            }
+        ]))
+        .is_err());
+    let mut moved = signed.clone();
+    moved.inputs[0] = signed.inputs[1].clone();
+    assert!(f.host.accept_response(&psbt_reply(&moved)).is_err());
+    let mut other_nonce = signed.clone();
+    let nonce = musig_input_pub_nonces(&signed.inputs[0]).unwrap()[0];
+    set_musig_input_pub_nonce(
+        &mut other_nonce.inputs[0],
+        &MusigPubNonce {
+            nonce: musig_input_pub_nonces(&signed.inputs[1]).unwrap()[0].nonce,
+            ..nonce
+        },
+    );
+    assert!(f.host.accept_response(&psbt_reply(&other_nonce)).is_err());
+    assert!(f.host.record(&session_id).unwrap().is_some());
+
+    let QrMusigHostResponse::Signed(accepted) =
+        f.host.accept_response(&psbt_reply(&signed)).unwrap()
+    else {
+        panic!("not a signed response");
+    };
+    assert_eq!(accepted, signed);
     assert!(f.host.record(&session_id).unwrap().is_none());
 }
 

@@ -267,7 +267,10 @@ sends them itself, and `accept_response` checks both request IDs and the signer.
 A signatures-only reply is merged into the PSBT it sent: ordinary signatures,
 and MuSig2 partial signatures as 0x1c. A public nonce entry must be the 0x1b it
 placed, a silent payment entry is refused and an entry of an unknown kind is
-skipped. A signed reply, or a refusal for the session, drops the session; other
+skipped. Before it stores anything, the host checks that the reply keeps every
+0x1b it sent and verifies each MuSig2 partial signature with BIP-327
+PartialSigVerify against those nonces, and rejects the whole reply on any
+failure. A signed reply, or a refusal for the session, drops the session; other
 refusals keep it.
 
 ## HotManager
