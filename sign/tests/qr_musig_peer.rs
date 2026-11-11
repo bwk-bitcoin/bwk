@@ -22,8 +22,10 @@ use bwk_psbt::{
     PsbtV2,
 };
 use bwk_qr_protocol::{
+    encode_response,
     request::{self, Descriptor as QrDescriptor, DescriptorBody, PrepareNonces, Sign},
-    response, Message, Request as QrRequest, RequestId as QrRequestId,
+    response, types, Message, Request as QrRequest, RequestId as QrRequestId,
+    Response as QrResponse, SignResponseKind,
 };
 use bwk_sign::{
     error::Error as SignError,
@@ -37,6 +39,7 @@ use bwk_sign::{
 use miniscript::bitcoin::{
     absolute::LockTime,
     bip32::{DerivationPath, Xpriv},
+    hashes::Hash,
     transaction::Version,
     Amount, Network, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
@@ -201,6 +204,7 @@ impl Fixture {
                 session_id,
                 self.descriptors(),
                 psbt,
+                Some(SignResponseKind::Psbt),
             )
             .unwrap();
         self.host.cancel_pending();
@@ -445,6 +449,7 @@ fn one_round_signing_through_the_host() {
             session_id,
             f.descriptors(),
             &psbt,
+            Some(SignResponseKind::Psbt),
         )
         .unwrap();
     let QrMusigHostResponse::Signed(mut signed) = f.exchange(bytes) else {
@@ -546,6 +551,111 @@ fn bip388_body_resolves_to_the_bip380_descriptor() {
     for input in &signed.inputs {
         assert_eq!(musig_input_partial_sigs(input).unwrap().len(), 2);
     }
+}
+
+/// The reply of a signer answering `entries` to the pending Signing request.
+fn signatures_reply(entries: Vec<response::SignatureEntry>) -> Response {
+    Response::Raw {
+        request: RequestId::new(1),
+        signer: signer_id(),
+        payload: encode_response(&QrResponse {
+            id: QrRequestId([2, 1]),
+            body: response::Body::Signed(response::Signed::Signatures(entries)),
+        })
+        .unwrap(),
+    }
+}
+
+#[test]
+fn host_merges_a_signatures_only_reply() {
+    let mut f = fixture();
+    let session_id = f.issue(2);
+    let psbt = f.psbt();
+    let bytes = f
+        .host
+        .sign_request(
+            capabilities(),
+            QrRequestId([2, 1]),
+            session_id,
+            f.descriptors(),
+            &psbt,
+            Some(SignResponseKind::Signatures),
+        )
+        .unwrap();
+    f.host.bind_outer_request(RequestId::new(1)).unwrap();
+    let Message::Request(QrRequest {
+        body: request::Body::Sign(signing),
+        ..
+    }) = bwk_qr_protocol::decode(&bytes).unwrap()
+    else {
+        panic!("not a Signing request");
+    };
+    assert_eq!(signing.want_kind, Some(SignResponseKind::Signatures));
+    let signed = signed_psbt(f.peer.sign(signing).unwrap());
+    let mut entries = vec![response::SignatureEntry::Unknown {
+        input_index: 0,
+        kind: 0x7f,
+        fields: vec![1, 2, 3],
+    }];
+    for (input_index, input) in signed.inputs.iter().enumerate() {
+        for sig in musig_input_partial_sigs(input).unwrap() {
+            entries.push(response::SignatureEntry::MusigPartialSig {
+                input_index: input_index as u32,
+                participant: types::PublicKey(sig.participant.serialize()),
+                aggregate: types::PublicKey(sig.aggregate.serialize()),
+                leaf_hash: sig.leaf_hash.map(|hash| hash.to_byte_array()),
+                signature: sig.signature,
+            });
+        }
+    }
+    assert_eq!(entries.len(), 5);
+
+    let mut unplaced = entries.clone();
+    let response::SignatureEntry::MusigPartialSig {
+        participant,
+        aggregate,
+        leaf_hash,
+        ..
+    } = entries[1].clone()
+    else {
+        panic!("not a partial signature");
+    };
+    unplaced.push(response::SignatureEntry::MusigPubNonce {
+        input_index: 0,
+        participant,
+        aggregate,
+        leaf_hash,
+        nonce: [2; 66],
+    });
+    assert!(f.host.accept_response(&signatures_reply(unplaced)).is_err());
+    let mut silent_payment = entries.clone();
+    silent_payment.push(response::SignatureEntry::SpEcdhShare {
+        scope: response::SpScope::Global,
+        scan_key: participant,
+        share: aggregate,
+    });
+    assert!(f
+        .host
+        .accept_response(&signatures_reply(silent_payment))
+        .is_err());
+    let mut unknown_input = entries.clone();
+    unknown_input.push(response::SignatureEntry::TapKey {
+        input_index: 9,
+        signature: vec![1; 64],
+    });
+    assert!(f
+        .host
+        .accept_response(&signatures_reply(unknown_input))
+        .is_err());
+    assert!(f.host.record(&session_id).unwrap().is_some());
+
+    let QrMusigHostResponse::Signed(merged) =
+        f.host.accept_response(&signatures_reply(entries)).unwrap()
+    else {
+        panic!("not a signed response");
+    };
+    assert_eq!(merged, signed);
+    assert!(f.host.record(&session_id).unwrap().is_none());
 }
 
 #[test]

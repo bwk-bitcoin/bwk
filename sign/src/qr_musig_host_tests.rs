@@ -468,6 +468,7 @@ fn sign_request_places_nonces_at_their_positions_and_names_the_session() {
             session_id,
             fixture.descriptors(),
             &psbt,
+            Some(SignResponseKind::Psbt),
         )
         .unwrap();
     let signing = sent_signing(&bytes);
@@ -508,6 +509,7 @@ fn sign_request_refuses_unissued_slots_and_other_nonces() {
             session_id,
             fixture.descriptors(),
             psbt,
+            Some(SignResponseKind::Psbt),
         )
     };
     assert!(sign(&mut host, pending, &psbt).is_err());
@@ -546,6 +548,7 @@ fn signed_response_drops_the_session_and_must_spend_the_same_transaction() {
             session_id,
             fixture.descriptors(),
             &psbt,
+            Some(SignResponseKind::Psbt),
         )
         .unwrap();
     host.bind_outer_request(RequestId::new(9)).unwrap();
@@ -595,6 +598,7 @@ fn session_refusal_drops_the_session_and_other_refusals_keep_it() {
             session_id,
             fixture.descriptors(),
             &psbt,
+            Some(SignResponseKind::Psbt),
         )
         .unwrap();
         host.bind_outer_request(RequestId::new(9)).unwrap();
@@ -674,6 +678,7 @@ fn placed_nonce_matches_the_device_nonce_for_the_slot() {
             session_id,
             fixture.descriptors(),
             &psbt,
+            Some(SignResponseKind::Psbt),
         )
         .unwrap();
     let sent = Psbt::deserialize(&sent_signing(&bytes).psbt).unwrap();

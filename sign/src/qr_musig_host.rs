@@ -12,16 +12,22 @@ use std::collections::BTreeMap;
 use bwk_descriptor::musig::parse_musig_descriptor;
 use bwk_persist::{storage::Store, PersistError};
 use bwk_psbt::{
-    musig::{set_musig_input_pub_nonce, MusigPubNonce},
+    musig::{
+        musig_input_pub_nonce, set_musig_input_partial_sig, set_musig_input_pub_nonce,
+        MusigPartialSig, MusigPubNonce,
+    },
     nonce_cache::{set_nonce_cache_session, NonceCacheSession},
 };
 use bwk_qr_protocol::{
-    decode, encode_request, request, response, Message, Request as QrRequest,
+    decode, encode_request, request, response, types, Message, Request as QrRequest,
     RequestId as QrRequestId, SignResponseKind,
 };
 use miniscript::bitcoin::{
     bip32::{ChildNumber, DerivationPath, Fingerprint},
-    secp256k1::PublicKey,
+    ecdsa,
+    hashes::Hash,
+    secp256k1::{PublicKey, XOnlyPublicKey},
+    taproot::{self, TapLeafHash},
     Psbt,
 };
 
@@ -254,7 +260,8 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigHostRecord>> QrMusigHos
 
     /// Places the session's nonces as the 0x1b of every slot of the signer in
     /// `psbt`, at its input and key expression index, names the session and builds
-    /// the Signing request. `descriptors` carry full BIP-380 bodies.
+    /// the Signing request. `descriptors` carry full BIP-380 bodies. `want_kind` is
+    /// only a preference: either reply kind is accepted.
     pub fn sign_request(
         &mut self,
         capabilities: response::Capabilities,
@@ -262,6 +269,7 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigHostRecord>> QrMusigHos
         session_id: [u8; SESSION_ID_LEN],
         descriptors: Vec<request::Descriptor>,
         psbt: &Psbt,
+        want_kind: Option<SignResponseKind>,
     ) -> Result<Vec<u8>, Error> {
         self.require_idle(capabilities)?;
         let record = self.existing(&session_id)?;
@@ -286,7 +294,7 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigHostRecord>> QrMusigHos
         let body = request::Body::Sign(request::Sign {
             descriptors,
             psbt: psbt.serialize(),
-            want_kind: Some(SignResponseKind::Psbt),
+            want_kind,
         });
         self.publish(record.signer, session_id, id, body)
     }
@@ -491,19 +499,128 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigHostRecord>> QrMusigHos
         signing: &request::Sign,
         signed: response::Signed,
     ) -> Result<QrMusigHostResponse, Error> {
-        let response::Signed::Psbt(bytes) = signed else {
-            return Err(Error::Invalid("expected a signed PSBT"));
-        };
         let original = Psbt::deserialize(&signing.psbt)
             .map_err(|_| Error::Invalid("invalid original PSBT"))?;
-        let returned =
-            Psbt::deserialize(&bytes).map_err(|_| Error::Invalid("invalid returned PSBT"))?;
-        if returned.unsigned_tx != original.unsigned_tx {
-            return Err(Error::Invalid("returned PSBT spends another transaction"));
-        }
+        let returned = match signed {
+            response::Signed::Psbt(bytes) => {
+                let returned = Psbt::deserialize(&bytes)
+                    .map_err(|_| Error::Invalid("invalid returned PSBT"))?;
+                if returned.unsigned_tx != original.unsigned_tx {
+                    return Err(Error::Invalid("returned PSBT spends another transaction"));
+                }
+                returned
+            }
+            response::Signed::Signatures(entries) => merge_signatures(original, &entries)?,
+        };
         self.store.remove(&session_id).map_err(Error::Store)?;
         Ok(QrMusigHostResponse::Signed(returned))
     }
+}
+
+/// The PSBT sent with every entry of a signatures-only reply set: ordinary
+/// signatures, and MuSig2 partial signatures as 0x1c. A public nonce entry must be
+/// the 0x1b already there. Silent payment entries are refused (the host sends no
+/// silent payment output), and entries of an unknown kind are skipped.
+fn merge_signatures(mut psbt: Psbt, entries: &[response::SignatureEntry]) -> Result<Psbt, Error> {
+    for entry in entries {
+        match entry {
+            response::SignatureEntry::Unknown { .. } => {}
+            response::SignatureEntry::SpEcdhShare { .. }
+            | response::SignatureEntry::SpDleqProof { .. } => {
+                return Err(Error::Invalid("unexpected silent payment entry"));
+            }
+            _ => merge_signature(&mut psbt, entry)?,
+        }
+    }
+    Ok(psbt)
+}
+
+fn merge_signature(psbt: &mut Psbt, entry: &response::SignatureEntry) -> Result<(), Error> {
+    let index = entry
+        .input_index()
+        .ok_or(Error::Invalid("unexpected global entry"))? as usize;
+    let input = psbt
+        .inputs
+        .get_mut(index)
+        .ok_or(Error::Invalid("signature for an unknown input"))?;
+    match entry {
+        response::SignatureEntry::Ecdsa {
+            public_key,
+            signature,
+            ..
+        } => {
+            let signature = ecdsa::Signature::from_slice(signature)
+                .map_err(|_| Error::Invalid("invalid ECDSA signature"))?;
+            input.partial_sigs.insert(
+                miniscript::bitcoin::PublicKey::new(key(public_key)?),
+                signature,
+            );
+        }
+        response::SignatureEntry::TapKey { signature, .. } => {
+            input.tap_key_sig = Some(taproot_signature(signature)?);
+        }
+        response::SignatureEntry::TapScript {
+            xonly_public_key,
+            tap_leaf_hash,
+            signature,
+            ..
+        } => {
+            let xonly = XOnlyPublicKey::from_slice(xonly_public_key)
+                .map_err(|_| Error::Invalid("invalid x-only key"))?;
+            input.tap_script_sigs.insert(
+                (xonly, TapLeafHash::from_byte_array(*tap_leaf_hash)),
+                taproot_signature(signature)?,
+            );
+        }
+        response::SignatureEntry::MusigPubNonce {
+            participant,
+            aggregate,
+            leaf_hash,
+            nonce,
+            ..
+        } => {
+            let placed = musig_input_pub_nonce(
+                input,
+                key(participant)?,
+                key(aggregate)?,
+                leaf_hash.map(TapLeafHash::from_byte_array),
+            )
+            .map_err(|_| Error::Invalid("invalid public nonce field"))?;
+            if placed != Some(*nonce) {
+                return Err(Error::Invalid("returned public nonce was not placed"));
+            }
+        }
+        response::SignatureEntry::MusigPartialSig {
+            participant,
+            aggregate,
+            leaf_hash,
+            signature,
+            ..
+        } => set_musig_input_partial_sig(
+            input,
+            &MusigPartialSig {
+                participant: key(participant)?,
+                aggregate: key(aggregate)?,
+                leaf_hash: leaf_hash.map(TapLeafHash::from_byte_array),
+                signature: *signature,
+            },
+        ),
+        response::SignatureEntry::SpEcdhShare { .. }
+        | response::SignatureEntry::SpDleqProof { .. }
+        | response::SignatureEntry::Unknown { .. } => {
+            return Err(Error::Invalid("unexpected signature entry"))
+        }
+    }
+    Ok(())
+}
+
+fn key(key: &types::PublicKey) -> Result<PublicKey, Error> {
+    PublicKey::from_slice(&key.0).map_err(|_| Error::Invalid("invalid public key"))
+}
+
+fn taproot_signature(signature: &[u8]) -> Result<taproot::Signature, Error> {
+    taproot::Signature::from_slice(signature)
+        .map_err(|_| Error::Invalid("invalid taproot signature"))
 }
 
 fn prepare_body(
