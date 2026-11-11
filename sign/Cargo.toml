@@ -19,7 +19,7 @@ bwk-descriptor.workspace = true
 bwk-psbt.workspace = true
 bwk-musig = { workspace = true, optional = true, features = ["rust-bitcoin"] }
 bwk-persist = { workspace = true, optional = true }
-bwk-qr-protocol = { workspace = true, optional = true }
+bwk-qr-protocol = { workspace = true, optional = true, features = ["bitcoin"] }
 getrandom = { workspace = true, optional = true }
 bip39 = { workspace = true, features = ["rand"] }
 serde.workspace = true

@@ -266,48 +266,70 @@ Slot eligibility retains the existing 0x1a and `tap_scripts` rules. If the same
 aggregate appears in the root and a selected leaf, retaining their shared 0x1a
 still requests the key path too; partial leaf data does not disable it.
 
-## Durable hot QR MuSig peer
+## QR MuSig on nonce cache sessions
 
-With `musig`, `qr_musig::QrMusigPeer::from_store(signer, store, cipher)` owns a
-`HotSigner`, a caller-selected `Store<Key = [u8; 32], Value = QrMusigPeerRecord>`
-and an `Arc<dyn bwk_persist::cipher::Cipher>`. The cipher must provide authenticated
-encryption. Secret exports are sealed before entering cloneable store records;
-neither the peer's record codec nor its QR responses contain plaintext roots.
-`qr_musig::{encode_record, decode_record}` are value codecs for caller-owned
-`RamStore` instances. The peer does not select a backend or perform file IO.
+With `musig`, `qr_musig::QrMusigPeer` and `qr_musig_host::QrMusigHost` sign MuSig2
+in one round over the QR protocol, with the nonce cache sessions of
+`bip-nonce-cache/BIP-DRAFT.md`: nonces are issued with Nonce Preparation before
+any transaction exists, and signing is an ordinary Signing exchange whose PSBT
+names the session in `PSBT_GLOBAL_NONCE_CACHE_SESSION`. Only aggregate then
+derive, as in `musig(A,B)/<0;1>/*`, is in scope: the participant key is then the
+same at every input.
 
-The store must be exclusively held and durable: a successful `flush` must commit
-all preceding writes. No `NoopBackend`, parallel peer sharing the same store,
-rollback, restored backup or deletion of used session IDs is safe. Keep burned
-tombstones permanently. A cipher does not prevent rollback or nonce reuse.
+### Peer
 
-`prepare(PrepareMusig)` accepts a full BIP380 descriptor, bounded public
-derivations and absolute input coverage, with no transaction. An identical
-prepared request returns the same attributed public nonces after another
-successful flush. A changed request never replaces an existing same-ID root.
+`QrMusigPeer::from_store(signer, store)` owns a `HotSigner` and a caller-selected
+`Store<Key = [u8; 4], Value = QrMusigPeerRecord>` holding the sessions by
+`session_id`. A session is a random secret (see Nonce cache sessions above) and
+its creation order; the secret lives only in this store, which the peer must own
+exclusively and whose successful `flush` must be durable.
+`qr_musig::{encode_record, decode_record}` are value codecs for a caller-owned
+`RamStore`: the creation order (8 bytes, little endian) then the secret (32
+bytes).
 
-`sign(SignMusig)` binds the selected session to the attempt, transaction, policy,
-owner and exact descriptor-resolved slots, including expression occurrence,
-derivation and actual sighash. Only advertised derivations are eligible. The
-allocation is flushed before any nonce publication. Incomplete participant
-transcripts return a `MusigSigned` PSBT containing nonces but no new signatures.
-Once complete, the attributed transcript is pinned in KeyAgg order and flushed.
-The encrypted record is then replaced with a root-free tombstone and flushed
-before the consuming `HotSigner::sign_musig_session` call. There is no ordinary
-signing fallback. Completed or missing sessions refuse signing retries.
+`prepare(PrepareNonces)` answers from the session holding `session_id`, and
+creates it when there is none and the request carries no reference. A reference
+that does not match the session, or names a session the peer does not hold, is
+refused and creates nothing. Storing more than `MAX_SESSIONS` (16) sessions
+evicts the oldest. The nonces are those of the key at the request path for every
+key expression index of the range and every input below `max_inputs`, ordered by
+key expression index then input. The store is flushed before the answer leaves.
 
-Every publication, including identical retries, requires a successful flush.
-A failed burn drops the transient root and disables further operations on that
-peer. Later calls retry persisting the tombstone but still refuse signing.
-Do not reopen an older store after a failed durability barrier; retain the live
-peer until its tombstone has been durably written. A signing failure after a
-successful burn also leaves the session permanently consumed.
+`sign(Sign)` refuses a PSBT that names no session, and a session it does not
+hold with that reference. Every descriptor carries a full BIP-380 body, and the
+signer signs each through `HotSigner::sign_nonce_cache`, which refuses a slot
+whose 0x1b is not the nonce it derives. The session is then removed and the
+store flushed before the signed PSBT leaves: a failed flush releases nothing.
 
-`handle(QrRequest)` preserves the inner request ID and returns explicit QR
-errors. `handle_remote(protocol::Request::Raw)` decodes the QR payload and returns
-`Response::Raw` with the same outer request ID and signer. Malformed wire data
-and non-Raw manager operations return attributed manager errors. Other inner
+`handle(QrRequest)` preserves the inner request ID and answers a refused session
+with the session `ERROR` `0x0D`, an input it does not own with nothing to sign,
+a malformed request with malformed request and a persistence failure with
+internal error. `handle_remote(protocol::Request::Raw)` decodes the QR payload
+and returns `Response::Raw` with the same outer request ID and signer. Other
 operations are refused, never passed through to ordinary hot signing.
+
+### Host
+
+`QrMusigHost::from_store(store)` keeps, in a
+`Store<Key = [u8; 4], Value = QrMusigHostRecord>`, the public nonces each signer
+issued per session, by key path, key expression index and input index.
+`qr_musig_host::{encode_host_record, decode_host_record}` are value codecs for a
+caller-owned `RamStore`.
+
+- `issue_request` draws a random `session_id` and asks for an `Issuance`: a key
+  path, the input coverage and a range of key expression indexes.
+- `extend_request` asks for more of a session it holds, with the session
+  reference once known, so the signer refuses rather than answer from another
+  secret after an eviction.
+- `sign_request` sets, for every slot of the signer in the PSBT, the issued nonce
+  at the slot's participant path, `SlotInfo::key_expression_index` and input
+  index as its 0x1b, names the session and builds the Signing request.
+
+Each returns the wire bytes. `submit_pending` sends them through
+`SigningManager::raw`, or `bind_outer_request` binds an outer ID when the caller
+sends them itself, and `accept_response` checks both request IDs and the signer.
+A signed PSBT, or a refusal for the session, drops the session; other refusals
+keep it.
 
 ## HotManager
 

@@ -1,36 +1,41 @@
-//! Durable host allocation and manager attribution for cached QR MuSig signing.
+//! Coordinator side of QR MuSig signing on nonce cache sessions
+//! (`bip-nonce-cache/BIP-DRAFT.md`): it issues a signer's public nonces with Nonce
+//! Preparation, places them as the PSBT's 0x1b from the descriptor, names the
+//! session with `PSBT_GLOBAL_NONCE_CACHE_SESSION` and sends an ordinary Signing
+//! request.
 //!
-//! The consumer must supply an exclusively owned durable Store. Noop backends,
-//! shared writers, rollback, restored snapshots and deleting used IDs are not
-//! supported: they can make an allocated public nonce available a second time.
-//! Store::flush must commit all prior writes before returning success. The host
-//! never accesses a backend directly. Record codecs can be used with RamStore.
+//! Records hold public data only. The host never accesses a backend directly;
+//! record codecs can be used with RamStore.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
-use bwk_descriptor::{
-    musig::{musig_descriptor_to_string, parse_musig_descriptor},
-    wallet::{WalletDescriptor, WalletDescriptorExt},
-};
-use bwk_musig::{nonce_agg, partial_verify, rust_bitcoin::RustBitcoin};
+use bwk_descriptor::musig::parse_musig_descriptor;
 use bwk_persist::{storage::Store, PersistError};
-use bwk_psbt::musig::{
-    set_musig_input_partial_sig, set_musig_input_pub_nonce, MusigPartialSig, MusigPubNonce,
+use bwk_psbt::{
+    musig::{set_musig_input_pub_nonce, MusigPubNonce},
+    nonce_cache::{set_nonce_cache_session, NonceCacheSession},
 };
 use bwk_qr_protocol::{
-    decode, encode_request, encode_response, request, response, Message, Request as QrRequest,
-    RequestId as QrRequestId, Response as QrResponse,
+    decode, encode_request, request, response, Message, Request as QrRequest,
+    RequestId as QrRequestId, SignResponseKind,
 };
-use miniscript::bitcoin::{bip32::Fingerprint, hashes::Hash, secp256k1::PublicKey, Psbt};
+use miniscript::bitcoin::{
+    bip32::{ChildNumber, DerivationPath, Fingerprint},
+    secp256k1::PublicKey,
+    Psbt,
+};
 
 use crate::{
     error::Error as SigningError,
     identity::SignerId,
     manager::{Error as ManagerError, SigningManager},
-    musig::{expression_slots, slot_infos, slot_sighash, SlotInfo},
+    musig::slot_infos,
+    nonce_cache::SESSION_ID_LEN,
     protocol::{RequestId, Response},
-    qr_musig::allocation_binding,
 };
+
+const RECORD_MAGIC: &[u8; 4] = b"QMH2";
+const PUB_NONCE_LEN: usize = 66;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -46,31 +51,33 @@ pub enum Error {
     Peer(String),
 }
 
-/// Allocation is permanent even if dispatch, cancellation or signing fails.
+/// What to issue: the nonces of key expression indexes `start..=end` for the inputs
+/// `0..max_inputs`, for the signer's key at `path`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum QrMusigHostState {
-    Preparing,
-    Prepared,
-    Allocated {
-        attempt_id: [u8; 32],
-        binding: [u8; 32],
-        /// Descriptor-ordered participant nonces, pinned before signing.
-        transcript: Option<Vec<Vec<[u8; 66]>>>,
-    },
-    Consumed {
-        attempt_id: [u8; 32],
-        binding: [u8; 32],
-        transcript: Vec<Vec<[u8; 66]>>,
-    },
+pub struct Issuance {
+    pub path: DerivationPath,
+    pub max_inputs: u8,
+    pub start: u32,
+    pub end: u32,
 }
 
-#[derive(Debug, Clone)]
+/// Where an issued nonce sits.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NoncePosition {
+    pub path: DerivationPath,
+    pub key_expression_index: u32,
+    pub input_index: u32,
+}
+
+/// The public nonces a signer issued for one session, stored under its
+/// `session_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QrMusigHostRecord {
     signer: SignerId,
     fingerprint: Fingerprint,
-    preparation: request::PrepareMusig,
-    prepared: Option<response::MusigPrepared>,
-    state: QrMusigHostState,
+    /// None until the signer answers a first issuance.
+    session_ref: Option<[u8; SESSION_ID_LEN]>,
+    nonces: BTreeMap<NoncePosition, [u8; PUB_NONCE_LEN]>,
 }
 
 /// RamStore value encoder; no backend or key layout is imposed on the caller.
@@ -85,78 +92,47 @@ pub fn decode_host_record(bytes: &[u8]) -> Result<QrMusigHostRecord, PersistErro
 }
 
 impl QrMusigHostRecord {
-    pub fn state(&self) -> &QrMusigHostState {
-        &self.state
+    pub fn signer(&self) -> &SignerId {
+        &self.signer
     }
 
-    pub fn preparation(&self) -> &request::PrepareMusig {
-        &self.preparation
+    pub fn session_ref(&self) -> Option<[u8; SESSION_ID_LEN]> {
+        self.session_ref
     }
 
-    pub fn prepared(&self) -> Option<&response::MusigPrepared> {
-        self.prepared.as_ref()
+    pub fn nonces(&self) -> &BTreeMap<NoncePosition, [u8; PUB_NONCE_LEN]> {
+        &self.nonces
     }
 
-    fn descriptor(&self) -> Result<WalletDescriptor, Error> {
-        match &self.preparation.descriptor.descriptor {
-            Some(request::DescriptorBody::Bip380(text)) => parse_musig_descriptor(text)
-                .map_err(|_| Error::Invalid("invalid stored descriptor")),
-            _ => Err(Error::Invalid(
-                "preparation requires a full BIP-380 descriptor",
-            )),
-        }
-    }
-
-    /// Public data only. Length-prefixed fields use little endian u32 lengths.
+    /// Length-prefixed fields use little endian u32 lengths, integers are little
+    /// endian.
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
-        let mut bytes = b"QMH1".to_vec();
+        let mut bytes = RECORD_MAGIC.to_vec();
         put_bytes(&mut bytes, self.signer.as_str().as_bytes())?;
         bytes.extend_from_slice(self.fingerprint.as_bytes());
-        let preparation = encode_request(&QrRequest {
-            id: QrRequestId([0; 2]),
-            body: request::Body::PrepareMusig(self.preparation.clone()),
-        })
-        .map_err(|_| Error::Invalid("cannot encode preparation"))?;
-        put_bytes(&mut bytes, &preparation)?;
-        let prepared = match &self.prepared {
-            Some(prepared) => encode_response(&QrResponse {
-                id: QrRequestId([0; 2]),
-                body: response::Body::MusigPrepared(prepared.clone()),
-            })
-            .map_err(|_| Error::Invalid("cannot encode prepared response"))?,
-            None => Vec::new(),
-        };
-        put_bytes(&mut bytes, &prepared)?;
-        match &self.state {
-            QrMusigHostState::Preparing => bytes.push(0),
-            QrMusigHostState::Prepared => bytes.push(1),
-            QrMusigHostState::Allocated {
-                attempt_id,
-                binding,
-                transcript,
-            } => {
-                bytes.push(2);
-                bytes.extend_from_slice(attempt_id);
-                bytes.extend_from_slice(binding);
-                put_transcript(&mut bytes, transcript.as_deref())?;
+        match self.session_ref {
+            Some(session_ref) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&session_ref);
             }
-            QrMusigHostState::Consumed {
-                attempt_id,
-                binding,
-                transcript,
-            } => {
-                bytes.push(3);
-                bytes.extend_from_slice(attempt_id);
-                bytes.extend_from_slice(binding);
-                put_transcript(&mut bytes, Some(transcript))?;
+            None => bytes.push(0),
+        }
+        put_len(&mut bytes, self.nonces.len())?;
+        for (position, nonce) in &self.nonces {
+            put_len(&mut bytes, position.path.len())?;
+            for child in &position.path {
+                bytes.extend_from_slice(&u32::from(*child).to_le_bytes());
             }
+            bytes.extend_from_slice(&position.key_expression_index.to_le_bytes());
+            bytes.extend_from_slice(&position.input_index.to_le_bytes());
+            bytes.extend_from_slice(nonce);
         }
         Ok(bytes)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let mut reader = RecordReader(bytes);
-        if reader.take(4)? != b"QMH1" {
+        if reader.take(RECORD_MAGIC.len())? != RECORD_MAGIC {
             return Err(Error::Invalid("invalid host record version"));
         }
         let signer = SignerId::new(
@@ -164,256 +140,202 @@ impl QrMusigHostRecord {
                 .map_err(|_| Error::Invalid("invalid stored signer"))?,
         );
         let fingerprint = Fingerprint::from(reader.array::<4>()?);
-        let preparation = match decode(reader.bytes()?) {
-            Ok(Message::Request(QrRequest {
-                body: request::Body::PrepareMusig(value),
-                ..
-            })) => value,
-            _ => return Err(Error::Invalid("invalid stored preparation")),
+        let session_ref = match reader.array::<1>()?[0] {
+            0 => None,
+            1 => Some(reader.array()?),
+            _ => return Err(Error::Invalid("invalid session reference marker")),
         };
-        let prepared_bytes = reader.bytes()?;
-        let prepared = if prepared_bytes.is_empty() {
-            None
-        } else {
-            match decode(prepared_bytes) {
-                Ok(Message::Response(QrResponse {
-                    body: response::Body::MusigPrepared(value),
-                    ..
-                })) => Some(value),
-                _ => return Err(Error::Invalid("invalid stored prepared response")),
+        let mut nonces = BTreeMap::new();
+        for _ in 0..reader.len()? {
+            let path = (0..reader.len()?)
+                .map(|_| Ok(ChildNumber::from(reader.u32()?)))
+                .collect::<Result<Vec<_>, Error>>()?;
+            let position = NoncePosition {
+                path: DerivationPath::from(path),
+                key_expression_index: reader.u32()?,
+                input_index: reader.u32()?,
+            };
+            let nonce = reader.array()?;
+            validate_nonce(&nonce)?;
+            if nonces.insert(position, nonce).is_some() {
+                return Err(Error::Invalid("duplicate stored nonce"));
             }
-        };
-        let state = match reader.array::<1>()?[0] {
-            0 => QrMusigHostState::Preparing,
-            1 => QrMusigHostState::Prepared,
-            2 => QrMusigHostState::Allocated {
-                attempt_id: reader.array()?,
-                binding: reader.array()?,
-                transcript: reader.transcript()?,
-            },
-            3 => QrMusigHostState::Consumed {
-                attempt_id: reader.array()?,
-                binding: reader.array()?,
-                transcript: reader
-                    .transcript()?
-                    .ok_or(Error::Invalid("missing consumed transcript"))?,
-            },
-            _ => return Err(Error::Invalid("invalid host state")),
-        };
+        }
         if !reader.0.is_empty() {
             return Err(Error::Invalid("trailing host record bytes"));
         }
-        let record = Self {
+        Ok(Self {
             signer,
             fingerprint,
-            preparation,
-            prepared,
-            state,
-        };
-        record.validate()?;
-        Ok(record)
-    }
-
-    fn validate(&self) -> Result<(), Error> {
-        let descriptor = self.descriptor()?;
-        preparation_slots(&self.preparation, &descriptor, self.fingerprint)?;
-        match (&self.state, &self.prepared) {
-            (QrMusigHostState::Preparing, None) => Ok(()),
-            (QrMusigHostState::Preparing, Some(_)) | (_, None) => {
-                Err(Error::Invalid("inconsistent host state"))
-            }
-            (_, Some(prepared)) => validate_prepared(self, &descriptor, prepared),
-        }
+            session_ref,
+            nonces,
+        })
     }
 }
 
 #[derive(Clone)]
 struct Pending {
     signer: SignerId,
+    session_id: [u8; SESSION_ID_LEN],
     outer: Option<RequestId>,
     request: QrRequest,
 }
 
 pub enum QrMusigHostResponse {
-    Prepared(response::MusigPrepared),
+    Prepared(response::NoncesPrepared),
     Signed(Psbt),
 }
 
-/// One outstanding manager request per host. Lost pending state can be retried
-/// from the durable record, but never allocated to another attempt.
-pub struct QrMusigHost<S: Store<Key = [u8; 32], Value = QrMusigHostRecord>> {
+/// One outstanding manager request per host.
+pub struct QrMusigHost<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigHostRecord>> {
     store: S,
     pending: Option<Pending>,
 }
 
-impl<S: Store<Key = [u8; 32], Value = QrMusigHostRecord>> QrMusigHost<S> {
-    /// The caller guarantees exclusive durable storage without rollback. The
-    /// Store trait cannot detect NoopBackend or an externally restored snapshot.
-    pub fn from_store(store: S) -> Result<Self, Error> {
-        for (id, record) in store.iter().map_err(Error::Store)? {
-            if id != record.preparation.session_id {
-                return Err(Error::Invalid("host record key mismatch"));
-            }
-            record.validate()?;
-        }
-        Ok(Self {
+impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigHostRecord>> QrMusigHost<S> {
+    pub fn from_store(store: S) -> Self {
+        Self {
             store,
             pending: None,
-        })
+        }
     }
 
-    pub fn record(&self, session_id: &[u8; 32]) -> Result<Option<QrMusigHostRecord>, Error> {
+    pub fn record(
+        &self,
+        session_id: &[u8; SESSION_ID_LEN],
+    ) -> Result<Option<QrMusigHostRecord>, Error> {
         self.store.get(session_id).map_err(Error::Store)
     }
 
-    /// No transaction is accepted or bound during preparation. Only the cache
-    /// capability enables this operation; ordinary MuSig support is insufficient.
-    #[allow(clippy::too_many_arguments)]
-    pub fn prepare_request(
+    /// Issues `issuance` in a new session of `signer`, under a random `session_id`
+    /// returned with the wire bytes.
+    pub fn issue_request(
         &mut self,
         signer: SignerId,
         capabilities: response::Capabilities,
         id: QrRequestId,
-        descriptor: &WalletDescriptor,
         fingerprint: Fingerprint,
-        preparation: request::PrepareMusig,
-    ) -> Result<Vec<u8>, Error> {
+        issuance: Issuance,
+    ) -> Result<([u8; SESSION_ID_LEN], Vec<u8>), Error> {
         self.require_idle(capabilities)?;
+        let session_id = self.new_session_id()?;
         let record = QrMusigHostRecord {
             signer: signer.clone(),
             fingerprint,
-            preparation: preparation.clone(),
-            prepared: None,
-            state: QrMusigHostState::Preparing,
-        };
-        if musig_descriptor_to_string(&record.descriptor()?, false)
-            != musig_descriptor_to_string(descriptor, false)
-        {
-            return Err(Error::Invalid("preparation policy mismatch"));
-        }
-        record.validate()?;
-        match self
-            .store
-            .get(&preparation.session_id)
-            .map_err(Error::Store)?
-        {
-            Some(existing)
-                if existing.signer == signer
-                    && existing.fingerprint == fingerprint
-                    && existing.preparation == preparation
-                    && matches!(
-                        existing.state,
-                        QrMusigHostState::Preparing | QrMusigHostState::Prepared
-                    ) => {}
-            Some(_) => return Err(Error::Invalid("cache ID already used")),
-            None => {
-                self.store
-                    .insert(preparation.session_id, record)
-                    .map_err(Error::Store)?;
-            }
-        }
-        self.publish(
-            signer,
-            QrRequest {
-                id,
-                body: request::Body::PrepareMusig(preparation),
-            },
-        )
-    }
-
-    /// Permanently allocates the prepared cache before returning wire bytes.
-    /// Retries must keep the transaction, attempt and exact selected own slots.
-    #[allow(clippy::too_many_arguments)]
-    pub fn allocate_sign_request(
-        &mut self,
-        signer: SignerId,
-        capabilities: response::Capabilities,
-        id: QrRequestId,
-        session_id: [u8; 32],
-        attempt_id: [u8; 32],
-        psbt: &Psbt,
-    ) -> Result<Vec<u8>, Error> {
-        self.require_idle(capabilities)?;
-        let mut record = self
-            .store
-            .get(&session_id)
-            .map_err(Error::Store)?
-            .ok_or(Error::Invalid("unknown cache ID"))?;
-        if record.signer != signer {
-            return Err(Error::Invalid("wrong cache owner"));
-        }
-        let descriptor = record.descriptor()?;
-        let binding = allocation_binding(psbt, &descriptor, record.fingerprint, attempt_id)
-            .map_err(Error::Signing)?;
-        let infos = selected_own_slots(psbt, &descriptor, &record)?;
-        validate_own_nonces(psbt, &record, &infos, false)?;
-        for info in &infos {
-            if info
-                .partial_sig(&psbt.inputs[info.slot.input_index])
-                .map_err(Error::Signing)?
-                .is_some()
-            {
-                return Err(Error::Invalid("own partial signature already present"));
-            }
-        }
-        // Cached own nonces count toward the first complete transcript, even
-        // when this request asks the peer to insert them in round one.
-        let mut with_own = psbt.clone();
-        insert_own_nonces(&mut with_own, &record, &infos)?;
-        let transcript = complete_transcript(&with_own, &infos)?;
-        let pinned = match &record.state {
-            QrMusigHostState::Prepared => transcript,
-            QrMusigHostState::Allocated {
-                attempt_id: old_attempt,
-                binding: old_binding,
-                transcript: old,
-            } if *old_attempt == attempt_id && *old_binding == binding => match (old, transcript) {
-                (Some(old), Some(current)) if *old == current => Some(current),
-                (None, current) => current,
-                _ => return Err(Error::Invalid("participant nonce transcript changed")),
-            },
-            _ => return Err(Error::Invalid("cache is not available for this attempt")),
-        };
-        record.state = QrMusigHostState::Allocated {
-            attempt_id,
-            binding,
-            transcript: pinned,
+            session_ref: None,
+            nonces: BTreeMap::new(),
         };
         self.store
             .insert(session_id, record)
             .map_err(Error::Store)?;
-        self.publish(
+        let bytes = self.publish(
             signer,
-            QrRequest {
-                id,
-                body: request::Body::SignMusig(request::SignMusig {
-                    session_id,
-                    attempt_id,
-                    psbt: psbt.serialize(),
-                }),
+            session_id,
+            id,
+            prepare_body(session_id, None, issuance),
+        )?;
+        Ok((session_id, bytes))
+    }
+
+    /// Issues `issuance` in a session this host already holds, naming it by its
+    /// reference so the signer refuses rather than answer from another secret.
+    pub fn extend_request(
+        &mut self,
+        capabilities: response::Capabilities,
+        id: QrRequestId,
+        session_id: [u8; SESSION_ID_LEN],
+        issuance: Issuance,
+    ) -> Result<Vec<u8>, Error> {
+        self.require_idle(capabilities)?;
+        let record = self.existing(&session_id)?;
+        let body = prepare_body(session_id, record.session_ref, issuance);
+        self.publish(record.signer, session_id, id, body)
+    }
+
+    /// Places the session's nonces as the 0x1b of every slot of the signer in
+    /// `psbt`, at its input and key expression index, names the session and builds
+    /// the Signing request. `descriptors` carry full BIP-380 bodies.
+    pub fn sign_request(
+        &mut self,
+        capabilities: response::Capabilities,
+        id: QrRequestId,
+        session_id: [u8; SESSION_ID_LEN],
+        descriptors: Vec<request::Descriptor>,
+        psbt: &Psbt,
+    ) -> Result<Vec<u8>, Error> {
+        self.require_idle(capabilities)?;
+        let record = self.existing(&session_id)?;
+        let session_ref = record
+            .session_ref
+            .ok_or(Error::Invalid("session not issued yet"))?;
+        let mut psbt = psbt.clone();
+        let mut placed = 0;
+        for descriptor in &descriptors {
+            placed += place_nonces(&mut psbt, descriptor, &record)?;
+        }
+        if placed == 0 {
+            return Err(Error::Invalid("no MuSig slot of the signer"));
+        }
+        set_nonce_cache_session(
+            &mut psbt,
+            NonceCacheSession {
+                session_id,
+                session_ref,
             },
-        )
+        );
+        let body = request::Body::Sign(request::Sign {
+            descriptors,
+            psbt: psbt.serialize(),
+            want_kind: Some(SignResponseKind::Psbt),
+        });
+        self.publish(record.signer, session_id, id, body)
+    }
+
+    fn existing(&self, session_id: &[u8; SESSION_ID_LEN]) -> Result<QrMusigHostRecord, Error> {
+        self.store
+            .get(session_id)
+            .map_err(Error::Store)?
+            .ok_or(Error::Invalid("unknown session"))
+    }
+
+    fn new_session_id(&self) -> Result<[u8; SESSION_ID_LEN], Error> {
+        loop {
+            let mut session_id = [0; SESSION_ID_LEN];
+            getrandom::getrandom(&mut session_id)
+                .map_err(|_| Error::Invalid("no randomness for a session id"))?;
+            if !self.store.contains_key(&session_id).map_err(Error::Store)? {
+                return Ok(session_id);
+            }
+        }
     }
 
     fn require_idle(&self, capabilities: response::Capabilities) -> Result<(), Error> {
         if self.pending.is_some() {
             return Err(Error::Invalid("another QR request is outstanding"));
         }
-        if !capabilities.supports_musig_cache() {
+        if !capabilities.supports_nonce_cache() {
             return Err(Error::Invalid(
-                "peer does not advertise MuSig cache support",
+                "peer does not advertise nonce cache support",
             ));
         }
         Ok(())
     }
 
-    fn publish(&mut self, signer: SignerId, request: QrRequest) -> Result<Vec<u8>, Error> {
+    fn publish(
+        &mut self,
+        signer: SignerId,
+        session_id: [u8; SESSION_ID_LEN],
+        id: QrRequestId,
+        body: request::Body,
+    ) -> Result<Vec<u8>, Error> {
+        let request = QrRequest { id, body };
         let bytes =
             encode_request(&request).map_err(|_| Error::Invalid("cannot encode QR request"))?;
         // Required even on retries: failed RamStore flushes leave changed RAM.
         self.store.flush().map_err(Error::Store)?;
         self.pending = Some(Pending {
             signer,
+            session_id,
             outer: None,
             request,
         });
@@ -453,11 +375,13 @@ impl<S: Store<Key = [u8; 32], Value = QrMusigHostRecord>> QrMusigHost<S> {
         Ok(outer)
     }
 
-    /// Only abandons response attribution. Allocations and tombstones stay put.
+    /// Only abandons response attribution; the records stay put.
     pub fn cancel_pending(&mut self) {
         self.pending = None;
     }
 
+    /// A refusal for a session missing, consumed or mismatched on the signer drops
+    /// the session: its nonces can no longer sign.
     pub fn accept_response(&mut self, response: &Response) -> Result<QrMusigHostResponse, Error> {
         let pending = self
             .pending
@@ -484,13 +408,14 @@ impl<S: Store<Key = [u8; 32], Value = QrMusigHostRecord>> QrMusigHost<S> {
             return Err(Error::Invalid("QR response attribution mismatch"));
         }
         let accepted = match (&pending.request.body, qr.body) {
-            (request::Body::PrepareMusig(preparation), response::Body::MusigPrepared(prepared)) => {
-                self.accept_prepared(preparation, prepared)?
+            (
+                request::Body::PrepareNonces(preparation),
+                response::Body::NoncesPrepared(prepared),
+            ) => self.accept_prepared(preparation, prepared)?,
+            (request::Body::Sign(signing), response::Body::Signed(signed)) => {
+                self.accept_signed(pending.session_id, signing, signed)?
             }
-            (request::Body::SignMusig(signing), response::Body::MusigSigned(signed)) => {
-                self.accept_signed(signing, signed)?
-            }
-            (_, response::Body::Error(error)) => return Err(Error::Peer(error.message)),
+            (_, response::Body::Error(error)) => return self.refused(pending.session_id, error),
             _ => return Err(Error::Invalid("wrong QR operation response")),
         };
         self.store.flush().map_err(Error::Store)?;
@@ -498,383 +423,171 @@ impl<S: Store<Key = [u8; 32], Value = QrMusigHostRecord>> QrMusigHost<S> {
         Ok(accepted)
     }
 
+    fn refused(
+        &mut self,
+        session_id: [u8; SESSION_ID_LEN],
+        error: response::ErrorBody,
+    ) -> Result<QrMusigHostResponse, Error> {
+        if error.error == response::Error::MusigSession {
+            self.store.remove(&session_id).map_err(Error::Store)?;
+        }
+        self.store.flush().map_err(Error::Store)?;
+        self.pending = None;
+        Err(Error::Peer(error.message))
+    }
+
     fn accept_prepared(
         &mut self,
-        preparation: &request::PrepareMusig,
-        prepared: response::MusigPrepared,
+        preparation: &request::PrepareNonces,
+        prepared: response::NoncesPrepared,
     ) -> Result<QrMusigHostResponse, Error> {
-        let mut record = self
-            .store
-            .get(&preparation.session_id)
-            .map_err(Error::Store)?
-            .ok_or(Error::Invalid("missing preparation record"))?;
-        if record.preparation != *preparation
-            || !matches!(
-                record.state,
-                QrMusigHostState::Preparing | QrMusigHostState::Prepared
-            )
+        prepared
+            .validate()
+            .map_err(|_| Error::Invalid("invalid prepared response"))?;
+        if prepared.session_id != preparation.session_id
+            || prepared.max_inputs != preparation.max_inputs
+            || prepared.start != preparation.start
+            || prepared.end != preparation.end
         {
-            return Err(Error::Invalid("preparation no longer available"));
+            return Err(Error::Invalid(
+                "prepared response does not echo the request",
+            ));
         }
-        validate_prepared(&record, &record.descriptor()?, &prepared)?;
-        if record.prepared.as_ref().is_some_and(|old| *old != prepared) {
-            return Err(Error::Invalid("prepared public nonces changed"));
+        let mut record = self.existing(&preparation.session_id)?;
+        if record
+            .session_ref
+            .is_some_and(|session_ref| session_ref != prepared.session_ref)
+        {
+            return Err(Error::Invalid("session reference changed"));
         }
-        record.prepared = Some(prepared.clone());
-        record.state = QrMusigHostState::Prepared;
+        let path = DerivationPath::from(&preparation.derivation_path);
+        let max_inputs = u32::from(prepared.max_inputs);
+        for (entry, nonce) in (0..).zip(&prepared.nonces) {
+            validate_nonce(nonce)?;
+            let position = NoncePosition {
+                path: path.clone(),
+                key_expression_index: prepared.start + entry / max_inputs,
+                input_index: entry % max_inputs,
+            };
+            if record
+                .nonces
+                .insert(position, *nonce)
+                .is_some_and(|previous| previous != *nonce)
+            {
+                return Err(Error::Invalid("issued nonce changed"));
+            }
+        }
+        record.session_ref = Some(prepared.session_ref);
         self.store
             .insert(preparation.session_id, record)
             .map_err(Error::Store)?;
         Ok(QrMusigHostResponse::Prepared(prepared))
     }
 
+    /// The signer deleted the session before answering, so the host drops it too.
     fn accept_signed(
         &mut self,
-        signing: &request::SignMusig,
-        signed: response::MusigSigned,
+        session_id: [u8; SESSION_ID_LEN],
+        signing: &request::Sign,
+        signed: response::Signed,
     ) -> Result<QrMusigHostResponse, Error> {
-        if signing.session_id != signed.session_id || signing.attempt_id != signed.attempt_id {
-            return Err(Error::Invalid("signing session or attempt mismatch"));
-        }
-        let mut record = self
-            .store
-            .get(&signing.session_id)
-            .map_err(Error::Store)?
-            .ok_or(Error::Invalid("missing allocation record"))?;
-        let descriptor = record.descriptor()?;
+        let response::Signed::Psbt(bytes) = signed else {
+            return Err(Error::Invalid("expected a signed PSBT"));
+        };
         let original = Psbt::deserialize(&signing.psbt)
             .map_err(|_| Error::Invalid("invalid original PSBT"))?;
         let returned =
-            Psbt::deserialize(&signed.psbt).map_err(|_| Error::Invalid("invalid returned PSBT"))?;
-        let binding = allocation_binding(
-            &original,
-            &descriptor,
-            record.fingerprint,
-            signing.attempt_id,
-        )
-        .map_err(Error::Signing)?;
-        let pinned = match &record.state {
-            QrMusigHostState::Allocated {
-                attempt_id,
-                binding: old,
-                transcript,
-            } if *attempt_id == signing.attempt_id && *old == binding => transcript.clone(),
-            // Retrying acceptance after a failed flush must still cross a barrier.
-            QrMusigHostState::Consumed {
-                attempt_id,
-                binding: old,
-                transcript,
-            } if *attempt_id == signing.attempt_id && *old == binding => Some(transcript.clone()),
-            _ => return Err(Error::Invalid("signing allocation mismatch")),
-        };
-        let infos = selected_own_slots(&original, &descriptor, &record)?;
-        validate_own_nonces(&returned, &record, &infos, true)?;
-        let transcript = complete_transcript(&returned, &infos)?;
-        if pinned
-            .as_ref()
-            .is_some_and(|old| Some(old) != transcript.as_ref())
-        {
-            return Err(Error::Invalid("returned participant transcript changed"));
+            Psbt::deserialize(&bytes).map_err(|_| Error::Invalid("invalid returned PSBT"))?;
+        if returned.unsigned_tx != original.unsigned_tx {
+            return Err(Error::Invalid("returned PSBT spends another transaction"));
         }
-        let consumed = validate_returned_psbt(&original, &returned, &record, &infos)?;
-        record.state = if consumed {
-            QrMusigHostState::Consumed {
-                attempt_id: signing.attempt_id,
-                binding,
-                transcript: transcript
-                    .ok_or(Error::Invalid("partial signature without complete nonces"))?,
-            }
-        } else {
-            if matches!(record.state, QrMusigHostState::Consumed { .. }) {
-                return Err(Error::Invalid("consumed cache cannot return to allocated"));
-            }
-            QrMusigHostState::Allocated {
-                attempt_id: signing.attempt_id,
-                binding,
-                transcript,
-            }
-        };
-        self.store
-            .insert(signing.session_id, record)
-            .map_err(Error::Store)?;
+        self.store.remove(&session_id).map_err(Error::Store)?;
         Ok(QrMusigHostResponse::Signed(returned))
     }
 }
 
-fn preparation_slots(
-    preparation: &request::PrepareMusig,
-    descriptor: &WalletDescriptor,
-    fingerprint: Fingerprint,
-) -> Result<Vec<(request::MusigDerivation, SlotInfo)>, Error> {
-    preparation
-        .validate()
-        .map_err(|_| Error::Invalid("invalid preparation bounds"))?;
-    let paths = descriptor
-        .single_paths()
-        .map_err(|_| Error::Invalid("invalid descriptor paths"))?;
-    let mut result = Vec::new();
-    for (position, derivation) in preparation.derivations.iter().enumerate() {
-        if preparation.derivations[..position].contains(derivation) {
-            return Err(Error::Invalid("duplicate preparation derivation"));
-        }
-        let single = paths
-            .get(derivation.keychain as usize)
-            .ok_or(Error::Invalid("unknown keychain"))?;
-        let definite = single
-            .derive_at(derivation.index)
-            .map_err(|_| Error::Invalid("invalid derivation index"))?;
-        let mut owned = false;
-        for input in 0..preparation.max_inputs {
-            for info in expression_slots(input as usize, &definite).map_err(Error::Signing)? {
-                if info.signer.0 == fingerprint {
-                    owned = true;
-                    result.push((*derivation, info));
-                }
-            }
-        }
-        if !owned {
-            return Err(Error::Invalid("derivation has no own MuSig expressions"));
-        }
-    }
-    Ok(result)
+fn prepare_body(
+    session_id: [u8; SESSION_ID_LEN],
+    session_ref: Option<[u8; SESSION_ID_LEN]>,
+    issuance: Issuance,
+) -> request::Body {
+    request::Body::PrepareNonces(request::PrepareNonces {
+        session_id,
+        session_ref,
+        max_inputs: issuance.max_inputs,
+        derivation_path: (&issuance.path).into(),
+        start: issuance.start,
+        end: issuance.end,
+    })
 }
 
-fn matches_nonce(nonce: &response::MusigNonce, info: &SlotInfo) -> bool {
-    nonce.input_index as usize == info.slot.input_index
-        && nonce.expression_index as usize == info.expression_index
-        && nonce.participant.0 == info.slot.participant.serialize()
-        && nonce.aggregate.0 == info.slot.aggregate.serialize()
-        && nonce.leaf_hash == info.slot.leaf_hash.map(|hash| hash.to_byte_array())
-}
-
-fn validate_prepared(
+/// Sets the issued nonce of every slot of the record's signer in `descriptor`; the
+/// count set.
+fn place_nonces(
+    psbt: &mut Psbt,
+    descriptor: &request::Descriptor,
     record: &QrMusigHostRecord,
-    descriptor: &WalletDescriptor,
-    prepared: &response::MusigPrepared,
-) -> Result<(), Error> {
-    prepared
-        .validate()
-        .map_err(|_| Error::Invalid("invalid prepared response"))?;
-    if prepared.session_id != record.preparation.session_id
-        || prepared.max_inputs != record.preparation.max_inputs
-    {
-        return Err(Error::Invalid("prepared session or coverage mismatch"));
-    }
-    let expected = preparation_slots(&record.preparation, descriptor, record.fingerprint)?;
-    if prepared.nonces.len() != expected.len() {
-        return Err(Error::Invalid("incomplete advertised nonce set"));
-    }
-    for (derivation, info) in &expected {
-        let matching: Vec<_> = prepared
+) -> Result<usize, Error> {
+    let Some(request::DescriptorBody::Bip380(text)) = &descriptor.descriptor else {
+        return Err(Error::Invalid("signing requires a full BIP-380 descriptor"));
+    };
+    let descriptor =
+        parse_musig_descriptor(text).map_err(|_| Error::Invalid("invalid descriptor"))?;
+    let own: Vec<_> = slot_infos(psbt, &descriptor)
+        .map_err(Error::Signing)?
+        .into_iter()
+        .filter(|info| info.signer.0 == record.fingerprint)
+        .collect();
+    for info in &own {
+        let position = NoncePosition {
+            path: info.signer.1.clone(),
+            key_expression_index: u32::try_from(info.key_expression_index)
+                .map_err(|_| Error::Invalid("key expression index out of range"))?,
+            input_index: u32::try_from(info.slot.input_index)
+                .map_err(|_| Error::Invalid("input index out of range"))?,
+        };
+        let nonce = *record
             .nonces
-            .iter()
-            .filter(|nonce| nonce.derivation == *derivation && matches_nonce(nonce, info))
-            .collect();
-        if matching.len() != 1 {
+            .get(&position)
+            .ok_or(Error::Invalid("no issued nonce for a slot of the signer"))?;
+        let input = &mut psbt.inputs[info.slot.input_index];
+        if info
+            .pub_nonce(input)
+            .map_err(Error::Signing)?
+            .is_some_and(|present| present != nonce)
+        {
             return Err(Error::Invalid(
-                "wrong or duplicate advertised nonce attribution",
+                "another public nonce of the signer is present",
             ));
         }
-        validate_nonce(&matching[0].nonce)?;
+        set_musig_input_pub_nonce(
+            input,
+            &MusigPubNonce {
+                participant: info.slot.participant,
+                aggregate: info.slot.aggregate,
+                leaf_hash: info.slot.leaf_hash,
+                nonce,
+            },
+        );
     }
-    Ok(())
+    Ok(own.len())
 }
 
-fn validate_nonce(nonce: &[u8; 66]) -> Result<(), Error> {
+fn validate_nonce(nonce: &[u8; PUB_NONCE_LEN]) -> Result<(), Error> {
     PublicKey::from_slice(&nonce[..33]).map_err(|_| Error::Invalid("invalid public nonce"))?;
     PublicKey::from_slice(&nonce[33..]).map_err(|_| Error::Invalid("invalid public nonce"))?;
     Ok(())
 }
 
-fn selected_own_slots(
-    psbt: &Psbt,
-    descriptor: &WalletDescriptor,
-    record: &QrMusigHostRecord,
-) -> Result<Vec<SlotInfo>, Error> {
-    if psbt.inputs.len() != psbt.unsigned_tx.input.len()
-        || psbt.outputs.len() != psbt.unsigned_tx.output.len()
-    {
-        return Err(Error::Invalid("PSBT map count mismatch"));
-    }
-    let infos: Vec<_> = slot_infos(psbt, descriptor)
-        .map_err(Error::Signing)?
-        .into_iter()
-        .filter(|info| info.signer.0 == record.fingerprint)
-        .collect();
-    if infos.is_empty() {
-        return Err(Error::Invalid("no selected own MuSig slots"));
-    }
-    let mut unique = BTreeSet::new();
-    for info in &infos {
-        if !unique.insert(info.slot) {
-            return Err(Error::Invalid("selected own slot appears more than once"));
-        }
-        advertised_nonce(record, info)?;
-    }
-    Ok(infos)
-}
-
-fn advertised_nonce(record: &QrMusigHostRecord, info: &SlotInfo) -> Result<[u8; 66], Error> {
-    let prepared = record
-        .prepared
-        .as_ref()
-        .ok_or(Error::Invalid("cache not prepared"))?;
-    let mut matches = prepared
-        .nonces
-        .iter()
-        .filter(|nonce| matches_nonce(nonce, info));
-    let nonce = matches
-        .next()
-        .ok_or(Error::Invalid("selected slot outside prepared coverage"))?;
-    if matches.next().is_some() {
-        return Err(Error::Invalid("ambiguous prepared nonce"));
-    }
-    Ok(nonce.nonce)
-}
-
-fn validate_own_nonces(
-    psbt: &Psbt,
-    record: &QrMusigHostRecord,
-    infos: &[SlotInfo],
-    required: bool,
-) -> Result<(), Error> {
-    for info in infos {
-        let input = psbt
-            .inputs
-            .get(info.slot.input_index)
-            .ok_or(Error::Invalid("missing returned input"))?;
-        match info.pub_nonce(input).map_err(Error::Signing)? {
-            Some(nonce) if nonce == advertised_nonce(record, info)? => {}
-            None if !required => {}
-            _ => return Err(Error::Invalid("own public nonce mismatch")),
-        }
-    }
+fn put_len(output: &mut Vec<u8>, len: usize) -> Result<(), Error> {
+    let len = u32::try_from(len).map_err(|_| Error::Invalid("host record field too large"))?;
+    output.extend_from_slice(&len.to_le_bytes());
     Ok(())
-}
-
-fn insert_own_nonces(
-    psbt: &mut Psbt,
-    record: &QrMusigHostRecord,
-    infos: &[SlotInfo],
-) -> Result<(), Error> {
-    for info in infos {
-        set_musig_input_pub_nonce(
-            &mut psbt.inputs[info.slot.input_index],
-            &MusigPubNonce {
-                participant: info.slot.participant,
-                aggregate: info.slot.aggregate,
-                leaf_hash: info.slot.leaf_hash,
-                nonce: advertised_nonce(record, info)?,
-            },
-        );
-    }
-    Ok(())
-}
-
-fn complete_transcript(
-    psbt: &Psbt,
-    infos: &[SlotInfo],
-) -> Result<Option<Vec<Vec<[u8; 66]>>>, Error> {
-    let mut transcript = Vec::new();
-    let mut complete = true;
-    for info in infos {
-        let input = &psbt.inputs[info.slot.input_index];
-        let mut nonces = Vec::new();
-        for participant in info.agg.participants() {
-            match info
-                .participant_nonce(input, *participant)
-                .map_err(Error::Signing)?
-            {
-                Some(nonce) => {
-                    validate_nonce(&nonce)?;
-                    nonces.push(nonce);
-                }
-                None => complete = false,
-            }
-        }
-        transcript.push(nonces);
-    }
-    Ok(if complete { Some(transcript) } else { None })
-}
-
-fn validate_returned_psbt(
-    original: &Psbt,
-    returned: &Psbt,
-    record: &QrMusigHostRecord,
-    infos: &[SlotInfo],
-) -> Result<bool, Error> {
-    if original.inputs.len() != returned.inputs.len() {
-        return Err(Error::Invalid("returned input count changed"));
-    }
-    let mut expected = original.clone();
-    insert_own_nonces(&mut expected, record, infos)?;
-    let mut consumed = false;
-    for info in infos {
-        let input = &returned.inputs[info.slot.input_index];
-        if let Some(signature) = info.partial_sig(input).map_err(Error::Signing)? {
-            let nonces = info.all_nonces(input).map_err(Error::Signing)?;
-            let aggregate_nonce = nonce_agg(&RustBitcoin, &nonces)
-                .map_err(|error| Error::Signing(SigningError::Musig(error)))?;
-            let key_agg = info.key_agg().map_err(Error::Signing)?;
-            let sighash = slot_sighash(original, &info.slot).map_err(Error::Signing)?;
-            if !partial_verify(
-                &RustBitcoin,
-                &signature,
-                &advertised_nonce(record, info)?,
-                &info.slot.participant.serialize(),
-                &key_agg,
-                &aggregate_nonce,
-                &sighash,
-            ) {
-                return Err(Error::Invalid("invalid returned partial signature"));
-            }
-            set_musig_input_partial_sig(
-                &mut expected.inputs[info.slot.input_index],
-                &MusigPartialSig {
-                    participant: info.slot.participant,
-                    aggregate: info.slot.aggregate,
-                    leaf_hash: info.slot.leaf_hash,
-                    signature,
-                },
-            );
-            consumed = true;
-        }
-    }
-    // Includes all proprietary attempt markers, other participants' fields,
-    // outputs and global maps: no arbitrary metadata from the peer is merged.
-    if expected != *returned {
-        return Err(Error::Invalid("unexpected returned PSBT changes"));
-    }
-    Ok(consumed)
 }
 
 fn put_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), Error> {
-    let len =
-        u32::try_from(bytes.len()).map_err(|_| Error::Invalid("host record field too large"))?;
-    output.extend_from_slice(&len.to_le_bytes());
+    put_len(output, bytes.len())?;
     output.extend_from_slice(bytes);
-    Ok(())
-}
-
-fn put_transcript(output: &mut Vec<u8>, transcript: Option<&[Vec<[u8; 66]>]>) -> Result<(), Error> {
-    match transcript {
-        None => output.push(0),
-        Some(groups) => {
-            output.push(1);
-            output.extend_from_slice(
-                &u32::try_from(groups.len())
-                    .map_err(|_| Error::Invalid("transcript too large"))?
-                    .to_le_bytes(),
-            );
-            for group in groups {
-                let bytes: Vec<_> = group
-                    .iter()
-                    .flat_map(|nonce| nonce.iter().copied())
-                    .collect();
-                put_bytes(output, &bytes)?;
-            }
-        }
-    }
     Ok(())
 }
 
@@ -896,42 +609,17 @@ impl<'a> RecordReader<'a> {
             .map_err(|_| Error::Invalid("truncated host field"))
     }
 
-    fn bytes(&mut self) -> Result<&'a [u8], Error> {
-        let len = u32::from_le_bytes(self.array()?) as usize;
-        self.take(len)
+    fn u32(&mut self) -> Result<u32, Error> {
+        Ok(u32::from_le_bytes(self.array()?))
     }
 
-    fn transcript(&mut self) -> Result<Option<Vec<Vec<[u8; 66]>>>, Error> {
-        match self.array::<1>()?[0] {
-            0 => Ok(None),
-            1 => {
-                let count = u32::from_le_bytes(self.array()?) as usize;
-                if count > self.0.len() / 4 {
-                    return Err(Error::Invalid("invalid transcript group count"));
-                }
-                if count == 0 {
-                    return Err(Error::Invalid("empty stored transcript"));
-                }
-                let mut groups = Vec::new();
-                for _ in 0..count {
-                    let bytes = self.bytes()?;
-                    if bytes.is_empty() || bytes.len() % 66 != 0 {
-                        return Err(Error::Invalid("invalid stored transcript"));
-                    }
-                    let mut nonces = Vec::new();
-                    for chunk in bytes.chunks_exact(66) {
-                        let nonce = chunk
-                            .try_into()
-                            .map_err(|_| Error::Invalid("invalid stored nonce"))?;
-                        validate_nonce(&nonce)?;
-                        nonces.push(nonce);
-                    }
-                    groups.push(nonces);
-                }
-                Ok(Some(groups))
-            }
-            _ => Err(Error::Invalid("invalid transcript marker")),
-        }
+    fn len(&mut self) -> Result<usize, Error> {
+        Ok(self.u32()? as usize)
+    }
+
+    fn bytes(&mut self) -> Result<&'a [u8], Error> {
+        let len = self.len()?;
+        self.take(len)
     }
 }
 
