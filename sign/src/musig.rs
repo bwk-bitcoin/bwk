@@ -11,7 +11,7 @@ use std::{
 
 use bwk_descriptor::{
     musig::musig_descriptor_to_string,
-    wallet::{WalletDefiniteDescriptor, WalletDescriptor, WalletDescriptorExt},
+    wallet::{WalletDefiniteDescriptor, WalletDefiniteKey, WalletDescriptor, WalletDescriptorExt},
 };
 use bwk_keys::musig::{DefiniteMusigAggregate, Error as KeyError};
 use bwk_musig::{
@@ -127,6 +127,10 @@ pub struct SlotInfo {
     pub slot: MusigSlot,
     /// Internal key first, then DFS leaf keys; plain and foreign keys count too.
     pub expression_index: usize,
+    /// The nonce cache key expression index of the participant's signer: the
+    /// position among the key expressions holding a key of `signer`'s fingerprint,
+    /// in the same order.
+    pub key_expression_index: usize,
     pub agg: DefiniteMusigAggregate,
     /// The descriptor's merkle root, for the key path taptweak.
     pub merkle_root: Option<TapNodeHash>,
@@ -317,34 +321,32 @@ pub fn expression_slots(
         return Ok(Vec::new());
     };
     let merkle_root = tr.spend_info().merkle_root();
-    let mut slots = Vec::new();
-    if let Some(agg) = tr.internal_key().as_musig() {
-        push_slots(input_index, 0, agg, None, merkle_root, &mut slots)?;
-    }
-    let mut expression_index = 1;
+    let mut keys = vec![(tr.internal_key().clone(), None)];
     for (_, ms) in tr.iter_scripts() {
         let leaf_hash = TapLeafHash::from_script(&ms.encode(), LeafVersion::TapScript);
-        for key in ms.iter_pk() {
-            if let Some(agg) = key.as_musig() {
-                push_slots(
-                    input_index,
-                    expression_index,
-                    agg,
-                    Some(leaf_hash),
-                    merkle_root,
-                    &mut slots,
-                )?;
-            }
-            expression_index += 1;
+        keys.extend(ms.iter_pk().map(|key| (key, Some(leaf_hash))));
+    }
+    let mut slots = Vec::new();
+    for (expression_index, (key, leaf_hash)) in keys.iter().enumerate() {
+        if let Some(agg) = key.as_musig() {
+            push_slots(
+                input_index,
+                &keys[..expression_index],
+                agg,
+                *leaf_hash,
+                merkle_root,
+                &mut slots,
+            )?;
         }
     }
     Ok(slots)
 }
 
 /// One slot per participant, signing for the key-path or script-path aggregate.
+/// `previous` lists the key expressions before this one.
 fn push_slots(
     input_index: usize,
-    expression_index: usize,
+    previous: &[(WalletDefiniteKey, Option<TapLeafHash>)],
     agg: &DefiniteMusigAggregate,
     leaf_hash: Option<TapLeafHash>,
     merkle_root: Option<TapNodeHash>,
@@ -375,8 +377,13 @@ fn push_slots(
             }
         }
         let signer = signer.ok_or(Error::DerivationPath)?;
+        let key_expression_index = previous
+            .iter()
+            .filter(|(key, _)| holds_key_of(key, signer.0))
+            .count();
         infos.push(SlotInfo {
-            expression_index,
+            expression_index: previous.len(),
+            key_expression_index,
             slot: MusigSlot {
                 input_index,
                 participant: *participant,
@@ -389,6 +396,13 @@ fn push_slots(
         });
     }
     Ok(())
+}
+
+/// True when `key`, or one of its musig() cosigners, derives from `fingerprint`.
+fn holds_key_of(key: &WalletDefiniteKey, fingerprint: Fingerprint) -> bool {
+    key.plain_keys()
+        .into_iter()
+        .any(|key| key.master_fingerprint() == fingerprint)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
