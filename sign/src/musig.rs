@@ -181,6 +181,16 @@ impl SlotInfo {
         )?)
     }
 
+    /// What a PSBT without a nonce cache session asks of this slot's participant.
+    pub(crate) fn two_round_step(&self, input: &Input) -> Result<TwoRoundStep, Error> {
+        match (self.pub_nonce(input)?, self.all_nonces(input)) {
+            (None, _) => Ok(TwoRoundStep::PubNonces),
+            (Some(_), Ok(_)) => Ok(TwoRoundStep::PartialSigs),
+            (Some(_), Err(Error::MusigNonces)) => Ok(TwoRoundStep::Nothing),
+            (Some(_), Err(e)) => Err(e),
+        }
+    }
+
     /// Every participant's 0x1b in KeyAgg order; `MusigNonces` when one is missing.
     pub(crate) fn all_nonces(&self, input: &Input) -> Result<Vec<[u8; 66]>, Error> {
         self.agg
@@ -192,6 +202,21 @@ impl SlotInfo {
             })
             .collect()
     }
+}
+
+/// What a PSBT without a nonce cache session asks of a signer, in increasing
+/// precedence: the step of a signer with several slots is the highest of theirs,
+/// so an answer carrying a public nonce carries no signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TwoRoundStep {
+    /// No slot of the signer.
+    NotOwned,
+    /// Its 0x1b is present, another participant's is missing.
+    Nothing,
+    /// The 0x1b of every participant is present: round 2.
+    PartialSigs,
+    /// Its 0x1b is missing: round 1.
+    PubNonces,
 }
 
 /// sha256 over the unsigned transaction, every spent output, the policy text and

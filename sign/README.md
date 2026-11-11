@@ -190,6 +190,17 @@ with `Error::MusigSession`. The ordinary keys sign too, and the PSBT is only
 changed on success. The caller deletes the session durably before it releases
 the signed PSBT.
 
+A PSBT without `PSBT_GLOBAL_NONCE_CACHE_SESSION` runs two rounds on a session
+secret (the "Two rounds" subsection of the BIP). `HotSigner::two_round_step`
+tells what it asks of the signer, the highest step of its slots: `PubNonces`
+when one lacks its own 0x1b, else `PartialSigs` when one carries the 0x1b of
+every participant, else `Nothing`, or `NotOwned` without any slot. An answer
+carrying a public nonce thus carries no signature. `nonce_cache_round_one` sets,
+as the 0x1b of every own slot without one, the nonce the secret derives, and
+signs nothing. `nonce_cache_round_two` is `sign_nonce_cache` on the slots
+carrying every participant's 0x1b only, with the ordinary keys; the other slots
+get nothing. Each has a `_v2` form for a PSBTv2.
+
 `musig::SlotInfo::key_expression_index` is that `j`: the position of the slot's
 key expression among the key expressions holding a key of the participant's
 signer (by fingerprint), the internal key first, then the keys of each leaf in
