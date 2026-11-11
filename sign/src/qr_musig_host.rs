@@ -9,12 +9,13 @@
 
 use std::collections::BTreeMap;
 
-use bwk_descriptor::musig::parse_musig_descriptor;
+use bwk_descriptor::{musig::parse_musig_descriptor, wallet::WalletDescriptor};
+use bwk_musig::{nonce_agg, partial_verify, rust_bitcoin::RustBitcoin};
 use bwk_persist::{storage::Store, PersistError};
 use bwk_psbt::{
     musig::{
-        musig_input_pub_nonce, set_musig_input_partial_sig, set_musig_input_pub_nonce,
-        MusigPartialSig, MusigPubNonce,
+        musig_input_partial_sigs, musig_input_pub_nonce, musig_input_pub_nonces,
+        set_musig_input_partial_sig, set_musig_input_pub_nonce, MusigPartialSig, MusigPubNonce,
     },
     nonce_cache::{set_nonce_cache_session, NonceCacheSession},
 };
@@ -35,7 +36,7 @@ use crate::{
     error::Error as SigningError,
     identity::SignerId,
     manager::{Error as ManagerError, SigningManager},
-    musig::slot_infos,
+    musig::{slot_infos, slot_sighash, MusigSlot, SlotInfo},
     nonce_cache::SESSION_ID_LEN,
     protocol::{RequestId, Response},
 };
@@ -510,8 +511,14 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigHostRecord>> QrMusigHos
                 }
                 returned
             }
-            response::Signed::Signatures(entries) => merge_signatures(original, &entries)?,
+            response::Signed::Signatures(entries) => merge_signatures(original.clone(), &entries)?,
         };
+        let descriptors = signing
+            .descriptors
+            .iter()
+            .map(wallet_descriptor)
+            .collect::<Result<Vec<_>, _>>()?;
+        verify_partial_sigs(&original, &returned, &descriptors)?;
         self.store.remove(&session_id).map_err(Error::Store)?;
         Ok(QrMusigHostResponse::Signed(returned))
     }
@@ -645,11 +652,7 @@ fn place_nonces(
     descriptor: &request::Descriptor,
     record: &QrMusigHostRecord,
 ) -> Result<usize, Error> {
-    let Some(request::DescriptorBody::Bip380(text)) = &descriptor.descriptor else {
-        return Err(Error::Invalid("signing requires a full BIP-380 descriptor"));
-    };
-    let descriptor =
-        parse_musig_descriptor(text).map_err(|_| Error::Invalid("invalid descriptor"))?;
+    let descriptor = wallet_descriptor(descriptor)?;
     let own: Vec<_> = slot_infos(psbt, &descriptor)
         .map_err(Error::Signing)?
         .into_iter()
@@ -688,6 +691,76 @@ fn place_nonces(
         );
     }
     Ok(own.len())
+}
+
+fn wallet_descriptor(descriptor: &request::Descriptor) -> Result<WalletDescriptor, Error> {
+    let Some(request::DescriptorBody::Bip380(text)) = &descriptor.descriptor else {
+        return Err(Error::Invalid("signing requires a full BIP-380 descriptor"));
+    };
+    parse_musig_descriptor(text).map_err(|_| Error::Invalid("invalid descriptor"))
+}
+
+/// Every 0x1b of `returned` must be one `sent` carries, and every 0x1c a valid
+/// BIP-327 partial signature against them, for a slot of `descriptors`.
+fn verify_partial_sigs(
+    sent: &Psbt,
+    returned: &Psbt,
+    descriptors: &[WalletDescriptor],
+) -> Result<(), Error> {
+    let mut slots = Vec::new();
+    for descriptor in descriptors {
+        slots.extend(slot_infos(sent, descriptor).map_err(Error::Signing)?);
+    }
+    let invalid_field = |_| Error::Invalid("invalid MuSig2 field");
+    for (input_index, (sent_input, input)) in sent.inputs.iter().zip(&returned.inputs).enumerate() {
+        if musig_input_pub_nonces(input).map_err(invalid_field)?
+            != musig_input_pub_nonces(sent_input).map_err(invalid_field)?
+        {
+            return Err(Error::Invalid("returned public nonces changed"));
+        }
+        for sig in musig_input_partial_sigs(input).map_err(invalid_field)? {
+            let slot = MusigSlot {
+                input_index,
+                participant: sig.participant,
+                aggregate: sig.aggregate,
+                leaf_hash: sig.leaf_hash,
+            };
+            let info = slots
+                .iter()
+                .find(|info| info.slot == slot)
+                .ok_or(Error::Invalid("partial signature for an unknown slot"))?;
+            verify_partial_sig(sent, info, &sig.signature)?;
+        }
+    }
+    Ok(())
+}
+
+/// BIP-327 PartialSigVerify of `signature` for `info`, with the nonces of `psbt`.
+fn verify_partial_sig(psbt: &Psbt, info: &SlotInfo, signature: &[u8; 32]) -> Result<(), Error> {
+    let input = &psbt.inputs[info.slot.input_index];
+    let pubnonce = info
+        .pub_nonce(input)
+        .map_err(Error::Signing)?
+        .ok_or(Error::Invalid("partial signature without its public nonce"))?;
+    let aggnonce = nonce_agg(
+        &RustBitcoin,
+        &info.all_nonces(input).map_err(Error::Signing)?,
+    )
+    .map_err(|error| Error::Signing(SigningError::Musig(error)))?;
+    let key_agg = info.key_agg().map_err(Error::Signing)?;
+    let sighash = slot_sighash(psbt, &info.slot).map_err(Error::Signing)?;
+    if !partial_verify(
+        &RustBitcoin,
+        signature,
+        &pubnonce,
+        &info.slot.participant.serialize(),
+        &key_agg,
+        &aggnonce,
+        &sighash,
+    ) {
+        return Err(Error::Invalid("invalid partial signature"));
+    }
+    Ok(())
 }
 
 fn validate_nonce(nonce: &[u8; PUB_NONCE_LEN]) -> Result<(), Error> {
