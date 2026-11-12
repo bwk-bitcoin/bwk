@@ -577,7 +577,10 @@ pub(crate) fn hot_signer(network: Network, seed: &Seed) -> Result<HotSigner, Con
 mod tests {
     use std::{path::Path, str::FromStr};
 
-    use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+    use bitcoin::{
+        hex::DisplayHex,
+        secp256k1::{PublicKey, Secp256k1, SecretKey},
+    };
 
     use super::*;
     use crate::account::mnemonic_probe;
@@ -1169,5 +1172,162 @@ mod tests {
         let err = ConfigError::MissingMnemonic;
         let msg = err.to_string();
         assert!(msg.contains("missing mnemonic"));
+    }
+
+    // Built from seed bytes
+
+    fn english_seed(passphrase: &str) -> [u8; 64] {
+        bwk_sign::bip39::Mnemonic::from_str(TEST_MNEMONIC)
+            .unwrap()
+            .to_seed(passphrase)
+    }
+
+    /// The seed of `TEST_MNEMONIC`'s entropy in the French wordlist.
+    fn french_seed() -> [u8; 64] {
+        let entropy = bwk_sign::bip39::Mnemonic::from_str(TEST_MNEMONIC)
+            .unwrap()
+            .to_entropy();
+        bwk_sign::bip39::Mnemonic::from_entropy_in(bwk_sign::bip39::Language::French, &entropy)
+            .unwrap()
+            .to_seed("")
+    }
+
+    fn seed_config(network: Network, seed: &[u8]) -> Config {
+        Config::from_seed(
+            "alice".to_string(),
+            network,
+            seed,
+            "https://blindbit.example.com".to_string(),
+            PathBuf::from("/tmp/bwk-test"),
+        )
+        .unwrap()
+    }
+
+    fn mnemonic_config(network: Network) -> Config {
+        Config::new(
+            "alice".to_string(),
+            network,
+            TEST_MNEMONIC.to_string(),
+            "https://blindbit.example.com".to_string(),
+            PathBuf::from("/tmp/bwk-test"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn english_seed_config_matches_the_mnemonic_config() {
+        let secp = Secp256k1::new();
+        // What `Config::new` derived before it went through the seed.
+        let expected = [
+            (
+                Network::Bitcoin,
+                "02fa210b3c4a60b80dd1616f48ae53bbdf0db744b3f9083385108f81be0acb58c6",
+                "tr([73c5da0a/86'/0'/0']xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYW\
+                 cLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ/<0;1>/*)#kjk9q86c",
+            ),
+            (
+                Network::Signet,
+                "02833085c9a716d36b467552c00d6aa8bd42e39adbe98b05bc203110177192f702",
+                "tr([73c5da0a/86'/1'/0']tpubDDfvzhdVV4unsoKt5aE6dcsNsfeWbTgmLZPi8LQDYU2xixrYemMfWJ\
+                 3BaVneH3u7DBQePdTwhpybaKRU95pi6PMUtLPBJLVQRpzEnjfjZzX/<0;1>/*)#f4475440",
+            ),
+        ];
+        for (network, spend_pk, taproot) in expected {
+            let mut words = mnemonic_config(network);
+            let mut seed = seed_config(network, &english_seed(""));
+            words.add_default_taproot_sub_account().unwrap();
+            seed.add_default_taproot_sub_account().unwrap();
+            words.add_default_segwit_sub_account().unwrap();
+            seed.add_default_segwit_sub_account().unwrap();
+
+            assert_eq!(seed.descriptor, words.descriptor);
+            assert_eq!(
+                seed.descriptor.scan_secret_key(&secp).unwrap(),
+                words.descriptor.scan_secret_key(&secp).unwrap()
+            );
+            assert_eq!(
+                seed.descriptor.spend_public_key(&secp).unwrap().to_string(),
+                spend_pk
+            );
+            let subs = |config: &Config| {
+                config
+                    .descriptors
+                    .iter()
+                    .map(|sub| sub.descriptor.to_string())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(subs(&seed), subs(&words));
+            assert_eq!(subs(&seed)[0], taproot);
+            assert!(seed.sanitize().is_ok());
+        }
+    }
+
+    #[test]
+    fn a_passphrase_changes_the_config() {
+        let plain = seed_config(Network::Signet, &english_seed(""));
+        let mut with_passphrase = seed_config(Network::Signet, &english_seed("TREZOR"));
+        assert_ne!(with_passphrase.descriptor, plain.descriptor);
+        with_passphrase.add_default_taproot_sub_account().unwrap();
+        assert!(!with_passphrase.descriptors[0]
+            .descriptor
+            .to_string()
+            .contains("73c5da0a"));
+    }
+
+    #[test]
+    fn a_french_seed_builds_a_hot_config() {
+        let mut config = seed_config(Network::Signet, &french_seed());
+        assert!(!config.descriptor.is_watch_only(&Secp256k1::new()).unwrap());
+        assert_ne!(
+            config.descriptor,
+            seed_config(Network::Signet, &english_seed("")).descriptor
+        );
+        config.add_default_taproot_sub_account().unwrap();
+        assert!(config.sanitize().is_ok());
+    }
+
+    #[test]
+    fn from_seed_refuses_a_wrong_length() {
+        for len in [0, 16, 32, 63, 65] {
+            let err = Config::from_seed(
+                "alice".to_string(),
+                Network::Signet,
+                &vec![7u8; len],
+                "https://blindbit.example.com".to_string(),
+                PathBuf::from("/tmp/bwk-test"),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                err,
+                ConfigError::Seed(receiver::error::Error::SeedLength(l)) if l == len
+            ));
+        }
+    }
+
+    #[test]
+    fn sanitize_rejects_a_mismatched_seed() {
+        let mut config = mnemonic_config(Network::Signet);
+        config.seed = Some(Seed::from(english_seed("TREZOR")));
+
+        assert!(matches!(
+            config.sanitize(),
+            Err(ConfigError::MnemonicDescriptorMismatch)
+        ));
+    }
+
+    #[test]
+    fn the_seed_is_never_persisted_nor_printed() {
+        let seed = english_seed("");
+        let config = seed_config(Network::Signet, &seed);
+        let hex = seed.to_lower_hex_string();
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("seed"));
+        assert!(!json.contains(&hex));
+        assert!(!format!("{config:?}").contains(&hex));
+
+        let reloaded: Config = serde_json::from_str(&json).unwrap();
+        assert!(reloaded.seed.is_none());
+        assert_eq!(reloaded.descriptor, config.descriptor);
     }
 }
