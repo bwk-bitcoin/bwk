@@ -22,10 +22,13 @@ use bitcoin::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::core::{
-    receiving::{Label, Receiver},
-    utils::common::{Network as SpNetwork, SilentPaymentAddress},
-    SpVersion,
+use crate::{
+    core::{
+        receiving::{Label, Receiver},
+        utils::common::{Network as SpNetwork, SilentPaymentAddress},
+        SpVersion,
+    },
+    seed::Seed,
 };
 
 const SP_PURPOSE: u32 = 352;
@@ -89,9 +92,7 @@ pub fn derive_spend_key(
 #[cfg(feature = "mnemonic")]
 pub fn mnemonic_fingerprint(mnemonic: &str, network: Network) -> Option<bip32::Fingerprint> {
     let mnemonic = bip39::Mnemonic::from_str(mnemonic).ok()?;
-    let seed = mnemonic.to_seed("");
-    let master = bip32::Xpriv::new_master(network, &seed).ok()?;
-    Some(master.fingerprint(&Secp256k1::new()))
+    Seed::from_mnemonic(&mnemonic, "").fingerprint(network).ok()
 }
 
 // Blockchain data fetched via the blindbit transport.
@@ -285,12 +286,19 @@ impl SpReceiver {
         network: Network,
         account: bip32::ChildNumber,
     ) -> Result<Self, Error> {
-        use bitcoin::bip32;
+        Self::new_from_seed(&Seed::from_mnemonic(&mnemonic, pp), network, account)
+    }
 
+    /// Builds the receiver from a BIP39 seed, at the BIP352 scan and spend
+    /// paths of `account`. Independent of the mnemonic's language and
+    /// passphrase, see [`Seed`].
+    pub fn new_from_seed(
+        seed: &Seed,
+        network: Network,
+        account: bip32::ChildNumber,
+    ) -> Result<Self, Error> {
         let secp = Secp256k1::new();
-        let seed = mnemonic.to_seed(pp);
-        let master_xpriv =
-            bip32::Xpriv::new_master(network, &seed).map_err(|_| Error::SeedDerivation)?;
+        let master_xpriv = seed.master_xpriv(network)?;
 
         let scan = master_xpriv
             .derive_priv(&secp, &scan_path(network, account))

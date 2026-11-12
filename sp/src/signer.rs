@@ -18,12 +18,15 @@ use crate::{
     account::{bip375, AccountError},
     core::dleq,
     receiver::{bip39, derive_spend_key},
+    seed::Seed,
 };
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("invalid mnemonic: {0}")]
     Mnemonic(bip39::Error),
+    #[error("invalid seed: {0}")]
+    Seed(crate::receiver::error::Error),
     #[error("key derivation failed")]
     Derivation,
     #[error("psbtv2 error: {0}")]
@@ -112,15 +115,38 @@ pub struct SpSigner {
 }
 
 impl SpSigner {
+    /// Builds the signer from a BIP39 mnemonic without passphrase, in a
+    /// wordlist `bip39` is built with (English only by default).
+    /// [`SpSigner::from_seed`] takes any wordlist and passphrase.
     pub fn from_mnemonic(
         mnemonic: &str,
         network: Network,
         account: ChildNumber,
     ) -> Result<Self, Error> {
         let mnemonic = bip39::Mnemonic::from_str(mnemonic).map_err(Error::Mnemonic)?;
+        Self::with_seed(&Seed::from_mnemonic(&mnemonic, ""), network, account)
+    }
+
+    /// Builds the signer from the 64 bytes of a BIP39 seed, holding `b_spend`
+    /// at the BIP352 spend path of `account`.
+    ///
+    /// Independent of the mnemonic's language and passphrase: BIP39 folds both
+    /// into the seed, so this never reads words. The seed of an English
+    /// mnemonic without passphrase gives the same signer as
+    /// [`SpSigner::from_mnemonic`]. The copy of `seed` this makes is wiped
+    /// before returning; wiping `seed` itself is the caller's.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Seed`] unless `seed` is exactly 64 bytes long.
+    pub fn from_seed(seed: &[u8], network: Network, account: ChildNumber) -> Result<Self, Error> {
+        let seed = Seed::from_slice(seed).map_err(Error::Seed)?;
+        Self::with_seed(&seed, network, account)
+    }
+
+    fn with_seed(seed: &Seed, network: Network, account: ChildNumber) -> Result<Self, Error> {
         let secp = Secp256k1::new();
-        let seed = mnemonic.to_seed("");
-        let master = bip32::Xpriv::new_master(network, &seed).map_err(|_| Error::Derivation)?;
+        let master = seed.master_xpriv(network).map_err(|_| Error::Derivation)?;
         let b_spend =
             derive_spend_key(&master, &secp, network, account).map_err(|_| Error::Derivation)?;
         Ok(Self {

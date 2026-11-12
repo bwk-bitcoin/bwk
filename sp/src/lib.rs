@@ -10,6 +10,7 @@ pub mod core;
 pub mod profile;
 pub mod receiver;
 pub mod scan;
+pub mod seed;
 #[cfg(feature = "mnemonic")]
 pub mod signer;
 mod thread_pool;
