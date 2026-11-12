@@ -122,7 +122,7 @@ Account (sp/src/account/mod.rs)
 ├── HeaderStore (validated header chain, shared by every scanner)
 ├── Reconciler per scanner (promotes its scan against the header chain)
 └── signing managers attached by name (a hot one for the sub-account
-    descriptors when the config carries a mnemonic)
+    descriptors when the config carries a seed or a mnemonic)
 ```
 
 `bwk_sp::Config::header_scanner` (on by default) applies the same opt-out to

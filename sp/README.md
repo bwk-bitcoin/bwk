@@ -47,6 +47,20 @@ loop {
 }
 ```
 
+## Hot account keys
+
+A hot account is built from a BIP39 mnemonic (`Config::new`,
+`Account::from_mnemonic`) or from the 64 bytes of its BIP39 seed
+(`Config::from_seed`, `Account::from_seed`). The mnemonic constructors read
+English words without passphrase. The seed constructors are independent of the
+mnemonic's language and passphrase, since BIP39 folds both into the seed: use
+them for any other wallet. Both derive the scan and spend keys at the BIP352
+paths (`m/352'/coin'/0'/1'/0`, `m/352'/coin'/0'/0'/0`) and the default
+sub-accounts from the same master key, so the seed of an English mnemonic
+without passphrase builds the same account as the mnemonic.
+`SpSigner::from_seed` signs its spends. Neither the seed nor the mnemonic is
+ever persisted; the seed bytes are wiped when dropped.
+
 ## Caller-owned persistence
 
 `Account::with_backend_factory(config, factory, config_store, header_store,
