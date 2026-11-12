@@ -1003,4 +1003,107 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("scan_sk must be 64 hex chars"));
     }
+
+    // Built from seed bytes
+
+    const WORDS: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+        abandon abandon abandon about";
+
+    fn words() -> bwk_sign::bip39::Mnemonic {
+        <bwk_sign::bip39::Mnemonic as std::str::FromStr>::from_str(WORDS).unwrap()
+    }
+
+    fn seed_config(network: Network, seed: &[u8]) -> Config {
+        Config::from_seed(
+            "alice".to_string(),
+            network,
+            seed,
+            "https://blindbit.example.com".to_string(),
+            PathBuf::from("/tmp/bwk-test"),
+        )
+        .unwrap()
+    }
+
+    fn sub_descriptors(config: &Config) -> Vec<String> {
+        config
+            .descriptors
+            .iter()
+            .map(|sub| sub.descriptor.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn english_seed_config_matches_the_mnemonic_config() {
+        // What `Config::new` derives from the words, as on signing_rework.
+        let expected = [
+            (
+                Network::Bitcoin,
+                "tr([73c5da0a/86'/0'/0']xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYW\
+                 cLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ/<0;1>/*)#kjk9q86c",
+            ),
+            (
+                Network::Signet,
+                "tr([73c5da0a/86'/1'/0']tpubDDfvzhdVV4unsoKt5aE6dcsNsfeWbTgmLZPi8LQDYU2xixrYemMfWJ\
+                 3BaVneH3u7DBQePdTwhpybaKRU95pi6PMUtLPBJLVQRpzEnjfjZzX/<0;1>/*)#f4475440",
+            ),
+        ];
+        for (network, taproot) in expected {
+            let mut from_words = Config::new(
+                "alice".to_string(),
+                network,
+                WORDS.to_string(),
+                "https://blindbit.example.com".to_string(),
+                PathBuf::from("/tmp/bwk-test"),
+            );
+            let mut from_seed = seed_config(network, &words().to_seed(""));
+            for config in [&mut from_words, &mut from_seed] {
+                config.add_default_taproot_sub_account().unwrap();
+                config.add_default_segwit_sub_account().unwrap();
+            }
+            assert!(from_seed.mnemonic.is_none());
+            assert_eq!(sub_descriptors(&from_seed), sub_descriptors(&from_words));
+            assert_eq!(sub_descriptors(&from_seed)[0], taproot);
+        }
+    }
+
+    #[test]
+    fn a_passphrase_changes_the_sub_accounts() {
+        let mut config = seed_config(Network::Signet, &words().to_seed("TREZOR"));
+        config.add_default_taproot_sub_account().unwrap();
+        assert!(!sub_descriptors(&config)[0].contains("73c5da0a"));
+    }
+
+    #[test]
+    fn from_seed_refuses_a_wrong_length() {
+        for len in [0, 16, 32, 63, 65] {
+            let err = Config::from_seed(
+                "alice".to_string(),
+                Network::Signet,
+                &vec![7u8; len],
+                "https://blindbit.example.com".to_string(),
+                PathBuf::from("/tmp/bwk-test"),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                err,
+                ConfigError::Seed(crate::receiver::error::Error::SeedLength(l)) if l == len
+            ));
+        }
+    }
+
+    #[test]
+    fn the_seed_is_never_persisted_nor_printed() {
+        use bitcoin::hex::DisplayHex;
+        let seed = words().to_seed("");
+        let config = seed_config(Network::Signet, &seed);
+        let hex = seed.to_lower_hex_string();
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("seed"));
+        assert!(!json.contains(&hex));
+        assert!(!format!("{config:?}").contains(&hex));
+
+        let reloaded: Config = serde_json::from_str(&json).unwrap();
+        assert!(reloaded.seed.is_none());
+    }
 }

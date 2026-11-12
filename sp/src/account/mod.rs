@@ -2059,7 +2059,12 @@ mod tests {
     /// A taproot sub-account holding one unconfirmed 0.5 BTC coin, as the
     /// scanner records a receive the server reported in the mempool.
     fn account_with_an_unconfirmed_taproot_coin() -> Account {
-        let mut config = test_config();
+        with_an_unconfirmed_taproot_coin(test_config())
+    }
+
+    /// The account of `config`, with a taproot sub-account holding one
+    /// unconfirmed 0.5 BTC coin.
+    fn with_an_unconfirmed_taproot_coin(mut config: Config) -> Account {
         config.add_default_taproot_sub_account().unwrap();
         let mut account = Account::new(config).unwrap();
         let scanner = account.scanners_mut().next().unwrap();
@@ -3256,6 +3261,128 @@ mod tests {
 
         assert!(matches!(err, AccountError::MissingPrevout(outpoint) if outpoint == foreign));
         assert!(psbt.inputs[0].tap_key_sig.is_none());
+    }
+    // Built from seed bytes
+
+    fn words() -> bip39::Mnemonic {
+        <bip39::Mnemonic as std::str::FromStr>::from_str(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+             abandon about",
+        )
+        .unwrap()
+    }
+
+    /// The same entropy as `words`, in the French wordlist.
+    fn french() -> bip39::Mnemonic {
+        bip39::Mnemonic::from_entropy_in(bip39::Language::French, &words().to_entropy()).unwrap()
+    }
+
+    fn seed_config(seed: &[u8]) -> Config {
+        Config::from_seed(
+            "test-account".to_string(),
+            Network::Signet,
+            seed,
+            "https://blindbit.example.com".to_string(),
+            PathBuf::from("/tmp/bwk-sp-account-test"),
+        )
+        .unwrap()
+        .with_persistence(None)
+    }
+
+    /// Spends the account's taproot coin to its own SP address and records
+    /// the spend; returns how many of its outputs the account found as its
+    /// own.
+    fn self_send(account: &Account) -> (usize, usize) {
+        let mut builder = account.tx_builder().feerate(1000);
+        builder.send_to_sp(account.sp_address(), 100_000);
+        for coin in builder.select_coins(100_000, 1000) {
+            builder.add_input(coin);
+        }
+        let mut psbt = builder.generate().unwrap();
+        let tx = account.sign_and_finalize(&mut psbt).unwrap();
+        let txid = account.record_unconfirmed_spend(&tx).unwrap();
+        let own = account
+            .coins()
+            .into_values()
+            .filter(|entry| entry.outpoint().txid == txid)
+            .count();
+        (own, tx.output.len())
+    }
+
+    #[test]
+    fn english_seed_account_matches_the_mnemonic_account() {
+        let from_words = with_an_unconfirmed_taproot_coin(test_config());
+        let from_seed = with_an_unconfirmed_taproot_coin(seed_config(&words().to_seed("")));
+
+        assert_eq!(from_seed.sp_address(), from_words.sp_address());
+        // What the words derive, as on signing_rework.
+        assert_eq!(
+            from_seed.sp_address().to_string(),
+            "tsp1qqdpels3srq45dlezqvk20t3dlueftry6p5thc7msjm0s6jm3g84jzq5rxzzunfck6d45va2jcqxk42\
+             9agt3e4klf3vzmcgp3zqthryhhqgnz4k3n"
+        );
+        assert_eq!(
+            from_seed.sp_receiver.try_get_secret_spend_key().unwrap(),
+            from_words.sp_receiver.try_get_secret_spend_key().unwrap()
+        );
+        assert_eq!(
+            from_seed.get_config().descriptors[0].descriptor.to_string(),
+            from_words.get_config().descriptors[0]
+                .descriptor
+                .to_string()
+        );
+        assert_eq!(from_seed.master_xprivs(), from_words.master_xprivs());
+        assert!(from_seed.can_sign());
+    }
+
+    #[test]
+    fn english_seed_account_spends_and_finds_its_change() {
+        let account = with_an_unconfirmed_taproot_coin(seed_config(&words().to_seed("")));
+        let (own, outputs) = self_send(&account);
+        assert_eq!(own, outputs);
+    }
+
+    #[test]
+    fn a_passphrase_changes_the_account() {
+        let plain = Account::new(seed_config(&words().to_seed(""))).unwrap();
+        let with_passphrase = Account::new(seed_config(&words().to_seed("TREZOR"))).unwrap();
+        assert_ne!(with_passphrase.sp_address(), plain.sp_address());
+        assert_ne!(
+            with_passphrase.master_xprivs().keys().collect::<Vec<_>>(),
+            plain.master_xprivs().keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_french_seed_account_spends_and_finds_its_change() {
+        let english = Account::new(seed_config(&words().to_seed(""))).unwrap();
+        let account = with_an_unconfirmed_taproot_coin(seed_config(&french().to_seed("")));
+        assert_ne!(account.sp_address(), english.sp_address());
+
+        let (own, outputs) = self_send(&account);
+        assert_eq!(own, outputs);
+    }
+
+    #[test]
+    fn from_seed_refuses_a_wrong_length() {
+        for len in [0, 32, 63, 65] {
+            let result = Account::from_seed(
+                "test-account".to_string(),
+                Network::Signet,
+                &vec![7u8; len],
+                "https://blindbit.example.com".to_string(),
+                PathBuf::from("/tmp/bwk-sp-test-from-seed"),
+            );
+            let Err(err) = result else {
+                panic!("expected an error");
+            };
+            assert!(matches!(
+                err,
+                AccountError::Config(config::ConfigError::Seed(
+                    crate::receiver::error::Error::SeedLength(l)
+                )) if l == len
+            ));
+        }
     }
 }
 
