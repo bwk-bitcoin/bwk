@@ -51,6 +51,7 @@ syn = { version = "2.0", default-features = false, features = ["derive", "full",
 env_logger = "0.11.6"
 temp-dir = "0.1.16"
 getrandom = "0.2"
+zeroize = "1"
 corepc-node = { version = "0.10", features = ["download", "29_0"] }
 electrsd = { git = "https://github.com/pythcoiner/electrsd.git", branch = "buffered_logs" }
 dns-lookup = "2.0"

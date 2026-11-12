@@ -7,6 +7,8 @@ pub enum Error {
     // Client creation
     #[error("failed to generate master key from seed")]
     SeedDerivation,
+    #[error("invalid BIP39 seed length: {0} bytes, expected 64")]
+    SeedLength(usize),
     #[error("failed to derive {0} key")]
     KeyDerivation(&'static str),
     #[error("secret spend key not available")]

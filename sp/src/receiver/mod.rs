@@ -259,12 +259,25 @@ impl SpReceiver {
         network: Network,
         account: bip32::ChildNumber,
     ) -> Result<Self, Error> {
+        Self::new_from_seed(
+            &crate::seed::Seed::from_mnemonic(&mnemonic, pp),
+            network,
+            account,
+        )
+    }
+
+    /// Builds the receiver, holding the secret spend key, from a BIP39 seed
+    /// at the BIP352 paths of `account`. Independent of the mnemonic's
+    /// language and passphrase, see [`crate::seed::Seed`].
+    pub fn new_from_seed(
+        seed: &crate::seed::Seed,
+        network: Network,
+        account: bitcoin::bip32::ChildNumber,
+    ) -> Result<Self, Error> {
         use bitcoin::bip32;
 
         let secp = Secp256k1::new();
-        let seed = mnemonic.to_seed(pp);
-        let master_xpriv =
-            bip32::Xpriv::new_master(network, &seed).map_err(|_| Error::SeedDerivation)?;
+        let master_xpriv = seed.master_xpriv(network)?;
         let network_idx = match network {
             Network::Bitcoin => 0u32,
             _ => 1,

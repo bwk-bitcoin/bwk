@@ -105,6 +105,9 @@ crossbeam = { workspace = true }
 # Random number generation
 getrandom = { workspace = true }
 
+# Wipes the BIP39 seed bytes on drop
+zeroize = { workspace = true }
+
 # Bip39 mnemonics (optional, mnemonic feature)
 bip39 = { workspace = true, optional = true }
 

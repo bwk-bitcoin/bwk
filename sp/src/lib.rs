@@ -10,6 +10,7 @@ pub mod core;
 pub mod profile;
 pub mod receiver;
 pub mod scan;
+pub mod seed;
 mod thread_pool;
 
 pub use bwk;
