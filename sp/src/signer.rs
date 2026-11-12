@@ -381,7 +381,7 @@ mod tests {
 
     use crate::{
         account::bip375,
-        signer::{Error, SpSigner},
+        signer::{sign_taproot_key_spend, Error, SpSigner},
     };
 
     fn signer() -> SpSigner {
@@ -647,5 +647,141 @@ mod tests {
         let mut psbt = empty_psbt(vec![bip86_input(9)]);
         signer.sign(&mut psbt).unwrap();
         assert!(psbt.inputs[0].psbt.tap_key_sig.is_none());
+    }
+
+    fn account_zero() -> ChildNumber {
+        ChildNumber::from_hardened_idx(0).unwrap()
+    }
+
+    fn mnemonic_seed(mnemonic: &crate::receiver::bip39::Mnemonic, passphrase: &str) -> [u8; 64] {
+        mnemonic.to_seed(passphrase)
+    }
+
+    fn english() -> crate::receiver::bip39::Mnemonic {
+        use std::str::FromStr;
+        crate::receiver::bip39::Mnemonic::from_str(MNEMONIC).unwrap()
+    }
+
+    /// The same entropy as `MNEMONIC`, in the French wordlist.
+    fn french() -> crate::receiver::bip39::Mnemonic {
+        crate::receiver::bip39::Mnemonic::from_entropy_in(
+            crate::receiver::bip39::Language::French,
+            &english().to_entropy(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn english_seed_signs_like_the_mnemonic() {
+        let secp = Secp256k1::new();
+        let words = SpSigner::from_mnemonic(MNEMONIC, Network::Regtest, account_zero()).unwrap();
+        let seed = SpSigner::from_seed(
+            &mnemonic_seed(&english(), ""),
+            Network::Regtest,
+            account_zero(),
+        )
+        .unwrap();
+        assert_eq!(seed.b_spend, words.b_spend);
+        assert_eq!(seed.master, words.master);
+        // What `from_mnemonic` derived before it went through the seed.
+        assert_eq!(
+            seed.b_spend.public_key(&secp).to_string(),
+            "02833085c9a716d36b467552c00d6aa8bd42e39adbe98b05bc203110177192f702"
+        );
+
+        // An SP coin and a BIP86 sub-account coin: both signers find the same
+        // key for each, and sign each the same under the same aux randomness.
+        let psbt = empty_psbt(vec![owned_input(&words, 3, 1), bip86_input(2)]);
+        let keys = |signer: &SpSigner| {
+            [
+                signer.reconstruct(&psbt.inputs[0], &secp).unwrap(),
+                signer.bip32_key(&psbt.inputs[1], &secp).unwrap(),
+            ]
+        };
+        assert_eq!(keys(&seed), keys(&words));
+        let tx = psbt.unsigned_tx().unwrap();
+        let prevouts: Vec<TxOut> = psbt
+            .inputs
+            .iter()
+            .map(|input| input.psbt.witness_utxo.clone().unwrap())
+            .collect();
+        let signatures = |signer: &SpSigner| {
+            keys(signer)
+                .iter()
+                .enumerate()
+                .map(|(idx, sk)| {
+                    let mut cache = SighashCache::new(&tx);
+                    sign_taproot_key_spend(&mut cache, &prevouts, idx, sk, &secp, &[5u8; 32])
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(signatures(&seed), signatures(&words));
+
+        // And `sign` completes the PSBT with both.
+        for signer in [&words, &seed] {
+            let mut signed = psbt.clone();
+            signer.sign(&mut signed).unwrap();
+            assert!(signed.inputs.iter().all(|i| i.psbt.tap_key_sig.is_some()));
+        }
+    }
+
+    #[test]
+    fn a_passphrase_changes_the_signer() {
+        let words = SpSigner::from_mnemonic(MNEMONIC, Network::Regtest, account_zero()).unwrap();
+        let seed = SpSigner::from_seed(
+            &mnemonic_seed(&english(), "TREZOR"),
+            Network::Regtest,
+            account_zero(),
+        )
+        .unwrap();
+        assert_ne!(seed.b_spend, words.b_spend);
+
+        // It no longer owns the coin of the passphrase-less seed.
+        let mut psbt = empty_psbt(vec![owned_input(&words, 3, 1)]);
+        seed.sign(&mut psbt).unwrap();
+        assert!(psbt.inputs[0].psbt.tap_key_sig.is_none());
+    }
+
+    #[test]
+    fn a_french_seed_signs_its_own_coins() {
+        let english_signer = SpSigner::from_seed(
+            &mnemonic_seed(&english(), ""),
+            Network::Regtest,
+            account_zero(),
+        )
+        .unwrap();
+        let french_signer = SpSigner::from_seed(
+            &mnemonic_seed(&french(), ""),
+            Network::Regtest,
+            account_zero(),
+        )
+        .unwrap();
+        assert_ne!(french_signer.b_spend, english_signer.b_spend);
+
+        let mut psbt = empty_psbt(vec![
+            owned_input(&french_signer, 3, 1),
+            owned_input(&english_signer, 4, 2),
+        ]);
+        french_signer.sign(&mut psbt).unwrap();
+        assert!(psbt.inputs[0].psbt.tap_key_sig.is_some());
+        assert!(psbt.inputs[1].psbt.tap_key_sig.is_none());
+    }
+
+    #[test]
+    fn a_seed_of_the_wrong_length_is_refused() {
+        for len in [0, 16, 32, 63, 65] {
+            let err = SpSigner::from_seed(&vec![1u8; len], Network::Regtest, account_zero())
+                .err()
+                .unwrap();
+            assert!(matches!(
+                err,
+                Error::Seed(crate::receiver::error::Error::SeedLength(l)) if l == len
+            ));
+            assert_eq!(
+                err.to_string(),
+                format!("invalid seed: invalid BIP39 seed length: {len} bytes, expected 64")
+            );
+        }
     }
 }

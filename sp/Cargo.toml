@@ -152,6 +152,7 @@ bwk-qr-protocol = { workspace = true, features = ["bitcoin"] }
 bwk = { workspace = true, features = ["sp", "test"] }
 bwk-utils = { workspace = true, features = ["test"] }
 bwk-sign = { workspace = true, features = ["test"] }
-bip39 = { workspace = true }
+# French: the seed tests build a non-English mnemonic.
+bip39 = { workspace = true, features = ["french"] }
 libc = { workspace = true }
 base64ct = { workspace = true, features = ["alloc"] }
