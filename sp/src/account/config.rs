@@ -19,6 +19,8 @@ use bwk::{
 use bwk_sign::{bwk_descriptor, hot_signer::HotSigner};
 use serde::{Deserialize, Serialize};
 
+use crate::seed::Seed;
+
 /// Default filename a [`bwk::persist::config_store::FileConfigStore`] uses for an
 /// SP account's config. Consumers are free to choose another path
 /// when constructing the store.
@@ -38,6 +40,11 @@ pub struct Config {
     // Keys (one of mnemonic or scan_sk must be set)
     /// BIP39 mnemonic phrase (for hot wallet)
     pub mnemonic: Option<String>,
+    /// BIP39 seed (for hot wallet), whatever the mnemonic's language and
+    /// passphrase, see [`Seed`]. Signs in place of `mnemonic` when both are
+    /// set. Construction parameter only; never persisted.
+    #[serde(skip)]
+    pub seed: Option<Seed>,
     /// Hex-encoded scan secret key (for signing device mode)
     pub scan_sk: Option<String>,
     /// Hex-encoded spend key (secret or public, depending on mode)
@@ -127,6 +134,7 @@ impl Config {
             account_name,
             network,
             mnemonic: Some(mnemonic),
+            seed: None,
             scan_sk: None,
             spend_key: None,
             blindbit_url,
@@ -178,6 +186,7 @@ impl Config {
             account_name,
             network,
             mnemonic: None,
+            seed: None,
             scan_sk: Some(scan_sk),
             spend_key: Some(spend_key),
             blindbit_url,
@@ -190,6 +199,36 @@ impl Config {
             header_checkpoint: None,
             descriptors: Vec::new(),
         })
+    }
+
+    /// Create a new Config from the 64 bytes of a BIP39 seed, whatever the
+    /// mnemonic's language and passphrase. The seed of an English mnemonic
+    /// without passphrase gives the same account as [`Config::new`].
+    pub fn from_seed(
+        account_name: String,
+        network: Network,
+        seed: &[u8],
+        blindbit_url: String,
+        data_dir: PathBuf,
+    ) -> Result<Self, ConfigError> {
+        let seed = Seed::from_slice(seed).map_err(ConfigError::Seed)?;
+        Ok(Self {
+            mnemonic: None,
+            seed: Some(seed),
+            ..Self::new(account_name, network, String::new(), blindbit_url, data_dir)
+        })
+    }
+
+    /// The seed the hot signers of this account are built from: `seed`, else
+    /// the seed of `mnemonic`.
+    pub(crate) fn signing_seed(&self) -> Result<Option<Seed>, ConfigError> {
+        match (&self.seed, &self.mnemonic) {
+            (Some(seed), _) => Ok(Some(seed.clone())),
+            (None, Some(mnemonic)) => mnemonic_seed(mnemonic)
+                .map(Some)
+                .map_err(ConfigError::Signer),
+            (None, None) => Ok(None),
+        }
     }
 
     // Sanitization
@@ -269,15 +308,15 @@ impl Config {
     /// Add a default embedded BIP84 (P2WPKH) sub-account derived from this
     /// config's mnemonic at account index 0.
     pub fn add_default_segwit_sub_account(&mut self) -> Result<(), ConfigError> {
-        let mnemonic = self.mnemonic.clone().ok_or(ConfigError::MissingMnemonic)?;
-        self.add_sub_account_from_mnemonic(&mnemonic, SubAccountKind::Segwit, None)
+        let seed = self.signing_seed()?.ok_or(ConfigError::MissingMnemonic)?;
+        self.add_sub_account_from_seed(&seed, SubAccountKind::Segwit, None)
     }
 
     /// Add a default embedded BIP86 (P2TR) sub-account derived from this
     /// config's mnemonic at account index 0.
     pub fn add_default_taproot_sub_account(&mut self) -> Result<(), ConfigError> {
-        let mnemonic = self.mnemonic.clone().ok_or(ConfigError::MissingMnemonic)?;
-        self.add_sub_account_from_mnemonic(&mnemonic, SubAccountKind::Taproot, None)
+        let seed = self.signing_seed()?.ok_or(ConfigError::MissingMnemonic)?;
+        self.add_sub_account_from_seed(&seed, SubAccountKind::Taproot, None)
     }
 
     /// Add an embedded BIP84 (P2WPKH) sub-account derived from an external
@@ -312,8 +351,17 @@ impl Config {
         kind: SubAccountKind,
         sub_account_mnemonic: Option<String>,
     ) -> Result<(), ConfigError> {
-        let signer =
-            HotSigner::new_from_mnemonics(self.network, mnemonic).map_err(ConfigError::Signer)?;
+        let seed = mnemonic_seed(mnemonic).map_err(ConfigError::Signer)?;
+        self.add_sub_account_from_seed(&seed, kind, sub_account_mnemonic)
+    }
+
+    fn add_sub_account_from_seed(
+        &mut self,
+        seed: &Seed,
+        kind: SubAccountKind,
+        sub_account_mnemonic: Option<String>,
+    ) -> Result<(), ConfigError> {
+        let signer = hot_signer(self.network, seed)?;
         let account = ChildNumber::from_hardened_idx(0).expect("hardcoded account index");
         let descriptor = match kind {
             SubAccountKind::Segwit => {
@@ -430,8 +478,10 @@ pub enum ConfigError {
     ScanSkHex(hex::FromHexError),
     #[error("spend_key is not valid hex: {0}")]
     SpendKeyHex(hex::FromHexError),
-    #[error("missing mnemonic")]
+    #[error("missing mnemonic or seed")]
     MissingMnemonic,
+    #[error("invalid seed: {0}")]
+    Seed(crate::receiver::error::Error),
     #[error("signer error: {0}")]
     Signer(bwk_sign::error::Error),
     #[error("descriptor path error: {0}")]
@@ -440,6 +490,20 @@ pub enum ConfigError {
     Derivator(#[source] bwk_descriptor::derivator::Error),
     #[error("no default descriptor for a {0:?} sub-account")]
     NoDefaultDescriptor(SubAccountKind),
+}
+
+/// The seed of `mnemonic` without passphrase, failing as
+/// [`HotSigner::new_from_mnemonics`] does on a phrase it cannot parse.
+pub(crate) fn mnemonic_seed(mnemonic: &str) -> Result<Seed, bwk_sign::error::Error> {
+    let mnemonic = <bwk_sign::bip39::Mnemonic as std::str::FromStr>::from_str(mnemonic)
+        .map_err(|_| bwk_sign::error::Error::Derivator)?;
+    Ok(Seed::from_mnemonic(&mnemonic, ""))
+}
+
+/// A hot signer holding `seed`'s master key.
+pub(crate) fn hot_signer(network: Network, seed: &Seed) -> Result<HotSigner, ConfigError> {
+    let master = seed.master_xpriv(network).map_err(ConfigError::Seed)?;
+    Ok(HotSigner::new_from_xpriv(network, master))
 }
 
 #[cfg(test)]
