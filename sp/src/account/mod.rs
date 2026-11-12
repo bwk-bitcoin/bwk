@@ -32,6 +32,7 @@ use {
         core::utils::common::SilentPaymentAddress,
         receiver::SpReceiver,
         scan::{state::ScanState, ScanRuntimeConfig, ScanRuntimeConfigError},
+        seed::Seed,
     },
     bitcoin::{
         hashes::Hash,
@@ -678,11 +679,12 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
 
         // One scanner per configured sub-account descriptor, all reporting on
         // this account's channel, plus the signers they cannot hold themselves.
-        // In memory: every signer is re-derivable from a mnemonic the
-        // persisted config already carries.
+        // In memory: every signer is re-derivable from the seed or mnemonic
+        // the config is constructed with.
         let mut hot_manager = HotManager::new();
-        if let Some(mnemonic) = config.mnemonic.clone() {
-            hot_manager.new_bip32_signer_from_mnemonic(config.network, mnemonic);
+        let seed = config.signing_seed()?;
+        if let Some(seed) = &seed {
+            hot_manager.add_bip32_signer(config::hot_signer(config.network, seed)?);
         }
         let mut scanners = Vec::with_capacity(config.descriptors.len());
         for (i, sub_cfg) in config.descriptors.iter().enumerate() {
@@ -693,11 +695,11 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
                 kind: SubAccountKind::from(&scanner.descriptor()),
             });
             scanners.push(scanner);
-            if let Some(mnemonic) = sub_cfg.mnemonic.clone().or_else(|| config.mnemonic.clone()) {
+            if let Some(sub_seed) = sub_account_seed(sub_cfg, seed.as_ref())? {
                 register_sub_signer(
                     &mut hot_manager,
                     config.network,
-                    &mnemonic,
+                    &sub_seed,
                     sub_cfg.descriptor.clone(),
                 )?;
             }
@@ -757,10 +759,9 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
             })
             .collect();
 
-        let mnemonic_fingerprint = config
-            .mnemonic
-            .as_deref()
-            .and_then(|mnemonic| crate::receiver::mnemonic_fingerprint(mnemonic, config.network));
+        let mnemonic_fingerprint = seed
+            .as_ref()
+            .and_then(|seed| seed.fingerprint(config.network).ok());
 
         let mut account = Account {
             sp_receiver,
@@ -817,6 +818,22 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
             blindbit_url,
             data_dir,
         )?;
+        Self::new(config)
+    }
+
+    /// Create account from the 64 bytes of a BIP39 seed (convenience
+    /// constructor), whatever the mnemonic's language and passphrase.
+    ///
+    /// This is a convenience wrapper around [`Config::from_seed`] +
+    /// `Account::new()`.
+    pub fn from_seed(
+        account_name: String,
+        network: Network,
+        seed: &[u8],
+        blindbit_url: String,
+        data_dir: std::path::PathBuf,
+    ) -> Result<Self, AccountError> {
+        let config = Config::from_seed(account_name, network, seed, blindbit_url, data_dir)?;
         Self::new(config)
     }
 
@@ -1080,11 +1097,8 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
         let index = self.config.descriptors.len();
         let config = self.config.scanner_config(index, &sub_config);
         let scanner = ElectrumScanner::try_new_with_sender(config, self.sender.clone())?;
-        let mnemonic = sub_config
-            .mnemonic
-            .clone()
-            .or_else(|| self.config.mnemonic.clone());
-        self.add_sub_account(scanner, mnemonic)?;
+        let seed = sub_account_seed(&sub_config, self.config.signing_seed()?.as_ref())?;
+        self.add_signed_sub_account(scanner, seed)?;
         self.config.descriptors.push(sub_config);
         self.config_store.save(&self.config)?;
         Ok(())
@@ -1101,14 +1115,27 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     /// [`AccountError::HeaderScannerMismatch`] is returned.
     pub fn add_sub_account(
         &mut self,
-        mut scanner: ElectrumScanner<RamProfile<DefaultBackend>>,
+        scanner: ElectrumScanner<RamProfile<DefaultBackend>>,
         mnemonic: Option<String>,
+    ) -> Result<(), AccountError> {
+        let seed = mnemonic
+            .map(|mnemonic| {
+                config::mnemonic_seed(&mnemonic).map_err(AccountError::SubAccountMnemonic)
+            })
+            .transpose()?;
+        self.add_signed_sub_account(scanner, seed)
+    }
+
+    fn add_signed_sub_account(
+        &mut self,
+        mut scanner: ElectrumScanner<RamProfile<DefaultBackend>>,
+        seed: Option<Seed>,
     ) -> Result<(), AccountError> {
         if scanner.config().header_scanner != self.config.header_scanner {
             return Err(AccountError::HeaderScannerMismatch);
         }
-        if let Some(mnemonic) = mnemonic {
-            self.seed_sub_signer(&mnemonic, scanner.wallet_descriptor())?;
+        if let Some(seed) = seed {
+            self.seed_sub_signer(&seed, scanner.wallet_descriptor())?;
         }
         scanner.set_origin(CoinOrigin::SubAccount {
             index: self.sub_accounts.len(),
@@ -1171,18 +1198,18 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     /// when a watch-only account has none yet.
     fn seed_sub_signer(
         &mut self,
-        mnemonic: &str,
+        seed: &Seed,
         descriptor: bwk_sign::bwk_descriptor::descriptor::Descriptor,
     ) -> Result<(), AccountError> {
         let Some(hot) = self.hot.clone() else {
             let mut hot_manager = HotManager::new();
-            register_sub_signer(&mut hot_manager, self.config.network, mnemonic, descriptor)?;
+            register_sub_signer(&mut hot_manager, self.config.network, seed, descriptor)?;
             return self.attach_hot_manager(hot_manager);
         };
         register_sub_signer(
             &mut hot.lock().expect("poisoned"),
             self.config.network,
-            mnemonic,
+            seed,
             descriptor,
         )?;
         self.refresh_signers();
@@ -1429,7 +1456,7 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     }
 
     /// The BIP32 master fingerprint derived from this account's
-    /// construction-time mnemonic, if one was supplied. Cached at
+    /// construction-time seed or mnemonic, if one was supplied. Cached at
     /// construction; the account never reaches a master xpriv to answer this.
     pub fn mnemonic_fingerprint(&self) -> Option<bitcoin::bip32::Fingerprint> {
         self.mnemonic_fingerprint
@@ -2041,24 +2068,37 @@ fn header_store_target<'a>(
 }
 
 #[cfg(feature = "mnemonic")]
-/// Seed a hot signer from `mnemonic` and let it sign for `descriptor`.
+/// Seed a hot signer from `seed` and let it sign for `descriptor`.
 ///
 /// A fingerprint already registered is left as is: re-seeding it would register
 /// a second signer holding the same seed.
 fn register_sub_signer(
     signing_manager: &mut HotManager,
     network: Network,
-    mnemonic: &str,
+    seed: &Seed,
     descriptor: bwk_sign::bwk_descriptor::descriptor::Descriptor,
 ) -> Result<(), AccountError> {
-    let signer = bwk_sign::hot_signer::HotSigner::new_from_mnemonics(network, mnemonic)
-        .map_err(AccountError::SubAccountMnemonic)?;
+    let signer = config::hot_signer(network, seed)?;
     if !signing_manager.has_bip32_signer(&signer.fingerprint()) {
         signing_manager.add_bip32_signer(signer);
     }
     signing_manager
         .register_bip32_descriptor(descriptor)
         .map_err(AccountError::SubAccountDescriptor)
+}
+
+#[cfg(feature = "mnemonic")]
+/// The seed that signs for `sub`: its own mnemonic's, else the account's.
+fn sub_account_seed(
+    sub: &SubAccountConfig,
+    account_seed: Option<&Seed>,
+) -> Result<Option<Seed>, AccountError> {
+    match &sub.mnemonic {
+        Some(mnemonic) => config::mnemonic_seed(mnemonic)
+            .map(Some)
+            .map_err(AccountError::SubAccountMnemonic),
+        None => Ok(account_seed.cloned()),
+    }
 }
 
 #[cfg(feature = "mnemonic")]

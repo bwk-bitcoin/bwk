@@ -2,6 +2,7 @@
 //! from.
 
 use bitcoin::{bip32, secp256k1::Secp256k1, Network};
+use bwk_sign::bip39;
 use zeroize::Zeroizing;
 
 use crate::receiver::error::Error;
@@ -42,7 +43,6 @@ impl Seed {
     }
 
     /// The BIP39 seed of `mnemonic` under `passphrase`.
-    #[cfg(feature = "mnemonic")]
     pub fn from_mnemonic(mnemonic: &bip39::Mnemonic, passphrase: &str) -> Self {
         let mut seed = Zeroizing::new([0u8; SEED_LEN]);
         *seed = mnemonic.to_seed(passphrase);

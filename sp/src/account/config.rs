@@ -6,6 +6,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    str::FromStr,
     sync::Arc,
 };
 
@@ -28,7 +29,7 @@ use bwk_sign::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::receiver;
+use crate::{receiver, seed::Seed};
 
 mod sp_descriptor_serde {
     use std::str::FromStr;
@@ -63,10 +64,15 @@ pub struct Config {
     pub network: Network,
 
     // Keys
-    /// BIP39 mnemonic phrase (for hot wallet). Construction parameter only;
-    /// never persisted.
+    /// BIP39 mnemonic phrase (for hot wallet), English and without
+    /// passphrase. Construction parameter only; never persisted.
     #[serde(skip)]
     pub mnemonic: Option<String>,
+    /// BIP39 seed (for hot wallet), whatever the mnemonic's language and
+    /// passphrase, see [`Seed`]. Signs in place of `mnemonic` when both are
+    /// set. Construction parameter only; never persisted.
+    #[serde(skip)]
+    pub seed: Option<Seed>,
     /// BIP392 `sp()` descriptor holding the scan key and spend key; the sole
     /// source of truth for this account's silent-payment key material.
     #[serde(with = "sp_descriptor_serde")]
@@ -179,11 +185,50 @@ impl Config {
         blindbit_url: String,
         data_dir: PathBuf,
     ) -> Result<Self, ConfigError> {
-        let descriptor = Self::derive_descriptor(network, &mnemonic)?;
+        let seed = mnemonic_seed(&mnemonic).map_err(ConfigError::Signer)?;
+        let mut config = Self::from_keys(account_name, network, &seed, blindbit_url, data_dir)?;
+        config.mnemonic = Some(mnemonic);
+        Ok(config)
+    }
+
+    /// Create a new Config from the 64 bytes of a BIP39 seed.
+    ///
+    /// The hot wallet constructor for any mnemonic: BIP39 folds the
+    /// mnemonic's language and its passphrase into the seed, so the account
+    /// gets the standard BIP352 keys whatever they are. Derives the account's
+    /// `sp()` descriptor from the seed at the BIP352 paths; the seed of an
+    /// English mnemonic without passphrase gives the same config as
+    /// [`Config::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Seed`] unless `seed` is exactly 64 bytes long.
+    pub fn from_seed(
+        account_name: String,
+        network: Network,
+        seed: &[u8],
+        blindbit_url: String,
+        data_dir: PathBuf,
+    ) -> Result<Self, ConfigError> {
+        let seed = Seed::from_slice(seed).map_err(ConfigError::Seed)?;
+        let mut config = Self::from_keys(account_name, network, &seed, blindbit_url, data_dir)?;
+        config.seed = Some(seed);
+        Ok(config)
+    }
+
+    fn from_keys(
+        account_name: String,
+        network: Network,
+        seed: &Seed,
+        blindbit_url: String,
+        data_dir: PathBuf,
+    ) -> Result<Self, ConfigError> {
+        let descriptor = Self::derive_descriptor(network, seed)?;
         Ok(Self {
             account_name,
             network,
-            mnemonic: Some(mnemonic),
+            mnemonic: None,
+            seed: None,
             descriptor,
             blindbit_url,
             endpoint: Endpoint::default(),
@@ -215,6 +260,7 @@ impl Config {
             account_name,
             network,
             mnemonic: None,
+            seed: None,
             descriptor,
             blindbit_url,
             endpoint: Endpoint::default(),
@@ -229,9 +275,8 @@ impl Config {
         }
     }
 
-    fn derive_descriptor(network: Network, mnemonic: &str) -> Result<SpDescriptor, ConfigError> {
-        let signer =
-            HotSigner::new_from_mnemonics(network, mnemonic).map_err(ConfigError::Signer)?;
+    fn derive_descriptor(network: Network, seed: &Seed) -> Result<SpDescriptor, ConfigError> {
+        let signer = hot_signer(network, seed)?;
         let account = ChildNumber::from_hardened_idx(0).expect("hardcoded account index");
         Ok(SpDescriptor::Packed {
             origin: None,
@@ -249,8 +294,8 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::MnemonicDescriptorMismatch`] if a mnemonic is
-    /// set and it does not derive this config's `sp()` descriptor.
+    /// Returns [`ConfigError::MnemonicDescriptorMismatch`] if a mnemonic or a
+    /// seed is set and it does not derive this config's `sp()` descriptor.
     pub fn sanitize(&mut self) -> Result<(), ConfigError> {
         // Birthday height
         let min = self.min_birthday_height();
@@ -260,19 +305,32 @@ impl Config {
             _ => {}
         }
 
-        self.check_mnemonic_matches_descriptor()
+        if let Some(mnemonic) = self.mnemonic.as_deref() {
+            let seed = mnemonic_seed(mnemonic).map_err(ConfigError::Signer)?;
+            self.check_seed_matches_descriptor(&seed)?;
+        }
+        if let Some(seed) = &self.seed {
+            self.check_seed_matches_descriptor(seed)?;
+        }
+        Ok(())
     }
 
-    /// Verify that `self.mnemonic`, when present, derives the same BIP352
-    /// scan and spend keys as `self.descriptor`. Watch-only configs (no
-    /// mnemonic) are always valid.
-    fn check_mnemonic_matches_descriptor(&self) -> Result<(), ConfigError> {
-        let Some(mnemonic) = self.mnemonic.as_deref() else {
-            return Ok(());
-        };
+    /// The seed the hot signers of this account are built from: `seed`, else
+    /// the seed of `mnemonic`. `None` for a watch-only config.
+    pub(crate) fn signing_seed(&self) -> Result<Option<Seed>, ConfigError> {
+        match (&self.seed, &self.mnemonic) {
+            (Some(seed), _) => Ok(Some(seed.clone())),
+            (None, Some(mnemonic)) => mnemonic_seed(mnemonic)
+                .map(Some)
+                .map_err(ConfigError::Signer),
+            (None, None) => Ok(None),
+        }
+    }
 
-        let signer =
-            HotSigner::new_from_mnemonics(self.network, mnemonic).map_err(ConfigError::Signer)?;
+    /// Verify that `seed` derives the same BIP352 scan and spend keys as
+    /// `self.descriptor`.
+    fn check_seed_matches_descriptor(&self, seed: &Seed) -> Result<(), ConfigError> {
+        let signer = hot_signer(self.network, seed)?;
         let account = ChildNumber::from_hardened_idx(0).expect("hardcoded account index");
         let secp = Secp256k1::new();
 
@@ -356,17 +414,17 @@ impl Config {
     }
 
     /// Add a default embedded BIP84 (P2WPKH) sub-account derived from this
-    /// config's mnemonic at account index 0.
+    /// config's seed or mnemonic at account index 0.
     pub fn add_default_segwit_sub_account(&mut self) -> Result<(), ConfigError> {
-        let mnemonic = self.mnemonic.clone().ok_or(ConfigError::MissingMnemonic)?;
-        self.add_sub_account_from_mnemonic(&mnemonic, SubAccountKind::Segwit, None)
+        let seed = self.signing_seed()?.ok_or(ConfigError::MissingMnemonic)?;
+        self.add_sub_account_from_seed(&seed, SubAccountKind::Segwit, None)
     }
 
     /// Add a default embedded BIP86 (P2TR) sub-account derived from this
-    /// config's mnemonic at account index 0.
+    /// config's seed or mnemonic at account index 0.
     pub fn add_default_taproot_sub_account(&mut self) -> Result<(), ConfigError> {
-        let mnemonic = self.mnemonic.clone().ok_or(ConfigError::MissingMnemonic)?;
-        self.add_sub_account_from_mnemonic(&mnemonic, SubAccountKind::Taproot, None)
+        let seed = self.signing_seed()?.ok_or(ConfigError::MissingMnemonic)?;
+        self.add_sub_account_from_seed(&seed, SubAccountKind::Taproot, None)
     }
 
     /// Add an embedded BIP84 (P2WPKH) sub-account derived from an external
@@ -401,8 +459,17 @@ impl Config {
         kind: SubAccountKind,
         sub_account_mnemonic: Option<String>,
     ) -> Result<(), ConfigError> {
-        let signer =
-            HotSigner::new_from_mnemonics(self.network, mnemonic).map_err(ConfigError::Signer)?;
+        let seed = mnemonic_seed(mnemonic).map_err(ConfigError::Signer)?;
+        self.add_sub_account_from_seed(&seed, kind, sub_account_mnemonic)
+    }
+
+    fn add_sub_account_from_seed(
+        &mut self,
+        seed: &Seed,
+        kind: SubAccountKind,
+        sub_account_mnemonic: Option<String>,
+    ) -> Result<(), ConfigError> {
+        let signer = hot_signer(self.network, seed)?;
         let account = ChildNumber::from_hardened_idx(0).expect("hardcoded account index");
         let descriptor = match kind {
             SubAccountKind::Segwit => {
@@ -474,8 +541,10 @@ pub enum ConfigError {
     Io(String),
     #[error("parse error: {0}")]
     Parse(String),
-    #[error("missing mnemonic")]
+    #[error("missing mnemonic or seed")]
     MissingMnemonic,
+    #[error("invalid seed: {0}")]
+    Seed(crate::receiver::error::Error),
     #[error("signer error: {0}")]
     Signer(bwk_sign::error::Error),
     #[error("descriptor path error: {0}")]
@@ -486,8 +555,22 @@ pub enum ConfigError {
     NoDefaultDescriptor(SubAccountKind),
     #[error("descriptor error: {0}")]
     Descriptor(#[source] bwk_descriptor::sp_descriptor::Error),
-    #[error("mnemonic does not derive the configured sp() descriptor")]
+    #[error("mnemonic or seed does not derive the configured sp() descriptor")]
     MnemonicDescriptorMismatch,
+}
+
+/// The seed of `mnemonic` without passphrase, failing as
+/// [`HotSigner::new_from_mnemonics`] does on a phrase it cannot parse.
+pub(crate) fn mnemonic_seed(mnemonic: &str) -> Result<Seed, bwk_sign::error::Error> {
+    let mnemonic = bwk_sign::bip39::Mnemonic::from_str(mnemonic)
+        .map_err(|_| bwk_sign::error::Error::Derivator)?;
+    Ok(Seed::from_mnemonic(&mnemonic, ""))
+}
+
+/// A hot signer holding `seed`'s master key.
+pub(crate) fn hot_signer(network: Network, seed: &Seed) -> Result<HotSigner, ConfigError> {
+    let master = seed.master_xpriv(network).map_err(ConfigError::Seed)?;
+    Ok(HotSigner::new_from_xpriv(network, master))
 }
 
 #[cfg(test)]
