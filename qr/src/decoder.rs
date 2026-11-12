@@ -13,17 +13,17 @@ pub enum Decoded {
     #[cfg(feature = "bbqr")]
     Bytes(Vec<u8>),
     #[cfg(feature = "protocol")]
-    Request(crate::protocol::Request),
+    Request(crate::protocol::ll::Request),
     #[cfg(feature = "protocol")]
-    Response(crate::protocol::Response),
+    Response(crate::protocol::ll::Response),
 }
 
 #[cfg(feature = "protocol")]
-impl From<crate::protocol::Message> for Decoded {
-    fn from(message: crate::protocol::Message) -> Self {
+impl From<crate::protocol::ll::Message> for Decoded {
+    fn from(message: crate::protocol::ll::Message) -> Self {
         match message {
-            crate::protocol::Message::Request(request) => Self::Request(request),
-            crate::protocol::Message::Response(response) => Self::Response(response),
+            crate::protocol::ll::Message::Request(request) => Self::Request(request),
+            crate::protocol::ll::Message::Response(response) => Self::Response(response),
         }
     }
 }
@@ -109,7 +109,7 @@ impl Decoder {
 #[cfg(feature = "protocol")]
 fn decode_payload(decoded: Decoded) -> Result<Decoded, Error> {
     match decoded {
-        Decoded::Bytes(data) => Ok(crate::protocol::decode(&data)?.into()),
+        Decoded::Bytes(data) => Ok(crate::protocol::ll::decode(&data)?.into()),
         other => Ok(other),
     }
 }

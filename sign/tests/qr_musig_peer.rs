@@ -6,6 +6,19 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use bipqr::{
+    backend::{Active, Backend},
+    ll::{
+        decode, encode_request, encode_response,
+        request::{
+            self, Descriptor as QrDescriptor, DescriptorBody, PrepareNonces, RegisterDescriptor,
+            Sign,
+        },
+        response::{self, NoncesPrepared, Registration},
+        types, Message, Request as QrRequest, RequestId as QrRequestId, Response as QrResponse,
+        SignResponseKind,
+    },
+};
 use bwk_descriptor::{
     descriptor::Descriptor,
     updater::update_input,
@@ -22,15 +35,6 @@ use bwk_psbt::{
     },
     PsbtV2,
 };
-use bwk_qr_protocol::{
-    encode_response,
-    request::{
-        self, Descriptor as QrDescriptor, DescriptorBody, PrepareNonces, RegisterDescriptor, Sign,
-    },
-    response::{self, Registration},
-    types, Message, Request as QrRequest, RequestId as QrRequestId, Response as QrResponse,
-    SignResponseKind,
-};
 use bwk_sign::{
     error::Error as SignError,
     hot_signer::HotSigner,
@@ -39,7 +43,7 @@ use bwk_sign::{
     protocol::{Request, RequestId, Response},
     qr_musig::{
         decode_record, decode_registered, encode_record, encode_registered, Error, QrMusigPeer,
-        QrMusigPeerRecord, MAX_SESSIONS,
+        QrMusigPeerRecord, MAX_NONCE_EXPRESSIONS, MAX_NONCE_INPUTS, MAX_SESSIONS,
     },
     qr_musig_host::{Issuance, QrMusigHost, QrMusigHostRecord, QrMusigHostResponse},
 };
@@ -181,7 +185,7 @@ impl Fixture {
     }
 
     /// Issues a session for both of `a`'s key expressions over `max_inputs` inputs.
-    fn issue(&mut self, max_inputs: u8) -> [u8; 4] {
+    fn issue(&mut self, max_inputs: u32) -> [u8; 4] {
         let (session_id, bytes) = self
             .host
             .issue_request(
@@ -223,7 +227,7 @@ impl Fixture {
         let Message::Request(QrRequest {
             body: request::Body::Sign(signing),
             ..
-        }) = bwk_qr_protocol::decode(&bytes).unwrap()
+        }) = decode(&bytes).unwrap()
         else {
             panic!("not a Signing request");
         };
@@ -243,6 +247,7 @@ impl Fixture {
             descriptors: self.descriptors(),
             psbt: psbt.serialize(),
             want_kind: None,
+            accept_trimmed: false,
         }
     }
 
@@ -282,7 +287,7 @@ fn role_path(role: u32) -> DerivationPath {
     DerivationPath::from_str(&format!("m/87'/1'/0'/{role}")).unwrap()
 }
 
-fn issuance(role: u32, max_inputs: u8, key_expression_index: u32) -> Issuance {
+fn issuance(role: u32, max_inputs: u32, key_expression_index: u32) -> Issuance {
     Issuance {
         path: role_path(role),
         max_inputs,
@@ -370,13 +375,19 @@ fn spend(descriptor: &WalletDescriptor, indexes: &[u32]) -> Psbt {
 
 fn preparation(session_id: [u8; 4], session_ref: Option<[u8; 4]>) -> PrepareNonces {
     PrepareNonces {
-        session_id,
+        session_id: Some(session_id),
         session_ref,
+        descriptor: None,
         max_inputs: 2,
-        derivation_path: (&role_path(2)).into(),
+        derivation_path: Active::to_ll_path(&role_path(2)),
         start: 0,
-        end: 1,
+        end: Some(1),
     }
+}
+
+/// The reference of the session `prepared` initialized.
+fn session_ref(prepared: &NoncesPrepared) -> [u8; 4] {
+    prepared.session.unwrap().session_ref
 }
 
 fn signed_psbt(signed: response::Signed) -> Psbt {
@@ -400,31 +411,33 @@ fn fail_after(persistence: &PeerPersistence, after: usize) {
 }
 
 #[test]
-fn preparation_retries_return_the_same_nonces_and_reference() {
+fn preparation_retries_return_the_same_nonces_from_the_held_session() {
     let mut f = fixture();
     let prepared = f.peer.prepare(preparation([1; 4], None)).unwrap();
-    assert_eq!(prepared.session_id, [1; 4]);
-    assert_eq!(prepared.max_inputs, 2);
-    assert_eq!((prepared.start, prepared.end), (0, 1));
+    assert_eq!(prepared.session.unwrap().session_id, [1; 4]);
     assert_eq!(prepared.nonces.len(), 4);
     assert_eq!(
         prepared.nonces.iter().collect::<BTreeSet<_>>().len(),
         4,
         "every (i, j) gets its own nonce"
     );
-    assert_eq!(f.peer.prepare(preparation([1; 4], None)).unwrap(), prepared);
+    let held = NoncesPrepared {
+        session: None,
+        nonces: prepared.nonces.clone(),
+    };
+    assert_eq!(f.peer.prepare(preparation([1; 4], None)).unwrap(), held);
     assert_eq!(
         f.peer
-            .prepare(preparation([1; 4], Some(prepared.session_ref)))
+            .prepare(preparation([1; 4], Some(session_ref(&prepared))))
             .unwrap(),
-        prepared
+        held
     );
     assert_eq!(f.committed().len(), 1);
     f.peer = peer(&f.persistence, &f.registry);
-    assert_eq!(f.peer.prepare(preparation([1; 4], None)).unwrap(), prepared);
+    assert_eq!(f.peer.prepare(preparation([1; 4], None)).unwrap(), held);
 
     let other = f.peer.prepare(preparation([2; 4], None)).unwrap();
-    assert_ne!(other.session_ref, prepared.session_ref);
+    assert_ne!(session_ref(&other), session_ref(&prepared));
     assert!(other
         .nonces
         .iter()
@@ -435,15 +448,54 @@ fn preparation_retries_return_the_same_nonces_and_reference() {
 fn reference_mismatch_and_unknown_session_are_refused_without_creating() {
     let mut f = fixture();
     let prepared = f.peer.prepare(preparation([1; 4], None)).unwrap();
-    let mut wrong = prepared.session_ref;
+    let mut wrong = session_ref(&prepared);
     wrong[0] ^= 1;
     assert_session_refusal(f.peer.prepare(preparation([1; 4], Some(wrong))));
     assert_session_refusal(
         f.peer
-            .prepare(preparation([2; 4], Some(prepared.session_ref))),
+            .prepare(preparation([2; 4], Some(session_ref(&prepared)))),
     );
     assert_eq!(f.committed().keys().collect::<Vec<_>>(), vec![&[1; 4]]);
-    assert_eq!(f.peer.prepare(preparation([1; 4], None)).unwrap(), prepared);
+    assert_eq!(
+        f.peer.prepare(preparation([1; 4], None)).unwrap().nonces,
+        prepared.nonces
+    );
+}
+
+#[test]
+fn preparation_without_a_session_id_draws_a_new_session() {
+    let mut f = fixture();
+    let mut drawn = preparation([0; 4], None);
+    drawn.session_id = None;
+    let prepared = f.peer.prepare(drawn.clone()).unwrap();
+    let session = prepared.session.unwrap();
+    assert_eq!(
+        f.committed().keys().collect::<Vec<_>>(),
+        vec![&session.session_id]
+    );
+    let again = f.peer.prepare(drawn).unwrap();
+    assert_ne!(again.session.unwrap().session_id, session.session_id);
+    assert_eq!(f.committed().len(), 2);
+}
+
+#[test]
+fn preparation_beyond_the_peer_bounds_is_refused_without_creating() {
+    let mut f = fixture();
+    let mut wide = preparation([1; 4], None);
+    wide.end = Some(MAX_NONCE_EXPRESSIONS);
+    assert!(matches!(f.peer.prepare(wide), Err(Error::Request(_))));
+    let mut many = preparation([1; 4], None);
+    many.max_inputs = MAX_NONCE_INPUTS + 1;
+    assert!(matches!(f.peer.prepare(many), Err(Error::Request(_))));
+    assert!(f.committed().is_empty());
+
+    let mut widest = preparation([1; 4], None);
+    widest.end = Some(MAX_NONCE_EXPRESSIONS - 1);
+    widest.max_inputs = 1;
+    assert_eq!(
+        f.peer.prepare(widest).unwrap().nonces.len(),
+        MAX_NONCE_EXPRESSIONS as usize
+    );
 }
 
 #[test]
@@ -457,9 +509,12 @@ fn oldest_session_is_evicted() {
     assert_eq!(committed.len(), MAX_SESSIONS);
     assert!(!committed.contains_key(&[0; 4]));
     assert!(committed.contains_key(&[1; 4]));
-    assert_session_refusal(f.peer.prepare(preparation([0; 4], Some(first.session_ref))));
+    assert_session_refusal(
+        f.peer
+            .prepare(preparation([0; 4], Some(session_ref(&first)))),
+    );
     let recreated = f.peer.prepare(preparation([0; 4], None)).unwrap();
-    assert_ne!(recreated.session_ref, first.session_ref);
+    assert_ne!(session_ref(&recreated), session_ref(&first));
     assert!(!f.committed().contains_key(&[1; 4]));
 }
 
@@ -475,7 +530,10 @@ fn issuance_flush_failure_releases_nothing_and_retries() {
     let prepared = f.peer.prepare(preparation([1; 4], None)).unwrap();
     assert_eq!(f.committed().len(), 1);
     f.peer = peer(&f.persistence, &f.registry);
-    assert_eq!(f.peer.prepare(preparation([1; 4], None)).unwrap(), prepared);
+    assert_eq!(
+        f.peer.prepare(preparation([1; 4], None)).unwrap().nonces,
+        prepared.nonces
+    );
 }
 
 #[test]
@@ -632,7 +690,7 @@ fn host_merges_a_signatures_only_reply() {
     let Message::Request(QrRequest {
         body: request::Body::Sign(signing),
         ..
-    }) = bwk_qr_protocol::decode(&bytes).unwrap()
+    }) = decode(&bytes).unwrap()
     else {
         panic!("not a Signing request");
     };
@@ -737,7 +795,7 @@ fn host_rejects_a_reply_failing_partial_signature_verification() {
     let Message::Request(QrRequest {
         body: request::Body::Sign(signing),
         ..
-    }) = bwk_qr_protocol::decode(&bytes).unwrap()
+    }) = decode(&bytes).unwrap()
     else {
         panic!("not a Signing request");
     };
@@ -1108,7 +1166,7 @@ fn assert_registration(registration: Registration, alias: &str, registered: bool
         registration,
         Registration {
             descriptor_alias: alias.to_string(),
-            registered: Some(registered),
+            registered,
             stored: Some(registered),
             proof: None,
         }
@@ -1198,7 +1256,7 @@ fn another_descriptor_under_a_registered_alias_is_the_already_registered_error()
     assert!(matches!(
         status.body,
         response::Body::Registration(Registration {
-            registered: Some(true),
+            registered: true,
             ..
         })
     ));
@@ -1412,7 +1470,7 @@ fn raw_handler_preserves_both_request_ids_and_signer_and_reports_errors() {
     let response = f.peer.handle_remote(Request::Raw {
         request,
         signer: signer_id(),
-        payload: bwk_qr_protocol::encode_request(&inner).unwrap(),
+        payload: encode_request(&inner).unwrap(),
     });
     let Response::Raw {
         request: returned,
@@ -1424,7 +1482,7 @@ fn raw_handler_preserves_both_request_ids_and_signer_and_reports_errors() {
     };
     assert_eq!(returned, request);
     assert_eq!(returned_signer, signer_id());
-    let Message::Response(response) = bwk_qr_protocol::decode(&payload).unwrap() else {
+    let Message::Response(response) = decode(&payload).unwrap() else {
         panic!("not a QR response");
     };
     assert_eq!(response.id, inner.id);

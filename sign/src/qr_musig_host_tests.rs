@@ -5,6 +5,13 @@ use std::{
     time::Duration,
 };
 
+use bipqr::{
+    backend::{Active, Backend},
+    ll::{
+        decode, encode_response, request, response, Message, MessageType, Request as QrRequest,
+        RequestId as QrRequestId, Response as QrResponse, SignResponseKind,
+    },
+};
 use bwk_descriptor::{
     musig::parse_musig_descriptor,
     updater::update_input,
@@ -14,10 +21,6 @@ use bwk_persist::{storage::Store, PersistError};
 use bwk_psbt::{
     musig::{musig_input_pub_nonce, set_musig_input_pub_nonce, MusigPubNonce},
     nonce_cache::{nonce_cache_session, NonceCacheSession},
-};
-use bwk_qr_protocol::{
-    decode, encode_response, request, response, Message, Request as QrRequest,
-    RequestId as QrRequestId, Response as QrResponse, SignResponseKind,
 };
 use crossbeam::channel;
 use miniscript::bitcoin::{
@@ -142,7 +145,7 @@ impl Fixture {
         let public_key = self.device.public_key_at(&issuance.path).serialize();
         let mut nonces = Vec::new();
         for j in issuance.start..=issuance.end {
-            for i in 0..u32::from(issuance.max_inputs) {
+            for i in 0..issuance.max_inputs {
                 let (_, nonce) = self.secret.nonce(i, j, &secret_key, &public_key).unwrap();
                 nonces.push(nonce);
             }
@@ -150,13 +153,21 @@ impl Fixture {
         nonces
     }
 
+    /// The answer of the device initializing `session_id`.
     fn prepared(&self, session_id: [u8; 4], issuance: &Issuance) -> response::NoncesPrepared {
         response::NoncesPrepared {
-            session_id,
-            session_ref: self.secret.session_ref(),
-            max_inputs: issuance.max_inputs,
-            start: issuance.start,
-            end: issuance.end,
+            session: Some(response::Session {
+                session_id,
+                session_ref: self.secret.session_ref(),
+            }),
+            nonces: self.nonces(issuance),
+        }
+    }
+
+    /// The answer of the device from a session it already holds.
+    fn extended(&self, issuance: &Issuance) -> response::NoncesPrepared {
+        response::NoncesPrepared {
+            session: None,
             nonces: self.nonces(issuance),
         }
     }
@@ -194,7 +205,7 @@ fn fixture() -> Fixture {
     }
 }
 
-fn issuance(max_inputs: u8) -> Issuance {
+fn issuance(max_inputs: u32) -> Issuance {
     Issuance {
         path: DerivationPath::from_str(COSIGNER_PATH).unwrap(),
         max_inputs,
@@ -252,7 +263,7 @@ fn raw_response(outer: RequestId, id: QrRequestId, body: response::Body) -> Resp
 fn issue(
     host: &mut QrMusigHost<TestStore>,
     fixture: &Fixture,
-    max_inputs: u8,
+    max_inputs: u32,
 ) -> ([u8; 4], Vec<u8>) {
     host.issue_request(
         SignerId::new("qr"),
@@ -265,7 +276,7 @@ fn issue(
 }
 
 /// Issues a session of `max_inputs` inputs and accepts the device's answer.
-fn issued(host: &mut QrMusigHost<TestStore>, fixture: &Fixture, max_inputs: u8) -> [u8; 4] {
+fn issued(host: &mut QrMusigHost<TestStore>, fixture: &Fixture, max_inputs: u32) -> [u8; 4] {
     let (session_id, _) = issue(host, fixture, max_inputs);
     host.bind_outer_request(RequestId::new(7)).unwrap();
     let prepared = fixture.prepared(session_id, &issuance(max_inputs));
@@ -305,10 +316,10 @@ fn raw_manager_attribution_and_record_roundtrip() {
     else {
         panic!("not a Nonce Preparation request");
     };
-    assert_eq!(preparation.session_id, session_id);
+    assert_eq!(preparation.session_id, Some(session_id));
     assert_eq!(preparation.session_ref, None);
     assert_eq!(
-        DerivationPath::from(&preparation.derivation_path),
+        Active::from_ll_path(&preparation.derivation_path),
         DerivationPath::from_str(COSIGNER_PATH).unwrap()
     );
     let (mut manager, outbound, inbound) = RemoteManager::pair();
@@ -409,7 +420,7 @@ fn extension_sends_the_session_reference_and_keeps_issued_nonces() {
     assert_eq!(preparation.session_ref, Some(fixture.secret.session_ref()));
     host.bind_outer_request(RequestId::new(8)).unwrap();
 
-    let mut changed = fixture.prepared(session_id, &wider);
+    let mut changed = fixture.extended(&wider);
     changed.nonces.swap(0, 1);
     assert!(host
         .accept_response(&raw_response(
@@ -418,30 +429,36 @@ fn extension_sends_the_session_reference_and_keeps_issued_nonces() {
             response::Body::NoncesPrepared(changed)
         ))
         .is_err());
-    let mut other_session = fixture.prepared(session_id, &wider);
-    other_session.session_ref = [0; 4];
-    assert!(host
-        .accept_response(&raw_response(
+    let mut other_session = fixture.extended(&wider);
+    other_session.session = Some(response::Session {
+        session_id,
+        session_ref: [0; 4],
+    });
+    assert!(matches!(
+        host.accept_response(&raw_response(
             RequestId::new(8),
             QrRequestId([3, 4]),
             response::Body::NoncesPrepared(other_session)
-        ))
-        .is_err());
-    let mut wrong_echo = fixture.prepared(session_id, &wider);
-    wrong_echo.max_inputs = 1;
-    wrong_echo.nonces.truncate(1);
-    assert!(host
-        .accept_response(&raw_response(
+        )),
+        Err(Error::Invalid("session reference changed"))
+    ));
+    let mut short = fixture.extended(&wider);
+    short.nonces.truncate(1);
+    assert!(matches!(
+        host.accept_response(&raw_response(
             RequestId::new(8),
             QrRequestId([3, 4]),
-            response::Body::NoncesPrepared(wrong_echo)
+            response::Body::NoncesPrepared(short)
+        )),
+        Err(Error::Invalid(
+            "prepared nonce count does not match the request"
         ))
-        .is_err());
+    ));
     assert!(host
         .accept_response(&raw_response(
             RequestId::new(8),
             QrRequestId([9, 9]),
-            response::Body::NoncesPrepared(fixture.prepared(session_id, &wider))
+            response::Body::NoncesPrepared(fixture.extended(&wider))
         ))
         .is_err());
     assert_eq!(host.record(&session_id).unwrap().unwrap().nonces().len(), 1);
@@ -449,10 +466,43 @@ fn extension_sends_the_session_reference_and_keeps_issued_nonces() {
     host.accept_response(&raw_response(
         RequestId::new(8),
         QrRequestId([3, 4]),
-        response::Body::NoncesPrepared(fixture.prepared(session_id, &wider)),
+        response::Body::NoncesPrepared(fixture.extended(&wider)),
     ))
     .unwrap();
     assert_eq!(host.record(&session_id).unwrap().unwrap().nonces().len(), 2);
+}
+
+#[test]
+fn first_issuance_answer_must_announce_its_session() {
+    let fixture = fixture();
+    let mut host = QrMusigHost::from_store(TestStore::default());
+    let (session_id, _) = issue(&mut host, &fixture, 1);
+    host.bind_outer_request(RequestId::new(7)).unwrap();
+    let answer = |prepared| {
+        raw_response(
+            RequestId::new(7),
+            QrRequestId([1, 2]),
+            response::Body::NoncesPrepared(prepared),
+        )
+    };
+    assert!(matches!(
+        host.accept_response(&answer(fixture.extended(&issuance(1)))),
+        Err(Error::Invalid("prepared response initialized no session"))
+    ));
+    assert!(matches!(
+        host.accept_response(&answer(fixture.prepared([0xee; 4], &issuance(1)))),
+        Err(Error::Invalid("prepared response names another session"))
+    ));
+    assert_eq!(
+        host.record(&session_id).unwrap().unwrap().session_ref(),
+        None
+    );
+    host.accept_response(&answer(fixture.prepared(session_id, &issuance(1))))
+        .unwrap();
+    assert_eq!(
+        host.record(&session_id).unwrap().unwrap().session_ref(),
+        Some(fixture.secret.session_ref())
+    );
 }
 
 #[test]
@@ -606,7 +656,7 @@ fn session_refusal_drops_the_session_and_other_refusals_keep_it() {
             RequestId::new(9),
             QrRequestId([5, 6]),
             response::Body::Error(response::ErrorBody {
-                message_type: bwk_qr_protocol::MessageType::Signing,
+                message_type: MessageType::Signing,
                 error,
                 message: "refused".into(),
             }),

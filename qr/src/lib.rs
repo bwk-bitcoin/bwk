@@ -2,7 +2,8 @@
 //!
 //! The crate keeps QR primitives internal. Callers use [`encoder::Encoder`] and
 //! [`decoder::Decoder`] for plain text QR codes or, with the `protocol` feature, the
-//! signing-flow messages in [`protocol`].
+//! signing-flow messages of [`protocol`], the `bipqr` codec and its `bitcoin`
+//! conversions.
 
 pub mod config;
 pub mod error;
@@ -18,4 +19,4 @@ mod gen;
 mod scan;
 
 #[cfg(feature = "protocol")]
-pub use bwk_qr_protocol as protocol;
+pub use bipqr as protocol;

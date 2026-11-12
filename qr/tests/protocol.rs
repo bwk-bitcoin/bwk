@@ -6,7 +6,10 @@ use bwk_qr::{
     decoder::{Decoded, Decoder, Progress},
     encoder::Encoder,
     image::Image,
-    protocol::{self, request, response},
+    protocol::{
+        backend::{Active, Backend},
+        ll::{self as protocol, request, response},
+    },
 };
 
 fn id() -> protocol::RequestId {
@@ -25,7 +28,7 @@ fn psbt() -> Vec<u8> {
 }
 
 fn path(path: &str) -> protocol::types::DerivationPath {
-    (&path.parse::<bip32::DerivationPath>().unwrap()).into()
+    Active::to_ll_path(&path.parse::<bip32::DerivationPath>().unwrap())
 }
 
 fn xpub() -> bip32::Xpub {
@@ -113,7 +116,7 @@ fn keys_response(capabilities: u32) -> protocol::Response {
     protocol::Response {
         id: id(),
         body: response::Body::Keys(response::Keys {
-            keys: vec![(&xpub()).into(), (&xpub()).into()],
+            keys: vec![Active::to_ll_xpub(&xpub()), Active::to_ll_xpub(&xpub())],
             fingerprint: protocol::types::Fingerprint([0xde, 0xad, 0xbe, 0xef]),
             vendor: "bwk".to_string(),
             model: "bwk-signer".to_string(),
@@ -139,6 +142,7 @@ fn sign_request() -> protocol::Request {
             }],
             psbt: psbt(),
             want_kind: Some(protocol::SignResponseKind::Psbt),
+            accept_trimmed: false,
         }),
     }
 }
@@ -165,7 +169,7 @@ fn registration_response(stored: Option<bool>) -> protocol::Response {
         id: id(),
         body: response::Body::Registration(response::Registration {
             descriptor_alias: "main".to_string(),
-            registered: Some(true),
+            registered: true,
             stored,
             proof: Some(vec![0xaa; 32]),
         }),
@@ -266,7 +270,7 @@ fn address_uri_response_round_trips() {
     round_trip_response(protocol::Response {
         id: id(),
         body: response::Body::AddressUri(response::AddressUri {
-            uri: Some("bitcoin:bc1qxyz".to_string()),
+            uri: "bitcoin:bc1qxyz".to_string(),
         }),
     });
 }
@@ -291,8 +295,7 @@ fn signed_signatures_response_round_trips() {
         body: response::Body::Signed(response::Signed::Signatures(vec![
             response::SignatureEntry::Ecdsa {
                 input_index: 0,
-                public_key: (&bitcoin::PublicKey::new(xpub().public_key))
-                    .try_into()
+                public_key: Active::to_ll_public_key(&bitcoin::PublicKey::new(xpub().public_key))
                     .unwrap(),
                 signature: vec![0x30; 71],
             },

@@ -73,7 +73,7 @@ fn raw_decode_keeps_plain_codes_as_text() {
 #[cfg(feature = "protocol")]
 #[test]
 fn protocol_payload_stays_undecoded_on_the_raw_path() {
-    use bwk_qr::protocol::{self, request, types::DerivationPath};
+    use bwk_qr::protocol::ll::{self as protocol, request, types::DerivationPath};
 
     let request = protocol::Request {
         id: protocol::RequestId([7; protocol::REQUEST_ID_LEN]),

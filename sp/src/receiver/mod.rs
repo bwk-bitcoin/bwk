@@ -317,14 +317,17 @@ impl SpReceiver {
 
 #[cfg(all(test, feature = "mnemonic"))]
 mod tests {
+    use bipqr::{
+        backend::{Active, Backend},
+        ll::{
+            request::{Scan, SpKeys},
+            types::DerivationPath,
+        },
+    };
     use bitcoin::{
         bip32,
         secp256k1::{Secp256k1, SecretKey},
         Network,
-    };
-    use bwk_qr_protocol::{
-        request::{Scan, SpKeys},
-        types::DerivationPath,
     };
 
     use crate::{
@@ -383,7 +386,7 @@ mod tests {
     }
 
     /// The recipe a signer follows for a silent payment Address Verification request
-    /// (bwk-qr-protocol `DescriptorBody::SpKeys`): from its own seed, derive the spend
+    /// (bipqr `DescriptorBody::SpKeys`): from its own seed, derive the spend
     /// key at the path the request names, derive the scan key at its path or take the
     /// scan private key the request carries, apply the label `DERIV` names, if any,
     /// then encode the address.
@@ -395,22 +398,22 @@ mod tests {
     ) -> SilentPaymentAddress {
         let secp = Secp256k1::new();
         assert_eq!(
-            bip32::Fingerprint::from(&keys.fingerprint),
+            Active::from_ll_fingerprint(&keys.fingerprint),
             master_xpriv.fingerprint(&secp)
         );
         let spend_pk = master_xpriv
-            .derive_priv(&secp, &bip32::DerivationPath::from(&keys.spend_path))
+            .derive_priv(&secp, &Active::from_ll_path(&keys.spend_path))
             .unwrap()
             .private_key
             .public_key(&secp);
         let scan_sk = match &keys.scan {
             Scan::Path(path) => {
                 master_xpriv
-                    .derive_priv(&secp, &bip32::DerivationPath::from(path))
+                    .derive_priv(&secp, &Active::from_ll_path(path))
                     .unwrap()
                     .private_key
             }
-            Scan::Key(key) => SecretKey::try_from(key).unwrap(),
+            Scan::Key(key) => Active::from_ll_secret_key(key).unwrap(),
         };
         let m_pubkey = match label {
             Some(m) => spend_pk
@@ -437,9 +440,9 @@ mod tests {
         let seed = test_mnemonic().to_seed("");
         let master_xpriv = bip32::Xpriv::new_master(network, &seed).unwrap();
         let keys = SpKeys {
-            fingerprint: (&master_xpriv.fingerprint(&secp)).into(),
-            spend_path: (&spend_path(network, account)).into(),
-            scan: Scan::Path((&scan_path(network, account)).into()),
+            fingerprint: Active::to_ll_fingerprint(&master_xpriv.fingerprint(&secp)),
+            spend_path: Active::to_ll_path(&spend_path(network, account)),
+            scan: Scan::Path(Active::to_ll_path(&scan_path(network, account))),
         };
 
         assert_eq!(
@@ -471,9 +474,9 @@ mod tests {
             chain_code: bip32::ChainCode::from([0; 32]),
         };
         let keys = SpKeys {
-            fingerprint: (&master_xpriv.fingerprint(&secp)).into(),
+            fingerprint: Active::to_ll_fingerprint(&master_xpriv.fingerprint(&secp)),
             spend_path: DerivationPath(vec![]),
-            scan: Scan::Key((&scan_sk).into()),
+            scan: Scan::Key(Active::to_ll_secret_key(&scan_sk)),
         };
 
         let expected = [

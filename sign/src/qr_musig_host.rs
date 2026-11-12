@@ -11,6 +11,13 @@
 
 use std::collections::BTreeMap;
 
+use bipqr::{
+    backend::{Active, Backend},
+    ll::{
+        decode, encode_request, request, response, types, Message, Request as QrRequest,
+        RequestId as QrRequestId, SignResponseKind,
+    },
+};
 use bwk_descriptor::{musig::parse_musig_descriptor, wallet::WalletDescriptor};
 use bwk_musig::{nonce_agg, partial_verify, rust_bitcoin::RustBitcoin};
 use bwk_persist::{storage::Store, PersistError};
@@ -20,10 +27,6 @@ use bwk_psbt::{
         set_musig_input_partial_sig, set_musig_input_pub_nonce, MusigPartialSig, MusigPubNonce,
     },
     nonce_cache::{nonce_cache_session, set_nonce_cache_session, NonceCacheSession},
-};
-use bwk_qr_protocol::{
-    decode, encode_request, request, response, types, Message, Request as QrRequest,
-    RequestId as QrRequestId, SignResponseKind,
 };
 use miniscript::bitcoin::{
     bip32::{ChildNumber, DerivationPath, Fingerprint},
@@ -67,7 +70,7 @@ pub enum Error {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Issuance {
     pub path: DerivationPath,
-    pub max_inputs: u8,
+    pub max_inputs: u32,
     pub start: u32,
     pub end: u32,
 }
@@ -306,6 +309,7 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigHostRecord>> QrMusigHos
             descriptors,
             psbt: psbt.serialize(),
             want_kind,
+            accept_trimmed: false,
         });
         self.publish(record.signer, Some(session_id), id, body)
     }
@@ -338,6 +342,7 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigHostRecord>> QrMusigHos
             descriptors,
             psbt: psbt.serialize(),
             want_kind,
+            accept_trimmed: false,
         });
         self.publish(signer, None, id, body)
     }
@@ -487,32 +492,25 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigHostRecord>> QrMusigHos
         preparation: &request::PrepareNonces,
         prepared: response::NoncesPrepared,
     ) -> Result<QrMusigHostResponse, Error> {
-        prepared
-            .validate()
-            .map_err(|_| Error::Invalid("invalid prepared response"))?;
-        if prepared.session_id != preparation.session_id
-            || prepared.max_inputs != preparation.max_inputs
-            || prepared.start != preparation.start
-            || prepared.end != preparation.end
-        {
+        let session_id = preparation
+            .session_id
+            .ok_or(Error::Invalid("preparation without a session id"))?;
+        let end = preparation.end.unwrap_or(preparation.start);
+        let expected = (u64::from(end - preparation.start) + 1) * u64::from(preparation.max_inputs);
+        if prepared.nonces.len() as u64 != expected {
             return Err(Error::Invalid(
-                "prepared response does not echo the request",
+                "prepared nonce count does not match the request",
             ));
         }
-        let mut record = self.existing(&preparation.session_id)?;
-        if record
-            .session_ref
-            .is_some_and(|session_ref| session_ref != prepared.session_ref)
-        {
-            return Err(Error::Invalid("session reference changed"));
-        }
-        let path = DerivationPath::from(&preparation.derivation_path);
-        let max_inputs = u32::from(prepared.max_inputs);
+        let mut record = self.existing(&session_id)?;
+        let session_ref = prepared_session_ref(session_id, &record, prepared.session)?;
+        let path = Active::from_ll_path(&preparation.derivation_path);
+        let max_inputs = preparation.max_inputs;
         for (entry, nonce) in (0..).zip(&prepared.nonces) {
             validate_nonce(nonce)?;
             let position = NoncePosition {
                 path: path.clone(),
-                key_expression_index: prepared.start + entry / max_inputs,
+                key_expression_index: preparation.start + entry / max_inputs,
                 input_index: entry % max_inputs,
             };
             if record
@@ -523,9 +521,9 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigHostRecord>> QrMusigHos
                 return Err(Error::Invalid("issued nonce changed"));
             }
         }
-        record.session_ref = Some(prepared.session_ref);
+        record.session_ref = Some(session_ref);
         self.store
-            .insert(preparation.session_id, record)
+            .insert(session_id, record)
             .map_err(Error::Store)?;
         Ok(QrMusigHostResponse::Prepared(prepared))
     }
@@ -571,6 +569,26 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigHostRecord>> QrMusigHos
                 Ok(QrMusigHostResponse::PubNonces(returned))
             }
         }
+    }
+}
+
+/// The reference of the session a Nonce Preparation answer comes from: the one the
+/// signer announces when it initialized `session_id`, else the one already held.
+fn prepared_session_ref(
+    session_id: [u8; SESSION_ID_LEN],
+    record: &QrMusigHostRecord,
+    session: Option<response::Session>,
+) -> Result<[u8; SESSION_ID_LEN], Error> {
+    match (session, record.session_ref) {
+        (Some(session), _) if session.session_id != session_id => {
+            Err(Error::Invalid("prepared response names another session"))
+        }
+        (Some(session), Some(held)) if session.session_ref != held => {
+            Err(Error::Invalid("session reference changed"))
+        }
+        (Some(session), _) => Ok(session.session_ref),
+        (None, Some(held)) => Ok(held),
+        (None, None) => Err(Error::Invalid("prepared response initialized no session")),
     }
 }
 
@@ -706,12 +724,13 @@ fn prepare_body(
     issuance: Issuance,
 ) -> request::Body {
     request::Body::PrepareNonces(request::PrepareNonces {
-        session_id,
+        session_id: Some(session_id),
         session_ref,
+        descriptor: None,
         max_inputs: issuance.max_inputs,
-        derivation_path: (&issuance.path).into(),
+        derivation_path: Active::to_ll_path(&issuance.path),
         start: issuance.start,
-        end: issuance.end,
+        end: Some(issuance.end),
     })
 }
 

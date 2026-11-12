@@ -1,5 +1,5 @@
 #[cfg(feature = "protocol")]
-use crate::protocol::{decode, encode};
+use crate::protocol::ll::{decode, encode};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {

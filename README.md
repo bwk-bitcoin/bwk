@@ -61,7 +61,6 @@ Blindbit).
 | bwk-hwi         | Hardware wallet transport and device drivers          |
 | bwk-error       | In-house error derive, reached as `thiserror`         |
 | bwk-qr          | QR generation, scanning, BBQR framing                 |
-| bwk-qr-protocol | Signing-flow message codec (no_std, C binding)        |
 | bwk-backoff     | Exponential backoff                                   |
 | bwk-utils       | Test helpers                                          |
 +-----------------+-------------------------------------------------------+
@@ -82,7 +81,6 @@ See crate READMEs:
 [bwk-hwi](hwi/README.md),
 [bwk-error](error/README.md),
 [bwk-qr](qr/README.md),
-[bwk-qr-protocol](qr-protocol/README.md),
 [bwk-backoff](backoff/README.md),
 [bwk-utils](utils/README.md)
 

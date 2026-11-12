@@ -34,16 +34,19 @@ impl Encoder {
     }
 
     #[cfg(feature = "protocol")]
-    pub fn encode_request(&self, request: &crate::protocol::Request) -> Result<Vec<Image>, Error> {
-        self.encode_bytes(&crate::protocol::encode_request(request)?)
+    pub fn encode_request(
+        &self,
+        request: &crate::protocol::ll::Request,
+    ) -> Result<Vec<Image>, Error> {
+        self.encode_bytes(&crate::protocol::ll::encode_request(request)?)
     }
 
     #[cfg(feature = "protocol")]
     pub fn encode_response(
         &self,
-        response: &crate::protocol::Response,
+        response: &crate::protocol::ll::Response,
     ) -> Result<Vec<Image>, Error> {
-        self.encode_bytes(&crate::protocol::encode_response(response)?)
+        self.encode_bytes(&crate::protocol::ll::encode_response(response)?)
     }
 
     /// Splits any payload into BBQR generic-binary parts, one frame each.

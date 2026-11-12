@@ -63,8 +63,7 @@ tests locally. Commit messages must be single-line and follow existing style
 | bwk-persist     | KV persistence: Store, RamStore, JSON/SQLite backends       |
 | bwk-hwi         | Hardware wallet transport and device drivers                |
 | bwk-error       | In-house derive for error impls, reached as `thiserror`     |
-| bwk-qr          | QR generation, scanning, BBQR framing                       |
-| bwk-qr-protocol | Signing-flow message codec (no_std, no deps, C binding)     |
+| bwk-qr          | QR generation, scanning, BBQR framing, bipqr messages       |
 | bwk-backoff     | Exponential backoff utility                                 |
 | bwk-utils       | Test helpers (behind `test` feature)                        |
 +-----------------+-------------------------------------------------------------+
@@ -190,5 +189,7 @@ Electrum integration, all through `bwk_utils::test::regtest`. Tests in
 
 - `spdk-core`, `spdk-wallet`, `backend-blindbit-v1`: optional comparison
   benchmark dependencies only (`bwk-sp/bench-spdk`)
+- `bipqr`: QR signing protocol codec (git, pinned by rev), used by bwk-qr,
+  bwk-sign (`musig`) and bwk-sp's tests
 - `miniscript`: Descriptor parsing and script generation
 - `bitcoin`: Bitcoin primitives (v0.32)

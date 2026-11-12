@@ -10,6 +10,15 @@
 
 use std::{collections::BTreeSet, str::FromStr};
 
+use bipqr::{
+    backend::{Active, Backend},
+    ll::{
+        decode, encode_response,
+        request::{self, DescriptorBody, PrepareNonces, RegisterDescriptor, Sign},
+        response::{self, NoncesPrepared, Registration, Session, Signed},
+        Message, Request as QrRequest, Response as QrResponse,
+    },
+};
 use bwk_descriptor::{
     descriptor::Descriptor,
     musig::{musig_descriptor_to_string, parse_musig_descriptor},
@@ -20,12 +29,7 @@ use bwk_psbt::{
     nonce_cache::{nonce_cache_session, nonce_cache_session_v2, NonceCacheSession},
     PsbtV2,
 };
-use bwk_qr_protocol::{
-    request::{self, DescriptorBody, PrepareNonces, RegisterDescriptor, Sign},
-    response::{self, NoncesPrepared, Registration, Signed},
-    Message, Request as QrRequest, Response as QrResponse,
-};
-use miniscript::bitcoin::{bip32::DerivationPath, Psbt};
+use miniscript::bitcoin::Psbt;
 
 use crate::{
     error::Error as SignError,
@@ -37,6 +41,13 @@ use crate::{
 
 /// The most sessions the peer keeps: storing one more evicts the oldest.
 pub const MAX_SESSIONS: usize = 16;
+/// The most key expression indexes one Nonce Preparation covers, the
+/// `MAX_NONCE_EXPRESSIONS` of bwk-qr-protocol's ENCODING.md at 90bd84f, a bound
+/// bipqr leaves to the signer.
+pub const MAX_NONCE_EXPRESSIONS: u32 = 16;
+/// The most inputs one Nonce Preparation covers, the bound of the one-byte
+/// `MAX_INPUTS` of bwk-qr-protocol's ENCODING.md at 90bd84f.
+pub const MAX_NONCE_INPUTS: u32 = u8::MAX as u32;
 const SEQUENCE_LEN: usize = 8;
 const RECORD_LEN: usize = SEQUENCE_LEN + SECRET_LEN;
 const TWO_ROUND_SESSION_TAG: &[u8] = b"bwk/qr-musig/two-round-session";
@@ -112,27 +123,34 @@ where
         };
         Ok(Registration {
             descriptor_alias: alias,
-            registered: Some(registered),
+            registered,
             stored: Some(registered),
             proof: None,
         })
     }
 
     /// Issues the nonces of the session holding `session_id`, creating it when
-    /// absent and the request carries no reference. The session is durable before
-    /// the nonces are returned.
+    /// absent and the request carries no reference, under a random `session_id`
+    /// when the request names none. The session is durable before the nonces are
+    /// returned.
     pub fn prepare(&mut self, request: PrepareNonces) -> Result<NoncesPrepared, Error> {
         request
             .validate()
             .map_err(|error| Error::Request(error.to_string()))?;
-        let secret = self.session(request.session_id, request.session_ref)?;
-        let path = DerivationPath::from(&request.derivation_path);
+        let end = request.end.unwrap_or(request.start);
+        if end - request.start >= MAX_NONCE_EXPRESSIONS || request.max_inputs > MAX_NONCE_INPUTS {
+            return Err(Error::Request(
+                "nonce preparation exceeds the peer's bounds".to_string(),
+            ));
+        }
+        let (secret, session) = self.session(request.session_id, request.session_ref)?;
+        let path = Active::from_ll_path(&request.derivation_path);
         let public_key = self.signer.public_key_at(&path).serialize();
         let mut sk = self.signer.private_key_at(&path);
         let mut secret_key = sk.secret_bytes();
         sk.non_secure_erase();
-        let nonces = (request.start..=request.end)
-            .flat_map(|j| (0..u32::from(request.max_inputs)).map(move |i| (i, j)))
+        let nonces = (request.start..=end)
+            .flat_map(|j| (0..request.max_inputs).map(move |i| (i, j)))
             .map(|(i, j)| {
                 let (_, pubnonce) = secret.nonce(i, j, &secret_key, &public_key)?;
                 Ok(pubnonce)
@@ -142,28 +160,45 @@ where
         let nonces = nonces?;
         // Also retries a flush an earlier call failed.
         self.store.flush()?;
-        Ok(NoncesPrepared {
-            session_id: request.session_id,
-            session_ref: secret.session_ref(),
-            max_inputs: request.max_inputs,
-            start: request.start,
-            end: request.end,
-            nonces,
-        })
+        Ok(NoncesPrepared { session, nonces })
     }
 
+    /// The secret of the session a Nonce Preparation names, with the session to
+    /// announce when this call created it.
     fn session(
         &mut self,
-        session_id: [u8; SESSION_ID_LEN],
+        session_id: Option<[u8; SESSION_ID_LEN]>,
         session_ref: Option<[u8; SESSION_ID_LEN]>,
-    ) -> Result<SessionSecret, Error> {
+    ) -> Result<(SessionSecret, Option<Session>), Error> {
+        let session_id = match session_id {
+            Some(session_id) => session_id,
+            None => self.new_session_id()?,
+        };
         match (self.store.get(&session_id)?, session_ref) {
-            (Some(record), None) => Ok(record.secret),
+            (Some(record), None) => Ok((record.secret, None)),
             (Some(record), Some(session_ref)) if record.secret.session_ref() == session_ref => {
-                Ok(record.secret)
+                Ok((record.secret, None))
             }
-            (None, None) => self.create_session(session_id),
+            (None, None) => {
+                let secret = self.create_session(session_id)?;
+                let session = Session {
+                    session_id,
+                    session_ref: secret.session_ref(),
+                };
+                Ok((secret, Some(session)))
+            }
             _ => Err(SignError::MusigSession.into()),
+        }
+    }
+
+    /// A random `session_id` no held session uses.
+    fn new_session_id(&self) -> Result<[u8; SESSION_ID_LEN], Error> {
+        loop {
+            let mut session_id = [0; SESSION_ID_LEN];
+            getrandom::getrandom(&mut session_id).map_err(|_| SignError::MusigSession)?;
+            if !self.store.contains_key(&session_id)? {
+                return Ok(session_id);
+            }
         }
     }
 
@@ -363,14 +398,14 @@ where
                 message: "QR MuSig peer requires Raw".to_string(),
             };
         };
-        let inner = match bwk_qr_protocol::decode(&payload) {
+        let inner = match decode(&payload) {
             Ok(Message::Request(inner)) => inner,
             Ok(Message::Response(_)) => {
                 return Response::error(request, signer, "expected QR request");
             }
             Err(error) => return Response::error(request, signer, format!("{error:?}")),
         };
-        match bwk_qr_protocol::encode_response(&self.handle(inner)) {
+        match encode_response(&self.handle(inner)) {
             Ok(payload) => Response::Raw {
                 request,
                 signer,

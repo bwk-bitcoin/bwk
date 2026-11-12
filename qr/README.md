@@ -8,12 +8,12 @@ Two layers sit on top of each other and are usable on their own:
 - QR primitives: render a payload into a grayscale raster, read the codes back
   out of a camera frame. Pure Rust, no `unsafe`, no vendored C, no build script.
 - The signing-flow protocol: the binary codec from
-  [`bwk-qr-protocol`](../qr-protocol/README.md), chunked across animated frames
-  with BBQR generic-binary framing.
-  [ENCODING.md](../qr-protocol/ENCODING.md) is the authoritative wire format.
+  [`bipqr`](https://github.com/pythcoiner/bipqr), chunked across animated frames
+  with BBQR generic-binary framing. Its ENCODING.md is the authoritative wire
+  format.
 
-The codec is its own crate so a bare-metal signer can take it without the QR
-layer; `bwk-qr` is the QR and framing layer on top.
+The codec lives in its own repository so a bare-metal signer can take it without
+the QR layer; `bwk-qr` is the QR and framing layer on top.
 
 Features, all on by default:
 
@@ -24,8 +24,9 @@ Features, all on by default:
   payload: `Encoder::encode_bytes` splits bytes into frames, and
   `Decoder::process_raw` joins them back into `Decoded::Bytes`, undecoded.
 - `protocol` implies `bbqr`, and decodes the joined payloads as the signing-flow
-  codec, which lives in `bwk-qr-protocol`. It turns on that crate's `bitcoin`
-  feature, for the adapters between its byte-level types and the `bitcoin` ones.
+  codec, which lives in `bipqr` and is re-exported as `protocol`: the codec under
+  `protocol::ll`, and with its `bitcoin_0_32` feature on, `protocol::backend`
+  converts between its byte-level types and the `bitcoin` ones.
 
 `Encoder`, `Decoder`, `Config` and `Image` are the whole public surface;
 generation and scanning are crate-internal helpers. `Image` is an 8-bit
@@ -50,4 +51,4 @@ qr/src/
 ```
 
 The Rust API returns `Result` and `Option`. FFI consumers should translate those
-types at their own boundary; `bwk-qr-protocol` ships a C binding for the codec.
+types at their own boundary; `bipqr-ll` ships a C binding for the codec.

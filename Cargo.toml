@@ -10,7 +10,7 @@ members = [
     "error",
     "coin",
     "keys", "utils", "sign", "descriptor", "tx",
-    "qr", "qr-protocol",
+    "qr",
     "persist",
     "p2p",
     "mitm",
@@ -64,6 +64,7 @@ trybuild = "1.0"
 qrcodegen = "=1.8.0"
 quircs = "=0.10.3"
 bbqr = { path = "bbqr" }
+bipqr = { git = "https://github.com/pythcoiner/bipqr", rev = "f0aa297152b36b95a5ae850b90fc8b341bd1240a", default-features = false }
 
 # spdk dependencies
 secp256k1_spscan-sys = { path = "secp256k1_spscan-sys" }
@@ -90,7 +91,6 @@ bwk-persist = { path = "persist" }
 bwk-utils = { path = "utils" }
 bwk-p2p = { path = "p2p" }
 bwk-qr = { path = "qr" }
-bwk-qr-protocol = { path = "qr-protocol" }
 bwk-psbt = { path = "psbt" }
 bwk-musig = { path = "musig", default-features = false }
 bwk-bup = { path = "bup" }
