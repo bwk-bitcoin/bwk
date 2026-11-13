@@ -603,7 +603,13 @@ fn require_capability(capabilities: response::Capabilities, flag: u32) -> Result
 /// signatures, MuSig2 public nonces as 0x1b and partial signatures as 0x1c. A
 /// public nonce entry must not change a 0x1b already there. Silent payment entries are refused (the host sends no
 /// silent payment output), and entries of an unknown kind are skipped.
-fn merge_signatures(mut psbt: Psbt, entries: &[response::SignatureEntry]) -> Result<Psbt, Error> {
+///
+/// Public for the hosts that send a Signing request outside a nonce cache session;
+/// it checks no signature, the caller verifies what it merges.
+pub fn merge_signatures(
+    mut psbt: Psbt,
+    entries: &[response::SignatureEntry],
+) -> Result<Psbt, Error> {
     for entry in entries {
         match entry {
             response::SignatureEntry::Unknown { .. } => {}
