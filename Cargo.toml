@@ -64,7 +64,7 @@ trybuild = "1.0"
 qrcodegen = "=1.8.0"
 quircs = "=0.10.3"
 bbqr = { path = "bbqr" }
-bipqr = { git = "https://github.com/pythcoiner/bipqr", rev = "f0aa297152b36b95a5ae850b90fc8b341bd1240a", default-features = false }
+bipqr = { git = "https://github.com/pythcoiner/bipqr", rev = "d1a09b4bd33777a813af8c80e5720b91824b6c5f", default-features = false }
 
 # spdk dependencies
 secp256k1_spscan-sys = { path = "secp256k1_spscan-sys" }
