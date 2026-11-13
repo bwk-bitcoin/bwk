@@ -27,11 +27,18 @@ use bwk_psbt::{
         set_musig_input_partial_sig, set_musig_input_pub_nonce, MusigPartialSig, MusigPubNonce,
     },
     nonce_cache::{nonce_cache_session, set_nonce_cache_session, NonceCacheSession},
+    sp::{
+        set_sp_global_dleq_v2, set_sp_global_ecdh_share_v2, set_sp_input_dleq,
+        set_sp_input_ecdh_share, sp_global_dleq_v2, sp_global_ecdh_share_v2, sp_input_dleq,
+        sp_input_ecdh_share,
+    },
+    PsbtV2,
 };
 use miniscript::bitcoin::{
     bip32::{ChildNumber, DerivationPath, Fingerprint},
     ecdsa,
     hashes::Hash,
+    psbt,
     secp256k1::{PublicKey, XOnlyPublicKey},
     taproot::{self, TapLeafHash},
     Psbt,
@@ -617,20 +624,124 @@ pub fn merge_signatures(
             | response::SignatureEntry::SpDleqProof { .. } => {
                 return Err(Error::Invalid("unexpected silent payment entry"));
             }
-            _ => merge_signature(&mut psbt, entry)?,
+            _ => merge_signature(input_of(&mut psbt.inputs, entry)?, entry)?,
         }
     }
     Ok(psbt)
 }
 
-fn merge_signature(psbt: &mut Psbt, entry: &response::SignatureEntry) -> Result<(), Error> {
-    let index = entry
+/// `merge_signatures` into a v2 PSBT, which also takes the silent payment entries: an
+/// ECDH share and a DLEQ proof are written as their BIP-375 global or per-input field.
+/// An entry must not change a share or proof already there. It checks no signature,
+/// share or proof, the caller verifies what it merges.
+pub fn merge_signatures_v2(
+    mut psbt: PsbtV2,
+    entries: &[response::SignatureEntry],
+) -> Result<PsbtV2, Error> {
+    for entry in entries {
+        match entry {
+            response::SignatureEntry::Unknown { .. } => {}
+            response::SignatureEntry::SpEcdhShare {
+                scope,
+                scan_key,
+                share,
+            } => merge_ecdh_share(&mut psbt, *scope, key(scan_key)?, key(share)?)?,
+            response::SignatureEntry::SpDleqProof {
+                scope,
+                scan_key,
+                proof,
+            } => merge_dleq_proof(&mut psbt, *scope, key(scan_key)?, *proof)?,
+            _ => {
+                let index = signed_input(entry)?;
+                let input = psbt
+                    .inputs
+                    .get_mut(index)
+                    .ok_or(Error::Invalid("signature for an unknown input"))?;
+                merge_signature(&mut input.psbt, entry)?;
+            }
+        }
+    }
+    Ok(psbt)
+}
+
+fn merge_ecdh_share(
+    psbt: &mut PsbtV2,
+    scope: response::SpScope,
+    scan: PublicKey,
+    share: PublicKey,
+) -> Result<(), Error> {
+    let invalid = |_| Error::Invalid("invalid ECDH share field");
+    let placed = match scope {
+        response::SpScope::Global => sp_global_ecdh_share_v2(psbt, scan).map_err(invalid)?,
+        response::SpScope::Input(index) => {
+            sp_input_ecdh_share(&sp_input(psbt, index)?.psbt, scan).map_err(invalid)?
+        }
+    };
+    match placed {
+        Some(placed) if placed != share => Err(Error::Invalid("returned ECDH share changed")),
+        Some(_) => Ok(()),
+        None => {
+            match scope {
+                response::SpScope::Global => set_sp_global_ecdh_share_v2(psbt, scan, share),
+                response::SpScope::Input(index) => {
+                    set_sp_input_ecdh_share(&mut sp_input(psbt, index)?.psbt, scan, share)
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn merge_dleq_proof(
+    psbt: &mut PsbtV2,
+    scope: response::SpScope,
+    scan: PublicKey,
+    proof: [u8; types::DLEQ_PROOF_LEN],
+) -> Result<(), Error> {
+    let invalid = |_| Error::Invalid("invalid DLEQ proof field");
+    let placed = match scope {
+        response::SpScope::Global => sp_global_dleq_v2(psbt, scan).map_err(invalid)?,
+        response::SpScope::Input(index) => {
+            sp_input_dleq(&sp_input(psbt, index)?.psbt, scan).map_err(invalid)?
+        }
+    };
+    match placed {
+        Some(placed) if placed != proof => Err(Error::Invalid("returned DLEQ proof changed")),
+        Some(_) => Ok(()),
+        None => {
+            match scope {
+                response::SpScope::Global => set_sp_global_dleq_v2(psbt, scan, proof),
+                response::SpScope::Input(index) => {
+                    set_sp_input_dleq(&mut sp_input(psbt, index)?.psbt, scan, proof)
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn sp_input(psbt: &mut PsbtV2, index: u32) -> Result<&mut bwk_psbt::Input, Error> {
+    psbt.inputs
+        .get_mut(index as usize)
+        .ok_or(Error::Invalid("silent payment entry for an unknown input"))
+}
+
+fn signed_input(entry: &response::SignatureEntry) -> Result<usize, Error> {
+    Ok(entry
         .input_index()
-        .ok_or(Error::Invalid("unexpected global entry"))? as usize;
-    let input = psbt
-        .inputs
-        .get_mut(index)
-        .ok_or(Error::Invalid("signature for an unknown input"))?;
+        .ok_or(Error::Invalid("unexpected global entry"))? as usize)
+}
+
+fn input_of<'a>(
+    inputs: &'a mut [psbt::Input],
+    entry: &response::SignatureEntry,
+) -> Result<&'a mut psbt::Input, Error> {
+    inputs
+        .get_mut(signed_input(entry)?)
+        .ok_or(Error::Invalid("signature for an unknown input"))
+}
+
+fn merge_signature(input: &mut psbt::Input, entry: &response::SignatureEntry) -> Result<(), Error> {
     match entry {
         response::SignatureEntry::Ecdsa {
             public_key,

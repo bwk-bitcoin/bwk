@@ -749,3 +749,91 @@ fn placed_nonce_matches_the_device_nonce_for_the_slot() {
         Some(expected)
     );
 }
+
+#[test]
+fn v2_merge_writes_silent_payment_entries_as_bip375_fields() {
+    use bwk_psbt::{
+        musig::musig_input_partial_sigs,
+        sp::{sp_global_ecdh_share_v2, sp_input_dleq},
+        PsbtV2,
+    };
+    use miniscript::bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+
+    use crate::qr_musig_host::{merge_signatures, merge_signatures_v2};
+
+    let secp = Secp256k1::new();
+    let point =
+        |byte| PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[byte; 32]).unwrap());
+    let wire = |key: PublicKey| bipqr::ll::types::PublicKey(key.serialize());
+    let tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn::default()],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::new(),
+        }],
+    };
+    let v0 = Psbt::from_unsigned_tx(tx).unwrap();
+    let v2 = PsbtV2::from_bitcoin_psbt(v0.clone()).unwrap();
+    let (scan, share) = (point(1), point(2));
+    let entries = vec![
+        response::SignatureEntry::SpEcdhShare {
+            scope: response::SpScope::Global,
+            scan_key: wire(scan),
+            share: wire(share),
+        },
+        response::SignatureEntry::SpDleqProof {
+            scope: response::SpScope::Input(0),
+            scan_key: wire(scan),
+            proof: [9; 64],
+        },
+        response::SignatureEntry::MusigPartialSig {
+            input_index: 0,
+            participant: wire(point(3)),
+            aggregate: wire(point(4)),
+            leaf_hash: None,
+            signature: [5; 32],
+        },
+    ];
+
+    let merged = merge_signatures_v2(v2.clone(), &entries).unwrap();
+    assert_eq!(sp_global_ecdh_share_v2(&merged, scan).unwrap(), Some(share));
+    assert_eq!(
+        sp_input_dleq(&merged.inputs[0].psbt, scan).unwrap(),
+        Some([9; 64])
+    );
+    assert_eq!(
+        musig_input_partial_sigs(&merged.inputs[0].psbt)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        merge_signatures_v2(merged.clone(), &entries).is_ok(),
+        "the same entries merge again"
+    );
+
+    let changed = vec![response::SignatureEntry::SpEcdhShare {
+        scope: response::SpScope::Global,
+        scan_key: wire(scan),
+        share: wire(point(6)),
+    }];
+    assert!(
+        matches!(
+            merge_signatures_v2(merged, &changed),
+            Err(Error::Invalid(_))
+        ),
+        "a share already there must not change"
+    );
+    let unknown_input = vec![response::SignatureEntry::SpDleqProof {
+        scope: response::SpScope::Input(3),
+        scan_key: wire(scan),
+        proof: [9; 64],
+    }];
+    assert!(merge_signatures_v2(v2, &unknown_input).is_err());
+    assert!(
+        merge_signatures(v0, &entries).is_err(),
+        "a v0 PSBT has no silent payment fields"
+    );
+}
