@@ -1,6 +1,7 @@
 /* Byte-only FFI shim for the SP scan kernels. */
 
 #include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 
 #include "secp256k1.h"
@@ -49,27 +50,45 @@ int secp256k1_spscan_scan_spend_points(
     size_t n_spend_points
 ) {
     secp256k1_pubkey tweak;
-    secp256k1_pubkey spend_points[64];
-    secp256k1_xonly_pubkey candidates[64];
+    secp256k1_pubkey *spend_points = NULL;
+    secp256k1_xonly_pubkey *candidates = NULL;
     size_t n_candidates = n_spend_points;
+    int ret = 0;
 
-    if (n_spend_points == 0 || n_spend_points > 64) {
+    if (n_spend_points == 0) {
         return 0;
     }
     if (!secp256k1_ec_pubkey_parse(ctx, &tweak, tweak33, 33)) {
         return 0;
     }
-    if (!spscan_parse_pubkeys(ctx, spend_points, spend_points33, n_spend_points)) {
+    if (n_spend_points > SIZE_MAX / sizeof(*spend_points) ||
+        n_spend_points > SIZE_MAX / sizeof(*candidates)) {
         return 0;
+    }
+    spend_points = malloc(n_spend_points * sizeof(*spend_points));
+    candidates = malloc(n_spend_points * sizeof(*candidates));
+    if (spend_points == NULL || candidates == NULL) {
+        goto done;
+    }
+    if (!spscan_parse_pubkeys(ctx, spend_points, spend_points33, n_spend_points)) {
+        goto done;
     }
     if (!secp256k1_silentpayments_recipient_scan_lightclient_spend_points(
             ctx, candidates, &n_candidates, &tweak, scan_key32,
             spend_points, n_spend_points)) {
-        return 0;
+        goto done;
+    }
+    if (n_candidates != n_spend_points) {
+        goto done;
     }
     spscan_serialize_xonly(ctx, out_xonly32, candidates, n_candidates);
     *n_out = n_candidates;
-    return 1;
+    ret = 1;
+
+done:
+    free(spend_points);
+    free(candidates);
+    return ret;
 }
 
 /* Batch entry. Parses n_tweaks tweaks and n_spend_points spend points, runs the
@@ -96,8 +115,16 @@ int secp256k1_spscan_scan_spend_points_batch(
         return 1;
     }
 
+    if (n_tweaks > SIZE_MAX / n_spend_points) {
+        goto done;
+    }
     total = n_tweaks * n_spend_points;
     n_candidates = total;
+    if (n_tweaks > SIZE_MAX / sizeof(*tweaks) ||
+        n_spend_points > SIZE_MAX / sizeof(*spend_points) ||
+        total > SIZE_MAX / sizeof(*candidates)) {
+        goto done;
+    }
     tweaks = malloc(n_tweaks * sizeof(*tweaks));
     spend_points = malloc(n_spend_points * sizeof(*spend_points));
     candidates = malloc(total * sizeof(*candidates));
@@ -114,6 +141,9 @@ int secp256k1_spscan_scan_spend_points_batch(
     if (!secp256k1_silentpayments_recipient_scan_lightclient_spend_points_batch(
             ctx, candidates, &n_candidates, tweaks, n_tweaks, scan_key32,
             spend_points, n_spend_points)) {
+        goto done;
+    }
+    if (n_candidates != total) {
         goto done;
     }
     spscan_serialize_xonly(ctx, out_xonly32, candidates, n_candidates);

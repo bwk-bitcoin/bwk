@@ -17,6 +17,7 @@ rand.workspace = true
 bwk-coin.workspace = true
 thiserror.workspace = true
 bwk-descriptor.workspace = true
+bwk-psbt.workspace = true
 
 # Features dependencies
 bwk-sign.workspace = true
@@ -27,3 +28,4 @@ bwk-utils.optional = true
 [features]
 default = []
 test = ["dep:bwk-sign", "dep:bwk-utils", "bwk-utils/test", "bwk-coin/test"]
+musig = ["bwk-descriptor/musig", "bwk-psbt/musig"]

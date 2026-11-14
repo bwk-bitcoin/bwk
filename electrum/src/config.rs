@@ -6,16 +6,23 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use miniscript::{Descriptor, DescriptorPublicKey};
 use serde::{Deserialize, Serialize};
 
-use bwk_descriptor::{derivator, descriptor::DescriptorDerivator};
+use bwk_descriptor::{
+    descriptor::{Descriptor, DescriptorDerivator},
+    wallet::WalletDescriptor,
+};
 use bwk_persist::{backend::PersistenceBackend, PersistError, PersistenceKind};
 
-use crate::{checkpoint::Checkpoint, raw_client::CertificateCheck};
+use crate::{
+    checkpoint::Checkpoint,
+    open,
+    persistence::{BackendFactory, BackendIdentity, BackendKind},
+    raw_client::CertificateCheck,
+};
 
 /// Filename for the binary header cache under [`ScannerConfig::account_dir`].
-/// Headers are always binary-backed, independent of `persistence`.
+/// Used by native persistence; caller-owned backends choose their own layout.
 pub const HEADERS_FILENAME: &str = "headers.bin";
 
 /// Unused addresses watched past the generated tip, for a caller with no
@@ -145,9 +152,14 @@ pub struct ScannerConfig {
     pub header_checkpoint: Option<Checkpoint>,
     pub network: miniscript::bitcoin::Network,
     pub look_ahead: u32,
-    pub descriptor: Descriptor<DescriptorPublicKey>,
+    pub descriptor: Descriptor,
     /// Which backend keeps this account's data, `None` for in-memory only.
     pub persistence: Option<PersistenceKind>,
+    /// Overrides native persistence, even when `persistence` is `None`.
+    #[serde(skip)]
+    pub backend_factory: Option<Arc<dyn BackendFactory>>,
+    #[serde(default, skip_serializing_if = "BackendKind::is_wallet")]
+    pub backend_kind: BackendKind,
 }
 
 impl ScannerConfig {
@@ -155,7 +167,7 @@ impl ScannerConfig {
     /// caller has no opinion on: online, no server pinned, header scanner on,
     /// [`DEFAULT_LOOK_AHEAD`] addresses of look-ahead.
     pub fn new(
-        descriptor: Descriptor<DescriptorPublicKey>,
+        descriptor: Descriptor,
         data_dir: PathBuf,
         dir_name: String,
         account: String,
@@ -174,22 +186,41 @@ impl ScannerConfig {
             look_ahead: DEFAULT_LOOK_AHEAD,
             descriptor,
             persistence,
+            backend_factory: None,
+            backend_kind: BackendKind::Wallet,
         }
     }
 
-    /// Check the descriptor is one the scan can derive from: multipath,
-    /// unhardened, wildcarded and on `network`. Callers run it before opening
-    /// any store, so a descriptor the derivator rejects errors out instead of
-    /// panicking once the coin store is built.
-    pub fn validate_descriptor(&self) -> Result<(), derivator::Error> {
-        self.descriptor.spk_derivator(self.network).map(|_| ())
+    /// The miniscript descriptor, `None` when `descriptor` is `sp()`.
+    pub fn miniscript_descriptor(&self) -> Option<&WalletDescriptor> {
+        self.descriptor.as_miniscript()
     }
 
-    /// Open the persistence backend this config selects, rooted at
-    /// [`ScannerConfig::account_dir`]. `NoopBackend` when `persistence` is
-    /// `None`.
+    /// Check the descriptor is one the scan can derive from: a miniscript
+    /// descriptor, not `sp()`, multipath, unhardened, wildcarded and on
+    /// `network`. Callers run it before opening any store, so a descriptor the
+    /// derivator rejects errors out instead of panicking once the coin store is
+    /// built.
+    pub fn validate_descriptor(&self) -> Result<(), open::Error> {
+        let descriptor = self
+            .miniscript_descriptor()
+            .ok_or(open::Error::SpDescriptor)?;
+        descriptor.spk_derivator(self.network)?;
+        Ok(())
+    }
+
+    /// Open caller-owned persistence when a factory is supplied. Otherwise use
+    /// the native backend at [`ScannerConfig::account_dir`], or `NoopBackend`
+    /// when `persistence` is `None`.
     pub fn build_backend(&self) -> Result<Arc<dyn PersistenceBackend>, PersistError> {
-        bwk_persist::build_backend(self.persistence, self.account_dir())
+        match &self.backend_factory {
+            Some(factory) => factory.open(&BackendIdentity {
+                account: self.account.clone(),
+                network: self.network,
+                kind: self.backend_kind,
+            }),
+            None => bwk_persist::build_backend(self.persistence, self.account_dir()),
+        }
     }
 
     pub fn set_stay_offline(&mut self, stay_offline: bool) {
@@ -250,7 +281,7 @@ mod tests {
         let signer = HotSigner::new_from_mnemonics(Network::Regtest, &mnemo.to_string()).unwrap();
         let xpub = signer.xpub(&DerivationPath::from_str("m/84'/0'/0'/1").unwrap());
         ScannerConfig::new(
-            wpkh(xpub),
+            wpkh(xpub).into(),
             PathBuf::default(),
             String::new(),
             "test".into(),

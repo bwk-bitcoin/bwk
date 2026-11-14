@@ -1,5 +1,5 @@
 use crate::{
-    client::PING_INTERVAL,
+    client::{PING_INTERVAL, PING_TIMEOUT},
     electrum::{request::Request, response::Response},
     raw_client,
 };
@@ -40,7 +40,8 @@ pub(super) enum Flow {
 /// it emits the error once and returns instead of looping and re-emitting.
 /// Recovery is the consumer's responsibility (e.g. `HeaderStore::restart()`).
 /// The connection is pinged every [`PING_INTERVAL`]; pongs never reach the
-/// consumer.
+/// consumer. A ping with no answer within [`PING_TIMEOUT`] ends the listener as
+/// a drop does, reporting [`raw_client::Error::Disconnected`].
 pub(super) fn run_listener<RQ, RS, Req, S>(
     mut client: Client,
     send: mpsc::Sender<RS>,
@@ -61,9 +62,17 @@ pub(super) fn run_listener<RQ, RS, Req, S>(
     let mut backoff = Backoff::new_ms(50);
     let mut inbox: VecDeque<Req> = VecDeque::new();
     let mut last_ping = Instant::now();
+    // When the ping awaiting an answer went out. Any response clears it: a
+    // pong queued behind a long batch still proves the connection alive.
+    let mut ping_sent: Option<Instant> = None;
 
     loop {
         let mut received = false;
+
+        if ping_sent.is_some_and(|sent| sent.elapsed() >= PING_TIMEOUT) {
+            let _ = send.send(transport_err(raw_client::Error::Disconnected));
+            return;
+        }
 
         if last_ping.elapsed() >= PING_INTERVAL {
             let mut ping = Request::ping();
@@ -73,6 +82,7 @@ pub(super) fn run_listener<RQ, RS, Req, S>(
                 return;
             }
             last_ping = Instant::now();
+            ping_sent.get_or_insert(last_ping);
         }
 
         // A pending batch unanswered too long means electrs likely dropped a
@@ -111,6 +121,7 @@ pub(super) fn run_listener<RQ, RS, Req, S>(
 
         match client.inner.try_recv(&client.index) {
             Ok(Some(responses)) => {
+                ping_sent = None;
                 if let Some(reqs) = &mut last_request {
                     let answered: BTreeSet<usize> =
                         responses.iter().filter_map(|resp| resp.id()).collect();

@@ -9,13 +9,13 @@
 
 mod common;
 
-use bitcoin::{
-    bip32::DerivationPath, hashes::Hash, Address, Amount, Network, OutPoint, ScriptBuf, Sequence,
-    TxOut,
-};
+use bitcoin::{hashes::Hash, Address, Amount, Network, OutPoint, ScriptBuf, Sequence, TxOut};
 use bwk_coin::{Coin, CoinSpendInfo, CoinStatus, TAPROOT_KEYSPEND_SATISFACTION_WU};
 use bwk_sp::{
-    core::utils::common::{Network as SpNetwork, SilentPaymentAddress},
+    core::{
+        utils::common::{Network as SpNetwork, SilentPaymentAddress},
+        SpVersion,
+    },
     receiver::error::Error as ReceiverError,
 };
 use bwk_tx::template::{TxOutputSpec, TxRequest, TxRequestError};
@@ -118,9 +118,14 @@ fn invalid_address_source(acc: &bwk_sp::account::Account, address: &str) -> Rece
 
 fn sp_address(acc: &bwk_sp::account::Account, network: SpNetwork) -> String {
     let own = acc.sp_address();
-    SilentPaymentAddress::new(own.get_scan_key(), own.get_spend_key(), network, 0)
-        .unwrap()
-        .to_string()
+    SilentPaymentAddress::new(
+        own.get_scan_key(),
+        own.get_spend_key(),
+        network,
+        SpVersion::V0,
+    )
+    .unwrap()
+    .to_string()
 }
 
 #[test]
@@ -218,10 +223,7 @@ fn sp_coin(amount: u64) -> Coin {
         status: CoinStatus::Confirmed,
         label: None,
         satisfaction_size: TAPROOT_KEYSPEND_SATISFACTION_WU,
-        spend_info: CoinSpendInfo::Sp {
-            derivation: DerivationPath::default(),
-            tweak: [0u8; 32],
-        },
+        spend_info: CoinSpendInfo::Sp { tweak: [0u8; 32] },
     }
 }
 

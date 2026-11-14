@@ -25,6 +25,25 @@ pub trait HWI: Debug {
     fn display_address(&self, script: &AddressScript) -> Result<(), Error>;
     /// 7. Sign a partially signed bitcoin transaction (PSBT).
     fn sign_tx(&self, tx: &mut Psbt) -> Result<(), Error>;
+    /// Like 7, for `wallet` (ignored by devices holding their policies).
+    fn sign_tx_with_wallet(&self, tx: &mut Psbt, wallet: &DeviceWallet)
+        -> Result<(), Error>;
+    /// Like 6, for `wallet` (ignored by devices holding their policies).
+    fn display_address_with_wallet(
+        &self,
+        script: &AddressScript,
+        wallet: &DeviceWallet,
+    ) -> Result<(), Error>;
+}
+
+/// A wallet policy as registered on a device, sent with the requests that need it.
+pub struct DeviceWallet {
+    /// Name given at registration (Ledger's HMAC covers it).
+    pub name: String,
+    /// Descriptor with keys inline, as given to `register_wallet`.
+    pub policy: String,
+    /// HMAC returned by `register_wallet` (Ledger), `None` otherwise.
+    pub hmac: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,20 +64,121 @@ A Empty case means the method is unimplemented on the client or device side.
 | BitBox02[^1]         | >= v9.15.0 | >= v9.15.0 | >= v9.15.0 | >= v9.15.0 | >= v9.15.0           | >= v9.15.0 | >= v9.15.0 |
 | Coldcard[^2]         | >= v6.2.1X | >= v6.2.1X | >= v6.2.1X | >= v6.2.1X | >= v6.2.1X           | >= v6.2.1X | >= v6.2.1X |
 | Jade[^3]             | >= v1.0.30 | >= v1.0.30 | >= v1.0.30 | >= v1.0.30 | >= v1.0.30           | >= v1.0.30 | >= v1.0.30 |
-| Ledger Nano S/S+[^4] | >= v2.1.2  | >= v2.1.2  | >= v2.1.2  | >= v2.1.2  | *check hmac presence | >= v2.1.2  | >= v2.1.2  |
+| Ledger Nano S/S+[^4] | >= v2.1.2  | >= v2.1.2  | >= v2.1.2  | >= v2.1.2  | *check hmac presence | >= v2.1.2  | >= v2.1.2[^6] |
 | Specter[^5]          |            | >= v1.8.0  | >= v1.8.0  | >= v1.8.0  |                      |            | >= v1.8.0  |
 
 [^1]: https://github.com/digitalbitbox/bitbox02-firmware
-[^2]: https://github.com/alfred-hodler/rust-coldcard
+[^2]: https://github.com/alfred-hodler/rust-coldcard, vendored as a fork in `hwi/coldcard`:
+    USB HID and the simulator's Unix socket (see [coldcard/README.md](coldcard/README.md)).
 [^3]: https://github.com/Blockstream/Jade
 [^4]: https://github.com/LedgerHQ/app-bitcoin-new
 [^5]: https://github.com/cryptoadvance/specter-diy
+[^6]: The Ledger signs, and shows miniscript addresses, only with the wallet policy and
+    its HMAC: `sign_tx_with_wallet` / `display_address_with_wallet`, or a `Ledger`
+    built with `with_wallet`. Plain `sign_tx` without either is unimplemented.
 
 ## Service Module
 
 The `service` module provides automatic device discovery and management with support
 for multiple concurrent consumers. See [SERVICE.md](SERVICE.md) for detailed
 documentation and usage examples.
+
+## Ledger MuSig2
+
+The `musig` feature (off by default, forwarded by `bwk-sign/musig`) makes the Ledger a
+MuSig2 cosigner: `Ledger::sign_tx` writes what the app yields as BIP-373 fields through
+`bwk_psbt::musig`, keyed by the participant, the aggregate and the leaf hash exactly as
+the device yields them. Without it MuSig2 yields are ignored.
+
+```text
++---------------------------------+---------------------------------------------+
+| yield                           | written to psbt.inputs[i]                   |
++---------------------------------+---------------------------------------------+
+| Partial(Sig(key, sig))          | partial_sigs                                |
+| Partial(TapScriptSig(k,Some,s)) | tap_script_sigs                             |
+| Partial(TapScriptSig(_,None,s)) | tap_key_sig                                 |
+| MusigPubNonce (musig)           | 0x1b via set_musig_input_pub_nonce          |
+| MusigPartialSignature (musig)   | 0x1c via set_musig_input_partial_sig        |
+| MusigPubNonce / PartialSig      | ignored without the musig feature           |
+| Unknown, any other variant      | ignored                                     |
++---------------------------------+---------------------------------------------+
+```
+
+Round rule: the app runs MuSig2 round 2 whenever the PSBT carries any
+`PSBT_IN_MUSIG2_PUB_NONCE`, and round 1 (pubnonces only, no user approval when it signs
+musig keys only) otherwise. The caller sends round 1 with every pubnonce removed
+(`bwk_psbt::musig::remove_musig_input_pub_nonces` on a copy) and merges the device's
+nonces into the shared PSBT, then sends round 2 once every participant's nonce is
+there, with the same unsigned transaction. `sign_tx` does not strip nonces itself. A
+round 1 sent with a cosigner's nonce runs round 2: after the approval the app asks for
+its own missing pubnonce, the client cannot answer, and `sign_tx` fails with
+`Error::Device("Interpreter(\n    UnknownHash,\n)")`.
+
+The PSBT goes to the device as bwk's updater writes it: next to the aggregate's
+`[agg_fp]/<a or a+1>/i` `tap_key_origins` entry, each cosigner's own
+`[fp/87'/1'/0'/R]` entry. App 2.4.6 accepts it (it only matches musig() keys against
+2-step entries under the aggregate's fingerprint). One thing is stripped from the copy
+sent to the device: the `tap_key_origins` entries with no leaf hash that are not a
+0x1a participant, nor the internal key of an input whose `tap_scripts` hold the whole
+tree (`bwk_psbt::taproot::is_partial_tap_tree`). These are the keys outside the spend
+path of a PSBT restricted by `bwk::Account::restrict_spend_path`, which keeps them for
+the Coldcard. The app takes every musig() aggregate listed there as a spend, whatever
+the leaf hashes and `tap_scripts` say: on a 2-of-3 restricted to one leaf it yields a
+pubnonce for each of its two leaves, then fails round 2 with `Interpreter(UnknownHash)`
+on the missing cosigner nonce. A plain internal key left listed would be signed on the
+key path of a PSBT restricted to a leaf.
+
+Registration and address checks of `musig()` policies work as is: the client's paranoid
+check replaces each `musig()` by its aggregate xpub before miniscript parses the
+descriptor.
+
+## Speculos tests
+
+`tests/ledger_speculos.rs` drives `LedgerSimulator` against the Ledger Bitcoin Test
+app running under [Speculos](https://github.com/LedgerHQ/speculos), and
+`tests/ledger_musig_speculos.rs` (features `ledger,musig`) registers bwk-bup 2-of-2
+`tr(musig(L,H))` and `tr(NUMS,pk(musig(L,H)))` policies and spends both through the two
+MuSig2 rounds with a bwk `HotSigner` as the other cosigner. The tests are
+`#[ignore]`d. `tests/ledger_service_speculos.rs` (features `ledger,musig`) goes through
+`HwiService` only: Speculos on `127.0.0.1:9999`, the port the service polls, a plain
+taproot policy and a MuSig2 2-of-2 registered and signed with `sign_tx_with_wallet`,
+and a wrong HMAC refused. Run them with `tests/speculos/run.sh [nanox|nanosp]`, or
+`just test-ledger` in `hwi/` for both devices. Docker is the only prerequisite.
+
+`run.sh` builds the app ELF with the pinned builder image (cached in
+`target/speculos-cache/`), then runs the three test binaries with `SPECULOS_BIN`
+pointing at `tests/speculos/speculos-docker.sh`, which runs the pinned Speculos image
+for the `speculos` crate and removes its container when the crate kills it.
+
+`tests/speculos/versions.env` pins every input, for `run.sh` and CI alike: the app
+version (`LEDGER_APP_VERSION=2.4.6`), the builder image and the Speculos image, both
+by digest. 2.4.6 is the newest 2.4.x, runs the same MuSig2 round model as 2.4.2, and
+its screens are the ones the tests expect (2.4.2 fails 33 of the 44 tests).
+
+- `SPECULOS_ELF`: a prebuilt ELF of `LEDGER_APP_VERSION` for the device, used as is
+  instead of building one.
+- `SPECULOS_BIN`: overrides the wrapper (e.g. a local `speculos`).
+
+## Device tests
+
+Every device test is `#[ignore]`d and needs its simulator:
+
+- Ledger: `tests/speculos/run.sh [nanox|nanosp]` (Docker), see above.
+- Coldcard: `tests/coldcard_simulator.rs` and `tests/coldcard_simulator_musig.rs`
+  start the simulator of a built firmware checkout themselves, one per test:
+  `COLDCARD_SIM_UNIX_DIR` (its `unix` directory), `COLDCARD_SIM_PYTHON` (a Python with
+  the simulator requirements), optional `COLDCARD_SIM_LOG_DIR`;
+  `cargo test -p bwk-hwi --features musig --test coldcard_simulator --test
+  coldcard_simulator_musig -- --ignored --test-threads=1`.
+- Both and a hot key: `tests/devices/run.sh [-- <cargo test args>]` runs
+  `tests/musig_devices.rs`, a bwk-bup 2-of-3 MuSig2 wallet over a hot key, the Ledger
+  and the Coldcard, registered on both devices and spent on regtest through each of
+  its three 2-key leaves. It starts Speculos (the pinned `SPECULOS_IMAGE` of
+  `tests/speculos/versions.env`, nanosp) and the Coldcard simulator with fixed seeds,
+  approves their screens, and tears both down on exit. It needs `docker`,
+  `SPECULOS_ELF` (the nanosp ELF of `LEDGER_APP_VERSION`), `COLDCARD_SIM_UNIX_DIR`,
+  `COLDCARD_SIM_PYTHON` and `BITCOIND_V31_EXE` (a Bitcoin Core v31 `bitcoind`);
+  `LOG_DIR` (default `target/devices-logs`) gets the simulator and Speculos logs.
 
 ## License
 

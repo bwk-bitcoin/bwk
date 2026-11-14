@@ -18,4 +18,6 @@ pub enum Error {
     HeaderStore(#[from] StartError),
     #[error("the scan cannot derive from this descriptor: {0}")]
     Descriptor(#[from] derivator::Error),
+    #[error("the scan requires a miniscript descriptor, not sp()")]
+    SpDescriptor,
 }

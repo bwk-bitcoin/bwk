@@ -1,12 +1,9 @@
 use bwk_coin::{
     max_input_satisfaction_size, ChangeTip, Coin, CoinSource, CoinSpendInfo, CoinStatus, KeyChain,
 };
-use bwk_descriptor::derivator::SpkDerivator;
-use miniscript::{
-    bitcoin::{
-        self, address::NetworkUnchecked, block::Header, OutPoint, ScriptBuf, Sequence, Txid,
-    },
-    Descriptor, DescriptorPublicKey,
+use bwk_descriptor::{derivator::SpkDerivator, wallet::WalletDescriptor};
+use miniscript::bitcoin::{
+    self, address::NetworkUnchecked, block::Header, OutPoint, ScriptBuf, Sequence, Txid,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -347,7 +344,7 @@ impl<P: ScanProfile> CoinStore<P> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         network: bitcoin::Network,
-        descriptor: Descriptor<DescriptorPublicKey>,
+        descriptor: WalletDescriptor,
         notification: impl Into<NotificationSender>,
         account: String,
         recv_tip: u32,

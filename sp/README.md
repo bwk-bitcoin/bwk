@@ -47,6 +47,34 @@ loop {
 }
 ```
 
+## Caller-owned persistence
+
+`Account::with_backend_factory(config, factory, config_store, header_store,
+scan_runtime)` accepts the same `bwk_electrum::persistence::BackendFactory` as bwk.
+It overrides native persistence for SP coins, txs, labels, scan state and block
+hashes, every BIP32 sub-account, and owned headers. A supplied shared header store
+is used directly. Factory/read/decode failures propagate without a filesystem or
+no-op fallback.
+
+Requests contain logical account/network identities and a typed scope. SP rows
+use `SilentPayment`, sub-accounts use `SubAccount(index)` with the scanner name
+`{account_name}-sub-{index}`, and headers use `Headers` with the parent name.
+The caller maps these identities to its own storage and enforces authorization,
+version checks and size limits. No native path reaches the factory.
+
+Use `create_sub_account(SubAccountConfig)` to open and remember new descriptors
+through the retained factory. `add_sub_account` remains the low-level API for an
+already-open scanner; its caller owns metadata and reopen. Do not mix unmanaged
+scanners with `create_sub_account`. A failed config save after creation leaves
+the new descriptor in memory; retry `try_persist`, not creation.
+
+Cloned runtime configs retain the factory. Serialized metadata omits it, so pass
+it again when reopening deserialized configs. `try_persist` returns store and
+config callback errors and includes sub-accounts. Stop workers first; flushing
+is not destruction or a deletion barrier. Best-effort/background APIs still log
+errors. This enables a whole-file adapter, but does not implement host storage
+authorization, file-size limits or sandbox isolation itself.
+
 ## Sub-account coin events
 
 The BIP32 sub-accounts report on the account's notification channel. A coin
@@ -87,6 +115,12 @@ Notification ──► Account consumer
 - `SpTxStore`: Transaction history (direction and amount derived by the aggregator)
 - `bwk_electrum::label_store::LabelStore`: User labels for coins and transactions (shared with bwk)
 - `ScanState`: Scan progress and checkpoint management
+
+Use `Account::try_update_coin_label` and `try_update_tx_label` to update and save
+labels with error reporting. Empty labels delete the entry. Store and flush
+failures return `AccountError::Persist`. With RAM stores, failed writes leave
+the edited value or deletion in memory; retry the same update after restoring
+storage access. The existing `update_*_label` methods only log failures.
 
 ## Packaging
 

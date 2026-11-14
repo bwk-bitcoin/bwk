@@ -10,24 +10,28 @@ mod common;
 
 use std::str::FromStr;
 
-use bitcoin::Network;
+use bitcoin::{bip32::ChildNumber, Network};
 use bwk::bwk_electrum::coin_store::PaymentType;
 use bwk_coin::Coin;
-use bwk_sign::hot_signer::HotSigner;
+use bwk_sign::{
+    bwk_descriptor::wallet::{to_wallet, WalletDescriptor},
+    hot_signer::HotSigner,
+};
 use bwk_sp::{
     account::{
         recipient::{SpRecipientAddress, TxBuilderSpExt},
         Account,
     },
     core::receiving::NUMS_H,
+    signer::SpSigner,
 };
-use bwk_tx::{
-    recipient::Recipient,
-    transaction::{Amount, Error as TxError},
-};
+use bwk_tx::{recipient::Recipient, transaction::Amount};
 use miniscript::{Descriptor, DescriptorPublicKey};
 
-use common::{add_offline_sub_account, bip32_key, test_mnemonic, test_mnemonic_2, TestEnv};
+use common::{
+    add_offline_sub_account, bip32_key, sign_and_finalize_nums_tree_v2, sign_and_finalize_v2,
+    test_mnemonic, test_mnemonic_2, TestEnv,
+};
 
 const TR_INTERNAL_PATH: &str = "m/86'/1'/1'";
 const TR_LEAF_PATH: &str = "m/86'/1'/2'";
@@ -62,10 +66,11 @@ fn test_transactions() {
     test_mixed_sp_taptree_to_sp(&mut env);
     test_mixed_sp_wsh_to_sp(&mut env);
     test_non_eligible_inputs_to_sp(&mut env);
+    test_mixed_sp_nums_tree_to_sp(&mut env);
 }
 
-fn descriptor(descriptor: &str) -> Descriptor<DescriptorPublicKey> {
-    Descriptor::from_str(descriptor).unwrap()
+fn descriptor(descriptor: &str) -> WalletDescriptor {
+    to_wallet(Descriptor::<DescriptorPublicKey>::from_str(descriptor).unwrap())
 }
 
 /// Create a drain recipient for a standard address (Amount::Max, no change).
@@ -86,9 +91,8 @@ fn test_insufficient_funds(env: &TestEnv) {
     assert_eq!(account.balance(), 0);
     assert!(account.coins().is_empty());
 
-    let sp_address = account.sp_address();
     let mut builder = account.tx_builder().feerate(1000);
-    builder.send_to_sp(sp_address, 100_000);
+    builder.send_to(env.taproot_addr(0), 100_000);
 
     let coins = builder.select_coins(100_000, 1000);
     assert!(coins.is_empty());
@@ -119,8 +123,8 @@ fn test_bip32_only_sp_change_bookkeeping(env: &mut TestEnv) {
     builder.send_to(external.clone(), 100_000);
     builder.add_input(coin);
 
-    let mut psbt = builder.generate().unwrap();
-    let tx = account.sign_and_finalize(&mut psbt).unwrap();
+    let mut psbt = builder.generate_v2().unwrap();
+    let tx = sign_and_finalize_v2(&account, test_mnemonic(), &mut psbt);
     let change: u64 = tx
         .output
         .iter()
@@ -182,8 +186,8 @@ fn test_bip32_only_sp_change_bookkeeping(env: &mut TestEnv) {
 
     let mut spend_change = account.tx_builder().feerate(1000);
     spend_change.add_output(drain_to(env.taproot_addr(2)));
-    let mut psbt = spend_change.generate().unwrap();
-    account.sign_and_finalize(&mut psbt).unwrap();
+    let mut psbt = spend_change.generate_v2().unwrap();
+    sign_and_finalize_v2(&account, test_mnemonic(), &mut psbt);
 }
 
 fn test_standard_output_ownership_is_counted_once(env: &mut TestEnv) {
@@ -203,8 +207,8 @@ fn test_standard_output_ownership_is_counted_once(env: &mut TestEnv) {
     let mut builder = account.tx_builder().feerate(1000);
     builder.send_to(standard_output.clone(), 100_000);
     builder.add_input(coin);
-    let mut psbt = builder.generate().unwrap();
-    let tx = account.sign_and_finalize(&mut psbt).unwrap();
+    let mut psbt = builder.generate_v2().unwrap();
+    let tx = sign_and_finalize_v2(&account, test_mnemonic(), &mut psbt);
     let txid = account.record_unconfirmed_spend(&tx).unwrap();
     let output_value: u64 = tx.output.iter().map(|output| output.value.to_sat()).sum();
     let fee = input_value - output_value;
@@ -259,8 +263,8 @@ fn test_drain(env: &mut TestEnv) {
     builder.add_output(drain_recip);
     builder.drain_inputs();
 
-    let psbt = builder.generate().unwrap();
-    assert_eq!(psbt.unsigned_tx.input.len(), 2);
+    let psbt = builder.generate_v2().unwrap();
+    assert_eq!(psbt.inputs.len(), 2);
 }
 
 /// SP -> SP (self): send to own address, verify change.
@@ -279,8 +283,8 @@ fn test_sp_to_sp_self(env: &mut TestEnv) {
     for c in coins {
         builder.add_input(c);
     }
-    let mut psbt = builder.generate().unwrap();
-    let tx = account.sign_and_finalize(&mut psbt).unwrap();
+    let mut psbt = builder.generate_v2().unwrap();
+    let tx = sign_and_finalize_v2(&account, test_mnemonic(), &mut psbt);
     env.broadcast_and_mine(&tx);
 
     // Rescan to detect change outputs
@@ -320,8 +324,8 @@ fn test_sp_to_sp_other(env: &mut TestEnv) {
     for c in coins {
         builder.add_input(c);
     }
-    let mut psbt = builder.generate().unwrap();
-    let tx = sender.sign_and_finalize(&mut psbt).unwrap();
+    let mut psbt = builder.generate_v2().unwrap();
+    let tx = sign_and_finalize_v2(&sender, test_mnemonic(), &mut psbt);
     let txid = tx.compute_txid();
     env.broadcast_and_mine(&tx);
 
@@ -348,8 +352,8 @@ fn test_sp_to_taproot(env: &mut TestEnv) {
     for c in coins {
         builder.add_input(c);
     }
-    let mut psbt = builder.generate().unwrap();
-    let tx = account.sign_and_finalize(&mut psbt).unwrap();
+    let mut psbt = builder.generate_v2().unwrap();
+    let tx = sign_and_finalize_v2(&account, test_mnemonic(), &mut psbt);
     env.broadcast_and_mine(&tx);
 }
 
@@ -365,8 +369,8 @@ fn test_sp_to_segwit(env: &mut TestEnv) {
     for c in coins {
         builder.add_input(c);
     }
-    let mut psbt = builder.generate().unwrap();
-    let tx = account.sign_and_finalize(&mut psbt).unwrap();
+    let mut psbt = builder.generate_v2().unwrap();
+    let tx = sign_and_finalize_v2(&account, test_mnemonic(), &mut psbt);
     env.broadcast_and_mine(&tx);
 }
 
@@ -383,8 +387,8 @@ fn test_sp_to_mixed_sp_taproot(env: &mut TestEnv) {
     for c in coins {
         builder.add_input(c);
     }
-    let mut psbt = builder.generate().unwrap();
-    let tx = account.sign_and_finalize(&mut psbt).unwrap();
+    let mut psbt = builder.generate_v2().unwrap();
+    let tx = sign_and_finalize_v2(&account, test_mnemonic(), &mut psbt);
     env.broadcast_and_mine(&tx);
 
     account
@@ -414,8 +418,8 @@ fn test_sp_to_mixed_sp_segwit(env: &mut TestEnv) {
     for c in coins {
         builder.add_input(c);
     }
-    let mut psbt = builder.generate().unwrap();
-    let tx = account.sign_and_finalize(&mut psbt).unwrap();
+    let mut psbt = builder.generate_v2().unwrap();
+    let tx = sign_and_finalize_v2(&account, test_mnemonic(), &mut psbt);
     env.broadcast_and_mine(&tx);
 
     account
@@ -444,10 +448,10 @@ fn test_multi_sp_to_mixed_sp_taproot(env: &mut TestEnv) {
     builder.send_to_sp(account.sp_address(), 50_000);
     builder.send_to(env.taproot_addr(0), 50_000);
     builder.drain_inputs();
-    let mut psbt = builder.generate().unwrap();
-    assert_eq!(psbt.unsigned_tx.input.len(), 2);
+    let mut psbt = builder.generate_v2().unwrap();
+    assert_eq!(psbt.inputs.len(), 2);
 
-    let tx = account.sign_and_finalize(&mut psbt).unwrap();
+    let tx = sign_and_finalize_v2(&account, test_mnemonic(), &mut psbt);
     env.broadcast_and_mine(&tx);
 
     account
@@ -473,10 +477,10 @@ fn test_multi_sp_to_taproot(env: &mut TestEnv) {
     let mut builder = account.tx_builder().feerate(1000);
     builder.send_to(env.taproot_addr(0), 50_000);
     builder.drain_inputs();
-    let mut psbt = builder.generate().unwrap();
-    assert_eq!(psbt.unsigned_tx.input.len(), 2);
+    let mut psbt = builder.generate_v2().unwrap();
+    assert_eq!(psbt.inputs.len(), 2);
 
-    let tx = account.sign_and_finalize(&mut psbt).unwrap();
+    let tx = sign_and_finalize_v2(&account, test_mnemonic(), &mut psbt);
     env.broadcast_and_mine(&tx);
 }
 
@@ -491,8 +495,8 @@ fn test_mixed_sp_taproot_to_taproot(env: &mut TestEnv) {
     builder.add_output(drain_to(env.taproot_addr(1)));
     builder.drain_inputs();
     builder.add_input(tr_coin);
-    let mut psbt = builder.generate().unwrap();
-    let tx = account.sign_and_finalize(&mut psbt).unwrap();
+    let mut psbt = builder.generate_v2().unwrap();
+    let tx = sign_and_finalize_v2(&account, test_mnemonic(), &mut psbt);
     env.broadcast_and_mine(&tx);
 }
 
@@ -507,8 +511,8 @@ fn test_mixed_sp_taproot_to_segwit(env: &mut TestEnv) {
     builder.add_output(drain_to(env.segwit_addr(0)));
     builder.drain_inputs();
     builder.add_input(tr_coin);
-    let mut psbt = builder.generate().unwrap();
-    let tx = account.sign_and_finalize(&mut psbt).unwrap();
+    let mut psbt = builder.generate_v2().unwrap();
+    let tx = sign_and_finalize_v2(&account, test_mnemonic(), &mut psbt);
     env.broadcast_and_mine(&tx);
 }
 
@@ -523,8 +527,8 @@ fn test_mixed_sp_segwit_to_taproot(env: &mut TestEnv) {
     builder.add_output(drain_to(env.taproot_addr(0)));
     builder.drain_inputs();
     builder.add_input(sw_coin);
-    let mut psbt = builder.generate().unwrap();
-    let tx = account.sign_and_finalize(&mut psbt).unwrap();
+    let mut psbt = builder.generate_v2().unwrap();
+    let tx = sign_and_finalize_v2(&account, test_mnemonic(), &mut psbt);
     env.broadcast_and_mine(&tx);
 }
 
@@ -539,8 +543,8 @@ fn test_mixed_sp_segwit_to_segwit(env: &mut TestEnv) {
     builder.add_output(drain_to(env.segwit_addr(1)));
     builder.drain_inputs();
     builder.add_input(sw_coin);
-    let mut psbt = builder.generate().unwrap();
-    let tx = account.sign_and_finalize(&mut psbt).unwrap();
+    let mut psbt = builder.generate_v2().unwrap();
+    let tx = sign_and_finalize_v2(&account, test_mnemonic(), &mut psbt);
     env.broadcast_and_mine(&tx);
 }
 
@@ -560,10 +564,10 @@ fn test_multi_sp_inputs_to_sp_and_taproot(env: &mut TestEnv) {
     builder.send_to(env.taproot_addr(10), 50_000);
     builder.drain_inputs();
 
-    let mut psbt = builder.generate().unwrap();
-    assert_eq!(psbt.unsigned_tx.input.len(), 3);
+    let mut psbt = builder.generate_v2().unwrap();
+    assert_eq!(psbt.inputs.len(), 3);
 
-    let tx = account.sign_and_finalize(&mut psbt).unwrap();
+    let tx = sign_and_finalize_v2(&account, test_mnemonic(), &mut psbt);
     let txid = tx.compute_txid();
     env.broadcast_and_mine(&tx);
 
@@ -599,8 +603,8 @@ fn test_sp_to_three_sp_outputs_self(env: &mut TestEnv) {
         builder.add_input(c);
     }
 
-    let mut psbt = builder.generate().unwrap();
-    let tx = account.sign_and_finalize(&mut psbt).unwrap();
+    let mut psbt = builder.generate_v2().unwrap();
+    let tx = sign_and_finalize_v2(&account, test_mnemonic(), &mut psbt);
     let txid = tx.compute_txid();
     env.broadcast_and_mine(&tx);
 
@@ -633,10 +637,10 @@ fn test_multi_sp_inputs_to_three_sp_outputs(env: &mut TestEnv) {
     builder.send_to_sp(account.sp_address(), 60_000);
     builder.drain_inputs();
 
-    let mut psbt = builder.generate().unwrap();
-    assert_eq!(psbt.unsigned_tx.input.len(), 2);
+    let mut psbt = builder.generate_v2().unwrap();
+    assert_eq!(psbt.inputs.len(), 2);
 
-    let tx = account.sign_and_finalize(&mut psbt).unwrap();
+    let tx = sign_and_finalize_v2(&account, test_mnemonic(), &mut psbt);
     let txid = tx.compute_txid();
     env.broadcast_and_mine(&tx);
 
@@ -672,8 +676,8 @@ fn test_sp_to_sp_other_and_self(env: &mut TestEnv) {
         builder.add_input(c);
     }
 
-    let mut psbt = builder.generate().unwrap();
-    let tx = sender.sign_and_finalize(&mut psbt).unwrap();
+    let mut psbt = builder.generate_v2().unwrap();
+    let tx = sign_and_finalize_v2(&sender, test_mnemonic(), &mut psbt);
     let txid = tx.compute_txid();
     env.broadcast_and_mine(&tx);
 
@@ -724,8 +728,8 @@ fn test_mixed_sp_taproot_to_sp(env: &mut TestEnv) {
     builder.send_to_sp(account.sp_address(), 50_000);
     builder.drain_inputs();
     builder.add_input(tr_coin);
-    let mut psbt = builder.generate().unwrap();
-    let tx = account.sign_and_finalize(&mut psbt).unwrap();
+    let mut psbt = builder.generate_v2().unwrap();
+    let tx = sign_and_finalize_v2(&account, test_mnemonic(), &mut psbt);
     env.broadcast_and_mine(&tx);
 
     account
@@ -756,8 +760,8 @@ fn test_mixed_sp_segwit_to_sp(env: &mut TestEnv) {
     builder.send_to_sp(account.sp_address(), 50_000);
     builder.drain_inputs();
     builder.add_input(sw_coin);
-    let mut psbt = builder.generate().unwrap();
-    let tx = account.sign_and_finalize(&mut psbt).unwrap();
+    let mut psbt = builder.generate_v2().unwrap();
+    let tx = sign_and_finalize_v2(&account, test_mnemonic(), &mut psbt);
     env.broadcast_and_mine(&tx);
 
     account
@@ -798,11 +802,7 @@ fn test_mixed_sp_wsh_to_sp(env: &mut TestEnv) {
 
 /// Spend an SP coin and a coin of `descriptor` to our own SP address, then
 /// check the scanner finds the SP output and the SP change.
-fn assert_mixed_sp_to_sp(
-    env: &mut TestEnv,
-    name: &str,
-    descriptor: Descriptor<DescriptorPublicKey>,
-) {
+fn assert_mixed_sp_to_sp(env: &mut TestEnv, name: &str, descriptor: WalletDescriptor) {
     let start_height = env.next_scan_height();
     let mut account = env.sp_account(name);
     env.fund_sp(&mut account, 0.1);
@@ -813,10 +813,10 @@ fn assert_mixed_sp_to_sp(
     builder.send_to_sp(account.sp_address(), 50_000);
     builder.drain_inputs();
     builder.add_input(coin);
-    let mut psbt = builder.generate().unwrap();
-    assert_eq!(psbt.unsigned_tx.input.len(), 2);
-    assert_eq!(psbt.unsigned_tx.output.len(), 2);
-    let tx = account.sign_and_finalize(&mut psbt).unwrap();
+    let mut psbt = builder.generate_v2().unwrap();
+    assert_eq!(psbt.inputs.len(), 2);
+    assert_eq!(psbt.outputs.len(), 2);
+    let tx = sign_and_finalize_v2(&account, test_mnemonic(), &mut psbt);
     let txid = tx.compute_txid();
     env.broadcast_and_mine(&tx);
 
@@ -835,7 +835,7 @@ fn assert_mixed_sp_to_sp(
 }
 
 /// Only inputs BIP352 leaves out of the partial secret: there is no key to
-/// derive the SP outputs from, so `generate()` refuses the tx.
+/// derive the SP outputs from, so signing refuses the tx.
 fn test_non_eligible_inputs_to_sp(env: &mut TestEnv) {
     let account = env.sp_account("test-non-eligible");
     let wsh_coin = env.create_descriptor_coin(
@@ -862,5 +862,45 @@ fn assert_sp_send_refused(account: &Account, inputs: Vec<Coin>) {
     for coin in inputs {
         builder.add_input(coin);
     }
-    assert!(matches!(builder.generate(), Err(TxError::SpPartialSecret)));
+    let mut psbt = builder.generate_v2().unwrap();
+    let signer = SpSigner::from_mnemonic(
+        test_mnemonic(),
+        Network::Regtest,
+        ChildNumber::from_hardened_idx(0).unwrap(),
+    )
+    .unwrap();
+    assert!(signer.sign(&mut psbt).is_err());
+}
+
+/// SP + tr(H,pk(xpub)) -> SP address. The tr(H) input is spent by script path
+/// revealing H, so BIP352 leaves it out of the input key sum: the sender must
+/// skip it rather than refuse it, and the receiver skips it as well, so it
+/// finds the payment.
+fn test_mixed_sp_nums_tree_to_sp(env: &mut TestEnv) {
+    let start_height = env.next_scan_height();
+    let mut account = env.sp_account("test");
+    env.fund_sp(&mut account, 0.1);
+    let nums_coin = env.create_nums_tree_coin(0.1);
+
+    let mut builder = account.tx_builder().feerate(1000);
+    builder.send_to_sp(account.sp_address(), 50_000);
+    builder.drain_inputs();
+    builder.add_input(nums_coin);
+    let mut psbt = builder.generate_v2().unwrap();
+    let tx = sign_and_finalize_nums_tree_v2(&account, test_mnemonic(), &mut psbt);
+    assert_eq!(tx.input.len(), 2);
+    env.broadcast_and_mine(&tx);
+
+    account
+        .scan_blocks(Some(start_height), Some(env.height))
+        .unwrap();
+    let new_outputs: Vec<_> = account
+        .coins()
+        .into_iter()
+        .filter(|(op, _)| op.txid == tx.compute_txid())
+        .collect();
+    assert!(
+        !new_outputs.is_empty(),
+        "scanner must detect SP output from mixed SP+tr(H) send"
+    );
 }

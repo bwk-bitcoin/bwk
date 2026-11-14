@@ -501,7 +501,7 @@ fn requeue_confirmed_unverified<P: ScanProfile>(
 
 #[cfg(all(test, feature = "test"))]
 mod tests {
-    use bwk_descriptor::{derivator::SpkDerivator, descriptor::wpkh};
+    use bwk_descriptor::{derivator::SpkDerivator, descriptor::wpkh, wallet::to_wallet};
     use bwk_persist::backend::noop::NoopBackend;
     use bwk_sign::{bip39::Mnemonic, hot_signer::HotSigner};
     use bwk_utils::test::funding_tx;
@@ -538,7 +538,7 @@ mod tests {
         let signer =
             HotSigner::new_from_mnemonics(bitcoin::Network::Regtest, &mnemo.to_string()).unwrap();
         let xpub = signer.xpub(&DerivationPath::from_str("m/84'/0'/0'/1").unwrap());
-        let descriptor = wpkh(xpub);
+        let descriptor = to_wallet(wpkh(xpub));
         let derivator = SpkDerivator::new(descriptor.clone(), bitcoin::Network::Regtest).unwrap();
         let label_store = Arc::new(Mutex::new(LabelStore::new()));
         let backend: Arc<dyn bwk_persist::backend::PersistenceBackend> = Arc::new(NoopBackend);

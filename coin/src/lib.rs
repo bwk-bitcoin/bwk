@@ -3,13 +3,8 @@
 //! These describe what scanning finds and what spending consumes, so they sit
 //! below both `bwk-electrum` and `bwk-tx` rather than inside either.
 
-use miniscript::{
-    bitcoin::{
-        self, absolute, bip32::DerivationPath, key::rand, psbt, Psbt, ScriptBuf, TxIn, Witness,
-    },
-    psbt::PsbtExt,
-    DefiniteDescriptorKey, Descriptor, DescriptorPublicKey,
-};
+use bwk_descriptor::wallet::{WalletDefiniteDescriptor, WalletDescriptor, WalletDescriptorExt};
+use miniscript::bitcoin::{self, absolute, key::rand, psbt, Psbt, ScriptBuf, TxIn, Witness};
 use serde::{Deserialize, Serialize};
 
 /// Errors constructing or converting a [`Coin`].
@@ -36,11 +31,13 @@ pub enum KeyChain {
     Custom(u32),
 }
 
+/// The multipath branch of `value`: 0 receive, 1 change, the inverse of
+/// `From<u32> for KeyChain`.
 impl From<KeyChain> for u32 {
     fn from(value: KeyChain) -> Self {
         match value {
             KeyChain::Receive => 0,
-            KeyChain::Change => 0,
+            KeyChain::Change => 1,
             KeyChain::Custom(c) => c,
         }
     }
@@ -78,13 +75,10 @@ pub enum CoinSpendInfo {
     /// Descriptor-based coin (standard wallets)
     Bip32 {
         coin_path: (KeyChain, u32),
-        descriptor: Descriptor<DescriptorPublicKey>,
+        descriptor: WalletDescriptor,
     },
     /// Silent Payment coin (BIP352)
-    Sp {
-        derivation: DerivationPath,
-        tweak: [u8; 32],
-    },
+    Sp { tweak: [u8; 32] },
 }
 
 /// High-level source/classification for a wallet coin.
@@ -137,6 +131,14 @@ impl Coin {
         self.txout.value
     }
 
+    /// The (keychain, index) the coin derives at, none for a silent payment coin.
+    pub fn coin_path(&self) -> Option<(KeyChain, u32)> {
+        match &self.spend_info {
+            CoinSpendInfo::Bip32 { coin_path, .. } => Some(*coin_path),
+            CoinSpendInfo::Sp { .. } => None,
+        }
+    }
+
     pub fn is_bip32(&self) -> bool {
         matches!(self.spend_info, CoinSpendInfo::Bip32 { .. })
     }
@@ -163,16 +165,15 @@ impl Coin {
             CoinSpendInfo::Bip32 {
                 coin_path,
                 descriptor,
-                ..
             } => self.spk_to_psbt_input(*coin_path, descriptor),
-            CoinSpendInfo::Sp { .. } => self.sp_to_psbt_input(),
+            CoinSpendInfo::Sp { tweak } => self.sp_to_psbt_input(*tweak),
         }
     }
 
     fn spk_to_psbt_input(
         &self,
         coin_path: (KeyChain, u32),
-        descriptor: &Descriptor<DescriptorPublicKey>,
+        descriptor: &WalletDescriptor,
     ) -> Result<psbt::Input, Error> {
         let inp = psbt::Input {
             witness_utxo: Some(self.txout.clone()),
@@ -198,32 +199,31 @@ impl Coin {
             inputs: vec![inp],
             outputs: vec![],
         };
-        PsbtExt::update_input_with_descriptor(&mut dummy_psbt, 0, &descr)
+        bwk_descriptor::updater::update_input(&mut dummy_psbt, 0, &descr)
             .map_err(|_| Error::Update)?;
 
         Ok(dummy_psbt.inputs[0].clone())
     }
 
-    fn sp_to_psbt_input(&self) -> Result<psbt::Input, Error> {
-        // For SP coins, we create a basic PSBT input with witness_utxo
-        // The actual signing will be handled by the SP signer which uses the tweak
-        Ok(psbt::Input {
+    fn sp_to_psbt_input(&self, tweak: [u8; 32]) -> Result<psbt::Input, Error> {
+        let mut input = psbt::Input {
             witness_utxo: Some(self.txout.clone()),
             ..Default::default()
-        })
+        };
+        bwk_psbt::sp::set_sp_input_tweak(&mut input, tweak);
+        Ok(input)
     }
 }
 
 /// Derive the definite descriptor of a keychain at an index, out of a two-path
 /// multipath descriptor.
 pub fn derive_descriptor(
-    descriptor: &Descriptor<DescriptorPublicKey>,
+    descriptor: &WalletDescriptor,
     keychain: KeyChain,
     index: u32,
-) -> Result<Descriptor<DefiniteDescriptorKey>, Error> {
+) -> Result<WalletDefiniteDescriptor, Error> {
     let mut descriptors = descriptor
-        .clone()
-        .into_single_descriptors()
+        .single_paths()
         .map_err(|_| Error::MultiDescriptor)?
         .into_iter();
     let recv = descriptors.next().ok_or(Error::MultiDescriptor)?;
@@ -235,9 +235,7 @@ pub fn derive_descriptor(
         KeyChain::Custom(_) => return Err(Error::KeyChain),
     };
 
-    single
-        .at_derivation_index(index)
-        .map_err(|_| Error::Derivation)
+    single.derive_at(index).map_err(|_| Error::Derivation)
 }
 
 pub fn shuffle_coins(mut vec: Vec<Coin>) -> Vec<Coin> {
@@ -279,10 +277,9 @@ impl CoinSource for std::collections::BTreeMap<miniscript::bitcoin::OutPoint, Co
 /// Estimate the satisfaction size for an input, returning the result
 /// in weight units (WU).
 /// Note: The output of this function represent the worst case scenario.
-pub fn max_input_satisfaction_size(descriptor: &Descriptor<DescriptorPublicKey>) -> usize {
+pub fn max_input_satisfaction_size(descriptor: &WalletDescriptor) -> usize {
     descriptor
-        .clone()
-        .into_single_descriptors()
+        .single_paths()
         .expect("multikey")
         .first()
         .expect("multikey")
@@ -297,13 +294,17 @@ mod tests {
     use super::*;
     use bitcoin::bip32::Xpriv;
     use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use bwk_descriptor::wallet::to_wallet;
+    use miniscript::{Descriptor, DescriptorPublicKey};
     use std::str::FromStr;
 
-    fn bip32_descriptor() -> Descriptor<DescriptorPublicKey> {
+    fn bip32_descriptor() -> WalletDescriptor {
         let secp = Secp256k1::new();
         let xpriv = Xpriv::new_master(bitcoin::Network::Regtest, &[3u8; 32]).unwrap();
         let xpub = bitcoin::bip32::Xpub::from_priv(&secp, &xpriv);
-        Descriptor::<DescriptorPublicKey>::from_str(&format!("wpkh({xpub}/<0;1>/*)")).unwrap()
+        to_wallet(
+            Descriptor::<DescriptorPublicKey>::from_str(&format!("wpkh({xpub}/<0;1>/*)")).unwrap(),
+        )
     }
 
     fn bip32_coin(script_pubkey: ScriptBuf) -> Coin {
@@ -338,13 +339,30 @@ mod tests {
             status: CoinStatus::Confirmed,
             label: None,
             satisfaction_size: 0,
-            spend_info: CoinSpendInfo::Sp {
-                derivation: DerivationPath::default(),
-                tweak: [0u8; 32],
-            },
+            spend_info: CoinSpendInfo::Sp { tweak: [0u8; 32] },
         };
 
         assert_eq!(coin.source(), CoinSourceKind::SilentPayment);
+    }
+
+    #[test]
+    fn silent_payment_input_has_tweak() {
+        let coin = Coin {
+            txout: bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::new(),
+            },
+            outpoint: bitcoin::OutPoint::null(),
+            height: Some(1),
+            sequence: bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
+            status: CoinStatus::Confirmed,
+            label: None,
+            satisfaction_size: 0,
+            spend_info: CoinSpendInfo::Sp { tweak: [9u8; 32] },
+        };
+
+        let input = coin.to_psbt_input().unwrap();
+        assert_eq!(bwk_psbt::sp::sp_input_tweak(&input), Ok(Some([9u8; 32])));
     }
 
     #[test]
@@ -365,5 +383,36 @@ mod tests {
         assert_eq!(bip32_coin(p2wpkh).source(), CoinSourceKind::Segwit);
         assert_eq!(bip32_coin(p2tr).source(), CoinSourceKind::Taproot);
         assert_eq!(bip32_coin(ScriptBuf::new()).source(), CoinSourceKind::Other);
+    }
+
+    #[test]
+    fn keychain_branch_round_trips() {
+        assert_eq!(u32::from(KeyChain::Receive), 0);
+        assert_eq!(u32::from(KeyChain::Change), 1);
+        assert_eq!(u32::from(KeyChain::Custom(7)), 7);
+        for branch in [0, 1, 7] {
+            assert_eq!(u32::from(KeyChain::from(branch)), branch);
+        }
+    }
+
+    #[test]
+    fn coin_path_of_bip32_and_silent_payment_coins() {
+        assert_eq!(
+            bip32_coin(ScriptBuf::new()).coin_path(),
+            Some((KeyChain::Receive, 0))
+        );
+        let sp = Coin {
+            spend_info: CoinSpendInfo::Sp { tweak: [0u8; 32] },
+            ..bip32_coin(ScriptBuf::new())
+        };
+        assert_eq!(sp.coin_path(), None);
+    }
+
+    #[test]
+    fn bip32_coin_round_trips_through_serde() {
+        let coin = bip32_coin(ScriptBuf::new());
+        let json = serde_json::to_string(&coin).unwrap();
+        let decoded: Coin = serde_json::from_str(&json).unwrap();
+        assert_eq!(coin, decoded);
     }
 }
