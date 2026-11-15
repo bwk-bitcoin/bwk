@@ -508,10 +508,12 @@ impl PsbtV2 {
             }
             // Once a silent-payment output's script has been computed, it is
             // derived from the input hash, so the transaction must already be
-            // frozen: any still-modifiable field would invalidate it.
+            // frozen: any still-modifiable field would invalidate it. BIP-375 only
+            // forbids a non-zero PSBT_GLOBAL_TX_MODIFIABLE; BIP-370 lets it be
+            // omitted when nothing may be added, so an absent field is frozen too.
             if output.script_pubkey.is_some()
                 && sp_info.is_some()
-                && self.tx_modifiable.map(TxModifiable::bits) != Some(0)
+                && self.tx_modifiable.is_some_and(|flags| flags.bits() != 0)
             {
                 return Err(Error::InvalidField);
             }
@@ -1232,16 +1234,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_computed_silent_payment_output_without_frozen_flags() {
+    fn rejects_computed_silent_payment_output_with_modifiable_flags() {
         let scan = public_key(1);
         let spend = public_key(2);
         let mut psbt = psbt_with_script();
         sp::set_sp_v0_output(&mut psbt.outputs[0].psbt, scan, spend, None);
 
-        assert_eq!(psbt.serialize(), Err(Error::InvalidField));
+        // Absent: BIP-370 lets the field be omitted when nothing may be added.
+        psbt.tx_modifiable = None;
+        let bytes = psbt.serialize().expect("an absent field is frozen");
+        assert_eq!(
+            PsbtV2::deserialize(&bytes).expect("parses").tx_modifiable,
+            None
+        );
 
+        // Zero: frozen.
         psbt.tx_modifiable = Some(TxModifiable::none());
         assert!(psbt.serialize().is_ok());
+
+        // Non-zero: BIP-375 forbids it once an output script is computed.
+        psbt.tx_modifiable = Some(TxModifiable::try_from(TxModifiable::INPUTS).unwrap());
+        assert_eq!(psbt.serialize(), Err(Error::InvalidField));
     }
 
     #[test]

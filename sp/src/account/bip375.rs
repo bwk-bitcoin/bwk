@@ -623,7 +623,11 @@ pub fn verify_signed(psbt: &bwk_psbt::PsbtV2) -> Result<(), AccountError> {
             ));
         }
     }
-    if psbt.tx_modifiable != Some(bwk_psbt::TxModifiable::none()) {
+    // Absent or zero: BIP-375 only forbids a non-zero PSBT_GLOBAL_TX_MODIFIABLE.
+    if psbt
+        .tx_modifiable
+        .is_some_and(|flags| flags != bwk_psbt::TxModifiable::none())
+    {
         return Err(AccountError::Bip375("tx_modifiable not frozen".to_string()));
     }
     Ok(())
