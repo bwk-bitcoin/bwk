@@ -43,7 +43,7 @@ use crate::{
     remote_manager::RemoteManager,
 };
 
-const ORDINARY_MUSIG_CAPABILITY: u32 = 1 << 3;
+const ORDINARY_MUSIG_CAPABILITY: u32 = response::Capabilities::MUSIG2;
 const COSIGNER_PATH: &str = "m/87'/1'/0'/2";
 
 #[derive(Default)]

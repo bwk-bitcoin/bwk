@@ -54,8 +54,8 @@ use crate::{
 };
 
 const RECORD_MAGIC: &[u8; 4] = b"QMH2";
-/// Get Info capability bit 3: the signer is a BIP-327 MuSig2 participant.
-const MUSIG_CAPABILITY: u32 = 1 << 3;
+/// Get Info capability bit 7: the signer is a BIP-327 MuSig2 participant.
+const MUSIG_CAPABILITY: u32 = response::Capabilities::MUSIG2;
 const PUB_NONCE_LEN: usize = 66;
 
 #[derive(Debug, thiserror::Error)]

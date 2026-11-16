@@ -280,7 +280,7 @@ fn capabilities() -> response::Capabilities {
 }
 
 fn musig_capabilities() -> response::Capabilities {
-    response::Capabilities(1 << 3)
+    response::Capabilities(response::Capabilities::MUSIG2)
 }
 
 fn role_path(role: u32) -> DerivationPath {
