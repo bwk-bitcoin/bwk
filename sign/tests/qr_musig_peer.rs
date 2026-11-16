@@ -732,11 +732,18 @@ fn host_merges_a_signatures_only_reply() {
         nonce: [2; 66],
     });
     assert!(f.host.accept_response(&signatures_reply(unplaced)).is_err());
+    // A silent payment share, with its proof as the codec requires: the host sent no
+    // silent payment output, so it refuses the pair (ws-plaude/silent#140).
     let mut silent_payment = entries.clone();
     silent_payment.push(response::SignatureEntry::SpEcdhShare {
         scope: response::SpScope::Global,
         scan_key: participant,
         share: aggregate,
+    });
+    silent_payment.push(response::SignatureEntry::SpDleqProof {
+        scope: response::SpScope::Global,
+        scan_key: participant,
+        proof: [7; 64],
     });
     assert!(f
         .host

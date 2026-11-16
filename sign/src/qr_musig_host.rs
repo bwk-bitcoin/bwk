@@ -564,6 +564,11 @@ impl<S: Store<Key = [u8; SESSION_ID_LEN], Value = QrMusigHostRecord>> QrMusigHos
         match session_id {
             Some(session_id) => {
                 verify_partial_sigs(&original, &returned, &descriptors)?;
+                // An answer that signs nothing leaves the session to its real answer: a
+                // signer that cannot sign says so with 0x09 (ws-plaude/silent#140).
+                if partial_sig_count(&returned)? <= partial_sig_count(&original)? {
+                    return Err(Error::Invalid("the answer signs nothing"));
+                }
                 self.store.remove(&session_id).map_err(Error::Store)?;
                 Ok(QrMusigHostResponse::Signed(returned))
             }
@@ -961,6 +966,16 @@ fn verify_pub_nonces(
         }
     }
     Ok(())
+}
+
+/// How many MuSig2 partial signatures `psbt` carries.
+fn partial_sig_count(psbt: &Psbt) -> Result<usize, Error> {
+    psbt.inputs.iter().try_fold(0, |count, input| {
+        Ok(count
+            + musig_input_partial_sigs(input)
+                .map_err(invalid_field)?
+                .len())
+    })
 }
 
 /// Every 0x1b of `returned` must be one `sent` carries, and every 0x1c a valid

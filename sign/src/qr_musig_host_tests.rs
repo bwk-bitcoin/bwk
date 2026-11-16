@@ -585,8 +585,12 @@ fn sign_request_refuses_unissued_slots_and_other_nonces() {
     assert!(sign(&mut host, session_id, &psbt).is_ok());
 }
 
+// A signed answer is refused, the session kept for the real one, when it spends
+// another transaction or signs nothing, in either form (ws-plaude/silent#140). An
+// answer bringing the session's partial signatures drops it:
+// `one_round_signing_through_the_host`.
 #[test]
-fn signed_response_drops_the_session_and_must_spend_the_same_transaction() {
+fn a_signed_answer_of_another_transaction_or_signing_nothing_keeps_the_session() {
     let fixture = fixture();
     let mut host = QrMusigHost::from_store(TestStore::default());
     let session_id = issued(&mut host, &fixture, 1);
@@ -605,34 +609,23 @@ fn signed_response_drops_the_session_and_must_spend_the_same_transaction() {
     let sent = Psbt::deserialize(&sent_signing(&bytes).psbt).unwrap();
     let mut other = sent.clone();
     other.unsigned_tx.output[0].value = Amount::from_sat(1);
-    assert!(host
-        .accept_response(&raw_response(
-            RequestId::new(9),
-            QrRequestId([5, 6]),
-            response::Body::Signed(response::Signed::Psbt(other.serialize()))
-        ))
-        .is_err());
-    assert!(host
-        .accept_response(&raw_response(
-            RequestId::new(9),
-            QrRequestId([5, 6]),
-            response::Body::Signed(response::Signed::Signatures(Vec::new()))
-        ))
-        .is_err());
-    assert!(host.record(&session_id).unwrap().is_some());
-    let QrMusigHostResponse::Signed(returned) = host
-        .accept_response(&raw_response(
-            RequestId::new(9),
-            QrRequestId([5, 6]),
-            response::Body::Signed(response::Signed::Psbt(sent.serialize())),
-        ))
-        .unwrap()
-    else {
-        panic!("not a signed response");
-    };
-    assert_eq!(returned, sent);
-    assert!(host.record(&session_id).unwrap().is_none());
-    assert!(host.store.disk.lock().unwrap().rows.is_empty());
+    for answer in [
+        response::Signed::Psbt(other.serialize()),
+        response::Signed::Signatures(Vec::new()),
+        response::Signed::Psbt(sent.serialize()),
+    ] {
+        assert!(host
+            .accept_response(&raw_response(
+                RequestId::new(9),
+                QrRequestId([5, 6]),
+                response::Body::Signed(answer.clone())
+            ))
+            .is_err());
+        assert!(
+            host.record(&session_id).unwrap().is_some(),
+            "{answer:?} keeps the session"
+        );
+    }
 }
 
 #[test]
