@@ -5,6 +5,7 @@ use quircs::Quirc;
 use crate::{
     error::Error,
     image::{box_shrink, shrink_factor, Image},
+    threshold::local_threshold,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,10 +25,10 @@ pub fn scan(image: &Image, find_inverted: bool, max_pixels: usize) -> Result<Vec
         return Ok(Vec::new());
     }
 
-    let mut decoded = scan_inner(image.width as usize, image.height as usize, &image.data);
+    let mut decoded = read(image.width as usize, image.height as usize, &image.data);
     if find_inverted {
         let inverted = image.data.iter().map(|v| 255 - *v).collect::<Vec<_>>();
-        for item in scan_inner(image.width as usize, image.height as usize, &inverted) {
+        for item in read(image.width as usize, image.height as usize, &inverted) {
             if !decoded.iter().any(|existing| existing.bytes == item.bytes) {
                 decoded.push(item);
             }
@@ -49,6 +50,16 @@ fn fit(image: &Image, max_pixels: usize) -> Cow<'_, Image> {
     })
 }
 
+/// The codes quirc reads in `data`, or when it reads none, the codes it reads in its
+/// local threshold: a code whose dark modules sit above quirc's global threshold.
+fn read(width: usize, height: usize, data: &[u8]) -> Vec<Scanned> {
+    let decoded = scan_inner(width, height, data);
+    if !decoded.is_empty() {
+        return decoded;
+    }
+    scan_inner(width, height, &local_threshold(width, height, data))
+}
+
 // a camera frame routinely holds unreadable candidates, they must not sink the readable ones
 fn scan_inner(width: usize, height: usize, data: &[u8]) -> Vec<Scanned> {
     let mut quirc = Quirc::default();
@@ -66,7 +77,10 @@ fn scan_inner(width: usize, height: usize, data: &[u8]) -> Vec<Scanned> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{image::Image, scan::fit};
+    use crate::{
+        image::Image,
+        scan::{fit, read, scan_inner},
+    };
 
     fn image(width: u32, height: u32) -> Image {
         Image {
@@ -92,5 +106,88 @@ mod tests {
         let camera = image(1920, 1080);
         let fitted = fit(&camera, 1024 * 1024);
         assert_eq!((fitted.width, fitted.height), (960, 540));
+    }
+
+    /// `qr` drawn on a dim display in a dark room: the display at 110, its dark modules
+    /// at 75, the room at 12. One global threshold splits the room from the display and
+    /// leaves the whole code white.
+    #[cfg(feature = "gen")]
+    fn dim_display(qr: &Image, inverted: bool) -> Image {
+        let (width, height) = (720, 540);
+        let mut data = vec![12u8; (width * height) as usize];
+        let (left, top) = ((width - qr.width) / 2, (height - qr.height) / 2);
+        for y in top - 30..top + qr.height + 30 {
+            data[(y * width + left - 30) as usize..(y * width + left + qr.width + 30) as usize]
+                .fill(110);
+        }
+        for y in 0..qr.height {
+            for x in 0..qr.width {
+                if qr.data[(y * qr.width + x) as usize] < 128 {
+                    data[((top + y) * width + left + x) as usize] = 75;
+                }
+            }
+        }
+        if inverted {
+            data.iter_mut().for_each(|pixel| *pixel = 255 - *pixel);
+        }
+        Image {
+            data,
+            width,
+            height,
+        }
+    }
+
+    #[cfg(feature = "gen")]
+    #[test]
+    fn a_dim_code_quirc_misses_is_read_on_the_local_threshold() {
+        use crate::{config::Config, encoder::Encoder};
+
+        let code = Encoder::new(Config::default())
+            .unwrap()
+            .encode_text("dim display")
+            .unwrap();
+        let frame = dim_display(&code, false);
+        let (width, height) = (frame.width as usize, frame.height as usize);
+        assert!(
+            scan_inner(width, height, &frame.data).is_empty(),
+            "quirc alone reads the dim code"
+        );
+        let found = read(width, height, &frame.data);
+        assert_eq!(
+            found
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            ["dim display"]
+        );
+    }
+
+    #[cfg(feature = "bbqr")]
+    #[test]
+    fn dim_bbqr_parts_join_in_either_polarity() {
+        use crate::{
+            config::Config,
+            decoder::{Decoded, Decoder},
+            encoder::Encoder,
+        };
+
+        let payload: Vec<u8> = (0..=255u8).cycle().take(400).collect();
+        let parts = Encoder::for_part_bytes(150)
+            .unwrap()
+            .encode_bytes(&payload)
+            .unwrap();
+        assert!(parts.len() > 1);
+        for inverted in [false, true] {
+            let mut decoder = Decoder::new(Config::default()).unwrap();
+            let mut joined = Vec::new();
+            for part in &parts {
+                joined.extend(decoder.process_raw(&dim_display(part, inverted)).unwrap());
+            }
+            assert_eq!(
+                joined,
+                vec![Decoded::Bytes(payload.clone())],
+                "inverted: {inverted}"
+            );
+        }
     }
 }

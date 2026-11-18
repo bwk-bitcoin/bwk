@@ -17,6 +17,8 @@ pub mod encoder;
 mod gen;
 #[cfg(feature = "scan")]
 mod scan;
+#[cfg(feature = "scan")]
+mod threshold;
 
 #[cfg(feature = "protocol")]
 pub use bipqr as protocol;
