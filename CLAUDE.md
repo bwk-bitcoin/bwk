@@ -58,6 +58,7 @@ tests locally. Commit messages must be single-line and follow existing style
 | bwk-error      | In-house derive for error impls, reached as `thiserror`     |
 | bwk-backoff    | Exponential backoff utility                                 |
 | bwk-bbqr       | BBQR split and join, hex encoding                           |
+| bwk-qr         | QR generation and scanning, BBQR framing, bipqr protocol    |
 | bwk-utils      | Test helpers (behind `test` feature)                        |
 +----------------+-------------------------------------------------------------+
 ```
