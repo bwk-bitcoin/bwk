@@ -29,6 +29,24 @@ impl Encoder {
         Ok(Self { config })
     }
 
+    /// An encoder pinned at the smallest QR version a full BBQR part of `part_bytes`
+    /// fits, so every frame of a payload has the same module count.
+    #[cfg(feature = "bbqr")]
+    pub fn for_part_bytes(part_bytes: usize) -> Result<Self, Error> {
+        let config = |max_qr_version| Config {
+            max_qr_version,
+            bbqr_part_bytes: part_bytes,
+            ..Config::default()
+        };
+        for version in 1..40 {
+            match Self::new(config(version)) {
+                Err(Error::PartTooLarge { .. }) => continue,
+                result => return result,
+            }
+        }
+        Self::new(config(40))
+    }
+
     pub fn encode_text(&self, text: &str) -> Result<Image, Error> {
         gen::encode_text(text, gen::CorrectionLevel::Low, self.config.max_qr_version)
     }

@@ -4,6 +4,7 @@ use bwk_qr::{
     config::Config,
     decoder::{Decoded, Decoder},
     encoder::Encoder,
+    error::Error,
     image::Image,
 };
 
@@ -92,4 +93,43 @@ fn protocol_payload_stays_undecoded_on_the_raw_path() {
         decode_raw(&mut decoder, &frames),
         vec![Decoded::Bytes(message)]
     );
+}
+
+fn frame_width(encoder: &Encoder) -> u32 {
+    encoder.encode_bytes(&payload()).unwrap()[0].width
+}
+
+fn pinned(max_qr_version: u8, bbqr_part_bytes: usize) -> Result<Encoder, Error> {
+    Encoder::new(Config {
+        max_qr_version,
+        bbqr_part_bytes,
+        ..Config::default()
+    })
+}
+
+#[test]
+fn an_encoder_for_a_part_size_pins_the_smallest_version_a_full_part_fits() {
+    for (part_bytes, version) in [(100, 7), (150, 9)] {
+        let encoder = Encoder::for_part_bytes(part_bytes).unwrap();
+        assert_eq!(
+            frame_width(&encoder),
+            frame_width(&pinned(version, part_bytes).unwrap())
+        );
+        assert!(matches!(
+            pinned(version - 1, part_bytes),
+            Err(Error::PartTooLarge { .. })
+        ));
+    }
+}
+
+#[test]
+fn an_encoder_for_a_part_size_refuses_an_empty_part_or_one_no_version_holds() {
+    assert!(matches!(
+        Encoder::for_part_bytes(0),
+        Err(Error::ZeroPartSize)
+    ));
+    assert!(matches!(
+        Encoder::for_part_bytes(4096),
+        Err(Error::PartTooLarge { version: 40, .. })
+    ));
 }
