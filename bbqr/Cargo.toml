@@ -1,0 +1,13 @@
+[package]
+name = "bwk-bbqr"
+version = "0.1.0"
+description = "BBQR split and join, hex encoding of binary data"
+readme = "README.md"
+license-file.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+
+[dependencies]
+thiserror.workspace = true
