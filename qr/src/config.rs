@@ -3,6 +3,7 @@ pub struct Config {
     pub max_qr_version: u8,
     /// Must fit `max_qr_version` once rendered as an alphanumeric BBQR part.
     pub bbqr_part_bytes: usize,
+    /// The pixels a frame is scanned at: a larger one is shrunk to fit first.
     pub max_image_pixels: usize,
     pub max_message_bytes: usize,
     pub scan_inverted: bool,

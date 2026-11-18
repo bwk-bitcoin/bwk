@@ -69,15 +69,42 @@ fn frame_without_qr_decodes_to_nothing() {
     assert_eq!(decoder.process(&gray).unwrap(), vec![]);
 }
 
+// A camera that only offers 1080p: the code drawn 6 times larger, centred on a white
+// 1920 x 1080 frame, twice the default pixel limit.
+fn camera_frame(code: &Image) -> Image {
+    const SCALE: u32 = 6;
+    let (width, height) = (1920, 1080);
+    let mut data = vec![255; (width * height) as usize];
+    let left = (width - code.width * SCALE) / 2;
+    let top = (height - code.height * SCALE) / 2;
+    for y in 0..code.height * SCALE {
+        for x in 0..code.width * SCALE {
+            data[((top + y) * width + left + x) as usize] =
+                code.data[((y / SCALE) * code.width + x / SCALE) as usize];
+        }
+    }
+    Image {
+        data,
+        width,
+        height,
+    }
+}
+
 #[test]
-fn frame_over_the_pixel_limit_is_rejected() {
-    let mut decoder = Decoder::new(Config {
-        max_image_pixels: 64,
-        ..Config::default()
-    })
-    .unwrap();
+fn frame_over_the_pixel_limit_is_shrunk_and_read() {
+    let frame = camera_frame(&render(TAPROOT_ADDRESS));
+    assert!(frame.data.len() > Config::default().max_image_pixels);
+    let mut decoder = Decoder::new(Config::default()).unwrap();
     assert_eq!(
-        decoder.process(&render(TAPROOT_ADDRESS)),
-        Err(Error::BadFrame)
+        decoder.process(&frame).unwrap(),
+        vec![Decoded::Text(TAPROOT_ADDRESS.to_string())]
     );
+}
+
+#[test]
+fn frame_whose_data_does_not_match_its_size_is_rejected() {
+    let mut frame = render(TAPROOT_ADDRESS);
+    frame.data.pop();
+    let mut decoder = Decoder::new(Config::default()).unwrap();
+    assert_eq!(decoder.process(&frame), Err(Error::BadFrame));
 }
