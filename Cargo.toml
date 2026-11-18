@@ -16,6 +16,7 @@ members = [
     "secp256k1_spscan-sys",
     "bbqr",
     "qr",
+    "camera",
 ]
 
 [workspace.package]
@@ -59,6 +60,13 @@ dns-lookup = "2.0"
 trybuild = "1.0"
 qrcodegen = "=1.8.0"
 quircs = "=0.10.3"
+# Camera capture: V4L2 on Linux, Media Foundation on Windows. On macOS bwk-camera
+# drives its own AVFoundation session, nokhwa cannot pick a 720p preset there.
+nokhwa = { version = "=0.10.11", default-features = false, features = ["input-native"] }
+nokhwa-bindings-macos = "=0.2.4"
+flume = "0.11"
+objc = "0.2"
+v4l = "0.14"
 bwk-bbqr = { path = "bbqr" }
 bipqr = { git = "https://github.com/pythcoiner/bipqr", rev = "d7363e0ea67af01b0407deff5f33c499a627f897", default-features = false }
 
@@ -85,6 +93,7 @@ bwk-utils = { path = "utils" }
 bwk-p2p = { path = "p2p" }
 bwk = { path = "bwk" }
 bwk-qr = { path = "qr", default-features = false }
+bwk-camera = { path = "camera" }
 # bwk-error is the in-house derive. Aliasing the package as `thiserror` is deliberate,
 # not an oversight: error definitions across the tree keep reading `thiserror::Error`,
 # so the switch is a one-line manifest change instead of a rename touching every error

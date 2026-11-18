@@ -1,0 +1,327 @@
+use std::{
+    collections::BTreeSet,
+    fmt,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
+    thread,
+};
+
+use nokhwa::utils::{ApiBackend, CameraIndex};
+
+#[cfg(target_os = "macos")]
+use crate::macos::Stream;
+#[cfg(not(target_os = "macos"))]
+use crate::native::Stream;
+use crate::{error::Error, frame::Rgb, Config};
+
+/// The devices with a capture thread running. A second open of the same device fails,
+/// and a stopped thread may still hold it, so this is process wide.
+static RUNNING: Mutex<BTreeSet<CameraId>> = Mutex::new(BTreeSet::new());
+
+/// The node V4L2 opens a camera through, followed by its number.
+#[cfg(target_os = "linux")]
+const V4L2_NODE: &str = "/dev/video";
+
+/// The OS's stable identifier for a camera while it stays connected: other cameras
+/// being added or removed leave it unchanged. It is the device node on Linux
+/// (`/dev/videoN`), the device symbolic link on Windows and the `AVCaptureDevice`
+/// unique ID on macOS. On Linux a node freed by an unplugged camera can go to the next
+/// one plugged, so a remembered id may then find another camera.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CameraId(String);
+
+impl CameraId {
+    /// To remember a user's choice: the camera is found again among those [`list`]
+    /// returns by comparing it with their ids.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// nokhwa's V4L2 query gives the node number, not its path.
+    #[cfg(target_os = "linux")]
+    fn from_query(info: &nokhwa::utils::CameraInfo) -> Result<Self, Error> {
+        Ok(Self(format!("{V4L2_NODE}{}", info.index().as_index()?)))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn from_query(info: &nokhwa::utils::CameraInfo) -> Result<Self, Error> {
+        Ok(Self(info.misc()))
+    }
+
+    /// nokhwa's V4L2 backend opens a device by its node number only.
+    #[cfg(target_os = "linux")]
+    pub fn index(&self) -> Result<CameraIndex, Error> {
+        self.0
+            .strip_prefix(V4L2_NODE)
+            .and_then(|number| number.parse().ok())
+            .map(CameraIndex::Index)
+            .ok_or(Error::NoCamera)
+    }
+
+    /// Media Foundation and AVFoundation open a device by its id, `NoCamera` once gone.
+    #[cfg(not(target_os = "linux"))]
+    pub fn index(&self) -> Result<CameraIndex, Error> {
+        Ok(CameraIndex::String(self.0.clone()))
+    }
+}
+
+impl fmt::Display for CameraId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CameraInfo {
+    pub id: CameraId,
+    pub name: String,
+}
+
+/// The cameras that capture video, in the order the OS numbers them, sent once on the
+/// returned receiver. It is a receiver because on macOS the list waits for the user to
+/// answer the camera permission dialog, for as long as they take: the query runs on a
+/// thread of its own, so this returns at once and is safe on a UI thread. Elsewhere
+/// there is no dialog and the answer comes at once. Dropping the receiver discards it.
+pub fn list() -> mpsc::Receiver<Result<Vec<CameraInfo>, Error>> {
+    let (sender, receiver) = mpsc::channel();
+    let sender_cloned = sender.clone();
+    let spawned = thread::Builder::new()
+        .name("bwk-camera-list".to_owned())
+        .spawn(move || {
+            let _ = sender_cloned.send(query());
+        });
+    if let Err(error) = spawned {
+        let _ = sender.send(Err(Error::Capture(error.to_string())));
+    }
+    receiver
+}
+
+fn query() -> Result<Vec<CameraInfo>, Error> {
+    request_access()?;
+    let mut cameras = Vec::new();
+    for info in nokhwa::query(ApiBackend::Auto)? {
+        let id = CameraId::from_query(&info)?;
+        if !can_capture(&id) {
+            continue;
+        }
+        let index = info.index().as_index()?;
+        cameras.push((
+            index,
+            CameraInfo {
+                id,
+                name: info.human_name(),
+            },
+        ));
+    }
+    if cameras.is_empty() {
+        return Err(Error::NoCamera);
+    }
+    // V4L2 lists the nodes in directory order, the node number orders them as the OS
+    // list does elsewhere
+    cameras.sort_by_key(|(index, _)| *index);
+    Ok(cameras.into_iter().map(|(_, camera)| camera).collect())
+}
+
+/// Only macOS asks, and blocks until the user answers; elsewhere it is granted at once.
+fn request_access() -> Result<(), Error> {
+    if nokhwa::nokhwa_check() {
+        return Ok(());
+    }
+    let (sender, receiver) = mpsc::sync_channel(1);
+    nokhwa::nokhwa_initialize(move |granted| {
+        let _ = sender.try_send(granted);
+    });
+    match receiver.recv() {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(_) => Err(Error::PermissionDenied),
+    }
+}
+
+/// V4L2 lists a UVC webcam twice: its capture node and a node that only streams
+/// metadata. A node whose caps cannot be read is kept, so opening it reports why.
+#[cfg(target_os = "linux")]
+fn can_capture(id: &CameraId) -> bool {
+    match v4l::Device::with_path(id.as_str()).and_then(|device| device.query_caps()) {
+        Ok(caps) => caps
+            .capabilities
+            .contains(v4l::capability::Flags::VIDEO_CAPTURE),
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn can_capture(_id: &CameraId) -> bool {
+    true
+}
+
+/// A camera streaming on its own thread. Dropping it stops the capture.
+pub struct Camera {
+    frame: LatestFrame,
+    stop: Arc<AtomicBool>,
+}
+
+impl Camera {
+    /// The device opens on the capture thread, so a failure there shows up later
+    /// through [`Camera::failure`]. On macOS, [`list`] must have answered first: it asks
+    /// for camera access, and until granted this is `PermissionDenied`. A camera gone
+    /// since [`list`] fails with `NoCamera`, never opens another one.
+    pub fn start(id: &CameraId, config: Config) -> Result<Self, Error> {
+        if !nokhwa::nokhwa_check() {
+            return Err(Error::PermissionDenied);
+        }
+        let lease = Lease::take(id.clone()).ok_or(Error::Busy)?;
+        let frame = LatestFrame::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let frame_cloned = frame.clone();
+        let stop_cloned = stop.clone();
+        // the thread is detached: a v4l2 read has no timeout, so it notices the stop
+        // flag after its current frame and releases the device on its own
+        thread::Builder::new()
+            .name("bwk-camera".to_owned())
+            .spawn(move || {
+                let id = &lease.0;
+                if let Err(error) = capture(id, &config, &frame_cloned, &stop_cloned) {
+                    log::warn!("camera {id} stopped: {error}");
+                    frame_cloned.record_failure(error);
+                }
+            })
+            .map_err(|error| Error::Capture(error.to_string()))?;
+        Ok(Self { frame, stop })
+    }
+
+    /// The latest frame, moved out: once returned it is None until a newer one is
+    /// captured.
+    pub fn frame(&self) -> Option<Rgb> {
+        self.frame.take()
+    }
+
+    /// Why the capture stopped on its own, None while it runs.
+    pub fn failure(&self) -> Option<Error> {
+        self.frame.failure()
+    }
+}
+
+impl Drop for Camera {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+fn capture(
+    id: &CameraId,
+    config: &Config,
+    frame: &LatestFrame,
+    stop: &AtomicBool,
+) -> Result<(), Error> {
+    let mut stream = Stream::open(id, config)?;
+    while !stop.load(Ordering::Acquire) {
+        let Some(rgb) = stream.read(stop)? else {
+            break;
+        };
+        let rgb = rgb.fit(config.fine_scan);
+        frame.publish(rgb);
+    }
+    Ok(())
+}
+
+/// What the capture thread hands the reader: a frame is taken out when read, so it is
+/// read once, while the failure stays readable. A clone shares the same slot.
+#[derive(Default, Clone)]
+struct LatestFrame(Arc<Mutex<Latest>>);
+
+#[derive(Default)]
+struct Latest {
+    frame: Option<Rgb>,
+    failure: Option<Error>,
+}
+
+impl LatestFrame {
+    fn publish(&self, rgb: Rgb) {
+        self.0.lock().expect("poisoned").frame = Some(rgb);
+    }
+
+    fn take(&self) -> Option<Rgb> {
+        self.0.lock().expect("poisoned").frame.take()
+    }
+
+    fn record_failure(&self, error: Error) {
+        self.0.lock().expect("poisoned").failure = Some(error);
+    }
+
+    fn failure(&self) -> Option<Error> {
+        self.0.lock().expect("poisoned").failure.clone()
+    }
+}
+
+/// A device reserved in [`RUNNING`], released when dropped.
+struct Lease(CameraId);
+
+impl Lease {
+    /// None while another lease holds `id`.
+    fn take(id: CameraId) -> Option<Self> {
+        let taken = RUNNING.lock().expect("poisoned").insert(id.clone());
+        taken.then(|| Self(id))
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        RUNNING.lock().expect("poisoned").remove(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "linux")]
+    use nokhwa::utils::CameraIndex;
+
+    #[cfg(target_os = "linux")]
+    use crate::error::Error;
+    use crate::{
+        capture::{CameraId, LatestFrame, Lease},
+        frame::Rgb,
+    };
+
+    fn rgb(value: u8) -> Rgb {
+        Rgb::from_frame(vec![value; 3], 1, 1).unwrap()
+    }
+
+    #[test]
+    fn a_frame_is_read_once() {
+        let frame = LatestFrame::default();
+        assert_eq!(frame.take(), None);
+        frame.publish(rgb(1));
+        assert_eq!(frame.take(), Some(rgb(1)));
+        assert_eq!(frame.take(), None);
+    }
+
+    #[test]
+    fn a_newer_frame_replaces_an_untaken_one() {
+        let frame = LatestFrame::default();
+        frame.publish(rgb(1));
+        frame.publish(rgb(2));
+        assert_eq!(frame.take(), Some(rgb(2)));
+        assert_eq!(frame.take(), None);
+    }
+
+    #[test]
+    fn a_device_is_leased_once_until_released() {
+        // an id no real device has, so no other test races for it
+        let id = CameraId("bwk-camera-test".to_owned());
+        let lease = Lease::take(id.clone()).unwrap();
+        assert!(Lease::take(id.clone()).is_none());
+        drop(lease);
+        assert!(Lease::take(id).is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_linux_id_opens_its_node_number() {
+        let id = CameraId("/dev/video12".to_owned());
+        assert_eq!(id.index(), Ok(CameraIndex::Index(12)));
+        let id = CameraId("/dev/sda".to_owned());
+        assert_eq!(id.index(), Err(Error::NoCamera));
+    }
+}
