@@ -10,7 +10,7 @@ use nokhwa::{
 
 use crate::{
     frame::Rgb,
-    mode::{choose_mode, describe},
+    mode::{choose_mode, describe, fallback_note},
     Config, Error,
 };
 
@@ -27,10 +27,14 @@ impl Stream {
         )?;
         let offered = camera.compatible_camera_formats()?;
         log::debug!("camera {index} offers {}", describe(&offered));
-        let Some(chosen) = choose_mode(&offered, config) else {
+        let Some((chosen, met)) = choose_mode(&offered, config) else {
             return Err(Error::NoSuitableMode { offered });
         };
-        log::info!("camera {index} streams at {}", describe(&[chosen]));
+        log::info!(
+            "camera {index} streams at {}{}",
+            describe(&[chosen]),
+            fallback_note(config, met)
+        );
         camera.set_camera_requset(RequestedFormat::new::<LumaFormat>(
             RequestedFormatType::Exact(chosen),
         ))?;

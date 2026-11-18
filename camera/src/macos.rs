@@ -28,7 +28,7 @@ use objc::{
 
 use crate::{
     frame::{pack_rows, unreadable, Rgb},
-    mode::qualifies,
+    mode::{fallback_note, met_rate},
     Config, Error,
 };
 
@@ -90,17 +90,19 @@ impl Stream {
             _buffer_name: buffer_name,
             _device: device,
         };
-        // the preset decides the mode, so it is checked once it runs
-        if !qualifies(&stream.format, config) {
+        // the preset decides the mode, so it is checked once it runs, against the
+        // preferred frame rate then the fallback one
+        let Some(met) = met_rate(&stream.format, config) else {
             return Err(Error::NoSuitableMode {
                 offered: vec![stream.format],
             });
-        }
+        };
         log::info!(
-            "camera {index} streams at {}x{}@{}",
+            "camera {index} streams at {}x{}@{}{}",
             stream.format.width(),
             stream.format.height(),
-            stream.format.frame_rate()
+            stream.format.frame_rate(),
+            fallback_note(config, met)
         );
         Ok(stream)
     }

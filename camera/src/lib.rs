@@ -25,6 +25,8 @@ pub struct Config {
     pub min_width: u32,
     pub min_height: u32,
     pub min_fps: u32,
+    /// The frame rate a mode is chosen at when none reaches `min_fps`, if lower.
+    pub fallback_fps: Option<u32>,
     /// A larger frame is shrunk to fit before it is published.
     pub max_pixels: usize,
 }

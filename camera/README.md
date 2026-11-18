@@ -14,8 +14,11 @@ Camera capture for QR scanning: Linux (V4L2), Windows (Media Foundation) and mac
   limit of the `Config`; `Rgb::grey()` gives the luma a `bwk-qr` decoder reads.
 
 The mode is the lowest resolution that meets the minimum width, height and frame rate of
-the `Config`, raw formats (YUYV, NV12, GRAY, RGB, BGR) over MJPEG. On macOS the session
-runs at AVFoundation's 1280x720 preset, checked against the same minimum.
+the `Config`, raw formats (YUYV, NV12, GRAY, RGB, BGR) over MJPEG. When no mode reaches
+`min_fps`, the same choice runs again at `fallback_fps` if one is set, and the log says
+so; only when that also finds nothing does the camera fail with `NoSuitableMode`. On
+macOS the session runs at AVFoundation's 1280x720 preset, checked against the same
+minimum, then the fallback rate.
 
 The tuning stays the caller's: the minimum mode and the pixel limit come in the
 `Config`, how often frames are read and decoded is up to the reader.
