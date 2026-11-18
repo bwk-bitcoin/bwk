@@ -64,6 +64,7 @@ tests locally. Commit messages must be single-line and follow existing style
 | bwk-hwi         | Hardware wallet transport and device drivers                |
 | bwk-error       | In-house derive for error impls, reached as `thiserror`     |
 | bwk-qr          | QR generation, scanning, BBQR framing, bipqr messages       |
+| bwk-camera      | Camera capture for QR scanning (Linux, Windows, macOS)      |
 | bwk-backoff     | Exponential backoff utility                                 |
 | bwk-utils       | Test helpers (behind `test` feature)                        |
 +-----------------+-------------------------------------------------------------+
@@ -191,5 +192,7 @@ Electrum integration, all through `bwk_utils::test::regtest`. Tests in
   benchmark dependencies only (`bwk-sp/bench-spdk`)
 - `bipqr`: QR signing protocol codec (git, pinned by rev), used by bwk-qr,
   bwk-sign (`musig`) and bwk-sp's tests
+- `nokhwa`: camera capture (V4L2, Media Foundation, AVFoundation), used by
+  bwk-camera, which drives AVFoundation itself through `nokhwa-bindings-macos`
 - `miniscript`: Descriptor parsing and script generation
 - `bitcoin`: Bitcoin primitives (v0.32)

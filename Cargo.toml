@@ -11,6 +11,7 @@ members = [
     "coin",
     "keys", "utils", "sign", "descriptor", "tx",
     "qr",
+    "camera",
     "persist",
     "p2p",
     "mitm",
@@ -63,6 +64,13 @@ dns-lookup = "2.0"
 trybuild = "1.0"
 qrcodegen = "=1.8.0"
 quircs = "=0.10.3"
+# Camera capture: V4L2 on Linux, Media Foundation on Windows. On macOS bwk-camera
+# drives its own AVFoundation session, nokhwa cannot pick a 720p preset there.
+nokhwa = { version = "=0.10.11", default-features = false, features = ["input-native"] }
+nokhwa-bindings-macos = "=0.2.4"
+flume = "0.11"
+objc = "0.2"
+v4l = "0.14"
 bbqr = { path = "bbqr" }
 bipqr = { git = "https://github.com/pythcoiner/bipqr", rev = "d7363e0ea67af01b0407deff5f33c499a627f897", default-features = false }
 
@@ -90,7 +98,8 @@ bwk-descriptor = { path = "descriptor" }
 bwk-persist = { path = "persist" }
 bwk-utils = { path = "utils" }
 bwk-p2p = { path = "p2p" }
-bwk-qr = { path = "qr" }
+bwk-qr = { path = "qr", default-features = false }
+bwk-camera = { path = "camera" }
 bwk-psbt = { path = "psbt" }
 bwk-musig = { path = "musig", default-features = false }
 bwk-bup = { path = "bup" }

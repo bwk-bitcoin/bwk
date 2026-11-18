@@ -2,7 +2,10 @@ use std::borrow::Cow;
 
 use quircs::Quirc;
 
-use crate::{error::Error, image::Image};
+use crate::{
+    error::Error,
+    image::{box_shrink, shrink_factor, Image},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scanned {
@@ -33,37 +36,16 @@ pub fn scan(image: &Image, find_inverted: bool, max_pixels: usize) -> Result<Vec
     Ok(decoded)
 }
 
-/// `image` shrunk by the smallest integer factor that brings it within `max_pixels`,
-/// each pixel the average of its factor x factor block: no interpolation, so a module
-/// edge stays sharp.
+/// `image` shrunk by the smallest integer factor that brings it within `max_pixels`.
 fn fit(image: &Image, max_pixels: usize) -> Cow<'_, Image> {
-    let (width, height) = (image.width as usize, image.height as usize);
-    let mut factor = 1;
-    while (width / factor) * (height / factor) > max_pixels {
-        factor += 1;
-    }
+    let factor = shrink_factor(image.width, image.height, max_pixels);
     if factor == 1 {
         return Cow::Borrowed(image);
     }
-    let (out_width, out_height) = (width / factor, height / factor);
-    let mut data = Vec::with_capacity(out_width * out_height);
-    for y in 0..out_height {
-        for x in 0..out_width {
-            let mut sum = 0;
-            for row in y * factor..(y + 1) * factor {
-                let start = row * width + x * factor;
-                sum += image.data[start..start + factor]
-                    .iter()
-                    .map(|&value| usize::from(value))
-                    .sum::<usize>();
-            }
-            data.push((sum / (factor * factor)) as u8);
-        }
-    }
     Cow::Owned(Image {
-        data,
-        width: out_width as u32,
-        height: out_height as u32,
+        data: box_shrink(&image.data, image.width, image.height, 1, factor),
+        width: image.width / factor,
+        height: image.height / factor,
     })
 }
 
