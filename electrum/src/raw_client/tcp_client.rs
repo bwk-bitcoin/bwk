@@ -88,12 +88,7 @@ impl TcpClient {
     pub fn try_connect(&mut self, timeout: Option<Duration>) -> Result<(), Error> {
         let url = format!("{}:{}", self.url, self.port);
         let stream = if let Some(timeout) = timeout {
-            let addr = url
-                .to_socket_addrs()
-                .map_err(Error::Io)?
-                .next()
-                .ok_or(Error::SocketAddr)?;
-            net::TcpStream::connect_timeout(&addr, timeout).map_err(Error::TcpStream)?
+            crate::raw_client::connect_timeout(url.to_socket_addrs().map_err(Error::Io)?, timeout)?
         } else {
             net::TcpStream::connect(url).map_err(Error::TcpStream)?
         };

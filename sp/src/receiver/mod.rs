@@ -13,10 +13,9 @@ pub use bitcoin;
 
 use std::str::FromStr;
 
-#[cfg(feature = "mnemonic")]
-use bitcoin::bip32;
 use bitcoin::{
     absolute::Height,
+    bip32,
     hex::{DisplayHex, FromHex},
     secp256k1::{All, PublicKey, Secp256k1, SecretKey},
     Address, Amount, BlockHash, Network, ScriptBuf, Txid,
@@ -26,7 +25,74 @@ use serde::{Deserialize, Serialize};
 use crate::core::{
     receiving::{Label, Receiver},
     utils::common::{Network as SpNetwork, SilentPaymentAddress},
+    SpVersion,
 };
+
+const SP_PURPOSE: u32 = 352;
+const SP_SPEND_KEY: u32 = 0;
+const SP_SCAN_KEY: u32 = 1;
+const SP_KEY_INDEX: u32 = 0;
+
+/// The BIP352 `purpose'/coin_type'/account'` prefix shared by the scan and
+/// spend derivation paths.
+pub fn bip352_base_derivation(
+    network: Network,
+    account: bip32::ChildNumber,
+) -> Vec<bip32::ChildNumber> {
+    let network_idx = match network {
+        Network::Bitcoin => 0u32,
+        _ => 1,
+    };
+    vec![
+        bip32::ChildNumber::from_hardened_idx(SP_PURPOSE).expect("valid purpose"),
+        bip32::ChildNumber::from_hardened_idx(network_idx).expect("0 or 1"),
+        account,
+    ]
+}
+
+/// The BIP352 scan derivation path, `m/352'/{0,1}'/account'/1'/0`. Shared by
+/// [`SpReceiver`]'s mnemonic constructors and a later BIP376 updater.
+pub fn scan_path(network: Network, account: bip32::ChildNumber) -> bip32::DerivationPath {
+    let mut path = bip352_base_derivation(network, account);
+    path.push(bip32::ChildNumber::from_hardened_idx(SP_SCAN_KEY).expect("valid scan key"));
+    path.push(bip32::ChildNumber::from_normal_idx(SP_KEY_INDEX).expect("valid key index"));
+    path.into()
+}
+
+/// The BIP352 spend derivation path, `m/352'/{0,1}'/account'/0'/0`. Shared by
+/// [`SpReceiver`], `bwk_sp::signer::SpSigner`, and a later BIP376 updater.
+pub fn spend_path(network: Network, account: bip32::ChildNumber) -> bip32::DerivationPath {
+    let mut path = bip352_base_derivation(network, account);
+    path.push(bip32::ChildNumber::from_hardened_idx(SP_SPEND_KEY).expect("valid spend key"));
+    path.push(bip32::ChildNumber::from_normal_idx(SP_KEY_INDEX).expect("valid key index"));
+    path.into()
+}
+
+/// Derive the BIP352 spend secret key (`b_spend`) at [`spend_path`]. Shared by
+/// [`SpReceiver`] and `bwk_sp::signer::SpSigner`, the only two owners of this
+/// key.
+pub fn derive_spend_key(
+    master_xpriv: &bip32::Xpriv,
+    secp: &Secp256k1<All>,
+    network: Network,
+    account: bip32::ChildNumber,
+) -> Result<SecretKey, Error> {
+    master_xpriv
+        .derive_priv(secp, &spend_path(network, account))
+        .map_err(|_| Error::KeyDerivation("spend"))
+        .map(|k| k.private_key)
+}
+
+/// Derives the BIP32 master fingerprint from `mnemonic`, without handing back
+/// any private key material. Lets a consumer cache a [`bip32::Fingerprint`]
+/// for BIP376 key-origin metadata without ever holding a master xpriv.
+#[cfg(feature = "mnemonic")]
+pub fn mnemonic_fingerprint(mnemonic: &str, network: Network) -> Option<bip32::Fingerprint> {
+    let mnemonic = bip39::Mnemonic::from_str(mnemonic).ok()?;
+    let seed = mnemonic.to_seed("");
+    let master = bip32::Xpriv::new_master(network, &seed).ok()?;
+    Some(master.fingerprint(&Secp256k1::new()))
+}
 
 // Blockchain data fetched via the blindbit transport.
 
@@ -133,52 +199,12 @@ impl From<RecipientAddress> for String {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
-pub enum SpendKey {
-    Secret(SecretKey),
-    Public(PublicKey),
-}
-
-impl TryInto<SecretKey> for SpendKey {
-    type Error = Error;
-    fn try_into(self) -> Result<SecretKey, Error> {
-        match self {
-            Self::Secret(k) => Ok(k),
-            Self::Public(_) => Err(Error::MissingSecretKey),
-        }
-    }
-}
-
-impl From<&SpendKey> for PublicKey {
-    fn from(value: &SpendKey) -> Self {
-        match value {
-            SpendKey::Secret(k) => {
-                let secp = Secp256k1::signing_only();
-                k.public_key(&secp)
-            }
-            SpendKey::Public(p) => *p,
-        }
-    }
-}
-
-impl From<SpendKey> for PublicKey {
-    fn from(value: SpendKey) -> Self {
-        (&value).into()
-    }
-}
-
-impl From<SecretKey> for SpendKey {
-    fn from(value: SecretKey) -> Self {
-        Self::Secret(value)
-    }
-}
-
 // The receiver: key material + address/output derivation.
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct SpReceiver {
     scan_sk: SecretKey,
-    spend_key: SpendKey,
+    spend_pk: PublicKey,
     pub receiver: Receiver,
     network: Network,
 }
@@ -197,9 +223,9 @@ impl Default for SpReceiver {
         .public_key(bitcoin::key::Parity::Even);
         Self {
             scan_sk: default_sk,
-            spend_key: SpendKey::Secret(default_sk),
+            spend_pk: default_sk.public_key(&Secp256k1::new()),
             receiver: Receiver::new(
-                0,
+                SpVersion::V0,
                 default_pubkey,
                 default_pubkey,
                 Scalar::from_be_bytes(ONE).unwrap().into(),
@@ -212,13 +238,13 @@ impl Default for SpReceiver {
 }
 
 impl SpReceiver {
-    pub fn new(scan_sk: SecretKey, spend_key: SpendKey, network: Network) -> Result<Self, Error> {
+    pub fn new(scan_sk: SecretKey, spend_pk: PublicKey, network: Network) -> Result<Self, Error> {
         let secp = Secp256k1::new();
-        Self::new_inner(scan_sk, spend_key, network, secp)
+        Self::new_inner(scan_sk, spend_pk, network, secp)
     }
     fn new_inner(
         scan_sk: SecretKey,
-        spend_key: SpendKey,
+        spend_pk: PublicKey,
         network: Network,
         secp: Secp256k1<All>,
     ) -> Result<Self, Error> {
@@ -226,16 +252,16 @@ impl SpReceiver {
         let change_label = Label::new(scan_sk, 0);
 
         let receiver = Receiver::new(
-            0,
+            SpVersion::V0,
             scan_pubkey,
-            (&spend_key).into(),
+            spend_pk,
             change_label,
             network.into(),
         )?;
 
         Ok(Self {
             scan_sk,
-            spend_key,
+            spend_pk,
             receiver,
             network,
         })
@@ -265,35 +291,15 @@ impl SpReceiver {
         let seed = mnemonic.to_seed(pp);
         let master_xpriv =
             bip32::Xpriv::new_master(network, &seed).map_err(|_| Error::SeedDerivation)?;
-        let network_idx = match network {
-            Network::Bitcoin => 0u32,
-            _ => 1,
-        };
-        let base_deriv = vec![
-            bip32::ChildNumber::from_hardened_idx(352).expect("352"),
-            bip32::ChildNumber::from_hardened_idx(network_idx).expect("0 or 1"),
-            account,
-        ];
-
-        let mut scan_deriv = base_deriv.clone();
-        scan_deriv.push(bip32::ChildNumber::from_hardened_idx(1).expect("1"));
-        scan_deriv.push(bip32::ChildNumber::from_normal_idx(0).expect("0"));
-
-        let mut spend_deriv = base_deriv;
-        spend_deriv.push(bip32::ChildNumber::from_hardened_idx(0).expect("0"));
-        spend_deriv.push(bip32::ChildNumber::from_normal_idx(0).expect("0"));
 
         let scan = master_xpriv
-            .derive_priv(&secp, &scan_deriv)
+            .derive_priv(&secp, &scan_path(network, account))
             .map_err(|_| Error::KeyDerivation("scan"))?
             .private_key;
 
-        let spend = master_xpriv
-            .derive_priv(&secp, &spend_deriv)
-            .map_err(|_| Error::KeyDerivation("spend"))?
-            .private_key;
+        let spend = derive_spend_key(&master_xpriv, &secp, network, account)?;
 
-        Self::new_inner(scan, spend.into(), network, secp)
+        Self::new_inner(scan, spend.public_key(&secp), network, secp)
     }
 
     pub fn get_receiving_address(&self) -> SilentPaymentAddress {
@@ -304,10 +310,221 @@ impl SpReceiver {
         self.scan_sk
     }
 
-    pub fn try_get_secret_spend_key(&self) -> Result<SecretKey, Error> {
-        match self.spend_key {
-            SpendKey::Public(_) => Err(Error::MissingSecretKey),
-            SpendKey::Secret(sk) => Ok(sk),
+    pub fn spend_pubkey(&self) -> PublicKey {
+        self.spend_pk
+    }
+}
+
+#[cfg(all(test, feature = "mnemonic"))]
+mod tests {
+    use bipqr::{
+        backend::{Active, Backend},
+        ll::{
+            request::{Scan, SpKeys},
+            types::DerivationPath,
+        },
+    };
+    use bitcoin::{
+        bip32,
+        secp256k1::{Secp256k1, SecretKey},
+        Network,
+    };
+
+    use crate::{
+        core::{receiving::Label, utils::common::SilentPaymentAddress, SpVersion},
+        receiver::{derive_spend_key, scan_path, spend_path, SpReceiver},
+    };
+
+    const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+        abandon abandon abandon about";
+
+    fn test_mnemonic() -> bip39::Mnemonic {
+        bip39::Mnemonic::parse(TEST_MNEMONIC).unwrap()
+    }
+
+    #[test]
+    fn mnemonic_receiver_holds_no_secret_spend_key() {
+        let secp = Secp256k1::new();
+        let network = Network::Signet;
+        let account = bip32::ChildNumber::from_hardened_idx(0).unwrap();
+
+        let receiver = SpReceiver::new_from_mnemonic(test_mnemonic(), network).unwrap();
+
+        let seed = test_mnemonic().to_seed("");
+        let master_xpriv = bip32::Xpriv::new_master(network, &seed).unwrap();
+        let expected_spend_pk = derive_spend_key(&master_xpriv, &secp, network, account)
+            .unwrap()
+            .public_key(&secp);
+
+        assert_eq!(receiver.spend_pubkey(), expected_spend_pk);
+    }
+
+    #[test]
+    fn watch_only_and_mnemonic_receivers_match() {
+        let secp = Secp256k1::new();
+        let network = Network::Signet;
+        let account = bip32::ChildNumber::from_hardened_idx(0).unwrap();
+
+        let mnemonic_receiver = SpReceiver::new_from_mnemonic(test_mnemonic(), network).unwrap();
+
+        let seed = test_mnemonic().to_seed("");
+        let master_xpriv = bip32::Xpriv::new_master(network, &seed).unwrap();
+        let scan_sk = master_xpriv
+            .derive_priv(&secp, &scan_path(network, account))
+            .unwrap()
+            .private_key;
+        let spend_pk = derive_spend_key(&master_xpriv, &secp, network, account)
+            .unwrap()
+            .public_key(&secp);
+
+        let watch_only_receiver = SpReceiver::new(scan_sk, spend_pk, network).unwrap();
+
+        assert_eq!(
+            mnemonic_receiver.get_receiving_address(),
+            watch_only_receiver.get_receiving_address()
+        );
+    }
+
+    /// The recipe a signer follows for a silent payment Address Verification request
+    /// (bipqr `DescriptorBody::SpKeys`): from its own seed, derive the spend
+    /// key at the path the request names, derive the scan key at its path or take the
+    /// scan private key the request carries, apply the label `DERIV` names, if any,
+    /// then encode the address.
+    fn signer_address(
+        master_xpriv: &bip32::Xpriv,
+        keys: &SpKeys,
+        label: Option<u32>,
+        network: Network,
+    ) -> SilentPaymentAddress {
+        let secp = Secp256k1::new();
+        assert_eq!(
+            Active::from_ll_fingerprint(&keys.fingerprint),
+            master_xpriv.fingerprint(&secp)
+        );
+        let spend_pk = master_xpriv
+            .derive_priv(&secp, &Active::from_ll_path(&keys.spend_path))
+            .unwrap()
+            .private_key
+            .public_key(&secp);
+        let scan_sk = match &keys.scan {
+            Scan::Path(path) => {
+                master_xpriv
+                    .derive_priv(&secp, &Active::from_ll_path(path))
+                    .unwrap()
+                    .private_key
+            }
+            Scan::Key(key) => Active::from_ll_secret_key(key).unwrap(),
+        };
+        let m_pubkey = match label {
+            Some(m) => spend_pk
+                .add_exp_tweak(&secp, Label::new(scan_sk, m).as_inner())
+                .unwrap(),
+            None => spend_pk,
+        };
+        SilentPaymentAddress::new(
+            scan_sk.public_key(&secp),
+            m_pubkey,
+            network.into(),
+            SpVersion::V0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sp_keys_rebuild_the_receiving_address() {
+        let secp = Secp256k1::new();
+        let network = Network::Signet;
+        let account = bip32::ChildNumber::from_hardened_idx(0).unwrap();
+        let receiver = SpReceiver::new_from_mnemonic(test_mnemonic(), network).unwrap();
+
+        let seed = test_mnemonic().to_seed("");
+        let master_xpriv = bip32::Xpriv::new_master(network, &seed).unwrap();
+        let keys = SpKeys {
+            fingerprint: Active::to_ll_fingerprint(&master_xpriv.fingerprint(&secp)),
+            spend_path: Active::to_ll_path(&spend_path(network, account)),
+            scan: Scan::Path(Active::to_ll_path(&scan_path(network, account))),
+        };
+
+        assert_eq!(
+            signer_address(&master_xpriv, &keys, None, network),
+            receiver.get_receiving_address()
+        );
+    }
+
+    /// BIP-352 test vector "Receiving with labels: label with even parity": its scan
+    /// key is foreign to a signer whose master key is the vector's spend key, at the
+    /// empty spend path, and each label rebuilds the vector's address for it.
+    #[test]
+    fn sp_keys_with_a_foreign_scan_key_rebuild_the_labelled_addresses() {
+        let secp = Secp256k1::new();
+        let network = Network::Bitcoin;
+        let spend_sk: SecretKey =
+            "9d6ad855ce3417ef84e836892e5a56392bfba05fa5d97ccea30e266f540e08b3"
+                .parse()
+                .unwrap();
+        let scan_sk: SecretKey = "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c"
+            .parse()
+            .unwrap();
+        let master_xpriv = bip32::Xpriv {
+            network: network.into(),
+            depth: 0,
+            parent_fingerprint: bip32::Fingerprint::default(),
+            child_number: bip32::ChildNumber::from_normal_idx(0).unwrap(),
+            private_key: spend_sk,
+            chain_code: bip32::ChainCode::from([0; 32]),
+        };
+        let keys = SpKeys {
+            fingerprint: Active::to_ll_fingerprint(&master_xpriv.fingerprint(&secp)),
+            spend_path: DerivationPath(vec![]),
+            scan: Scan::Key(Active::to_ll_secret_key(&scan_sk)),
+        };
+
+        let expected = [
+            (
+                None,
+                "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwv",
+            ),
+            (
+                Some(2),
+                "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjex54dmqmmv6rw353tsuqhs99ydvadxzrsy9nuvk74epvee55drs734pqq",
+            ),
+            (
+                Some(3),
+                "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqsg59z2rppn4qlkx0yz9sdltmjv3j8zgcqadjn4ug98m3t6plujsq9qvu5n",
+            ),
+            (
+                Some(1001337),
+                "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgq7c2zfthc6x3a5yecwc52nxa0kfd20xuz08zyrjpfw4l2j257yq6qgnkdh5",
+            ),
+        ];
+        for (label, address) in expected {
+            assert_eq!(
+                signer_address(&master_xpriv, &keys, label, network).to_string(),
+                address,
+                "label {label:?}"
+            );
         }
+    }
+
+    #[test]
+    fn bip352_paths_match_bip352() {
+        let account = bip32::ChildNumber::from_hardened_idx(0).unwrap();
+
+        assert_eq!(
+            scan_path(Network::Bitcoin, account).to_string(),
+            "352'/0'/0'/1'/0"
+        );
+        assert_eq!(
+            spend_path(Network::Bitcoin, account).to_string(),
+            "352'/0'/0'/0'/0"
+        );
+        assert_eq!(
+            scan_path(Network::Signet, account).to_string(),
+            "352'/1'/0'/1'/0"
+        );
+        assert_eq!(
+            spend_path(Network::Signet, account).to_string(),
+            "352'/1'/0'/0'/0"
+        );
     }
 }

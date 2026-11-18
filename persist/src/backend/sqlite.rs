@@ -42,7 +42,7 @@ use std::{
 use rusqlite::{params, Connection, OptionalExtension};
 
 use super::{lock::DirLock, PersistenceBackend};
-use crate::{PersistError, ACCOUNT_STORE_KEY, DB_VERSION, VERSION_ROW_KEY};
+use crate::{cipher, PersistError, ACCOUNT_STORE_KEY, DB_VERSION, VERSION_ROW_KEY};
 
 /// Encode the current [`DB_VERSION`] as the bytes we stamp into the
 /// SQLite `account.version` row (4-byte little-endian).
@@ -208,7 +208,9 @@ impl PersistenceBackend for SqliteBackend {
             c.query_row(&sql, params![key], |row| row.get::<_, Vec<u8>>(0))
                 .optional()
                 .map_err(|e| PersistError::Sqlite(format!("get_row {store}/{key}: {e}")))
-        })
+        })?
+        .map(|value| cipher::open(&value))
+        .transpose()
     }
 
     fn get_rows(&self, store: &str) -> Result<Vec<(String, Vec<u8>)>, PersistError> {
@@ -226,9 +228,15 @@ impl PersistenceBackend for SqliteBackend {
                 .map_err(|e| PersistError::Sqlite(format!("query get_rows {store}: {e}")))?;
             let mut out = Vec::new();
             for r in rows {
-                out.push(
-                    r.map_err(|e| PersistError::Sqlite(format!("row get_rows {store}: {e}")))?,
-                );
+                let (key, value) =
+                    r.map_err(|e| PersistError::Sqlite(format!("row get_rows {store}: {e}")))?;
+                // The version row is the backend's own, written in clear.
+                let value = if store == ACCOUNT_STORE_KEY && key == VERSION_ROW_KEY {
+                    value
+                } else {
+                    cipher::open(&value)?
+                };
+                out.push((key, value));
             }
             Ok(out)
         })
@@ -236,6 +244,7 @@ impl PersistenceBackend for SqliteBackend {
 
     fn put_row(&self, store: &str, key: &str, bytes: &[u8]) -> Result<(), PersistError> {
         self.validate_store_name(store)?;
+        let bytes = cipher::seal(bytes)?;
         let needs_stamp = !self.stamped.load(Ordering::Acquire);
         self.with_conn(|c| {
             create_store_table_maybe(c, store)?;
@@ -314,6 +323,7 @@ impl PersistenceBackend for SqliteBackend {
                             "row {key:?} in store {store:?} is reserved for the backend"
                         )));
                     }
+                    let bytes = cipher::seal(bytes)?;
                     tx.execute(&insert_sql, params![key, bytes])
                         .map_err(|e| PersistError::Sqlite(format!("insert {store}/{key}: {e}")))?;
                 }

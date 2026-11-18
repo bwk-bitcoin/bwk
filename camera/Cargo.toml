@@ -1,0 +1,29 @@
+[package]
+name = "bwk-camera"
+version = "0.0.1"
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+keywords.workspace = true
+readme = "README.md"
+
+[dependencies]
+bwk-qr = { workspace = true }
+log = { workspace = true }
+nokhwa = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+v4l = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+flume = { workspace = true }
+nokhwa-bindings-macos = { workspace = true }
+objc = { workspace = true }
+
+[features]
+default = ["mjpeg"]
+# Decodes MJPEG frames, through mozjpeg and so a C toolchain. Without it an MJPEG mode
+# never qualifies, and a camera that offers nothing else gets no suitable mode.
+mjpeg = ["nokhwa/decoding"]

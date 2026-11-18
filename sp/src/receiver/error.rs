@@ -9,8 +9,6 @@ pub enum Error {
     SeedDerivation,
     #[error("failed to derive {0} key")]
     KeyDerivation(&'static str),
-    #[error("secret spend key not available")]
-    MissingSecretKey,
 
     // Validation
     #[error("invalid scan range: start ({0}) > end ({1})")]

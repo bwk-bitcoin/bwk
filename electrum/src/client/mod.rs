@@ -35,9 +35,16 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// A server may drop a client that stays silent (ElectrumX does after about
 /// ten minutes), so every listener pings its connection this often.
 #[cfg(not(test))]
-const PING_INTERVAL: Duration = Duration::from_secs(60);
+const PING_INTERVAL: Duration = Duration::from_secs(20);
 #[cfg(test)]
 const PING_INTERVAL: Duration = Duration::from_millis(200);
+/// A ping unanswered this long ends the connection as a drop does: a write to a
+/// silently dead socket still succeeds for many minutes, only the missing
+/// answer tells.
+#[cfg(not(test))]
+const PING_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const PING_TIMEOUT: Duration = Duration::from_millis(500);
 /// Length of one merkle branch sibling.
 pub const MERKLE_HASH_BYTES: usize = 32;
 const SHORT_HEX_BYTES: usize = 8;
@@ -401,7 +408,7 @@ impl Client {
     /// so this listener can be used standalone, outside a bwk/bwk-sp
     /// `Account`, with the consumer's own wrapper request/response types
     /// instead of `CoinRequest`/`CoinResponse` directly. The connection is
-    /// pinged every minute.
+    /// pinged every 20 seconds, and ends when a ping goes unanswered.
     pub fn listen_txs<RQ, RS>(self) -> (mpsc::Sender<RQ>, mpsc::Receiver<RS>)
     where
         RQ: Into<CoinRequest> + Debug + Send + 'static,
@@ -418,7 +425,7 @@ impl Client {
     /// generic so this listener can be used standalone, outside a bwk/bwk-sp
     /// `Account`, with the consumer's own wrapper request/response types
     /// instead of `HeaderRequest`/`HeaderResponse` directly. The connection
-    /// is pinged every minute.
+    /// is pinged every 20 seconds, and ends when a ping goes unanswered.
     pub fn listen_headers<RQ, RS>(self) -> (mpsc::Sender<RQ>, mpsc::Receiver<RS>)
     where
         RQ: Into<HeaderRequest> + Debug + Send + 'static,
@@ -736,6 +743,43 @@ mod tests {
             response.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn keepalive_answered_pings_keep_the_connection() {
+        let (_request, response, mut server) = listener_on_fake_server();
+        let started = Instant::now();
+
+        while started.elapsed() < PING_TIMEOUT * 2 {
+            let (method, id) = read_request(&mut server);
+            assert_eq!(method, "server.ping");
+            let pong = format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":null}}\n");
+            server.get_mut().write_all(pong.as_bytes()).unwrap();
+        }
+
+        assert!(matches!(
+            response.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn keepalive_unanswered_ping_ends_the_connection() {
+        let (_request, response, mut server) = listener_on_fake_server();
+        let (method, _) = read_request(&mut server);
+        assert_eq!(method, "server.ping");
+
+        assert!(matches!(
+            response.recv_timeout(PING_TIMEOUT * 5),
+            Ok(CoinResponse::Error(CoinError::Transport(
+                raw_client::Error::Disconnected
+            )))
+        ));
+        // The pings sent before the timeout, then the closed connection.
+        let mut line = String::new();
+        while server.read_line(&mut line).unwrap() != 0 {
+            line.clear();
+        }
     }
 
     #[test]

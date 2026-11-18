@@ -25,12 +25,9 @@ use std::{
 };
 
 use bwk_coin::{Coin, KeyChain};
-use bwk_descriptor::derivator::SpkDerivator;
-use bwk_persist::{backend::PersistenceBackend, storage::Store};
-use miniscript::{
-    bitcoin::{self, OutPoint, Txid},
-    Descriptor, DescriptorPublicKey,
-};
+use bwk_descriptor::{derivator::SpkDerivator, wallet::WalletDescriptor};
+use bwk_persist::{backend::PersistenceBackend, storage::Store, PersistError};
+use miniscript::bitcoin::{self, OutPoint, Txid};
 
 use crate::{
     address_store::{AddressEntry, AddressStatus, AddressTip},
@@ -163,16 +160,47 @@ impl<P: OpenScanFromBackend> ElectrumScanner<P> {
         let stores = P::open(backend.clone())?;
         let reopen_statuses: ReopenStatuses<P> =
             Arc::new(move || P::open_statuses(backend.clone()));
-        Ok(Self::from_stores(
-            config,
-            sender,
-            stores,
-            Some(reopen_statuses),
-        ))
+        let mut scanner = Self::from_stores(config, sender, stores, Some(reopen_statuses));
+        scanner.try_persist()?;
+        Ok(scanner)
     }
 }
 
 impl<P: ScanProfile> ElectrumScanner<P> {
+    /// Flush wallet rows. Refuses a running listener; after `stop`, joins pending
+    /// listeners and flushes the handed-back statuses too. Does not stop other
+    /// owners of these stores, such as a reconciler.
+    pub fn try_persist(&mut self) -> Result<(), PersistError> {
+        if self.listener.running() {
+            return Err(PersistError::Io("stop the scanner before flushing".into()));
+        }
+        self.listener.join();
+        if let Some(rx) = self.statuses_rx.as_ref() {
+            self.statuses_store = Some(match rx.recv() {
+                Ok(store) => store,
+                Err(_) => match &self.reopen_statuses {
+                    Some(reopen) => reopen()?,
+                    None => return Err(PersistError::Io("statuses store unavailable".into())),
+                },
+            });
+            self.statuses_rx = None;
+        }
+        {
+            let mut coins = self.coin_store.lock().expect("poisoned");
+            coins.tx_store_mut().try_persist()?;
+            coins
+                .address_store()
+                .lock()
+                .expect("poisoned")
+                .try_persist()?;
+        }
+        self.label_store.lock().expect("poisoned").try_persist()?;
+        if let Some(statuses) = self.statuses_store.as_mut() {
+            statuses.flush()?;
+        }
+        Ok(())
+    }
+
     /// Build a scanner over already-open stores. `reopen_statuses` is the
     /// panicked-listener recovery path; pass `None` when there is no backend
     /// to reopen from. The caller owns the descriptor check
@@ -203,9 +231,13 @@ impl<P: ScanProfile> ElectrumScanner<P> {
         let look_ahead = config.look_ahead;
         let receive = receive.max(stat_recv.saturating_sub(look_ahead));
         let change = change.max(stat_change.saturating_sub(look_ahead));
+        let descriptor = config
+            .miniscript_descriptor()
+            .cloned()
+            .expect("sp() is rejected by ScannerConfig::validate_descriptor at open time");
         let coin_store = Arc::new(Mutex::new(CoinStore::new(
             config.network,
-            config.descriptor.clone(),
+            descriptor,
             sender.clone(),
             config.account.clone(),
             receive,
@@ -247,7 +279,14 @@ impl<P: ScanProfile> ElectrumScanner<P> {
         self.config.account.clone()
     }
 
-    pub fn descriptor(&self) -> Descriptor<DescriptorPublicKey> {
+    pub fn descriptor(&self) -> WalletDescriptor {
+        self.config
+            .miniscript_descriptor()
+            .cloned()
+            .expect("sp() is rejected by ScannerConfig::validate_descriptor at open time")
+    }
+
+    pub fn wallet_descriptor(&self) -> bwk_descriptor::descriptor::Descriptor {
         self.config.descriptor.clone()
     }
 
@@ -349,26 +388,36 @@ impl<P: ScanProfile> ElectrumScanner<P> {
             .record_unconfirmed_tx(tx.clone());
     }
 
-    /// Updates the label of a coin identified by the given outpoint.
+    /// Updates the label of a coin identified by the given outpoint, and writes
+    /// it through the backend.
     ///
     /// An empty `label` removes the label instead of setting it.
     pub fn update_coin_label(&self, outpoint: String, label: String) {
         if let Ok(outpoint) = bitcoin::OutPoint::from_str(&outpoint) {
-            if !label.is_empty() {
-                self.label_store
-                    .lock()
-                    .expect("poisoned")
-                    .edit(LabelKey::OutPoint(outpoint), Some(label));
-            } else {
-                self.label_store
-                    .lock()
-                    .expect("poisoned")
-                    .remove(LabelKey::OutPoint(outpoint));
+            if let Err(e) = self.try_update_coin_label(outpoint, label) {
+                log::error!("ElectrumScanner::update_coin_label: {e}");
             }
         }
+    }
+
+    /// Updates and persists a coin label, returning any store or flush error.
+    /// An empty label deletes it. RAM changes remain usable after a failed flush;
+    /// retry this method or call `LabelStore::try_persist` to save them later.
+    pub fn try_update_coin_label(
+        &self,
+        outpoint: OutPoint,
+        label: String,
+    ) -> Result<(), PersistError> {
+        let result = {
+            let mut store = self.label_store.lock().expect("poisoned");
+            let value = (!label.is_empty()).then_some(label);
+            store.try_edit(LabelKey::OutPoint(outpoint), value)?;
+            store.try_persist()
+        };
         if let Ok(mut store) = self.coin_store.try_lock() {
             store.generate();
         }
+        result
     }
 
     /// Generates a new receiving address entry.
@@ -723,7 +772,7 @@ impl ElectrumScanner<RamProfile<DefaultBackend>> {
             .expect("generated mnemonic");
         let xpub = signer.xpub(&DerivationPath::from_str("m/84'/0'/0'/1").expect("static path"));
         let config = ScannerConfig::new(
-            wpkh(xpub),
+            wpkh(xpub).into(),
             PathBuf::default(),
             String::new(),
             "test".into(),
@@ -737,21 +786,75 @@ impl ElectrumScanner<RamProfile<DefaultBackend>> {
 #[cfg(test)]
 mod tests {
     use bwk_descriptor::derivator;
+    use bwk_persist::{storage::Store, PersistError, PersistenceKind, STATUSES_STORE_KEY};
     use bwk_sign::{bip39::Mnemonic, hot_signer::HotSigner};
     use miniscript::{
         bitcoin::{bip32::DerivationPath, Network},
         Descriptor, DescriptorPublicKey,
     };
-    use std::{collections::BTreeMap, path::PathBuf, str::FromStr, sync::mpsc};
+    #[cfg(feature = "test")]
+    use std::collections::BTreeMap;
+    use std::{
+        path::PathBuf,
+        str::FromStr,
+        sync::{mpsc, Arc},
+    };
 
+    #[cfg(feature = "test")]
+    use crate::coin_store::PaymentStatus;
     use crate::{
-        coin_store::PaymentStatus,
         config::ScannerConfig,
+        label_store::LabelKey,
         notification::Notification,
         open,
-        profile::{DefaultBackend, RamProfile},
+        persistence::{test_support::CallerFactory, BackendIdentity, BackendKind},
+        profile::{DefaultBackend, OpenScanFromBackend, RamProfile},
         scanner::ElectrumScanner,
     };
+
+    #[test]
+    fn lost_statuses_reopen_the_injected_backend_and_retry_read_errors() {
+        let factory = Arc::new(CallerFactory::new(true));
+        let mut config = label_test_config(std::env::temp_dir().join("unused-status-recovery"));
+        config.backend_factory = Some(factory.clone());
+        config.backend_kind = BackendKind::SubAccount(3);
+        let decoded: ScannerConfig =
+            serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+        assert_eq!(decoded.backend_kind, BackendKind::SubAccount(3));
+        assert!(decoded.backend_factory.is_none());
+        let backend = factory.backend(BackendIdentity {
+            account: config.account.clone(),
+            network: config.network,
+            kind: BackendKind::SubAccount(3),
+        });
+        let mut scanner: ElectrumScanner = ElectrumScanner::try_new(config).unwrap();
+        let script = scanner.recv_at(7).script_pubkey();
+        let mut statuses = RamProfile::<DefaultBackend>::open_statuses(backend.clone()).unwrap();
+        let value = (Some("caller status".into()), 0, 7);
+        statuses.insert(script.clone(), value.clone()).unwrap();
+        statuses.flush().unwrap();
+        scanner.statuses_store = None;
+        let (sender, receiver) = mpsc::channel();
+        drop(sender);
+        scanner.statuses_rx = Some(receiver);
+        *backend.fail_read.lock().unwrap() = Some(STATUSES_STORE_KEY.into());
+        assert_eq!(
+            scanner.try_persist(),
+            Err(PersistError::Io("read denied: statuses".into()))
+        );
+        *backend.fail_read.lock().unwrap() = None;
+        scanner.try_persist().unwrap();
+        assert_eq!(
+            scanner
+                .statuses_store
+                .as_ref()
+                .unwrap()
+                .get(&script)
+                .unwrap(),
+            Some(value)
+        );
+        assert_eq!(factory.requests.lock().unwrap().len(), 1);
+    }
 
     /// A descriptor the scan cannot derive from (single path, no `<0;1>`) must
     /// fail the open rather than panic once the coin store derives from it.
@@ -766,7 +869,7 @@ mod tests {
         ))
         .unwrap();
         let config = ScannerConfig::new(
-            single_path,
+            single_path.into(),
             PathBuf::default(),
             String::new(),
             "test".into(),
@@ -777,6 +880,114 @@ mod tests {
             ElectrumScanner::<RamProfile<DefaultBackend>>::try_new(config),
             Err(open::Error::Descriptor(derivator::Error::NotMultiXpub))
         ));
+    }
+
+    /// A coin label survives a reopen: it is written through the backend as it is
+    /// set, and removed the same way.
+    #[test]
+    fn a_coin_label_is_persisted() {
+        let dir = temp_dir::TempDir::new().unwrap();
+        let config = label_test_config(dir.path().to_path_buf());
+        let outpoint = miniscript::bitcoin::OutPoint::from_str(
+            "1111111111111111111111111111111111111111111111111111111111111111:0",
+        )
+        .unwrap();
+        let key = LabelKey::OutPoint(outpoint);
+        let open =
+            || ElectrumScanner::<RamProfile<DefaultBackend>>::try_new(config.clone()).unwrap();
+
+        let scanner = open();
+        scanner.update_coin_label(outpoint.to_string(), "rent".into());
+        drop(scanner);
+        let scanner = open();
+        assert_eq!(
+            scanner.label_store().lock().unwrap().get(&key).as_deref(),
+            Some("rent")
+        );
+
+        scanner.update_coin_label(outpoint.to_string(), String::new());
+        drop(scanner);
+        assert_eq!(open().label_store().lock().unwrap().get(&key), None);
+    }
+
+    fn label_test_config(dir: PathBuf) -> ScannerConfig {
+        let mnemo = Mnemonic::generate(12).unwrap();
+        let signer = HotSigner::new_from_mnemonics(Network::Regtest, &mnemo.to_string()).unwrap();
+        let xpub = signer.xpub(&DerivationPath::from_str("m/84'/0'/0'").unwrap());
+        let descriptor = Descriptor::<DescriptorPublicKey>::from_str(&format!(
+            "wpkh([{}/{}]{}/<0;1>/*)",
+            xpub.origin.0, xpub.origin.1, xpub.xkey
+        ))
+        .unwrap();
+        ScannerConfig::new(
+            descriptor.into(),
+            dir,
+            "labels".into(),
+            "test".into(),
+            Network::Regtest,
+            Some(PersistenceKind::Json),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn coin_label_write_errors_survive_retry_and_reopen() {
+        for value in ["new", ""] {
+            check_label_write_retry(value);
+        }
+    }
+
+    #[cfg(unix)]
+    fn check_label_write_retry(value: &str) {
+        let dir = temp_dir::TempDir::new().unwrap();
+        let config = label_test_config(dir.path().to_path_buf());
+        let outpoint = miniscript::bitcoin::OutPoint::null();
+        let key = LabelKey::OutPoint(outpoint);
+        let open =
+            || ElectrumScanner::<RamProfile<DefaultBackend>>::try_new(config.clone()).unwrap();
+        let scanner = open();
+        scanner
+            .try_update_coin_label(outpoint, "old".into())
+            .unwrap();
+        let failed = update_in_read_only_dir(&scanner, outpoint, value);
+        assert!(matches!(failed, Err(PersistError::Io(_))));
+        let expected = (!value.is_empty()).then_some(value);
+        assert_eq!(
+            scanner.label_store().lock().unwrap().get(&key).as_deref(),
+            expected
+        );
+        drop(scanner);
+        let scanner = open();
+        assert_eq!(
+            scanner.label_store().lock().unwrap().get(&key).as_deref(),
+            Some("old")
+        );
+        assert!(matches!(
+            update_in_read_only_dir(&scanner, outpoint, value),
+            Err(PersistError::Io(_))
+        ));
+        scanner.label_store().lock().unwrap().try_persist().unwrap();
+        drop(scanner);
+        assert_eq!(
+            open().label_store().lock().unwrap().get(&key).as_deref(),
+            expected
+        );
+    }
+
+    #[cfg(unix)]
+    fn update_in_read_only_dir(
+        scanner: &ElectrumScanner,
+        outpoint: miniscript::bitcoin::OutPoint,
+        label: &str,
+    ) -> Result<(), PersistError> {
+        let dir = scanner.config().account_dir();
+        let permissions = std::fs::metadata(&dir).unwrap().permissions();
+        let mut readonly = permissions.clone();
+        readonly.set_readonly(true);
+        std::fs::set_permissions(&dir, readonly).unwrap();
+        let result = scanner.try_update_coin_label(outpoint, label.into());
+        std::fs::set_permissions(&dir, permissions).unwrap();
+        result
     }
 
     /// A tx the server reported confirmed but the chain has not promoted yet

@@ -19,7 +19,7 @@ use crate::{
     coldcard,
     jade::{self, api::GetInfoResponse, Jade, SerialTransport},
     ledger::{self, bitcoin_client::client::Transport},
-    specter, AddressScript, DeviceKind, Error as HWIError, Version, HWI,
+    specter, AddressScript, DeviceKind, DeviceWallet, Error as HWIError, Version, HWI,
 };
 use bitcoin::{
     bip32::{DerivationPath, Fingerprint, Xpub},
@@ -30,6 +30,12 @@ use crossbeam::channel;
 use hidapi::{DeviceInfo, HidApi};
 use serde::{Deserialize, Serialize};
 use std::thread::{self, JoinHandle};
+
+#[cfg(all(feature = "coldcard", unix))]
+use std::{
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
+};
 
 #[cfg(feature = "bitbox")]
 use crate::bitbox::api::noise::{ConfigError, NoiseConfig, NoiseConfigData};
@@ -115,6 +121,10 @@ where
         &self.kind
     }
 
+    pub fn capabilities(&self) -> Capabilities {
+        capabilities(&self.kind, self.version.as_ref())
+    }
+
     pub fn get_extended_pubkey(&self, id: Id, path: &DerivationPath, display: bool) {
         let path = path.clone();
         let sender = self.sender.clone();
@@ -159,9 +169,9 @@ where
         thread::spawn(move || match (*device).register_wallet(&name, &policy) {
             Ok(hmac) => {
                 tracing::debug!(
-                    "SupportedDevice[{}]::register_wallet: success, hmac={:?}",
+                    "SupportedDevice[{}]::register_wallet: success, hmac returned={}",
                     fg,
-                    hmac
+                    hmac.is_some()
                 );
                 let _ = sender.send(SigningDeviceMsg::WalletRegistered(id, fg, name, hmac).into());
             }
@@ -242,6 +252,69 @@ where
                 let _ = sender.send(SigningDeviceMsg::Error(Some(id), e.to_string()).into());
             }
         });
+    }
+
+    /// Answers `TransactionSigned` or `Error`, like `sign_tx`.
+    pub fn sign_tx_with_wallet(&self, id: Id, tx: Psbt, wallet: DeviceWallet) {
+        let mut tx = tx;
+        let sender = self.sender.clone();
+        let fg = self.fingerprint;
+        let device = self.device.clone();
+        tracing::debug!(
+            "SupportedDevice[{}]::sign_tx_with_wallet: spawning task, wallet={}",
+            fg,
+            wallet.name
+        );
+        thread::spawn(
+            move || match (*device).sign_tx_with_wallet(&mut tx, &wallet) {
+                Ok(()) => {
+                    tracing::debug!("SupportedDevice[{}]::sign_tx_with_wallet: success", fg);
+                    let _ = sender.send(SigningDeviceMsg::TransactionSigned(id, fg, tx).into());
+                }
+                Err(e) => {
+                    tracing::debug!("SupportedDevice[{}]::sign_tx_with_wallet: error={}", fg, e);
+                    let _ = sender.send(SigningDeviceMsg::Error(Some(id), e.to_string()).into());
+                }
+            },
+        );
+    }
+
+    /// Answers `AddressDisplayed` or `Error`, like `display_address`.
+    pub fn display_address_with_wallet(
+        &self,
+        id: Id,
+        script: &AddressScript,
+        wallet: DeviceWallet,
+    ) {
+        let script = script.clone();
+        let sender = self.sender.clone();
+        let fg = self.fingerprint;
+        let device = self.device.clone();
+        tracing::debug!(
+            "SupportedDevice[{}]::display_address_with_wallet: spawning task, script={:?}, wallet={}",
+            fg,
+            script,
+            wallet.name
+        );
+        thread::spawn(
+            move || match (*device).display_address_with_wallet(&script, &wallet) {
+                Ok(()) => {
+                    tracing::debug!(
+                        "SupportedDevice[{}]::display_address_with_wallet: success",
+                        fg
+                    );
+                    let _ = sender.send(SigningDeviceMsg::AddressDisplayed(id, fg, script).into());
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "SupportedDevice[{}]::display_address_with_wallet: error={}",
+                        fg,
+                        e
+                    );
+                    let _ = sender.send(SigningDeviceMsg::Error(Some(id), e.to_string()).into());
+                }
+            },
+        );
     }
 }
 
@@ -368,7 +441,8 @@ pub enum SigningDeviceMsg<Id = ()> {
     Update,
     XPub(Id, Fingerprint, DerivationPath, Xpub),
     Version(Id, Fingerprint, Version),
-    /// Wallet registered with name and optional HMAC.
+    /// Wallet registered with name and optional HMAC: the Ledger HMAC, `None` for
+    /// devices without one. Send it back in `DeviceWallet::hmac`.
     WalletRegistered(Id, Fingerprint, String, Option<[u8; 32]>),
     /// Wallet registration check result.
     WalletIsRegistered(Id, Fingerprint, String, bool),
@@ -582,6 +656,11 @@ where
     }))
 }
 
+/// Socket path of a running Coldcard simulator. Read once when the listener starts;
+/// when unset the service never touches a socket.
+#[cfg(all(feature = "coldcard", unix))]
+pub const COLDCARD_SIMULATOR_ENV: &str = "BWK_COLDCARD_SIMULATOR";
+
 fn listen<Message, Id>(
     sender: channel::Sender<Message>,
     devices: Arc<Mutex<BTreeMap<String, SigningDevice<Message, Id>>>>,
@@ -614,6 +693,12 @@ fn listen<Message, Id>(
     let mut jade_handles = BTreeMap::<String, JoinHandle<()>>::new();
     #[cfg(feature = "ledger")]
     let mut ledger_simulator_handle = None;
+    #[cfg(all(feature = "coldcard", unix))]
+    let coldcard_simulator_socket = std::env::var_os(COLDCARD_SIMULATOR_ENV).map(PathBuf::from);
+    #[cfg(all(feature = "coldcard", unix))]
+    let mut coldcard_simulator_handle = None;
+    #[cfg(all(feature = "coldcard", unix))]
+    let mut coldcard_simulator_identity = None;
     #[cfg(feature = "bitbox")]
     let mut bitbox02_handles = BTreeMap::<String, JoinHandle<()>>::new();
     #[cfg(feature = "coldcard")]
@@ -657,6 +742,17 @@ fn listen<Message, Id>(
             &mut ledger_simulator_handle,
             devices.clone(),
         );
+
+        #[cfg(all(feature = "coldcard", unix))]
+        if let Some(socket) = &coldcard_simulator_socket {
+            handle_coldcard_simulator(
+                sender.clone(),
+                &mut coldcard_simulator_handle,
+                &mut coldcard_simulator_identity,
+                devices.clone(),
+                socket.clone(),
+            );
+        }
 
         let list = hid.device_list().collect::<Vec<_>>();
         tracing::trace!("HID device list contains {} device(s)", list.len());
@@ -810,13 +906,24 @@ where
     Message: From<SigningDeviceMsg<Id>> + Send + Clone + 'static,
     Id: Send + Clone + 'static,
 {
-    // If device is already in the map, don't poll it again
-    if devices.lock().expect("poisoned").contains_key(id) {
-        tracing::trace!(
-            "should_poll({}): device already in map, returning false",
-            id
-        );
-        return false;
+    // If device is already in the map and supported or locked, don't poll it again: an
+    // unsupported one is polled until it turns supported (a Ledger app opened).
+    match devices.lock().expect("poisoned").get(id) {
+        Some(SigningDevice::Supported(_)) => {
+            tracing::trace!(
+                "should_poll({}): supported device already in map, returning false",
+                id
+            );
+            return false;
+        }
+        Some(SigningDevice::Locked { .. }) => {
+            tracing::trace!(
+                "should_poll({}): locked device already in map, returning false",
+                id
+            );
+            return false;
+        }
+        _ => {}
     }
 
     let result = match handles.get(id) {
@@ -1272,6 +1379,10 @@ fn handle_locked_jade<Message, Id>(
     }
 }
 
+/// Speculos, probed on `127.0.0.1:9999` by `handle_ledger_simulator`.
+#[cfg(feature = "ledger")]
+const LEDGER_SIMULATOR_ID: &str = "ledger-simulator";
+
 #[cfg(feature = "ledger")]
 fn handle_ledger_simulator<Message, Id>(
     sender: channel::Sender<Message>,
@@ -1281,7 +1392,6 @@ fn handle_ledger_simulator<Message, Id>(
     Message: From<SigningDeviceMsg<Id>> + Send + Clone + 'static,
     Id: Send + Clone + 'static,
 {
-    const LEDGER_SIMULATOR_ID: &str = "ledger-simulator";
     // If device is already in the map, don't poll it again
     if devices
         .lock()
@@ -1533,6 +1643,101 @@ fn handle_locked_bitbox<Message, Id>(
     }
 }
 
+/// Device map id of the Coldcard simulator.
+#[cfg(all(feature = "coldcard", unix))]
+const COLDCARD_SIMULATOR_ID: &str = "coldcard-simulator";
+
+/// Device and inode of the file at `socket`, `None` when there is none.
+#[cfg(all(feature = "coldcard", unix))]
+fn socket_identity(socket: &Path) -> Option<(u64, u64)> {
+    std::fs::metadata(socket)
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+}
+
+/// The simulator reports no firmware version (its `vers` only carries the bootloader
+/// one), so no version gate applies, unlike `handle_coldcard`. `identity` is the
+/// socket file found when the listed simulator was connected: once the path is gone
+/// or names another file (a restarted simulator), the entry is dropped and the next
+/// cycle connects again.
+#[cfg(all(feature = "coldcard", unix))]
+fn handle_coldcard_simulator<Message, Id>(
+    sender: channel::Sender<Message>,
+    handle: &mut Option<JoinHandle<()>>,
+    identity: &mut Option<(u64, u64)>,
+    devices: Arc<Mutex<BTreeMap<String, SigningDevice<Message, Id>>>>,
+    socket: PathBuf,
+) where
+    Message: From<SigningDeviceMsg<Id>> + Send + Clone + 'static,
+    Id: Send + Clone + 'static,
+{
+    if devices
+        .lock()
+        .expect("poisoned")
+        .contains_key(COLDCARD_SIMULATOR_ID)
+    {
+        let current = socket_identity(&socket);
+        if current.is_some() && current == *identity {
+            tracing::trace!("handle_coldcard_simulator: device already in map, skipping");
+            return;
+        }
+        devices
+            .lock()
+            .expect("poisoned")
+            .remove(COLDCARD_SIMULATOR_ID);
+        *identity = None;
+        tracing::info!("Coldcard Simulator socket went away, dropped");
+        let _ = sender.send(SigningDeviceMsg::Update.into());
+        return;
+    }
+    if let Some(h) = handle {
+        if !h.is_finished() {
+            tracing::debug!("handle_coldcard_simulator: previous handle still running, skipping");
+            return;
+        }
+    }
+    tracing::trace!("handle_coldcard_simulator: spawning task");
+    *identity = socket_identity(&socket);
+    let jh = thread::spawn(
+        move || match coldcard::Coldcard::connect_simulator(&socket) {
+            Ok(device) => {
+                tracing::debug!("Coldcard Simulator connected");
+                match SigningDevice::new(
+                    COLDCARD_SIMULATOR_ID.into(),
+                    Arc::new(device),
+                    sender.clone(),
+                ) {
+                    Ok(hw) => {
+                        devices
+                            .lock()
+                            .expect("poisoned")
+                            .insert(COLDCARD_SIMULATOR_ID.into(), hw);
+                        let _ = sender.send(SigningDeviceMsg::Update.into());
+                    }
+                    Err(e) => {
+                        tracing::debug!("Failed to initialize Coldcard Simulator: {}", e);
+                    }
+                }
+            }
+            Err(HWIError::DeviceNotFound) => {
+                let was_present = devices
+                    .lock()
+                    .expect("poisoned")
+                    .remove(COLDCARD_SIMULATOR_ID)
+                    .is_some();
+                if was_present {
+                    tracing::info!("Coldcard Simulator disconnected");
+                    let _ = sender.send(SigningDeviceMsg::Update.into());
+                }
+            }
+            Err(e) => {
+                tracing::trace!("Coldcard Simulator not available: {}", e);
+            }
+        },
+    );
+    *handle = Some(jh);
+}
+
 #[cfg(feature = "coldcard")]
 fn handle_coldcard<Message, Id>(
     sender: &channel::Sender<Message>,
@@ -1560,7 +1765,12 @@ fn handle_coldcard<Message, Id>(
         tracing::debug!("Found {} potential Coldcard device(s)", list.len());
     }
 
-    let connected_ids: Vec<_> = list.iter().map(|d| coldcard_id(d)).collect();
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut connected_ids: Vec<_> = list.iter().map(|d| coldcard_id(d)).collect();
+    // the simulator shares the "coldcard-" prefix but is not a HID device: its own
+    // handler removes it
+    #[cfg(unix)]
+    connected_ids.push(COLDCARD_SIMULATOR_ID.into());
     tracing::trace!("handle_coldcard: connected_ids={:?}", connected_ids);
     cleanup_disconnected(sender, handles, &devices, &connected_ids, "coldcard-");
 
@@ -1712,7 +1922,10 @@ fn handle_ledger<Message, Id>(
         tracing::trace!("Found {} Ledger device(s)", list.len());
     }
 
-    let connected_ids: Vec<_> = list.iter().map(|d| ledger_id(d)).collect();
+    let mut connected_ids: Vec<_> = list.iter().map(|d| ledger_id(d)).collect();
+    // The simulator shares the "ledger-" prefix but is not a HID device. Its probe only
+    // runs while it is unlisted, so once listed it stays until the service stops.
+    connected_ids.push(LEDGER_SIMULATOR_ID.into());
     tracing::trace!("handle_ledger: connected_ids={:?}", connected_ids);
     cleanup_disconnected(sender, handles, &devices, &connected_ids, "ledger-");
 
@@ -1906,7 +2119,7 @@ fn ledger_version_supported(version: &Version) -> bool {
 }
 
 /// (DeviceKind, min version) - None means all versions support it.
-const DEVICES_COMPATIBLE_WITH_TAPMINISCRIPT: [(DeviceKind, Option<Version>); 5] = [
+const DEVICES_COMPATIBLE_WITH_TAPMINISCRIPT: [(DeviceKind, Option<Version>); 6] = [
     (
         DeviceKind::Ledger,
         Some(Version {
@@ -1927,6 +2140,7 @@ const DEVICES_COMPATIBLE_WITH_TAPMINISCRIPT: [(DeviceKind, Option<Version>); 5] 
             prerelease: None,
         }),
     ),
+    (DeviceKind::ColdcardSimulator, None),
     (
         DeviceKind::BitBox02,
         Some(Version {
@@ -1938,19 +2152,154 @@ const DEVICES_COMPATIBLE_WITH_TAPMINISCRIPT: [(DeviceKind, Option<Version>); 5] 
     ),
 ];
 
+/// (DeviceKind, min version) - None means all versions support it. The Ledger Bitcoin
+/// app signs `musig()` policies from 2.4.0, the Coldcard from EDGE firmware 6.5.0X.
+const DEVICES_COMPATIBLE_WITH_MUSIG: [(DeviceKind, Option<Version>); 4] = [
+    (
+        DeviceKind::Ledger,
+        Some(Version {
+            major: 2,
+            minor: 4,
+            patch: 0,
+            prerelease: None,
+        }),
+    ),
+    (
+        DeviceKind::LedgerSimulator,
+        Some(Version {
+            major: 2,
+            minor: 4,
+            patch: 0,
+            prerelease: None,
+        }),
+    ),
+    (
+        DeviceKind::Coldcard,
+        Some(Version {
+            major: 6,
+            minor: 5,
+            patch: 0,
+            prerelease: None,
+        }),
+    ),
+    (DeviceKind::ColdcardSimulator, None),
+];
+
+/// Whether `table` lists `device_kind` at `version` or later.
+fn listed(
+    table: &[(DeviceKind, Option<Version>)],
+    device_kind: &DeviceKind,
+    version: Option<&Version>,
+) -> bool {
+    table.iter().any(|(kind, minimal_version)| {
+        device_kind == kind
+            && match (version, minimal_version) {
+                (Some(v1), Some(v2)) => v1 >= v2,
+                (None, Some(_)) => false,
+                (Some(_), None) => true,
+                (None, None) => true,
+            }
+    })
+}
+
 pub fn is_compatible_with_tapminiscript(
     device_kind: &DeviceKind,
     version: Option<&Version>,
 ) -> bool {
-    DEVICES_COMPATIBLE_WITH_TAPMINISCRIPT
-        .iter()
-        .any(|(kind, minimal_version)| {
-            device_kind == kind
-                && match (version, minimal_version) {
-                    (Some(v1), Some(v2)) => v1 >= v2,
-                    (None, Some(_)) => false,
-                    (Some(_), None) => true,
-                    (None, None) => true,
-                }
-        })
+    listed(&DEVICES_COMPATIBLE_WITH_TAPMINISCRIPT, device_kind, version)
+}
+
+/// What a signing device can do, for a consumer to gate its features on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    /// Signs silent payment inputs and exports the BIP-352 scan and spend keys.
+    pub silent_payments: bool,
+    /// Signs `musig()` key expressions in taproot policies (both MuSig2 rounds).
+    pub musig: bool,
+}
+
+pub fn capabilities(device_kind: &DeviceKind, version: Option<&Version>) -> Capabilities {
+    Capabilities {
+        // No USB signing device supports silent payments yet.
+        silent_payments: false,
+        musig: listed(&DEVICES_COMPATIBLE_WITH_MUSIG, device_kind, version),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+    };
+
+    use crate::{
+        service::{
+            capabilities, is_compatible_with_tapminiscript, should_poll, Capabilities,
+            SigningDevice, SigningDeviceMsg, UnsupportedReason,
+        },
+        DeviceKind, Version,
+    };
+
+    fn version(major: u32, minor: u32, patch: u32) -> Version {
+        Version {
+            major,
+            minor,
+            patch,
+            prerelease: None,
+        }
+    }
+
+    #[test]
+    fn musig_capability_follows_the_minimal_firmware() {
+        let cases = [
+            (DeviceKind::Ledger, Some(version(2, 3, 9)), false),
+            (DeviceKind::Ledger, Some(version(2, 4, 0)), true),
+            (DeviceKind::Ledger, None, false),
+            (DeviceKind::LedgerSimulator, Some(version(2, 4, 6)), true),
+            (DeviceKind::Coldcard, Some(version(6, 4, 0)), false),
+            (DeviceKind::Coldcard, Some(version(6, 5, 0)), true),
+            (DeviceKind::ColdcardSimulator, None, true),
+            (DeviceKind::BitBox02, Some(version(9, 21, 0)), false),
+            (DeviceKind::Jade, Some(version(1, 0, 30)), false),
+            (DeviceKind::Specter, None, false),
+        ];
+        for (kind, version, musig) in cases {
+            assert_eq!(
+                capabilities(&kind, version.as_ref()),
+                Capabilities {
+                    silent_payments: false,
+                    musig,
+                },
+                "{kind} at {version:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_device_in_the_map_is_polled_again() {
+        let id = "ledger-test";
+        let devices = Arc::new(Mutex::new(BTreeMap::new()));
+        devices.lock().expect("poisoned").insert(
+            id.to_string(),
+            SigningDevice::<SigningDeviceMsg>::Unsupported {
+                id: id.to_string(),
+                kind: DeviceKind::Ledger,
+                version: None,
+                reason: UnsupportedReason::AppIsNotOpen,
+            },
+        );
+        assert!(
+            should_poll(&BTreeMap::new(), &devices, id),
+            "a Ledger listed with its app closed must be polled until the app opens"
+        );
+    }
+
+    #[test]
+    fn coldcard_simulator_is_compatible_with_tapminiscript() {
+        assert!(is_compatible_with_tapminiscript(
+            &DeviceKind::ColdcardSimulator,
+            None
+        ));
+    }
 }

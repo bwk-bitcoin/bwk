@@ -32,8 +32,10 @@ use crate::{
     header_validator::{self, expected_genesis, Error as ValidatorError},
     notification::{Notification, ValidationFailure},
     raw_client::CertificateCheck,
+    tx_store::Inclusion,
     worker::Worker,
 };
+use bwk_descriptor::spend::{ChainContext, Confirmation};
 use bwk_persist::{
     backend::{headers::HeaderBackend, noop::NoopBackend, PersistenceBackend},
     storage::{ram::RamStore, Store},
@@ -231,6 +233,59 @@ pub struct MerkleProof {
     pub pos: u32,
 }
 
+/// One view of the validated chain, read under a single lock: the tip and the
+/// blocks asked about all belong to the same chain. Take a fresh one after
+/// every chain change; a reorg never updates one already taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainSnapshot {
+    pub height: u32,
+    pub hash: BlockHash,
+    /// BIP113 median-time-past of the tip, `None` when the chain does not hold
+    /// the 11 blocks it is computed over.
+    pub median_time_past: Option<u32>,
+    /// The asked heights the chain holds, each with its block hash and the
+    /// median-time-past of its parent.
+    blocks: BTreeMap<u32, SnapshotBlock>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotBlock {
+    hash: BlockHash,
+    previous_mtp: Option<u32>,
+}
+
+impl ChainSnapshot {
+    /// Where a tx with `inclusion` sits on this chain. A claim on a block this
+    /// chain does not hold (another branch, above the tip, a height not asked
+    /// for) or one whose proof failed is `Unknown`, never trusted.
+    pub fn confirmation(&self, inclusion: &Inclusion) -> Confirmation {
+        let (height, hash) = match inclusion {
+            Inclusion::Unconfirmed => return Confirmation::Unconfirmed,
+            Inclusion::VerifyFailed { .. } => return Confirmation::Unknown,
+            Inclusion::ConfirmedUnverified { height, block_hash }
+            | Inclusion::Verified { height, block_hash } => (*height, *block_hash),
+        };
+        match self.blocks.get(&height) {
+            Some(block) if block.hash == hash => Confirmation::Confirmed {
+                height,
+                previous_mtp: block.previous_mtp,
+            },
+            _ => Confirmation::Unknown,
+        }
+    }
+
+    /// The context to check a coin's locks against, `confirmation` taken from
+    /// [`confirmation`](Self::confirmation) on this snapshot.
+    pub fn context(&self, confirmation: Confirmation) -> ChainContext {
+        ChainContext {
+            tip: self.hash,
+            height: self.height,
+            median_time_past: self.median_time_past,
+            confirmation,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StartError {
     #[error("failed to connect to electrum: {0}")]
@@ -316,6 +371,29 @@ struct ProgressListeners {
 }
 
 impl HeaderStore<RamStore<Arc<dyn PersistenceBackend>, u32, [u8; Header::SIZE]>> {
+    /// Open caller-owned header rows without discarding read or decode failures.
+    pub fn try_from_backend(
+        network: Network,
+        backend: Arc<dyn PersistenceBackend>,
+        checkpoint: Option<Checkpoint>,
+    ) -> Result<Arc<Self>, PersistError> {
+        #[cfg(not(feature = "no-checkpoint"))]
+        if network == Network::Bitcoin && checkpoint.is_none() {
+            return Err(PersistError::Io(
+                "a mainnet header store needs a checkpoint".into(),
+            ));
+        }
+        let store = RamStore::open(
+            backend,
+            STORE_KEY,
+            encode_height,
+            decode_height,
+            encode_header,
+            decode_header,
+        )?;
+        Ok(Self::with_checkpoint(network, store, checkpoint))
+    }
+
     pub fn new_in_memory(network: Network) -> Arc<Self> {
         let backend: Arc<dyn PersistenceBackend> = Arc::new(NoopBackend);
         Self::from_store(
@@ -610,6 +688,11 @@ impl<S> HeaderStore<S>
 where
     S: Store<Key = u32, Value = [u8; Header::SIZE]> + Send + 'static,
 {
+    /// Retry pending header writes, without changing worker ownership.
+    pub fn try_persist(&self) -> Result<(), PersistError> {
+        self.inner.lock().expect("poisoned").store.flush()
+    }
+
     pub fn from_store(network: Network, store: S) -> Arc<Self> {
         Self::with_checkpoint(network, store, None)
     }
@@ -1034,6 +1117,8 @@ where
 
     fn notify_listeners(&self) {
         self.listeners.notify(());
+        self.notifications
+            .notify_with(|| Notification::ChainChanged);
     }
 
     fn publish_progress(&self, event: HeaderProgressEvent) {
@@ -1116,6 +1201,46 @@ where
         let raw = inner.store.get(&tip).ok().flatten()?;
         let hash = deserialize::<Header>(&raw).ok()?.block_hash();
         Some((tip, hash))
+    }
+
+    /// The chain as one [`ChainSnapshot`], with the block hash and parent
+    /// median-time-past of each of `heights` the chain holds. `None` while the
+    /// chain is empty or not validated: a coordinator must not read maturity off
+    /// headers the scan does not promote against either.
+    pub fn chain_snapshot(&self, heights: impl IntoIterator<Item = u32>) -> Option<ChainSnapshot> {
+        let inner = self.inner.lock().expect("poisoned");
+        if inner.validation_state != HeaderValidationState::Valid {
+            return None;
+        }
+        let get = |k| {
+            inner
+                .store
+                .get(&k)
+                .ok()
+                .flatten()
+                .and_then(|raw| deserialize::<Header>(&raw).ok())
+        };
+        let height = inner.store.keys().ok()?.last()?;
+        let hash = get(height)?.block_hash();
+        let blocks = heights
+            .into_iter()
+            .filter(|h| *h <= height)
+            .filter_map(|h| {
+                let block = SnapshotBlock {
+                    hash: get(h)?.block_hash(),
+                    previous_mtp: h
+                        .checked_sub(1)
+                        .and_then(|parent| median_time_past(parent, get)),
+                };
+                Some((h, block))
+            })
+            .collect();
+        Some(ChainSnapshot {
+            height,
+            hash,
+            median_time_past: median_time_past(height, get),
+            blocks,
+        })
     }
 
     pub fn header(&self, h: u32) -> Option<Header> {
@@ -1347,6 +1472,19 @@ where
         inner.store.remove(&key)?;
     }
     inner.store.flush()
+}
+
+/// BIP113 median-time-past at `h`: the median time of block `h` and the ten
+/// before it, fewer only near genesis. `None` when `get` misses one of them, as
+/// below the anchor of a sparse chain: never computed over a shorter window.
+fn median_time_past<F>(h: u32, get: F) -> Option<u32>
+where
+    F: Fn(u32) -> Option<Header>,
+{
+    let mut times = (h.saturating_sub(header_validator::MTP_WINDOW as u32 - 1)..=h)
+        .map(|k| get(k).map(|header| header.time))
+        .collect::<Option<Vec<u32>>>()?;
+    Some(header_validator::median_time(&mut times))
 }
 
 /// Collect the contiguous run of headers ending at `h - 1`, reading each
@@ -4297,10 +4435,19 @@ mod tests {
         store.register_notifications(notif_tx);
         let raws: Vec<_> = chain[..2016].iter().map(raw_header).collect();
         store.append_batch(0, 0, &raws).unwrap();
+        assert!(matches!(
+            notif_rx.try_recv().unwrap(),
+            Notification::ChainChanged
+        ));
         assert!(notif_rx.try_recv().is_err());
 
         store.append(0, 2016, raw_header(&chain[2016])).unwrap_err();
 
+        // The wiped chain is a chain change, reported before the refusal.
+        assert!(matches!(
+            notif_rx.try_recv().unwrap(),
+            Notification::ChainChanged
+        ));
         assert!(is_checkpoint_refusal(notif_rx.try_recv().unwrap()));
     }
 
@@ -4818,5 +4965,203 @@ mod tests {
         assert_eq!(store.min_height(), Some(2016));
         assert_eq!(store.block_hash(2016), Some(chain[2016].block_hash()));
         assert_eq!(store.validation_state(), HeaderValidationState::Valid);
+    }
+
+    fn verified(chain: &[Header], h: u32) -> Inclusion {
+        Inclusion::Verified {
+            height: h,
+            block_hash: chain[h as usize].block_hash(),
+        }
+    }
+
+    #[test]
+    fn chain_snapshot_reads_tip_and_median_time_past_of_one_chain() {
+        // Block times are 1_700_000_000 + height.
+        let chain = build_chain(30);
+        let store = store_with_chain(&chain);
+
+        let snapshot = store.chain_snapshot([5, 20]).unwrap();
+
+        assert_eq!(snapshot.height, 29);
+        assert_eq!(snapshot.hash, chain[29].block_hash());
+        // Median of the times of blocks 19 to 29.
+        assert_eq!(snapshot.median_time_past, Some(1_700_000_024));
+        assert_eq!(
+            snapshot.confirmation(&verified(&chain, 20)),
+            Confirmation::Confirmed {
+                height: 20,
+                previous_mtp: Some(1_700_000_014),
+            }
+        );
+        // Near genesis the window is blocks 0 to 4.
+        assert_eq!(
+            snapshot.confirmation(&verified(&chain, 5)),
+            Confirmation::Confirmed {
+                height: 5,
+                previous_mtp: Some(1_700_000_002),
+            }
+        );
+        assert_eq!(
+            snapshot.context(Confirmation::Unconfirmed),
+            ChainContext {
+                tip: chain[29].block_hash(),
+                height: 29,
+                median_time_past: Some(1_700_000_024),
+                confirmation: Confirmation::Unconfirmed,
+            }
+        );
+    }
+
+    #[test]
+    fn chain_snapshot_trusts_only_claims_on_its_own_blocks() {
+        let chain = build_chain(30);
+        let store = store_with_chain(&chain);
+        let snapshot = store.chain_snapshot([20]).unwrap();
+
+        assert_eq!(
+            snapshot.confirmation(&Inclusion::Unconfirmed),
+            Confirmation::Unconfirmed
+        );
+        let other_block = Inclusion::ConfirmedUnverified {
+            height: 20,
+            block_hash: chain[21].block_hash(),
+        };
+        assert_eq!(snapshot.confirmation(&other_block), Confirmation::Unknown);
+        assert_eq!(
+            snapshot.confirmation(&Inclusion::VerifyFailed {
+                height: 20,
+                block_hash: chain[20].block_hash(),
+            }),
+            Confirmation::Unknown
+        );
+        // Height 21 was not asked for.
+        assert_eq!(
+            snapshot.confirmation(&verified(&chain, 21)),
+            Confirmation::Unknown
+        );
+        let above_tip = Inclusion::Verified {
+            height: 30,
+            block_hash: chain[29].block_hash(),
+        };
+        assert_eq!(
+            store.chain_snapshot([30]).unwrap().confirmation(&above_tip),
+            Confirmation::Unknown
+        );
+    }
+
+    #[test]
+    fn chain_snapshot_above_a_sparse_anchor_has_no_median_time_past_without_eleven_blocks() {
+        let floor = 2016;
+        let chain = build_chain(16);
+        let store = HeaderStore::new_in_memory(Network::Regtest);
+        for (i, header) in chain.iter().take(5).enumerate() {
+            store.insert_unchecked(floor + i as u32, raw_header(header));
+        }
+
+        let short = store.chain_snapshot([floor]).unwrap();
+
+        assert_eq!(short.height, floor + 4);
+        assert_eq!(short.median_time_past, None);
+        let anchor = Inclusion::Verified {
+            height: floor,
+            block_hash: chain[0].block_hash(),
+        };
+        assert_eq!(
+            short.confirmation(&anchor),
+            Confirmation::Confirmed {
+                height: floor,
+                previous_mtp: None,
+            }
+        );
+
+        for (i, header) in chain.iter().enumerate().skip(5) {
+            store.insert_unchecked(floor + i as u32, raw_header(header));
+        }
+        let full = store.chain_snapshot([floor + 10, floor + 11]).unwrap();
+
+        assert_eq!(full.height, floor + 15);
+        // Median of the times of chain[5] to chain[15].
+        assert_eq!(full.median_time_past, Some(1_700_000_010));
+        let confirmed = |i: u32| Inclusion::Verified {
+            height: floor + i,
+            block_hash: chain[i as usize].block_hash(),
+        };
+        // The parent of floor + 10 needs the block below the anchor.
+        assert_eq!(
+            full.confirmation(&confirmed(10)),
+            Confirmation::Confirmed {
+                height: floor + 10,
+                previous_mtp: None,
+            }
+        );
+        assert_eq!(
+            full.confirmation(&confirmed(11)),
+            Confirmation::Confirmed {
+                height: floor + 11,
+                previous_mtp: Some(1_700_000_005),
+            }
+        );
+    }
+
+    #[test]
+    fn chain_snapshot_needs_a_validated_chain() {
+        let store = HeaderStore::new_in_memory(Network::Regtest);
+        assert_eq!(store.chain_snapshot([]), None);
+
+        let store = store_with_chain(&build_chain(3));
+        store.set_validation_state_for_test(HeaderValidationState::Validating);
+
+        assert_eq!(store.chain_snapshot([]), None);
+    }
+
+    #[test]
+    fn reorg_replaces_the_chain_snapshot_and_notifies() {
+        let chain = build_chain(30);
+        let store = store_with_chain(&chain);
+        let (notif_tx, notif_rx) = mpsc::channel();
+        store.register_notifications(notif_tx);
+        let before = store.chain_snapshot([25]).unwrap();
+        let fork = build_branch(chain[24], 25, 6, 0xC0);
+        let branch: BTreeMap<u32, [u8; Header::SIZE]> = fork
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (25 + i as u32, raw_header(h)))
+            .collect();
+
+        store.replace_branch(0, 24, &branch).unwrap();
+        let after = store.chain_snapshot([25]).unwrap();
+
+        assert!(matches!(
+            notif_rx.try_recv().unwrap(),
+            Notification::ChainChanged
+        ));
+        assert_eq!(after.height, 30);
+        assert_eq!(after.hash, fork[5].block_hash());
+        // Median of chain[20..25] and the fork's times 1_700_010_025 + i.
+        assert_eq!(after.median_time_past, Some(1_700_010_025));
+        assert_eq!(
+            after.confirmation(&verified(&chain, 25)),
+            Confirmation::Unknown
+        );
+        let on_fork = Inclusion::Verified {
+            height: 25,
+            block_hash: fork[0].block_hash(),
+        };
+        assert_eq!(
+            after.confirmation(&on_fork),
+            Confirmation::Confirmed {
+                height: 25,
+                previous_mtp: Some(1_700_000_019),
+            }
+        );
+        // A snapshot taken before keeps describing the chain it was read from.
+        assert_eq!(before.hash, chain[29].block_hash());
+        assert_eq!(
+            before.confirmation(&verified(&chain, 25)),
+            Confirmation::Confirmed {
+                height: 25,
+                previous_mtp: Some(1_700_000_019),
+            }
+        );
     }
 }

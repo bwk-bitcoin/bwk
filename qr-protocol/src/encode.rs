@@ -1,0 +1,644 @@
+use alloc::{string::String, vec::Vec};
+
+use crate::{
+    get_info, nonce_cache, request, response, signature, sp,
+    types::{DerivationPath, ExtendedKey, PublicKey, MUSIG_PUB_NONCE_LEN, TAP_LEAF_HASH_LEN},
+    ErrorInfo, MessageType, Request, RequestId, Response, SignResponseKind, DIRECTION_REQUEST,
+    DIRECTION_RESPONSE, MAGIC, MAX_BYTES, MAX_DESCRIPTOR_ALIAS, MAX_VEC, REQUEST_ID_LEN,
+    STATUS_ERROR, STATUS_OK, VERSION,
+};
+
+pub const MAX_PATH: usize = 255;
+pub const MAX_PATCH: u32 = 0x00ff_ffff;
+const ERROR_CODE_FUTURE_MIN: u8 = 0x0f;
+const ERROR_CODE_FUTURE_MAX: u8 = 0xfe;
+const CAPABILITIES_MASK: u32 = 0x0000_000f | response::Capabilities::NONCE_CACHE;
+const NETWORKS_MASK: u8 = response::Networks::MAINNET
+    | response::Networks::TESTNET
+    | response::Networks::SIGNET
+    | response::Networks::REGTEST;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Error {
+    Sp(sp::Error),
+    GetInfo(get_info::Error),
+    Signature(signature::Error),
+    NonceCache(nonce_cache::Error),
+    PathTooLong(usize),
+    PatchTooLarge(u32),
+    ReservedCapabilityBits(u32),
+    ErrorCodeOutOfRange(u8),
+    VecTooLarge(usize),
+    BytesTooLarge(usize),
+    StringTooLong { len: usize, max: usize },
+    StringNul,
+    Unreachable,
+    DefinedSignatureKind(u8),
+    ReservedNetworkBits(u8),
+    DefinedState(u8),
+}
+
+impl Error {
+    pub fn info(&self) -> ErrorInfo {
+        match self {
+            Self::Sp(error) => error.info(),
+            Self::GetInfo(error) => error.info(),
+            Self::Signature(error) => error.info(),
+            Self::NonceCache(error) => error.info(),
+            Self::PathTooLong(_) => error_info!(300, "derivation path exceeds the maximum depth"),
+            Self::PatchTooLarge(_) => error_info!(301, "firmware patch version is too large"),
+            Self::ReservedCapabilityBits(_) => error_info!(302, "reserved capability bits are set"),
+            Self::ErrorCodeOutOfRange(_) => {
+                error_info!(303, "unknown error code is outside the reserved range")
+            }
+            Self::VecTooLarge(_) => error_info!(304, "vector exceeds the maximum item count"),
+            Self::BytesTooLarge(_) => error_info!(305, "byte field exceeds the maximum length"),
+            Self::StringTooLong { .. } => error_info!(306, "string exceeds the maximum length"),
+            Self::StringNul => error_info!(307, "string contains a nul byte"),
+            Self::Unreachable => error_info!(309, "unreachable encoder branch"),
+            Self::DefinedSignatureKind(_) => {
+                error_info!(
+                    310,
+                    "unknown signature entry uses a defined or reserved kind"
+                )
+            }
+            Self::ReservedNetworkBits(_) => error_info!(311, "reserved network bits are set"),
+            Self::DefinedState(_) => error_info!(312, "unknown signer state uses a defined value"),
+        }
+    }
+}
+
+error_display!(Error);
+
+impl From<sp::Error> for Error {
+    fn from(error: sp::Error) -> Self {
+        Self::Sp(error)
+    }
+}
+
+impl From<get_info::Error> for Error {
+    fn from(error: get_info::Error) -> Self {
+        Self::GetInfo(error)
+    }
+}
+
+impl From<signature::Error> for Error {
+    fn from(error: signature::Error) -> Self {
+        Self::Signature(error)
+    }
+}
+
+impl From<nonce_cache::Error> for Error {
+    fn from(error: nonce_cache::Error) -> Self {
+        Self::NonceCache(error)
+    }
+}
+
+pub fn encode_request(request: &Request) -> Result<Vec<u8>, Error> {
+    let mut out = envelope(request.body.message_type(), false, false, request.id);
+    encode_request_body(&mut out, &request.body)?;
+    Ok(out)
+}
+
+pub fn encode_response(response: &Response) -> Result<Vec<u8>, Error> {
+    let status = matches!(response.body, response::Body::Error(_));
+    let mut out = envelope(response.body.message_type(), true, status, response.id);
+    encode_response_body(&mut out, &response.body)?;
+    Ok(out)
+}
+
+/// Generate the [MAGIC][VERSION][MESSAGE_TYPE] envelope
+fn envelope(message_type: MessageType, response: bool, error: bool, id: RequestId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(MAGIC.len() + 2 /* VERSION */ + REQUEST_ID_LEN);
+    out.extend_from_slice(MAGIC);
+    out.push(VERSION);
+    out.push(
+        message_type.value()
+            | if response {
+                DIRECTION_RESPONSE
+            } else {
+                DIRECTION_REQUEST
+            }
+            | if error { STATUS_ERROR } else { STATUS_OK },
+    );
+    out.extend_from_slice(&id.0);
+    out
+}
+
+fn encode_request_body(out: &mut Vec<u8>, body: &request::Body) -> Result<(), Error> {
+    match body {
+        request::Body::GetKeys(request) => encode_get_keys_request(out, request),
+        request::Body::RegisterDescriptor(request) => {
+            encode_register_descriptor_request(out, request)
+        }
+        request::Body::VerifyAddress(request) => encode_verify_address_request(out, request),
+        request::Body::Sign(request) => encode_sign_request(out, request),
+        request::Body::PrepareNonces(request) => encode_prepare_nonces(out, request),
+        request::Body::GetInfo => Ok(()),
+    }
+}
+
+fn encode_response_body(out: &mut Vec<u8>, body: &response::Body) -> Result<(), Error> {
+    match body {
+        response::Body::Keys(response) => encode_keys_response(out, response),
+        response::Body::Registration(response) => encode_registration_response(out, response),
+        response::Body::AddressUri(response) => encode_address_uri_response(out, response),
+        response::Body::Signed(response) => encode_signed_response(out, response),
+        response::Body::NoncesPrepared(response) => encode_nonces_prepared(out, response),
+        response::Body::Info(response) => encode_info_response(out, response),
+        response::Body::Error(response) => encode_error_response(out, response),
+    }
+}
+
+fn encode_get_keys_request(out: &mut Vec<u8>, request: &request::GetKeys) -> Result<(), Error> {
+    write_vec(out, &request.keys, write_key_request)
+}
+
+fn encode_register_descriptor_request(
+    out: &mut Vec<u8>,
+    request: &request::RegisterDescriptor,
+) -> Result<(), Error> {
+    write_descriptor_alias(out, &request.descriptor_alias)?;
+    write_option(out, request.descriptor.as_ref(), write_descriptor_body)
+}
+
+fn encode_verify_address_request(
+    out: &mut Vec<u8>,
+    request: &request::VerifyAddress,
+) -> Result<(), Error> {
+    write_descriptor_alias(out, &request.descriptor_alias)?;
+    write_path(out, &request.derivation_path)?;
+    write_option(out, request.address.as_ref(), write_string)?;
+    write_option(out, request.descriptor.as_ref(), write_descriptor_body)?;
+    write_option(out, request.proof.as_ref(), |out, bytes| {
+        write_bytes(out, bytes)
+    })
+}
+
+fn encode_sign_request(out: &mut Vec<u8>, request: &request::Sign) -> Result<(), Error> {
+    write_vec(out, &request.descriptors, write_descriptor)?;
+    write_bytes(out, &request.psbt)?;
+    write_option(out, request.want_kind.as_ref(), |out, kind| {
+        out.push(kind.value());
+        Ok(())
+    })
+}
+
+fn encode_prepare_nonces(out: &mut Vec<u8>, request: &request::PrepareNonces) -> Result<(), Error> {
+    request.validate()?;
+    out.extend_from_slice(&request.session_id);
+    write_option(out, request.session_ref.as_ref(), |out, session_ref| {
+        out.extend_from_slice(session_ref);
+        Ok(())
+    })?;
+    out.push(request.max_inputs);
+    write_path(out, &request.derivation_path)?;
+    out.extend_from_slice(&request.start.to_be_bytes());
+    out.extend_from_slice(&request.end.to_be_bytes());
+    Ok(())
+}
+
+fn encode_nonces_prepared(
+    out: &mut Vec<u8>,
+    response: &response::NoncesPrepared,
+) -> Result<(), Error> {
+    response.validate()?;
+    out.extend_from_slice(&response.session_id);
+    out.extend_from_slice(&response.session_ref);
+    out.push(response.max_inputs);
+    out.extend_from_slice(&response.start.to_be_bytes());
+    out.extend_from_slice(&response.end.to_be_bytes());
+    write_vec(out, &response.nonces, write_pub_nonce)
+}
+
+fn write_pub_nonce(out: &mut Vec<u8>, nonce: &[u8; MUSIG_PUB_NONCE_LEN]) -> Result<(), Error> {
+    out.extend_from_slice(nonce);
+    Ok(())
+}
+
+fn encode_keys_response(out: &mut Vec<u8>, response: &response::Keys) -> Result<(), Error> {
+    write_vec(out, &response.keys, write_extended_key)?;
+    out.extend_from_slice(&response.fingerprint.0);
+    write_string(out, &response.vendor)?;
+    write_string(out, &response.model)?;
+    write_version(out, &response.version)?;
+    write_capabilities(out, &response.capabilities)
+}
+
+fn encode_info_response(out: &mut Vec<u8>, response: &response::Info) -> Result<(), Error> {
+    response.validate()?;
+    write_string(out, &response.vendor)?;
+    write_string(out, &response.model)?;
+    write_version(out, &response.version)?;
+    write_capabilities(out, &response.capabilities)?;
+    write_state(out, response.state)?;
+    write_networks(out, &response.networks)?;
+    out.extend_from_slice(&response.max_message.to_be_bytes());
+    out.push(response.max_alias);
+    out.push(response.max_keys);
+    out.extend_from_slice(&response.slots.to_be_bytes());
+    write_option(out, response.fingerprint.as_ref(), |out, fingerprint| {
+        out.extend_from_slice(&fingerprint.0);
+        Ok(())
+    })
+}
+
+fn encode_registration_response(
+    out: &mut Vec<u8>,
+    response: &response::Registration,
+) -> Result<(), Error> {
+    write_descriptor_alias(out, &response.descriptor_alias)?;
+    write_option(out, response.registered.as_ref(), write_bool)?;
+    write_option(out, response.stored.as_ref(), write_bool)?;
+    write_option(out, response.proof.as_ref(), |out, bytes| {
+        write_bytes(out, bytes)
+    })
+}
+
+fn encode_address_uri_response(
+    out: &mut Vec<u8>,
+    response: &response::AddressUri,
+) -> Result<(), Error> {
+    write_option(out, response.uri.as_ref(), write_string)
+}
+
+fn encode_signed_response(out: &mut Vec<u8>, response: &response::Signed) -> Result<(), Error> {
+    match response {
+        response::Signed::Psbt(psbt) => encode_signed_psbt_response(out, psbt),
+        response::Signed::Signatures(signatures) => {
+            encode_signed_signatures_response(out, signatures)
+        }
+    }
+}
+
+fn encode_signed_psbt_response(out: &mut Vec<u8>, psbt: &[u8]) -> Result<(), Error> {
+    out.push(SignResponseKind::Psbt.value());
+    write_bytes(out, psbt)
+}
+
+fn encode_signed_signatures_response(
+    out: &mut Vec<u8>,
+    signatures: &[response::SignatureEntry],
+) -> Result<(), Error> {
+    sp::validate_entries(signatures)?;
+    out.push(SignResponseKind::Signatures.value());
+    write_vec(out, signatures, write_signature)
+}
+
+fn encode_error_response(out: &mut Vec<u8>, response: &response::ErrorBody) -> Result<(), Error> {
+    write_error_code(out, response.error)?;
+    write_string(out, &response.message)
+}
+
+fn write_descriptor(out: &mut Vec<u8>, descriptor: &request::Descriptor) -> Result<(), Error> {
+    write_descriptor_alias(out, &descriptor.alias)?;
+    write_option(out, descriptor.descriptor.as_ref(), write_descriptor_body)?;
+    write_option(out, descriptor.proof.as_ref(), |out, bytes| {
+        write_bytes(out, bytes)
+    })
+}
+
+fn write_descriptor_alias(out: &mut Vec<u8>, alias: &String) -> Result<(), Error> {
+    write_string_with_limit(out, alias, MAX_DESCRIPTOR_ALIAS)
+}
+
+fn write_descriptor_body(out: &mut Vec<u8>, body: &request::DescriptorBody) -> Result<(), Error> {
+    out.push(body.value());
+    match body {
+        request::DescriptorBody::Bip380(value) => write_string(out, value),
+        request::DescriptorBody::Bip388 { keys, policy } => {
+            write_vec(out, keys, write_string)?;
+            write_string(out, policy)
+        }
+        request::DescriptorBody::SpKeys(keys) => write_sp_keys(out, keys),
+    }
+}
+
+fn write_sp_keys(out: &mut Vec<u8>, keys: &request::SpKeys) -> Result<(), Error> {
+    out.extend_from_slice(&keys.fingerprint.0);
+    write_path(out, &keys.spend_path)?;
+    let (path, key) = match &keys.scan {
+        request::Scan::Path(path) => (Some(path), None),
+        request::Scan::Key(key) => (None, Some(key)),
+    };
+    write_option(out, path, write_path)?;
+    write_option(out, key, |out, key| {
+        out.extend_from_slice(&key.0);
+        Ok(())
+    })
+}
+
+fn write_signature(out: &mut Vec<u8>, entry: &response::SignatureEntry) -> Result<(), Error> {
+    entry.validate()?;
+    let mut fields = Vec::new();
+    match entry {
+        response::SignatureEntry::Ecdsa { .. } => write_ecdsa_signature(&mut fields, entry),
+        response::SignatureEntry::TapKey { .. } => write_tap_key_signature(&mut fields, entry),
+        response::SignatureEntry::TapScript { .. } => {
+            write_tap_script_signature(&mut fields, entry)
+        }
+        response::SignatureEntry::MusigPubNonce { .. } => write_musig_pub_nonce(&mut fields, entry),
+        response::SignatureEntry::MusigPartialSig { .. } => {
+            write_musig_partial_sig(&mut fields, entry)
+        }
+        response::SignatureEntry::SpEcdhShare { .. } => write_sp_ecdh_share(&mut fields, entry),
+        response::SignatureEntry::SpDleqProof { .. } => write_sp_dleq_proof(&mut fields, entry),
+        response::SignatureEntry::Unknown { .. } => write_unknown_signature(&mut fields, entry),
+    }?;
+    let input_index = entry.input_index().unwrap_or(sp::GLOBAL_INPUT_INDEX);
+    out.extend_from_slice(&input_index.to_be_bytes());
+    out.push(entry.value());
+    write_bytes(out, &fields)
+}
+
+fn write_ecdsa_signature(out: &mut Vec<u8>, entry: &response::SignatureEntry) -> Result<(), Error> {
+    let response::SignatureEntry::Ecdsa {
+        public_key,
+        signature,
+        ..
+    } = entry
+    else {
+        return Err(Error::Unreachable);
+    };
+    out.extend_from_slice(&public_key.0);
+    write_bytes(out, signature)
+}
+
+fn write_tap_key_signature(
+    out: &mut Vec<u8>,
+    entry: &response::SignatureEntry,
+) -> Result<(), Error> {
+    let response::SignatureEntry::TapKey { signature, .. } = entry else {
+        return Err(Error::Unreachable);
+    };
+    write_bytes(out, signature)
+}
+
+fn write_tap_script_signature(
+    out: &mut Vec<u8>,
+    entry: &response::SignatureEntry,
+) -> Result<(), Error> {
+    let response::SignatureEntry::TapScript {
+        xonly_public_key,
+        tap_leaf_hash,
+        signature,
+        ..
+    } = entry
+    else {
+        return Err(Error::Unreachable);
+    };
+    out.extend_from_slice(xonly_public_key);
+    out.extend_from_slice(tap_leaf_hash);
+    write_bytes(out, signature)
+}
+
+fn write_musig_pub_nonce(out: &mut Vec<u8>, entry: &response::SignatureEntry) -> Result<(), Error> {
+    let response::SignatureEntry::MusigPubNonce {
+        participant,
+        aggregate,
+        leaf_hash,
+        nonce,
+        ..
+    } = entry
+    else {
+        return Err(Error::Unreachable);
+    };
+    write_musig_slot(out, participant, aggregate, leaf_hash.as_ref())?;
+    out.extend_from_slice(nonce);
+    Ok(())
+}
+
+fn write_musig_partial_sig(
+    out: &mut Vec<u8>,
+    entry: &response::SignatureEntry,
+) -> Result<(), Error> {
+    let response::SignatureEntry::MusigPartialSig {
+        participant,
+        aggregate,
+        leaf_hash,
+        signature,
+        ..
+    } = entry
+    else {
+        return Err(Error::Unreachable);
+    };
+    write_musig_slot(out, participant, aggregate, leaf_hash.as_ref())?;
+    out.extend_from_slice(signature);
+    Ok(())
+}
+
+fn write_musig_slot(
+    out: &mut Vec<u8>,
+    participant: &PublicKey,
+    aggregate: &PublicKey,
+    leaf_hash: Option<&[u8; TAP_LEAF_HASH_LEN]>,
+) -> Result<(), Error> {
+    out.extend_from_slice(&participant.0);
+    out.extend_from_slice(&aggregate.0);
+    write_option(out, leaf_hash, |out, hash| {
+        out.extend_from_slice(hash);
+        Ok(())
+    })
+}
+
+fn write_sp_ecdh_share(out: &mut Vec<u8>, entry: &response::SignatureEntry) -> Result<(), Error> {
+    let response::SignatureEntry::SpEcdhShare {
+        scope,
+        scan_key,
+        share,
+    } = entry
+    else {
+        return Err(Error::Unreachable);
+    };
+    write_sp_scope(out, scope)?;
+    out.extend_from_slice(&scan_key.0);
+    out.extend_from_slice(&share.0);
+    Ok(())
+}
+
+fn write_sp_dleq_proof(out: &mut Vec<u8>, entry: &response::SignatureEntry) -> Result<(), Error> {
+    let response::SignatureEntry::SpDleqProof {
+        scope,
+        scan_key,
+        proof,
+    } = entry
+    else {
+        return Err(Error::Unreachable);
+    };
+    write_sp_scope(out, scope)?;
+    out.extend_from_slice(&scan_key.0);
+    out.extend_from_slice(proof);
+    Ok(())
+}
+
+fn write_sp_scope(out: &mut Vec<u8>, scope: &response::SpScope) -> Result<(), Error> {
+    write_bool(out, &(*scope == response::SpScope::Global))
+}
+
+// The decoder reads a defined kind as its own variant and the reserved 0x00 is never
+// sent, so neither may hide behind `Unknown`.
+fn write_unknown_signature(
+    out: &mut Vec<u8>,
+    entry: &response::SignatureEntry,
+) -> Result<(), Error> {
+    let response::SignatureEntry::Unknown { kind, fields, .. } = entry else {
+        return Err(Error::Unreachable);
+    };
+    if *kind <= response::SIGNATURE_SP_DLEQ_PROOF {
+        return Err(Error::DefinedSignatureKind(*kind));
+    }
+    out.extend_from_slice(fields);
+    Ok(())
+}
+
+fn write_key_request(out: &mut Vec<u8>, key: &request::KeyRequest) -> Result<(), Error> {
+    write_path(out, &key.derivation_path)?;
+    out.push(key.kind.value());
+    Ok(())
+}
+
+fn write_path(out: &mut Vec<u8>, path: &DerivationPath) -> Result<(), Error> {
+    if path.0.len() > MAX_PATH {
+        return Err(Error::PathTooLong(path.0.len()));
+    }
+    out.push(path.0.len() as u8);
+    for child in &path.0 {
+        out.extend_from_slice(&child.to_be_bytes());
+    }
+    Ok(())
+}
+
+fn write_extended_key(out: &mut Vec<u8>, key: &ExtendedKey) -> Result<(), Error> {
+    out.extend_from_slice(&key.0);
+    Ok(())
+}
+
+fn write_version(out: &mut Vec<u8>, version: &response::FirmwareVersion) -> Result<(), Error> {
+    if version.patch > MAX_PATCH {
+        return Err(Error::PatchTooLarge(version.patch));
+    }
+    out.extend_from_slice(&version.major.to_be_bytes());
+    out.extend_from_slice(&version.minor.to_be_bytes());
+    out.push((version.patch >> 16) as u8);
+    out.push((version.patch >> 8) as u8);
+    out.push(version.patch as u8);
+    out.push(version.flag.value());
+    Ok(())
+}
+
+fn write_capabilities(
+    out: &mut Vec<u8>,
+    capabilities: &response::Capabilities,
+) -> Result<(), Error> {
+    if capabilities.0 & !CAPABILITIES_MASK != 0 {
+        return Err(Error::ReservedCapabilityBits(capabilities.0));
+    }
+    out.extend_from_slice(&capabilities.0.to_be_bytes());
+    Ok(())
+}
+
+// The decoder reads a defined state as its own variant, so none may hide behind
+// `Unknown`.
+fn write_state(out: &mut Vec<u8>, state: response::State) -> Result<(), Error> {
+    if let response::State::Unknown(value) = state {
+        if value <= response::STATE_UNINITIALIZED {
+            return Err(Error::DefinedState(value));
+        }
+    }
+    out.push(state.value());
+    Ok(())
+}
+
+fn write_networks(out: &mut Vec<u8>, networks: &response::Networks) -> Result<(), Error> {
+    if networks.0 & !NETWORKS_MASK != 0 {
+        return Err(Error::ReservedNetworkBits(networks.0));
+    }
+    out.push(networks.0);
+    Ok(())
+}
+
+fn write_error_code(out: &mut Vec<u8>, error: response::Error) -> Result<(), Error> {
+    if let response::Error::Unknown(value) = error {
+        if !(ERROR_CODE_FUTURE_MIN..=ERROR_CODE_FUTURE_MAX).contains(&value) {
+            return Err(Error::ErrorCodeOutOfRange(value));
+        }
+    }
+    out.push(error.value());
+    Ok(())
+}
+
+fn write_option<T, F>(out: &mut Vec<u8>, item: Option<&T>, write: F) -> Result<(), Error>
+where
+    F: FnOnce(&mut Vec<u8>, &T) -> Result<(), Error>,
+{
+    match item {
+        Some(item) => {
+            out.push(1);
+            write(out, item)
+        }
+        None => {
+            out.push(0);
+            Ok(())
+        }
+    }
+}
+
+fn write_vec<T, F>(out: &mut Vec<u8>, items: &[T], mut write: F) -> Result<(), Error>
+where
+    F: FnMut(&mut Vec<u8>, &T) -> Result<(), Error>,
+{
+    if items.len() > MAX_VEC {
+        return Err(Error::VecTooLarge(items.len()));
+    }
+    write_compact(out, items.len() as u64);
+    for item in items {
+        write(out, item)?;
+    }
+    Ok(())
+}
+
+fn write_bool(out: &mut Vec<u8>, value: &bool) -> Result<(), Error> {
+    out.push(u8::from(*value));
+    Ok(())
+}
+
+fn write_string(out: &mut Vec<u8>, s: &String) -> Result<(), Error> {
+    write_string_with_limit(out, s, usize::MAX)
+}
+
+fn write_string_with_limit(out: &mut Vec<u8>, s: &String, max: usize) -> Result<(), Error> {
+    if s.len() > max {
+        return Err(Error::StringTooLong { len: s.len(), max });
+    }
+    if s.as_bytes().contains(&0) {
+        return Err(Error::StringNul);
+    }
+    write_bytes(out, s.as_bytes())
+}
+
+fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), Error> {
+    if bytes.len() > MAX_BYTES {
+        return Err(Error::BytesTooLarge(bytes.len()));
+    }
+    write_compact(out, bytes.len() as u64);
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn write_compact(out: &mut Vec<u8>, value: u64) {
+    match value {
+        0..=0xfc => out.push(value as u8),
+        0xfd..=0xffff => {
+            out.push(0xfd);
+            out.extend_from_slice(&(value as u16).to_le_bytes());
+        }
+        0x1_0000..=0xffff_ffff => {
+            out.push(0xfe);
+            out.extend_from_slice(&(value as u32).to_le_bytes());
+        }
+        _ => {
+            out.push(0xff);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+}

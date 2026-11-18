@@ -1,2 +1,11 @@
 pub mod derivator;
 pub mod descriptor;
+#[cfg(feature = "musig")]
+pub mod musig;
+#[cfg(feature = "musig")]
+pub mod restrict;
+pub mod sp_descriptor;
+pub mod sp_key;
+pub mod spend;
+pub mod updater;
+pub mod wallet;

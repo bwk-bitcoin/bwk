@@ -24,7 +24,7 @@ use std::{
 
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::PersistError;
+use crate::{cipher, PersistError};
 
 /// Persistence interface for a wallet `Config` struct.
 ///
@@ -91,10 +91,12 @@ where
     C: Serialize + DeserializeOwned + Send + Sync,
 {
     fn save(&self, config: &C) -> Result<(), PersistError> {
+        let path = cipher::sealed_path(&self.path);
         let bytes = serde_json::to_vec_pretty(config)
             .map_err(|e| PersistError::Serde(format!("serialize config: {e}")))?;
+        let bytes = cipher::seal(&bytes)?;
 
-        if let Some(parent) = self.path.parent() {
+        if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).map_err(|e| {
                     PersistError::Io(format!("create_dir_all {}: {e}", parent.display()))
@@ -102,7 +104,7 @@ where
             }
         }
 
-        let mut tmp = self.path.clone();
+        let mut tmp = path.clone();
         let name = self
             .path
             .file_name()
@@ -120,28 +122,25 @@ where
                 .map_err(|e| PersistError::Io(format!("fsync {}: {e}", tmp.display())))?;
         }
 
-        fs::rename(&tmp, &self.path).map_err(|e| {
+        fs::rename(&tmp, &path).map_err(|e| {
             PersistError::Io(format!(
                 "rename {} -> {}: {e}",
                 tmp.display(),
-                self.path.display()
+                path.display()
             ))
         })
     }
 
     fn load(&self) -> Result<Option<C>, PersistError> {
-        match fs::read(&self.path) {
+        let path = cipher::sealed_path(&self.path);
+        match fs::read(&path) {
             Ok(bytes) => {
-                let cfg: C = serde_json::from_slice(&bytes).map_err(|e| {
-                    PersistError::Serde(format!("parse {}: {e}", self.path.display()))
-                })?;
+                let cfg: C = serde_json::from_slice(&cipher::open(&bytes)?)
+                    .map_err(|e| PersistError::Serde(format!("parse {}: {e}", path.display())))?;
                 Ok(Some(cfg))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(PersistError::Io(format!(
-                "read {}: {e}",
-                self.path.display()
-            ))),
+            Err(e) => Err(PersistError::Io(format!("read {}: {e}", path.display()))),
         }
     }
 }

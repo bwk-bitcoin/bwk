@@ -1,3 +1,5 @@
 /target/
 bench_data/
 Cargo.lock
+/.test-bins/
+*/target/*

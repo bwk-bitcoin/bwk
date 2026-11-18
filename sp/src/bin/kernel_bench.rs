@@ -14,6 +14,7 @@ use bwk_sp::core::{
     receiving::{Label, Receiver},
     secp256k1::{PublicKey, Secp256k1, SecretKey},
     utils::common::Network,
+    SpVersion,
 };
 
 fn main() {
@@ -27,8 +28,14 @@ fn main() {
     let spend_pubkey = PublicKey::from_secret_key(&secp, &key("spend", 0));
     let scan_pubkey = PublicKey::from_secret_key(&secp, &scan_key);
     let change_label = Label::new(scan_key, 0);
-    let receiver =
-        Receiver::new(0, scan_pubkey, spend_pubkey, change_label, Network::Regtest).unwrap();
+    let receiver = Receiver::new(
+        SpVersion::V0,
+        scan_pubkey,
+        spend_pubkey,
+        change_label,
+        Network::Regtest,
+    )
+    .unwrap();
     let spend_points = receiver.candidate_spend_points().unwrap();
 
     let n: usize = std::env::args()

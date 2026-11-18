@@ -233,7 +233,7 @@ pub(crate) fn check_mtp(
     }
 }
 
-fn median_time(times: &mut [u32]) -> u32 {
+pub(crate) fn median_time(times: &mut [u32]) -> u32 {
     times.sort_unstable();
     times[times.len() / 2]
 }

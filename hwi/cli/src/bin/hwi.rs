@@ -188,6 +188,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     DeviceKind::Ledger
                     | DeviceKind::LedgerSimulator
                     | DeviceKind::Coldcard
+                    | DeviceKind::ColdcardSimulator
                     | DeviceKind::Jade => (name.clone().expect("name is required"), policy.clone()),
                     _ => ("".into(), policy.clone()),
                 };

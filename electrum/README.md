@@ -24,6 +24,16 @@ side of that pairing, keeping a wallet's header store pointed at the endpoint
 its scanners watch. Wiring them together is the consumer's job (see
 `bwk::account::Account`).
 
+`HeaderStore::chain_snapshot` reads the validated chain under one lock: the tip
+height, hash and median-time-past, plus the hash and parent median-time-past of
+the confirmation heights asked for. `ChainSnapshot::context` turns a tx's
+`Inclusion` into the `bwk_descriptor` `ChainContext` that timelock and coinbase
+maturity are checked against. A median-time-past is `None` when the store lacks
+one of its 11 blocks (below a sparse anchor); only near genesis is it taken over
+fewer, as consensus does. The store reports
+`Notification::ChainChanged` on every chain change, reorgs included: a snapshot
+taken before it is stale.
+
 **Scope:** Electrum protocol, script subscription, transaction history/fetch,
 broadcasting, the scan stores, the validated header chain and the reconcile
 pass. Does NOT parse transactions (use rust-bitcoin) or sign anything (use
@@ -59,9 +69,19 @@ The scan reports its connection as `Notification::Electrum(TxListenerNotif)`.
 It sends `Stopped` once a `stop()` lands, and `Disconnected` when the connection
 dropped. A dropped connection is not retried: `start()` opens a new one.
 
+Use `ElectrumScanner::try_update_coin_label(OutPoint, String)` when the caller
+needs to report write failures. An empty label deletes it. For direct label
+edits, use `LabelStore::try_edit` or `try_remove`, then `try_persist`; a successful
+edit alone does not mean it was saved. These methods return `PersistError`.
+With RAM stores, a failed flush keeps the edited value or deletion in memory
+and pending for retry through `try_persist`. The existing methods without the
+`try_` prefix remain logging wrappers, not confirmation that a write succeeded.
+
 Every listener connection (the scan's, and the header store's two) sends
-`server.ping` every minute, so a server does not drop it as idle. A ping that
-fails to send ends the connection the same way as a drop.
+`server.ping` every 20 seconds, so a server does not drop it as idle. A ping
+that fails to send, or that gets no answer within 5 seconds, ends the connection
+the same way as a drop: a write to a silently dead socket can still succeed for
+many minutes.
 
 ### Async Listener (Recommended)
 

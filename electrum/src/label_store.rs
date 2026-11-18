@@ -93,9 +93,15 @@ impl<P: ScanProfile> LabelStore<P> {
 
     /// Persists pending changes through the configured backend.
     pub fn persist(&mut self) {
-        if let Err(e) = self.store.flush() {
+        if let Err(e) = self.try_persist() {
             log::error!("LabelStore::persist() flush: {e}");
         }
+    }
+
+    /// Persists pending changes, returning any backend error. With a RAM profile,
+    /// failed writes remain in memory and pending for the next call.
+    pub fn try_persist(&mut self) -> Result<(), PersistError> {
+        self.store.flush()
     }
 
     /// Retrieves the label associated with the given key (owned clone).
@@ -103,27 +109,37 @@ impl<P: ScanProfile> LabelStore<P> {
         self.store.get(key).ok().flatten()
     }
 
+    /// Collects the live labels into owned entries ordered by key, without flushing.
+    /// With a RAM profile, includes unflushed edits and edits whose flush failed.
+    pub fn snapshot(&self) -> Result<Vec<(LabelKey, String)>, PersistError> {
+        Ok(self.store.iter()?.collect())
+    }
+
     /// Edits the label associated with the given key.
     pub fn edit(&mut self, key: LabelKey, value: Option<String>) {
+        if let Err(e) = self.try_edit(key, value) {
+            log::error!("LabelStore::edit: {e}");
+        }
+    }
+
+    /// Edits or deletes a label without flushing, returning any store error.
+    pub fn try_edit(&mut self, key: LabelKey, value: Option<String>) -> Result<(), PersistError> {
         match value {
-            Some(v) => {
-                if let Err(e) = self.store.insert(key, v) {
-                    log::error!("LabelStore::edit insert: {e}");
-                }
-            }
-            None => {
-                if let Err(e) = self.store.remove(&key) {
-                    log::error!("LabelStore::edit remove: {e}");
-                }
-            }
+            Some(v) => self.store.insert(key, v).map(|_| ()),
+            None => self.try_remove(key),
         }
     }
 
     /// Removes the label associated with the given key.
     pub fn remove(&mut self, key: LabelKey) {
-        if let Err(e) = self.store.remove(&key) {
+        if let Err(e) = self.try_remove(key) {
             log::error!("LabelStore::remove: {e}");
         }
+    }
+
+    /// Removes a label without flushing, returning any store error.
+    pub fn try_remove(&mut self, key: LabelKey) -> Result<(), PersistError> {
+        self.store.remove(&key).map(|_| ())
     }
 
     /// Retrieves the label associated with the given Bitcoin address.
@@ -139,5 +155,87 @@ impl<P: ScanProfile> LabelStore<P> {
     /// Retrieves the label associated with the given transaction ID.
     pub fn transaction(&self, txid: bitcoin::Txid) -> Option<String> {
         self.get(&LabelKey::Transaction(txid))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, sync::Arc};
+
+    use bwk_persist::{backend::json::JsonBackend, PersistError};
+    use miniscript::bitcoin::OutPoint;
+
+    use crate::label_store::{LabelKey, LabelStore, STORE_KEY};
+
+    #[test]
+    fn snapshots_own_all_label_variants_and_empty_values() {
+        let mut store = LabelStore::new();
+        assert_eq!(store.snapshot().unwrap(), vec![]);
+        let outpoint = OutPoint::null();
+        let entries = vec![
+            (LabelKey::OutPoint(outpoint), "coin".to_string()),
+            (LabelKey::Transaction(outpoint.txid), "tx".to_string()),
+            (
+                LabelKey::Address("1BoatSLRHtKNngkdXEeobR76b53LETtpyT".parse().unwrap()),
+                String::new(),
+            ),
+        ];
+        for (key, value) in entries.iter().rev() {
+            store.try_edit(key.clone(), Some(value.clone())).unwrap();
+        }
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(snapshot, entries);
+        store
+            .try_edit(entries[0].0.clone(), Some("updated".into()))
+            .unwrap();
+        store.try_remove(entries[1].0.clone()).unwrap();
+        assert_eq!(
+            store.snapshot().unwrap(),
+            vec![(entries[0].0.clone(), "updated".into()), entries[2].clone()]
+        );
+        drop(store);
+        assert_eq!(snapshot, entries);
+    }
+
+    #[test]
+    fn failed_label_flush_retains_edits_and_deletions_for_retry() {
+        let key = LabelKey::OutPoint(OutPoint::null());
+
+        for (initial, value) in [
+            (None, Some("new".to_string())),
+            (Some("old".to_string()), Some("new".to_string())),
+            (Some("old".to_string()), None),
+        ] {
+            let dir = temp_dir::TempDir::new().unwrap();
+            let backend = Arc::new(JsonBackend::open(dir.path().to_path_buf()).unwrap());
+            let mut store = LabelStore::load_from_backend(backend.clone(), STORE_KEY).unwrap();
+            let blocked = backend.path_for(STORE_KEY).with_extension("json.tmp");
+            store.try_edit(key.clone(), initial.clone()).unwrap();
+            store.try_persist().unwrap();
+            fs::create_dir(&blocked).unwrap();
+            store.try_edit(key.clone(), value.clone()).unwrap();
+            let expected: Vec<_> = value
+                .clone()
+                .map(|v| (key.clone(), v))
+                .into_iter()
+                .collect();
+            let durable: Vec<_> = initial.map(|v| (key.clone(), v)).into_iter().collect();
+            assert_eq!(store.snapshot().unwrap(), expected);
+            assert!(matches!(store.try_persist(), Err(PersistError::Io(_))));
+            assert_eq!(store.get(&key), value);
+            assert_eq!(store.snapshot().unwrap(), expected);
+            let disk = LabelStore::load_from_backend(backend.clone(), STORE_KEY).unwrap();
+            assert_eq!(disk.snapshot().unwrap(), durable);
+            drop(disk);
+            fs::remove_dir(&blocked).unwrap();
+            store.try_persist().unwrap();
+            drop(store);
+            drop(backend);
+
+            let reopened = Arc::new(JsonBackend::open(dir.path().to_path_buf()).unwrap());
+            let store = LabelStore::load_from_backend(reopened, STORE_KEY).unwrap();
+            assert_eq!(store.get(&key), value);
+            assert_eq!(store.snapshot().unwrap(), expected);
+        }
     }
 }

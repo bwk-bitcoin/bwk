@@ -187,7 +187,8 @@ pub fn scan_spend_points(
     }
     let ctx = Ctx::new();
     let n_spend = spend_points.len();
-    let mut out = vec![0u8; n_spend * 32];
+    let out_len = n_spend.checked_mul(32).ok_or(MalformedPubkey)?;
+    let mut out = vec![0u8; out_len];
     let mut n_out: usize = n_spend;
 
     // SAFETY: out holds n_spend*32 bytes; spend_points is n_spend contiguous
@@ -204,6 +205,9 @@ pub fn scan_spend_points(
         )
     };
     if ret != 1 {
+        return Err(MalformedPubkey);
+    }
+    if n_out != n_spend {
         return Err(MalformedPubkey);
     }
 
@@ -228,8 +232,9 @@ pub fn scan_spend_points_batch(
     let ctx = Ctx::new();
     let n_tweaks = tweaks.len();
     let n_spend = spend_points.len();
-    let total = n_tweaks * n_spend;
-    let mut out = vec![0u8; total * 32];
+    let total = n_tweaks.checked_mul(n_spend).ok_or(MalformedPubkey)?;
+    let out_len = total.checked_mul(32).ok_or(MalformedPubkey)?;
+    let mut out = vec![0u8; out_len];
     let mut n_out: usize = total;
 
     // SAFETY: out holds total*32 bytes; tweaks/spend_points are contiguous
@@ -249,7 +254,9 @@ pub fn scan_spend_points_batch(
     if ret != 1 {
         return Err(MalformedPubkey);
     }
-    debug_assert_eq!(n_out, total, "batch wrote unexpected candidate count");
+    if n_out != total {
+        return Err(MalformedPubkey);
+    }
 
     Ok(pack_xonly(&out, n_out))
 }

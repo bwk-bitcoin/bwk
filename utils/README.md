@@ -74,3 +74,23 @@ let (url, port, electrsd) = restart_electrs(electrsd, &bitcoind);
 drive a reorg. `wait_until` polls its closure every 100ms and returns whether it
 ever held. `init_logger` keeps the `RUST_LOG` default so bitcoind and electrs do
 not flood the output, unlike `test::setup_logger` which forces debug level.
+
+### `mock_manager`: a remote signing far end
+
+`mock_manager::spawn` returns a `bwk_sign::remote_manager::RemoteManager`
+already wired to a background thread that answers the remote signing protocol
+on behalf of real `HotSigner`s, so every `Response::Signed` it sends back
+carries a signature that is valid on chain. It is the reference implementation
+of that far end: a consumer speaking the protocol from another language ports
+this request/response loop rather than designing its own.
+
+```rust
+use bwk_utils::mock_manager;
+
+let (manager, mock) = mock_manager::spawn(Network::Regtest, &[mnemonic]);
+
+// The next request answers with a Response::Error instead
+mock.fail_next("device unplugged");
+```
+
+Dropping the `MockRemote` handle stops the thread.

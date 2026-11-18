@@ -1,6 +1,6 @@
 use bwk_coin::{ChangeTip, KeyChain};
 use bwk_descriptor::derivator::SpkDerivator;
-use bwk_persist::storage::Store;
+use bwk_persist::{storage::Store, PersistError};
 use miniscript::bitcoin::{self, address::NetworkUnchecked, Script, ScriptBuf, Txid};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -158,6 +158,11 @@ impl<P: ScanProfile> AddressStore<P> {
             log::error!("AddressStore::notify() fail to send notification: {e:?}");
         }
         self.update_watch_tip();
+    }
+
+    /// Retry pending address-tip writes after a failed automatic flush.
+    pub fn try_persist(&self) -> Result<(), PersistError> {
+        self.account_store.lock().expect("poisoned").flush()
     }
 
     /// Updates the watch tip for receiving and change addresses.
@@ -675,7 +680,6 @@ mod tests {
         // Create a dummy finalization context
         let ctx = FinalizationContext {
             inputs: &[],
-            partial_secret: None,
             network,
         };
 
