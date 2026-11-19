@@ -3,7 +3,7 @@
 mod common;
 
 use bwk_qr::{
-    config::Config,
+    config::DecoderConfig,
     decoder::{Decoded, Decoder},
     error::Error,
     image::Image,
@@ -38,73 +38,96 @@ fn bip21_uri_round_trips() {
 #[test]
 fn inverted_frame_decodes_only_when_configured() {
     let rendered = render(TAPROOT_ADDRESS);
-    let inverted = Image {
-        data: rendered.data.iter().map(|v| 255 - *v).collect(),
-        width: rendered.width,
-        height: rendered.height,
-    };
+    let inverted = Image::from_frame(
+        rendered.data().iter().map(|v| 255 - *v).collect(),
+        rendered.side(),
+        rendered.side(),
+    )
+    .unwrap();
 
-    let mut permissive = Decoder::new(Config::default()).unwrap();
+    let mut permissive = Decoder::new();
     assert_eq!(
         permissive.process(&inverted).unwrap(),
-        vec![Decoded::Text(TAPROOT_ADDRESS.to_string())]
+        Some(Decoded::Text(TAPROOT_ADDRESS.to_string()))
     );
 
-    let mut strict = Decoder::new(Config {
+    let mut strict = Decoder::with_config(DecoderConfig {
         scan_inverted: false,
-        ..Config::default()
-    })
-    .unwrap();
-    assert_eq!(strict.process(&inverted).unwrap(), vec![]);
+        ..DecoderConfig::default()
+    });
+    assert_eq!(strict.process(&inverted).unwrap(), None);
 }
 
 #[test]
 fn frame_without_qr_decodes_to_nothing() {
-    let mut decoder = Decoder::new(Config::default()).unwrap();
-    let gray = Image {
-        data: vec![128; 100 * 100],
-        width: 100,
-        height: 100,
-    };
-    assert_eq!(decoder.process(&gray).unwrap(), vec![]);
+    let mut decoder = Decoder::new();
+    let gray = Image::from_frame(vec![128; 100 * 100], 100, 100).unwrap();
+    assert_eq!(decoder.process(&gray).unwrap(), None);
 }
 
-// A camera that only offers 1080p: the code drawn 6 times larger, centred on a white
-// 1920 x 1080 frame, twice the default pixel limit.
-fn camera_frame(code: &Image) -> Image {
-    const SCALE: u32 = 6;
-    let (width, height) = (1920, 1080);
+const CAMERA_WIDTH: u32 = 1920;
+const CAMERA_HEIGHT: u32 = 1080;
+
+// A camera that only offers 1080p: the code drawn `scale` times larger on a white
+// 1920 x 1080 frame, its left edge at `left` and centered vertically.
+fn camera_frame(code: &Image, scale: u32, left: u32) -> Image {
+    let (width, height) = (CAMERA_WIDTH, CAMERA_HEIGHT);
     let mut data = vec![255; (width * height) as usize];
-    let left = (width - code.width * SCALE) / 2;
-    let top = (height - code.height * SCALE) / 2;
-    for y in 0..code.height * SCALE {
-        for x in 0..code.width * SCALE {
+    let top = (height - code.side() * scale) / 2;
+    for y in 0..code.side() * scale {
+        for x in 0..code.side() * scale {
             data[((top + y) * width + left + x) as usize] =
-                code.data[((y / SCALE) * code.width + x / SCALE) as usize];
+                code.data()[((y / scale) * code.side() + x / scale) as usize];
         }
     }
-    Image {
-        data,
-        width,
-        height,
-    }
+    Image::from_frame(data, width, height).unwrap()
+}
+
+fn centered_left(code: &Image, scale: u32) -> u32 {
+    (CAMERA_WIDTH - code.side() * scale) / 2
 }
 
 #[test]
-fn frame_over_the_pixel_limit_is_shrunk_and_read() {
-    let frame = camera_frame(&render(TAPROOT_ADDRESS));
-    assert!(frame.data.len() > Config::default().max_image_pixels);
-    let mut decoder = Decoder::new(Config::default()).unwrap();
+fn code_in_the_center_of_a_wide_frame_is_read() {
+    const SCALE: u32 = 6;
+    let code = render(TAPROOT_ADDRESS);
+    let frame = camera_frame(&code, SCALE, centered_left(&code, SCALE));
+    let mut decoder = Decoder::new();
     assert_eq!(
         decoder.process(&frame).unwrap(),
-        vec![Decoded::Text(TAPROOT_ADDRESS.to_string())]
+        Some(Decoded::Text(TAPROOT_ADDRESS.to_string()))
     );
 }
 
 #[test]
+fn code_outside_the_centered_square_is_not_read() {
+    const SCALE: u32 = 2;
+    let code = render(TAPROOT_ADDRESS);
+    let side = code.side() * SCALE;
+    assert!(side <= (CAMERA_WIDTH - CAMERA_HEIGHT) / 2);
+    let mut decoder = Decoder::new();
+    assert_eq!(
+        decoder
+            .process(&camera_frame(&code, SCALE, centered_left(&code, SCALE)))
+            .unwrap(),
+        Some(Decoded::Text(TAPROOT_ADDRESS.to_string()))
+    );
+    for left in [0, CAMERA_WIDTH - side] {
+        assert_eq!(
+            decoder.process(&camera_frame(&code, SCALE, left)).unwrap(),
+            None,
+            "left: {left}"
+        );
+    }
+}
+
+#[test]
 fn frame_whose_data_does_not_match_its_size_is_rejected() {
-    let mut frame = render(TAPROOT_ADDRESS);
-    frame.data.pop();
-    let mut decoder = Decoder::new(Config::default()).unwrap();
-    assert_eq!(decoder.process(&frame), Err(Error::BadFrame));
+    let frame = render(TAPROOT_ADDRESS);
+    let mut data = frame.data().to_vec();
+    data.pop();
+    assert_eq!(
+        Image::from_frame(data, frame.side(), frame.side()),
+        Err(Error::BadFrame)
+    );
 }

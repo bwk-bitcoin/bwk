@@ -6,10 +6,10 @@ authors.workspace = true
 license-file.workspace = true
 repository.workspace = true
 keywords.workspace = true
-readme.workspace = true
+readme = "README.md"
 
 [dependencies]
-bbqr = { workspace = true, optional = true }
+bwk-bbqr = { workspace = true, optional = true }
 bipqr = { workspace = true, features = ["bitcoin_0_32"], optional = true }
 qrcodegen = { workspace = true, optional = true }
 quircs = { workspace = true, optional = true }
@@ -22,5 +22,5 @@ bitcoin = { workspace = true }
 default = ["gen", "scan", "protocol"]
 gen = ["dep:qrcodegen"]
 scan = ["dep:quircs"]
-bbqr = ["gen", "scan", "dep:bbqr"]
+bbqr = ["gen", "scan", "dep:bwk-bbqr"]
 protocol = ["bbqr", "dep:bipqr"]

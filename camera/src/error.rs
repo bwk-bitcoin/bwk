@@ -9,11 +9,10 @@ pub enum Error {
     #[error("the camera is already in use")]
     Busy,
     #[error(
-        "no camera mode meets the minimum resolution and frame rate, offered: {}",
+        "no camera mode meets the minimum side and frame rate, offered: {}",
         describe(offered)
     )]
     NoSuitableMode { offered: Vec<CameraFormat> },
-    /// Refused, or not answered in time.
     #[error("camera permission refused")]
     PermissionDenied,
     #[error("camera capture failed: {0}")]
@@ -30,7 +29,12 @@ impl From<NokhwaError> for Error {
             Self::PermissionDenied
         } else if lowercase.contains("busy") || lowercase.contains("in use") {
             Self::Busy
-        } else if lowercase.contains("not found") || lowercase.contains("no camera") {
+        } else if lowercase.contains("not found")
+            || lowercase.contains("no camera")
+            || lowercase.contains("no such file or directory")
+            || lowercase.contains("no such device")
+            || lowercase.contains("device is null")
+        {
             Self::NoCamera
         } else {
             Self::Capture(text)
@@ -40,7 +44,10 @@ impl From<NokhwaError> for Error {
 
 #[cfg(test)]
 mod tests {
-    use nokhwa::utils::{CameraFormat, FrameFormat};
+    use nokhwa::{
+        utils::{CameraFormat, FrameFormat},
+        NokhwaError,
+    };
 
     use crate::error::Error;
 
@@ -54,8 +61,29 @@ mod tests {
         };
         assert_eq!(
             error.to_string(),
-            "no camera mode meets the minimum resolution and frame rate, offered: \
+            "no camera mode meets the minimum side and frame rate, offered: \
              640x480@30 MJPEG, 320x240@15 YUYV"
         );
+    }
+
+    #[test]
+    fn a_missing_linux_device_is_no_camera() {
+        for reason in [
+            "No such file or directory (os error 2)",
+            "No such device (os error 19)",
+        ] {
+            let error =
+                NokhwaError::OpenDeviceError("0".to_string(), format!("V4L2 Error: {reason}"));
+            assert_eq!(Error::from(error), Error::NoCamera, "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_camera_gone_since_the_list_is_no_camera() {
+        // what Media Foundation, then AVFoundation, report for an id no longer present
+        for reason in ["Not Found", "Device is null"] {
+            let error = NokhwaError::OpenDeviceError("id".to_string(), reason.to_string());
+            assert_eq!(Error::from(error), Error::NoCamera, "{reason}");
+        }
     }
 }

@@ -63,6 +63,7 @@ tests locally. Commit messages must be single-line and follow existing style
 | bwk-persist     | KV persistence: Store, RamStore, JSON/SQLite backends       |
 | bwk-hwi         | Hardware wallet transport and device drivers                |
 | bwk-error       | In-house derive for error impls, reached as `thiserror`     |
+| bwk-bbqr        | BBQR split and join, hex encoding                           |
 | bwk-qr          | QR generation, scanning, BBQR framing, bipqr messages       |
 | bwk-camera      | Camera capture for QR scanning (Linux, Windows, macOS)      |
 | bwk-backoff     | Exponential backoff utility                                 |

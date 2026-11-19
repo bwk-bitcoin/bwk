@@ -2,7 +2,7 @@
 
 mod common;
 
-use bwk_qr::{config::Config, encoder::Encoder, error::Error};
+use bwk_qr::{config::QrSize, encoder::Encoder, error::Error};
 
 use common::{render, ADDRESS, SP_ADDRESS};
 
@@ -10,9 +10,8 @@ const DESCRIPTOR: &str = "tr([f00dbabe/86h/0h/0h]xpub6BgBgsespWvERF3LHQu6CnqdvfE
 
 fn assert_render_size(text: &str, size: u32, pixels: usize) {
     let image = render(text);
-    assert_eq!(image.width, size);
-    assert_eq!(image.height, size);
-    assert_eq!(image.data.len(), pixels);
+    assert_eq!(image.side(), size);
+    assert_eq!(image.data().len(), pixels);
 }
 
 #[test]
@@ -31,7 +30,7 @@ fn descriptor_renders_version_seven() {
 }
 
 #[test]
-fn sp_address_fits_default_version_cap() {
+fn sp_address_renders_version_six() {
     assert_render_size(SP_ADDRESS, 196, 38416);
 }
 
@@ -42,15 +41,9 @@ fn empty_text_renders_version_one() {
 
 #[test]
 fn version_cap_rejects_payload_that_does_not_fit() {
-    let capped = Encoder::new(Config {
-        max_qr_version: 3,
-        // a full BBQR part still has to fit the capped version
-        bbqr_part_bytes: 32,
-        ..Config::default()
-    })
-    .unwrap();
+    let capped = Encoder::new(QrSize::S29);
     assert_eq!(capped.encode_text(SP_ADDRESS), Err(Error::TooLong));
 
-    let default = Encoder::new(Config::default()).unwrap();
-    assert!(default.encode_text(SP_ADDRESS).is_ok());
+    let roomy = Encoder::new(QrSize::S41);
+    assert!(roomy.encode_text(SP_ADDRESS).is_ok());
 }

@@ -4,34 +4,36 @@ use std::sync::atomic::AtomicBool;
 
 use nokhwa::{
     pixel_format::LumaFormat,
-    utils::{CameraIndex, RequestedFormat, RequestedFormatType},
+    utils::{RequestedFormat, RequestedFormatType},
     Camera,
 };
 
 use crate::{
+    capture::CameraId,
+    error::Error,
     frame::Rgb,
     mode::{choose_mode, describe, fallback_note},
-    Config, Error,
+    Config,
 };
 
-pub(crate) struct Stream {
+pub struct Stream {
     camera: Camera,
 }
 
 impl Stream {
-    pub(crate) fn open(index: u32, config: &Config) -> Result<Self, Error> {
+    pub fn open(id: &CameraId, config: &Config) -> Result<Self, Error> {
         // LumaFormat accepts every frame format, the mode choice narrows it down
         let mut camera = Camera::new(
-            CameraIndex::Index(index),
+            id.index()?,
             RequestedFormat::new::<LumaFormat>(RequestedFormatType::None),
         )?;
         let offered = camera.compatible_camera_formats()?;
-        log::debug!("camera {index} offers {}", describe(&offered));
+        log::debug!("camera {id} offers {}", describe(&offered));
         let Some((chosen, met)) = choose_mode(&offered, config) else {
             return Err(Error::NoSuitableMode { offered });
         };
         log::info!(
-            "camera {index} streams at {}{}",
+            "camera {id} streams at {}{}",
             describe(&[chosen]),
             fallback_note(config, met)
         );
@@ -43,7 +45,7 @@ impl Stream {
     }
 
     /// Blocks until the next frame: a v4l2 read has no timeout.
-    pub(crate) fn read(&mut self, _stop: &AtomicBool) -> Result<Option<Rgb>, Error> {
+    pub fn read(&mut self, _stop: &AtomicBool) -> Result<Option<Rgb>, Error> {
         let buffer = self.camera.frame()?;
         let resolution = buffer.resolution();
         Rgb::convert(

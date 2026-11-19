@@ -1,36 +1,18 @@
 use qrcodegen::{QrCode, QrCodeEcc, QrSegment, Version};
 
-use crate::{error::Error, image::Image};
+use crate::{config::QrSize, error::Error, image::Image};
 
-const QUIET_ZONE: i32 = 4;
-const MODULE_SCALE: i32 = 4;
+pub const QUIET_ZONE: i32 = 4;
+pub const MODULE_SCALE: i32 = 4;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CorrectionLevel {
-    Low,
-    Medium,
-    Quartile,
-    High,
-}
-
-impl From<CorrectionLevel> for QrCodeEcc {
-    fn from(level: CorrectionLevel) -> Self {
-        match level {
-            CorrectionLevel::Low => QrCodeEcc::Low,
-            CorrectionLevel::Medium => QrCodeEcc::Medium,
-            CorrectionLevel::Quartile => QrCodeEcc::Quartile,
-            CorrectionLevel::High => QrCodeEcc::High,
-        }
-    }
-}
-
-pub fn encode_text(data: &str, level: CorrectionLevel, max_version: u8) -> Result<Image, Error> {
+pub fn encode_text(data: &str, max_size: impl Into<QrSize>) -> Result<Image, Error> {
+    let max_size = max_size.into();
     let segments = QrSegment::make_segments(data);
     QrCode::encode_segments_advanced(
         &segments,
-        level.into(),
+        QrCodeEcc::Low,
         Version::MIN,
-        Version::new(max_version),
+        Version::new(max_size.version()),
         None,
         true,
     )
@@ -39,35 +21,25 @@ pub fn encode_text(data: &str, level: CorrectionLevel, max_version: u8) -> Resul
 }
 
 #[cfg(feature = "bbqr")]
-pub fn encode_alphanumeric(data: &str, version: u8) -> Result<Image, Error> {
+pub fn encode_alphanumeric(data: &str, size: impl Into<QrSize>) -> Result<Image, Error> {
     if !QrSegment::is_alphanumeric(data) {
         return Err(Error::PartNotAlphanumeric);
     }
-    let version = Version::new(version);
+    let version = Version::new(size.into().version());
     let segment = QrSegment::make_alphanumeric(data);
     QrCode::encode_segments_advanced(&[segment], QrCodeEcc::Low, version, version, None, false)
         .map(qr_to_image)
         .map_err(|_| Error::TooLong)
 }
 
-fn qr_to_image(qr: QrCode) -> Image {
-    let qr_size = qr.size();
-    let modules = qr_size + QUIET_ZONE * 2;
-    let size = modules * MODULE_SCALE;
-    let mut data = Vec::with_capacity((size * size) as usize);
-    for y in -QUIET_ZONE..qr_size + QUIET_ZONE {
-        for _ in 0..MODULE_SCALE {
-            for x in -QUIET_ZONE..qr_size + QUIET_ZONE {
-                let value = if qr.get_module(x, y) { 0 } else { 255 };
-                for _ in 0..MODULE_SCALE {
-                    data.push(value);
-                }
-            }
+pub fn qr_to_image(qr: QrCode) -> Image {
+    let size = (qr.size() + QUIET_ZONE * 2) * MODULE_SCALE;
+    let module = |at: u32| at as i32 / MODULE_SCALE - QUIET_ZONE;
+    Image::from_fn(size as u32, |x, y| {
+        if qr.get_module(module(x), module(y)) {
+            0
+        } else {
+            255
         }
-    }
-    Image {
-        data,
-        width: size as u32,
-        height: size as u32,
-    }
+    })
 }

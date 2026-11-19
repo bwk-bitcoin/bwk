@@ -1,27 +1,31 @@
 use std::panic;
 
-use bwk_qr::image::{box_shrink, shrink_factor, Image};
+use bwk_qr::image::{box_shrink, crop_center_square, shrink_factor, Image};
 use nokhwa::{
     pixel_format::RgbFormat,
     utils::{FrameFormat, Resolution},
     FormatDecoder,
 };
 
-use crate::Error;
+use crate::error::Error;
 
 const RGB_CHANNELS: usize = 3;
+/// Rec. 601 luma weights, in 256ths.
+const LUMA_RED: u16 = 77;
+const LUMA_GREEN: u16 = 150;
+const LUMA_BLUE: u16 = 29;
 
-/// RGB888, three interleaved bytes per pixel, row-major.
+/// An RGB888 square: three interleaved bytes per pixel, row-major from the top-left pixel
+/// with no padding between rows, so `data` is `side * side * 3` bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rgb {
-    pub data: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
+    data: Vec<u8>,
+    side: u32,
 }
 
 impl Rgb {
-    /// A captured frame in `format`, as RGB888.
-    pub(crate) fn convert(
+    /// The centered square of a captured frame in `format`, as RGB888.
+    pub fn convert(
         format: FrameFormat,
         width: u32,
         height: u32,
@@ -32,73 +36,70 @@ impl Rgb {
             RgbFormat::write_output(format, Resolution::new(width, height), raw)
         })
         .map_err(|_| unreadable())??;
-        let rgb = Self {
-            data,
-            width,
-            height,
-        };
-        if !rgb.validate_len() {
+        Self::from_frame(data, width, height)
+    }
+
+    /// The centered square of a `width` x `height` RGB888 frame without row padding.
+    pub fn from_frame(data: Vec<u8>, width: u32, height: u32) -> Result<Self, Error> {
+        let expected = u128::from(width) * u128::from(height) * RGB_CHANNELS as u128;
+        if data.len() as u128 != expected {
+            log::error!(
+                "a {width}x{height} RGB888 frame holds {} bytes instead of {expected}",
+                data.len()
+            );
             return Err(unreadable());
         }
-        Ok(rgb)
+        let side = width.min(height);
+        if width == height {
+            return Ok(Self { data, side });
+        }
+        Ok(Self {
+            data: crop_center_square(&data, width, height, RGB_CHANNELS),
+            side,
+        })
     }
 
-    fn validate_len(&self) -> bool {
-        (self.width as usize)
-            .checked_mul(self.height as usize)
-            .and_then(|pixels| pixels.checked_mul(RGB_CHANNELS))
-            == Some(self.data.len())
-    }
-
-    /// Shrunk by the smallest integer factor that brings it within `max_pixels`.
-    pub(crate) fn shrink(self, max_pixels: usize) -> Self {
-        let factor = shrink_factor(self.width, self.height, max_pixels);
-        if factor == 1 {
+    /// Shrunk by [`shrink_factor`], or as is when `fine_scan`.
+    pub fn fit(self, fine_scan: bool) -> Self {
+        let factor = shrink_factor(self.side);
+        if fine_scan || factor == 1 {
             return self;
         }
         Self {
-            data: box_shrink(&self.data, self.width, self.height, RGB_CHANNELS, factor),
-            width: self.width / factor,
-            height: self.height / factor,
+            data: box_shrink(&self.data, self.side, self.side, RGB_CHANNELS, factor),
+            side: self.side / factor,
         }
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn side(&self) -> u32 {
+        self.side
     }
 
     /// One byte of Rec. 601 luma per pixel, what a QR decoder reads.
     pub fn grey(&self) -> Image {
-        Image {
-            data: self
-                .data
-                .chunks_exact(RGB_CHANNELS)
-                .map(|pixel| {
-                    ((u16::from(pixel[0]) * 77
-                        + u16::from(pixel[1]) * 150
-                        + u16::from(pixel[2]) * 29)
-                        >> 8) as u8
-                })
-                .collect(),
-            width: self.width,
-            height: self.height,
-        }
+        Image::from_fn(self.side, |x, y| {
+            let start = (y as usize * self.side as usize + x as usize) * RGB_CHANNELS;
+            let pixel = &self.data[start..start + RGB_CHANNELS];
+            ((u16::from(pixel[0]) * LUMA_RED
+                + u16::from(pixel[1]) * LUMA_GREEN
+                + u16::from(pixel[2]) * LUMA_BLUE)
+                >> 8) as u8
+        })
     }
 }
 
-/// A published frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Frame {
-    pub rgb: Rgb,
-    /// Starts at 1 and grows by one per frame, so a reader that keeps the last one it
-    /// read skips a frame it has seen.
-    pub seq: u64,
-}
-
-pub(crate) fn unreadable() -> Error {
+pub fn unreadable() -> Error {
     Error::Capture("the camera returned an unreadable frame".to_owned())
 }
 
 /// AVFoundation may pad each row of `width` x `height` RGB888 pixels: the padding is
 /// dropped. None when `raw` is shorter than a row or not whole rows.
 #[cfg(any(target_os = "macos", test))]
-pub(crate) fn pack_rows(raw: Vec<u8>, width: u32, height: u32) -> Option<Vec<u8>> {
+pub fn pack_rows(raw: Vec<u8>, width: u32, height: u32) -> Option<Vec<u8>> {
     let row = (width as usize).checked_mul(RGB_CHANNELS)?;
     let expected = row.checked_mul(height as usize)?;
     if raw.len() == expected {
@@ -123,25 +124,21 @@ mod tests {
     use nokhwa::utils::FrameFormat;
 
     use crate::{
+        error::Error,
         frame::{pack_rows, unreadable, Rgb},
-        Error,
     };
 
-    fn rgb(data: Vec<u8>, width: u32, height: u32) -> Rgb {
-        Rgb {
-            data,
-            width,
-            height,
-        }
+    fn rgb(data: Vec<u8>, side: u32) -> Rgb {
+        Rgb { data, side }
     }
 
     #[test]
     fn yuyv_converts_two_pixels_per_four_bytes() {
         // Y0 U Y1 V with no chroma: (Y - 16) * 298 / 256, rounded
-        let raw = [16, 128, 235, 128];
+        let raw = [16, 128, 235, 128, 235, 128, 16, 128];
         assert_eq!(
-            Rgb::convert(FrameFormat::YUYV, 2, 1, &raw).unwrap(),
-            rgb(vec![0, 0, 0, 255, 255, 255], 2, 1)
+            Rgb::convert(FrameFormat::YUYV, 2, 2, &raw).unwrap(),
+            rgb(vec![0, 0, 0, 255, 255, 255, 255, 255, 255, 0, 0, 0], 2)
         );
     }
 
@@ -153,7 +150,6 @@ mod tests {
             Rgb::convert(FrameFormat::NV12, 2, 2, &raw).unwrap(),
             rgb(
                 vec![0, 0, 0, 130, 130, 130, 130, 130, 130, 255, 255, 255],
-                2,
                 2
             )
         );
@@ -162,8 +158,8 @@ mod tests {
     #[test]
     fn grey_is_spread_over_the_three_channels() {
         assert_eq!(
-            Rgb::convert(FrameFormat::GRAY, 2, 1, &[7, 9]).unwrap(),
-            rgb(vec![7, 7, 7, 9, 9, 9], 2, 1)
+            Rgb::convert(FrameFormat::GRAY, 2, 2, &[7, 9, 11, 13]).unwrap(),
+            rgb(vec![7, 7, 7, 9, 9, 9, 11, 11, 11, 13, 13, 13], 2)
         );
     }
 
@@ -171,11 +167,11 @@ mod tests {
     fn raw_rgb_is_kept_and_raw_bgr_is_swapped() {
         assert_eq!(
             Rgb::convert(FrameFormat::RAWRGB, 1, 1, &[1, 2, 3]).unwrap(),
-            rgb(vec![1, 2, 3], 1, 1)
+            rgb(vec![1, 2, 3], 1)
         );
         assert_eq!(
             Rgb::convert(FrameFormat::RAWBGR, 1, 1, &[1, 2, 3]).unwrap(),
-            rgb(vec![3, 2, 1], 1, 1)
+            rgb(vec![3, 2, 1], 1)
         );
     }
 
@@ -208,24 +204,63 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_frame_within_the_limit_is_kept_as_is() {
-        let frame = rgb((0..24).collect(), 4, 2);
-        assert_eq!(frame.clone().shrink(8), frame);
+    /// A raw RGB `width` x `height` frame whose pixel n is (n, 10 n, 255 - n), converted.
+    fn numbered(width: u32, height: u32) -> Rgb {
+        let raw: Vec<u8> = (0..(width * height) as u8)
+            .flat_map(|n| [n, 10 * n, 255 - n])
+            .collect();
+        Rgb::convert(FrameFormat::RAWRGB, width, height, &raw).unwrap()
     }
 
     #[test]
-    fn a_frame_above_the_limit_is_averaged_by_the_smallest_factor_that_fits() {
-        // pixel n of a 4 x 2 frame is (n, 10 n, 255 - n)
-        let frame = rgb((0..8u8).flat_map(|n| [n, 10 * n, 255 - n]).collect(), 4, 2);
-        assert_eq!(frame.shrink(7), rgb(vec![2, 25, 252, 4, 45, 250], 2, 1));
+    fn a_square_frame_is_kept_as_is_at_conversion() {
+        let frame = numbered(2, 2);
+        assert_eq!(
+            frame,
+            rgb(vec![0, 0, 255, 1, 10, 254, 2, 20, 253, 3, 30, 252], 2)
+        );
+    }
+
+    #[test]
+    fn a_wide_frame_is_cropped_to_its_centered_square_at_conversion() {
+        // 4 x 2: pixels 1, 2, 5 and 6
+        assert_eq!(
+            numbered(4, 2),
+            rgb(vec![1, 10, 254, 2, 20, 253, 5, 50, 250, 6, 60, 249], 2)
+        );
+    }
+
+    #[test]
+    fn a_tall_frame_is_cropped_to_its_centered_square_at_conversion() {
+        // 1 x 3: pixel 1
+        assert_eq!(numbered(1, 3), rgb(vec![1, 10, 254], 1));
+    }
+
+    #[test]
+    fn a_frame_below_twice_the_scan_side_is_never_shrunk() {
+        let frame = rgb(vec![7; 2159 * 2159 * 3], 2159);
+        assert_eq!(frame.clone().fit(false), frame);
+    }
+
+    #[test]
+    fn a_2160_frame_is_averaged_by_2_unless_fine_scan() {
+        // each 2 x 2 block holds 0, 2, 2 and 0 on every channel: (0 + 2 + 2 + 0) / 4 = 1
+        let data: Vec<u8> = (0..2160 * 2160)
+            .flat_map(|n| {
+                let value = ((n % 2160 + n / 2160) % 2 * 2) as u8;
+                [value; 3]
+            })
+            .collect();
+        let frame = rgb(data, 2160);
+        assert_eq!(frame.clone().fit(true), frame);
+        assert_eq!(frame.fit(false), rgb(vec![1; 1080 * 1080 * 3], 1080));
     }
 
     #[test]
     fn grey_weighs_green_most_and_blue_least() {
-        let grey = rgb(vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255], 2, 2).grey();
-        assert_eq!(grey.data, vec![76, 149, 28, 255]);
-        assert_eq!((grey.width, grey.height), (2, 2));
+        let grey = rgb(vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255], 2).grey();
+        assert_eq!(grey.data(), [76, 149, 28, 255]);
+        assert_eq!(grey.side(), 2);
     }
 
     #[test]

@@ -186,6 +186,21 @@ run_p2p_tests() {
 run_build() {
     echo "=== build ==="
     cargo build --release --features "$BUILD_FEATURES"
+    run_qr_feature_builds
+}
+
+# The workspace build compiles bwk-qr with all its features only, so a cfg slip
+# in a smaller set would go unnoticed. The script from the tip also runs on
+# earlier commits, which may predate bwk-qr.
+run_qr_feature_builds() {
+    local features
+    if [ ! -f qr/Cargo.toml ]; then
+        return
+    fi
+    for features in gen scan bbqr; do
+        echo "=== bwk-qr build: $features ==="
+        cargo build --release -p bwk-qr --no-default-features --features "$features"
+    done
 }
 
 run_default_build() {

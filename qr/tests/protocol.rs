@@ -1,15 +1,16 @@
 #![cfg(feature = "protocol")]
 
+use bipqr::{
+    backend::{Active, Backend},
+    ll::{self as protocol, request, response},
+};
 use bitcoin::{absolute, bip32, transaction, Psbt, Transaction};
+use bwk_bbqr::Progress;
 use bwk_qr::{
-    config::Config,
-    decoder::{Decoded, Decoder, Progress},
+    config::QrSize,
+    decoder::{Decoded, Decoder},
     encoder::Encoder,
     image::Image,
-    protocol::{
-        backend::{Active, Backend},
-        ll::{self as protocol, request, response},
-    },
 };
 
 fn id() -> protocol::RequestId {
@@ -52,28 +53,23 @@ fn bip388() -> request::DescriptorBody {
 }
 
 fn encoder() -> Encoder {
-    Encoder::new(Config::default()).unwrap()
+    Encoder::new(QrSize::S125)
 }
 
-// small parts force a message across several BBQR frames
+// a small size forces a message across several BBQR frames
 fn frame_encoder() -> Encoder {
-    Encoder::new(Config {
-        bbqr_part_bytes: 16,
-        ..Config::default()
-    })
-    .unwrap()
+    Encoder::new(QrSize::S29)
 }
 
 fn decoder() -> Decoder {
-    Decoder::new(Config::default()).unwrap()
+    Decoder::new()
 }
 
 fn decode_all(decoder: &mut Decoder, frames: &[Image]) -> Vec<Decoded> {
-    let mut decoded = Vec::new();
-    for frame in frames {
-        decoded.extend(decoder.process(frame).unwrap());
-    }
-    decoded
+    frames
+        .iter()
+        .filter_map(|frame| decoder.process(frame).unwrap())
+        .collect()
 }
 
 fn round_trip_request(request: protocol::Request) {
@@ -160,7 +156,7 @@ fn register_descriptor_request(descriptor: Option<request::DescriptorBody>) -> p
 fn sign_request_frames() -> (protocol::Request, Vec<Image>) {
     let request = sign_request();
     let frames = frame_encoder().encode_request(&request).unwrap();
-    assert_eq!(frames.len(), 5);
+    assert_eq!(frames.len(), 3);
     (request, frames)
 }
 
@@ -197,7 +193,13 @@ fn protocol_request_round_trips_through_bbqr_frames() {
         decode_all(&mut decoder, &reversed),
         vec![Decoded::Request(request)]
     );
-    assert_eq!(decoder.progress(), Some(Progress { seen: 5, total: 5 }));
+    assert_eq!(
+        decoder.progress(),
+        Some(Progress {
+            received: vec![true; 3],
+            last: 0,
+        })
+    );
 }
 
 #[test]
@@ -215,7 +217,7 @@ fn protocol_response_round_trips_through_one_frame() {
     assert_eq!(frames.len(), 1);
     assert_eq!(
         decoder().process(&frames[0]).unwrap(),
-        vec![Decoded::Response(response)]
+        Some(Decoded::Response(response))
     );
 }
 
@@ -353,9 +355,15 @@ fn frames_out_of_order_decode() {
 fn duplicate_frame_is_ignored() {
     let (request, frames) = sign_request_frames();
     let mut decoder = decoder();
-    assert_eq!(decoder.process(&frames[0]).unwrap(), vec![]);
-    assert_eq!(decoder.process(&frames[0]).unwrap(), vec![]);
-    assert_eq!(decoder.progress(), Some(Progress { seen: 1, total: 5 }));
+    assert_eq!(decoder.process(&frames[0]).unwrap(), None);
+    assert_eq!(decoder.process(&frames[0]).unwrap(), None);
+    assert_eq!(
+        decoder.progress(),
+        Some(Progress {
+            received: vec![true, false, false],
+            last: 0,
+        })
+    );
     assert_eq!(
         decode_all(&mut decoder, &frames[1..]),
         vec![Decoded::Request(request)]
@@ -372,28 +380,29 @@ fn progress_reports_seen_and_total() {
         assert_eq!(
             decoder.progress(),
             Some(Progress {
-                seen: index + 1,
-                total: 5,
+                received: (0..3).map(|part| part <= index).collect(),
+                last: index,
             })
         );
     }
 }
 
 #[test]
-fn decoder_handles_two_messages_without_reset() {
+fn decoder_handles_a_second_message_after_a_reset() {
     let encoder = frame_encoder();
     let request = sign_request();
     let response = keys_response(0x0000_000b);
     let request_frames = encoder.encode_request(&request).unwrap();
     let response_frames = encoder.encode_response(&response).unwrap();
-    assert_eq!(request_frames.len(), 5);
-    assert_eq!(response_frames.len(), 13);
+    assert_eq!(request_frames.len(), 3);
+    assert_eq!(response_frames.len(), 6);
 
     let mut decoder = decoder();
     assert_eq!(
         decode_all(&mut decoder, &request_frames),
         vec![Decoded::Request(request)]
     );
+    decoder.reset();
     assert_eq!(
         decode_all(&mut decoder, &response_frames),
         vec![Decoded::Response(response)]

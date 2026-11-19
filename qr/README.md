@@ -21,17 +21,27 @@ Features, all on by default:
 - `scan` uses `quircs` to scan grayscale frames. It pulls only quircs' own small
   tree.
 - `bbqr` implies `gen` and `scan`, and adds BBQR generic-binary framing for any
-  payload: `Encoder::encode_bytes` splits bytes into frames, and
+  payload: `Encoder::encode_bbqr` splits bytes into frames, and
   `Decoder::process_raw` joins them back into `Decoded::Bytes`, undecoded.
+  `Decoder::progress` returns a `bwk_bbqr::Progress`, so a caller that reads it
+  depends on `bwk-bbqr`.
 - `protocol` implies `bbqr`, and decodes the joined payloads as the signing-flow
-  codec, which lives in `bipqr` and is re-exported as `protocol`: the codec under
-  `protocol::ll`, and with its `bitcoin_0_32` feature on, `protocol::backend`
-  converts between its byte-level types and the `bitcoin` ones.
+  codec, which lives in `bipqr`: the codec under `bipqr::ll`, and with its
+  `bitcoin_0_32` feature on, `bipqr::backend` converts between its byte-level
+  types and the `bitcoin` ones. A caller of the protocol depends on `bipqr` for
+  these types.
 
-`Encoder`, `Decoder`, `Config` and `Image` are the whole public surface;
-generation and scanning are crate-internal helpers. `Image` is an 8-bit
-grayscale raster, row-major, `width * height` bytes, `0` dark and `255` light: a
-camera frame on the way in, a rendered QR on the way out.
+`Encoder`, `Decoder` with `Decoded`, the `config` module (`QrSize`, `QrDensity`,
+`DecoderConfig`), the `image` module (`Image`, `crop_center_square`, `box_shrink`,
+`shrink_factor`, `SCAN_SIDE`) and `Error` are the whole public surface; generation
+and scanning are crate-internal helpers. The `Encoder` is built with a size, a
+`QrSize` or the coarser `QrDensity`, and has no default one. `Image` is an 8-bit
+grayscale square, row-major, `side * side` bytes, `0` dark and `255` light: a camera
+frame on the way in, cropped to its centered square by `Image::from_frame`, a
+rendered QR on the way out. The `Decoder` reads it shrunk by the largest integer
+factor that keeps its side at or above `SCAN_SIDE` (1080), so a 1080 frame is read
+whole and a 2160 one at 1080, unless `DecoderConfig::fine_scan` is set; a code
+outside the centered square of the camera frame is not read.
 
 Camera capture, windowing and rendering belong to the consumer, and so do
 signing, PSBT finalization and descriptor evaluation: the protocol layer carries
@@ -40,14 +50,15 @@ and no global state, and the `Decoder` is the only stateful type.
 
 ```
 qr/src/
-  lib.rs      public modules, crate docs
-  config.rs   Config, QR density and parser bounds
-  error.rs    Error
-  image.rs    Image, the one raw-data type crossing the API
-  gen.rs      QR generation                          (feature: gen)
-  scan.rs     grayscale decode                       (feature: scan)
-  encoder.rs  plain text, bytes, protocol -> frames  (feature: gen)
-  decoder.rs  frames -> Decoded, BBQR reassembly     (feature: scan)
+  lib.rs       public modules, crate docs
+  config.rs    QrSize, QrDensity, DecoderConfig: QR size and scan bounds
+  error.rs     Error
+  image.rs     Image, the one raw-data type crossing the API
+  gen.rs       QR generation                          (feature: gen)
+  scan.rs      grayscale decode                       (feature: scan)
+  threshold.rs local adaptive threshold fallback      (feature: scan)
+  encoder.rs   plain text, bytes, protocol -> frames  (feature: gen)
+  decoder.rs   frames -> Decoded, BBQR reassembly     (feature: scan)
 ```
 
 The Rust API returns `Result` and `Option`. FFI consumers should translate those

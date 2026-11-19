@@ -5,35 +5,37 @@
 //! Comparing each pixel to the mean of its own neighbourhood, as ZBar does, keeps the
 //! modules apart wherever the code sits in the frame.
 
-/// How much darker than its neighbourhood mean a pixel must be to turn black, so a
-/// flat area stays white rather than turning to noise.
-const OFFSET: u64 = 3;
-/// The neighbourhood is about an eighth of the frame's shorter side, within these
-/// bounds: wide enough that a finder pattern's dark core is not compared to itself.
-const MIN_RADIUS: usize = 8;
-const MAX_RADIUS: usize = 128;
+use crate::image::Image;
 
-/// `data`, `width` x `height` grey pixels, as black (0) and white (255): black where a
-/// pixel is more than [`OFFSET`] below the mean of the square around it, the square
-/// clipped at the frame's edges.
-pub(crate) fn local_threshold(width: usize, height: usize, data: &[u8]) -> Vec<u8> {
-    if width == 0 || height == 0 {
-        return Vec::new();
-    }
-    let radius = (width.min(height) / 16).clamp(MIN_RADIUS, MAX_RADIUS);
-    let sums = SummedArea::new(width, height, data);
-    let mut binary = Vec::with_capacity(data.len());
-    for y in 0..height {
-        let (top, bottom) = (y.saturating_sub(radius), (y + radius + 1).min(height));
-        for x in 0..width {
-            let (left, right) = (x.saturating_sub(radius), (x + radius + 1).min(width));
-            let count = ((bottom - top) * (right - left)) as u64;
-            let pixel = u64::from(data[y * width + x]);
-            let dark = (pixel + OFFSET) * count < sums.sum(left, top, right, bottom);
-            binary.push(if dark { 0 } else { 255 });
+/// How much darker than its neighbourhood mean a pixel must be, in grey levels (0 to
+/// 255), to turn black, so a flat area stays white rather than turning to noise.
+const OFFSET: u64 = 3;
+/// The neighbourhood is a square window an eighth of the image's side, within these
+/// bounds, as ZBar's `qr_binarize` sizes it: large enough not to fit inside the dark core
+/// of a version 1 finder pattern.
+const WINDOW_DIVISOR: usize = 8;
+const MIN_WINDOW: usize = 16;
+const MAX_WINDOW: usize = 256;
+
+/// `image` as black (0) and white (255): black where a pixel is more than [`OFFSET`] below
+/// the mean of the square around it, the square clipped at the image's edges.
+pub fn local_threshold(image: &Image) -> Image {
+    let side = image.side() as usize;
+    let radius = (side / WINDOW_DIVISOR).clamp(MIN_WINDOW, MAX_WINDOW) / 2;
+    let sums = SummedArea::new(image);
+    Image::from_fn(image.side(), |x, y| {
+        let pixel = u64::from(image.pixel(x, y));
+        let (x, y) = (x as usize, y as usize);
+        let (top, bottom) = (y.saturating_sub(radius), (y + radius + 1).min(side));
+        let (left, right) = (x.saturating_sub(radius), (x + radius + 1).min(side));
+        let count = ((bottom - top) * (right - left)) as u64;
+        let dark = (pixel + OFFSET) * count < sums.sum(left, top, right, bottom);
+        if dark {
+            0
+        } else {
+            255
         }
-    }
-    binary
+    })
 }
 
 /// Each entry is the sum of every pixel above and left of it, so the sum of any
@@ -44,13 +46,14 @@ struct SummedArea {
 }
 
 impl SummedArea {
-    fn new(width: usize, height: usize, data: &[u8]) -> Self {
-        let stride = width + 1;
-        let mut sums = vec![0; stride * (height + 1)];
-        for y in 0..height {
+    fn new(image: &Image) -> Self {
+        let side = image.side() as usize;
+        let stride = side + 1;
+        let mut sums = vec![0; stride * stride];
+        for y in 0..side {
             let mut row = 0;
-            for x in 0..width {
-                row += u64::from(data[y * width + x]);
+            for x in 0..side {
+                row += u64::from(image.pixel(x as u32, y as u32));
                 sums[(y + 1) * stride + x + 1] = sums[y * stride + x + 1] + row;
             }
         }
@@ -66,27 +69,29 @@ impl SummedArea {
 
 #[cfg(test)]
 mod tests {
-    use crate::threshold::{local_threshold, SummedArea};
+    use crate::{
+        image::Image,
+        threshold::{local_threshold, SummedArea},
+    };
 
     #[test]
     fn a_rectangle_sum_matches_adding_its_pixels() {
-        let data: Vec<u8> = (0..20).collect();
-        let sums = SummedArea::new(5, 4, &data);
+        // 5 x 5, pixel n is n
+        let sums = SummedArea::new(&Image::from_fn(5, |x, y| (y * 5 + x) as u8));
         // rows 1..3, columns 2..5: 7 + 8 + 9 + 12 + 13 + 14
         assert_eq!(sums.sum(2, 1, 5, 3), 63);
-        assert_eq!(sums.sum(0, 0, 5, 4), (0..20).sum::<u64>());
+        assert_eq!(sums.sum(0, 0, 5, 5), (0..25).sum::<u64>());
         assert_eq!(sums.sum(3, 2, 3, 4), 0);
     }
 
     #[test]
-    fn a_flat_or_empty_frame_stays_white() {
-        for (width, height) in [(0, 0), (0, 2), (2, 0), (1, 1), (3, 2), (40, 30)] {
+    fn a_flat_or_empty_image_stays_white() {
+        for side in [0, 1, 2, 3, 40] {
             for level in [0, 3, 127, 255] {
-                let data = vec![level; width * height];
                 assert_eq!(
-                    local_threshold(width, height, &data),
-                    vec![255; width * height],
-                    "{width}x{height} at {level}"
+                    local_threshold(&Image::from_fn(side, |_, _| level)),
+                    Image::from_fn(side, |_, _| 255),
+                    "side {side} at {level}"
                 );
             }
         }
@@ -95,10 +100,8 @@ mod tests {
     #[test]
     fn a_pixel_turns_black_only_below_its_neighbourhood_mean_by_more_than_the_offset() {
         // one dim pixel in a 17 x 17 field at 100: the mean around it barely moves
-        let mut data = vec![100; 17 * 17];
-        data[8 * 17 + 8] = 90;
-        assert_eq!(local_threshold(17, 17, &data)[8 * 17 + 8], 0);
-        data[8 * 17 + 8] = 98;
-        assert_eq!(local_threshold(17, 17, &data)[8 * 17 + 8], 255);
+        let field = |dim| Image::from_fn(17, move |x, y| if (x, y) == (8, 8) { dim } else { 100 });
+        assert_eq!(local_threshold(&field(90)).pixel(8, 8), 0);
+        assert_eq!(local_threshold(&field(98)).pixel(8, 8), 255);
     }
 }
