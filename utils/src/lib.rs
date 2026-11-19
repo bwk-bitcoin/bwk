@@ -188,6 +188,8 @@ pub mod ureq_resolver {
         ureq::unversioned::transport::NextTimeout {
             after: ureq::unversioned::transport::time::Duration::Exact(resolve_timeout),
             reason: ureq::Timeout::Resolve,
+            per_read: None,
+            per_write: None,
         }
     }
 
