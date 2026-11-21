@@ -17,7 +17,8 @@ platforms (Android, iOS) are not targeted.
 - `Camera::start(&id, config)` streams one camera on a capture thread that keeps only
   the latest frame, and fails with `NoCamera` once that camera is gone.
   `Camera::frame()` moves that frame out, so it returns each frame once, then None
-  until a newer one is captured. Dropping the `Camera` stops the capture.
+  until a newer one is captured. `Camera::wait_frame(timeout)` blocks until a newer
+  frame or the capture failure, at most `timeout`. Dropping the `Camera` stops the capture.
 - A frame is RGB888 (`Rgb`), square: the centered square of the captured frame,
   shrunk with an integer box average by `bwk_qr::image::shrink_factor` unless
   `Config::fine_scan`: a 1080 frame is kept whole, a 2160 one halved. It is what a

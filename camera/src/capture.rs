@@ -3,9 +3,10 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc, Arc, Condvar, Mutex,
     },
     thread,
+    time::Duration,
 };
 
 use nokhwa::utils::{ApiBackend, CameraIndex};
@@ -197,6 +198,12 @@ impl Camera {
         self.frame.take()
     }
 
+    /// Like [`Camera::frame`], but waits up to `timeout` for a newer frame. Returns None
+    /// at once once the capture failed.
+    pub fn wait_frame(&self, timeout: Duration) -> Option<Rgb> {
+        self.frame.wait(timeout)
+    }
+
     /// Why the capture stopped on its own, None while it runs.
     pub fn failure(&self) -> Option<Error> {
         self.frame.failure()
@@ -229,7 +236,13 @@ fn capture(
 /// What the capture thread hands the reader: a frame is taken out when read, so it is
 /// read once, while the failure stays readable. A clone shares the same slot.
 #[derive(Default, Clone)]
-struct LatestFrame(Arc<Mutex<Latest>>);
+struct LatestFrame(Arc<Slot>);
+
+#[derive(Default)]
+struct Slot {
+    latest: Mutex<Latest>,
+    changed: Condvar,
+}
 
 #[derive(Default)]
 struct Latest {
@@ -239,19 +252,33 @@ struct Latest {
 
 impl LatestFrame {
     fn publish(&self, rgb: Rgb) {
-        self.0.lock().expect("poisoned").frame = Some(rgb);
+        self.0.latest.lock().expect("poisoned").frame = Some(rgb);
+        self.0.changed.notify_all();
     }
 
     fn take(&self) -> Option<Rgb> {
-        self.0.lock().expect("poisoned").frame.take()
+        self.0.latest.lock().expect("poisoned").frame.take()
+    }
+
+    fn wait(&self, timeout: Duration) -> Option<Rgb> {
+        let latest = self.0.latest.lock().expect("poisoned");
+        let (mut latest, _) = self
+            .0
+            .changed
+            .wait_timeout_while(latest, timeout, |latest| {
+                latest.frame.is_none() && latest.failure.is_none()
+            })
+            .expect("poisoned");
+        latest.frame.take()
     }
 
     fn record_failure(&self, error: Error) {
-        self.0.lock().expect("poisoned").failure = Some(error);
+        self.0.latest.lock().expect("poisoned").failure = Some(error);
+        self.0.changed.notify_all();
     }
 
     fn failure(&self) -> Option<Error> {
-        self.0.lock().expect("poisoned").failure.clone()
+        self.0.latest.lock().expect("poisoned").failure.clone()
     }
 }
 
@@ -277,10 +304,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     use nokhwa::utils::CameraIndex;
 
-    #[cfg(target_os = "linux")]
-    use crate::error::Error;
+    use std::time::Duration;
+
     use crate::{
         capture::{CameraId, LatestFrame, Lease},
+        error::Error,
         frame::Rgb,
     };
 
@@ -304,6 +332,23 @@ mod tests {
         frame.publish(rgb(2));
         assert_eq!(frame.take(), Some(rgb(2)));
         assert_eq!(frame.take(), None);
+    }
+
+    #[test]
+    fn a_waiting_reader_wakes_on_a_frame() {
+        let frame = LatestFrame::default();
+        let publisher = frame.clone();
+        let thread = std::thread::spawn(move || publisher.publish(rgb(1)));
+        assert_eq!(frame.wait(Duration::from_secs(10)), Some(rgb(1)));
+        thread.join().unwrap();
+        assert_eq!(frame.wait(Duration::from_millis(1)), None);
+    }
+
+    #[test]
+    fn a_failure_ends_the_wait() {
+        let frame = LatestFrame::default();
+        frame.record_failure(Error::NoCamera);
+        assert_eq!(frame.wait(Duration::from_secs(10)), None);
     }
 
     #[test]
