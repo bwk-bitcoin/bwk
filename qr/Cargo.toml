@@ -13,10 +13,12 @@ bwk-bbqr = { workspace = true, optional = true }
 bipqr = { workspace = true, features = ["bitcoin_0_32"], optional = true }
 qrcodegen = { workspace = true, optional = true }
 quircs = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
 thiserror.workspace = true
 
 [dev-dependencies]
 bitcoin = { workspace = true }
+serde_json.workspace = true
 
 [features]
 default = ["gen", "scan", "protocol"]
@@ -24,3 +26,4 @@ gen = ["dep:qrcodegen"]
 scan = ["dep:quircs"]
 bbqr = ["gen", "scan", "dep:bwk-bbqr"]
 protocol = ["bbqr", "dep:bipqr"]
+serde = ["dep:serde"]

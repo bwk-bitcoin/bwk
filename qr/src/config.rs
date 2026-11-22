@@ -154,6 +154,8 @@ const DATA_CODEWORDS_ECC_LOW: [usize; 40] = [
 /// - `High`, `S61`: 230 bytes;
 /// - `Highest`, `S65`: 263 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum QrDensity {
     Lowest,
     Low,
@@ -189,5 +191,20 @@ impl Default for DecoderConfig {
             fine_scan: false,
             scan_inverted: true,
         }
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod tests {
+    use crate::config::QrDensity;
+
+    #[test]
+    fn density_is_written_in_snake_case() {
+        let json = serde_json::to_string(&QrDensity::Highest).unwrap();
+        assert_eq!(json, "\"highest\"");
+        assert_eq!(
+            serde_json::from_str::<QrDensity>(&json).unwrap(),
+            QrDensity::Highest
+        );
     }
 }

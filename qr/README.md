@@ -31,6 +31,9 @@ Features, all on by default:
   types and the `bitcoin` ones. A caller of the protocol depends on `bipqr` for
   these types.
 
+`serde`, off by default, derives `Serialize` and `Deserialize` on `QrDensity`, so a
+caller can store the setting.
+
 `Encoder`, `Decoder` with `Decoded`, the `config` module (`QrSize`, `QrDensity`,
 `DecoderConfig`), the `image` module (`Image`, `crop_center_square`, `box_shrink`,
 `shrink_factor`, `SCAN_SIDE`) and `Error` are the whole public surface; generation
