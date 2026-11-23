@@ -695,7 +695,7 @@ mod integration_tests {
 
     use rand::random_range;
     use std::{
-        collections::{BTreeMap, BTreeSet},
+        collections::BTreeSet,
         sync::{mpsc, Once},
         thread::sleep,
         time::Duration,
@@ -1104,19 +1104,10 @@ mod integration_tests {
         wait_until_timeout(
             || {
                 let coins = account.scanner().coins();
-                coins.len() == 2
+                coins.len() == 2 && coins.values().all(|c| c.height().is_some())
             },
             TIMEOUT,
         );
-
-        let coins = account.scanner().coins();
-        let coins_height: BTreeMap<_, _> =
-            coins.into_iter().map(|(c, e)| (c, e.height())).collect();
-
-        // With the pending-claims queue and merkle verification in
-        // place, both coins are confirmed at this point and should carry
-        // a height.
-        assert!(coins_height.iter().all(|(_, e)| e.is_some()));
 
         let height_before_reorg = get_block_height(&bitcoind);
         let h_before_reorg = get_block_hash_str(&bitcoind, height_before_reorg);
