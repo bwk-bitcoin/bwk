@@ -5,8 +5,6 @@
 pub enum Error {
     #[error("unsupported version {0}, only version 0 is supported")]
     UnsupportedVersion(u32),
-    #[error("address length is wrong: {0}")]
-    WrongAddressLength(usize),
     #[error("no input provided")]
     NoInputProvided,
     #[error("no outpoints provided")]
@@ -23,12 +21,6 @@ pub enum Error {
     InvalidLabel(#[from] hex::FromHexError),
     #[error("label must be 32 bytes (256 bits) long")]
     LabelLength,
-    #[error(transparent)]
-    InvalidAddress(#[from] bech32::Error),
-    #[error("wrong address prefix, expected \"sp\", \"tsp\", or \"sprt\", got {0:?}")]
-    WrongHrp(String),
-    #[error("invalid network: {0}")]
-    InvalidNetwork(String),
     #[error(transparent)]
     Secp256k1Error(#[from] crate::core::secp256k1::Error),
     #[error(transparent)]

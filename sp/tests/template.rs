@@ -13,11 +13,9 @@ use bitcoin::{
     bip32::DerivationPath, hashes::Hash, Address, Amount, Network, OutPoint, ScriptBuf, Sequence,
     TxOut,
 };
+use bwk_address::{backend::rust_bitcoin::SilentPaymentAddress, sp::Network as SpNetwork};
 use bwk_coin::{Coin, CoinSpendInfo, CoinStatus, TAPROOT_KEYSPEND_SATISFACTION_WU};
-use bwk_sp::{
-    core::utils::common::{Network as SpNetwork, SilentPaymentAddress},
-    receiver::error::Error as ReceiverError,
-};
+use bwk_sp::receiver::error::Error as ReceiverError;
 use bwk_tx::template::{TxOutputSpec, TxRequest, TxRequestError};
 use common::{test_account_named, test_outpoint};
 

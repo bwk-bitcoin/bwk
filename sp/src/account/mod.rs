@@ -22,7 +22,6 @@ use {
             tx_store::{header_time, SpTxEntry, SpTxStore},
         },
         blindbit::{self, InfoResponse},
-        core::utils::common::SilentPaymentAddress,
         receiver::{bip39, SpReceiver},
         scan::{state::ScanState, ScanRuntimeConfig, ScanRuntimeConfigError},
     },
@@ -49,6 +48,7 @@ use {
         },
         persist::config_store::{ConfigStore, NoopConfigStore},
     },
+    bwk_address::backend::rust_bitcoin::SilentPaymentAddress,
     bwk_sign::signing_manager::SigningManager,
     miniscript::{psbt::PsbtExt, Descriptor, DescriptorPublicKey},
     std::{

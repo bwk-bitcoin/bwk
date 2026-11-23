@@ -13,13 +13,12 @@
 
 use std::collections::HashMap;
 
+use bwk_address::backend::rust_bitcoin::SilentPaymentAddress;
+
 use crate::core::{
     error::Error,
     secp256k1::{ecdh::shared_secret_point, PublicKey, Secp256k1, SecretKey, XOnlyPublicKey},
-    utils::{
-        common::{calculate_t_n, SilentPaymentAddress},
-        hash::calculate_input_hash,
-    },
+    utils::{common::calculate_t_n, hash::calculate_input_hash},
 };
 
 /// Create outputs for a given set of silent payment recipients and their corresponding shared secrets.

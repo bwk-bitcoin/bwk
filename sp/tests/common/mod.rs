@@ -554,7 +554,7 @@ pub fn generate_recipient_pubkey(
     sk: bitcoin::secp256k1::SecretKey,
     outpoint: OutPoint,
     txout: &TxOut,
-    sp_addr: bwk_sp::core::utils::common::SilentPaymentAddress,
+    sp_addr: bwk_address::backend::rust_bitcoin::SilentPaymentAddress,
     secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
 ) -> Option<XOnlyPublicKey> {
     use bitcoin::key::TapTweak;

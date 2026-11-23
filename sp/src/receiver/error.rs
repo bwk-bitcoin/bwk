@@ -25,8 +25,8 @@ pub enum Error {
         "silent payment address network ({address:?}) does not match account network ({account:?})"
     )]
     SpNetworkMismatch {
-        address: crate::core::utils::common::Network,
-        account: crate::core::utils::common::Network,
+        address: bwk_address::sp::Network,
+        account: bwk_address::sp::Network,
     },
 
     // Wrapped external errors

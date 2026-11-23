@@ -77,7 +77,6 @@ blindbitd = { git = "https://github.com/pythcoiner/blindbitd.git" }
 bdk_coin_select = "0.4.0"
 secp256k1 = { version = "0.29.1", features = ["rand", "global-context"] }
 bitcoin_hashes = "0.13.0"
-bech32 = "0.9"
 bimap = "0.6"
 ureq = { version = "3.5", default-features = false }
 

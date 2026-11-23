@@ -21,7 +21,7 @@ use crate::core::{
         ecdh::shared_secret_point, Parity, PublicKey, Scalar, Secp256k1, SecretKey, XOnlyPublicKey,
     },
     utils::{
-        common::{calculate_P_n, calculate_t_n, Network, SilentPaymentAddress},
+        common::{calculate_P_n, calculate_t_n},
         hash::{calculate_input_hash, LabelHash},
     },
 };
@@ -30,6 +30,7 @@ use bitcoin::{
     hashes::{hash160, Hash},
     ScriptBuf, TxIn, TxOut,
 };
+use bwk_address::{backend::rust_bitcoin::SilentPaymentAddress, sp::Network};
 use serde::{
     de::{self, SeqAccess, Visitor},
     ser::{SerializeStruct, SerializeTuple},
@@ -668,8 +669,8 @@ mod tests {
     use crate::core::{
         receiving::Receiver,
         secp256k1::{PublicKey, Secp256k1, SecretKey},
-        utils::common::Network,
     };
+    use bwk_address::sp::Network;
     use serde_json::{json, Value};
 
     fn receiver() -> Receiver {

@@ -74,6 +74,7 @@ bench-spdk = ["dep:spdk-core", "dep:spdk-wallet", "dep:backend-blindbit-v1", "de
 [dependencies]
 # bwk crates
 bwk = { workspace = true, features = ["sp"] }
+bwk-address = { workspace = true, features = ["serde"] }
 bwk-utils = { workspace = true, features = ["ureq"] }
 bwk-sign = { workspace = true, default-features = false, features = ["sp"] }
 bwk-coin = { workspace = true }
@@ -87,7 +88,6 @@ secp256k1 = { workspace = true }
 bitcoin_hashes = { workspace = true }
 
 # Silent Payments support
-bech32 = { workspace = true }
 bimap = { workspace = true }
 
 # Serialization

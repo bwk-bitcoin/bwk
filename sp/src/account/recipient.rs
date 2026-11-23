@@ -4,7 +4,7 @@
 //! Uses newtype wrappers to satisfy the orphan rule.
 
 use crate::{
-    core::{receiving::NUMS_H, utils::common::SilentPaymentAddress},
+    core::receiving::NUMS_H,
     receiver::{
         bitcoin::{
             bip32::{Fingerprint, Xpriv},
@@ -17,6 +17,7 @@ use crate::{
     },
 };
 
+use bwk_address::backend::rust_bitcoin::SilentPaymentAddress;
 use bwk_coin::{derive_descriptor, Coin, CoinSpendInfo};
 use bwk_tx::{
     error::Error as TxError,
@@ -256,7 +257,7 @@ pub enum SpRecipientError {
     /// The SP address network is not the builder's network (e.g. a testnet
     /// `tsp1...` address on a regtest wallet).
     NetworkMismatch {
-        address: crate::core::utils::common::Network,
+        address: bwk_address::sp::Network,
         builder: Network,
     },
 }
@@ -633,14 +634,12 @@ impl SpPartialSecretProvider for Account {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        core::utils::common::Network as SpNetwork,
-        receiver::bitcoin::{
-            bip32::{DerivationPath, Fingerprint, Xpriv, Xpub},
-            secp256k1::{PublicKey, Secp256k1, SecretKey, XOnlyPublicKey},
-            Amount as BtcAmount, OutPoint, Sequence, TxOut, Txid,
-        },
+    use crate::receiver::bitcoin::{
+        bip32::{DerivationPath, Fingerprint, Xpriv, Xpub},
+        secp256k1::{PublicKey, Secp256k1, SecretKey, XOnlyPublicKey},
+        Amount as BtcAmount, OutPoint, Sequence, TxOut, Txid,
     };
+    use bwk_address::sp::Network as SpNetwork;
     use bwk_coin::{derive_descriptor, Coin, CoinSpendInfo, CoinStatus, KeyChain};
     use bwk_tx::error::Error as TxError;
     use miniscript::{Descriptor, DescriptorPublicKey};

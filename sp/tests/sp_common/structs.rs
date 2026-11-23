@@ -2,7 +2,7 @@
 //! originally imported from cygnet3/rust-silentpayments. See `sp/NOTICE`.
 
 #![allow(non_snake_case)]
-use bwk_sp::core::utils::common::SilentPaymentAddress;
+use bwk_address::backend::rust_bitcoin::SilentPaymentAddress;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]

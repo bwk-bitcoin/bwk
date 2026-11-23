@@ -4,10 +4,8 @@
 use std::{fs::File, io::Read, str::FromStr};
 
 use bitcoin_hashes::Hash;
-use bwk_sp::core::{
-    secp256k1::{Message, Scalar, SecretKey, XOnlyPublicKey},
-    utils::common::SilentPaymentAddress,
-};
+use bwk_address::backend::rust_bitcoin::SilentPaymentAddress;
+use bwk_sp::core::secp256k1::{Message, Scalar, SecretKey, XOnlyPublicKey};
 use serde_json::from_str;
 
 use super::structs::{OutputWithSignature, TestData};

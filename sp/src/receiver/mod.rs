@@ -21,12 +21,10 @@ use bitcoin::{
     secp256k1::{All, PublicKey, Secp256k1, SecretKey},
     Address, Amount, BlockHash, Network, ScriptBuf, Txid,
 };
+use bwk_address::{backend::rust_bitcoin::SilentPaymentAddress, sp::Network as SpNetwork};
 use serde::{Deserialize, Serialize};
 
-use crate::core::{
-    receiving::{Label, Receiver},
-    utils::common::{Network as SpNetwork, SilentPaymentAddress},
-};
+use crate::core::receiving::{Label, Receiver};
 
 // Blockchain data fetched via the blindbit transport.
 

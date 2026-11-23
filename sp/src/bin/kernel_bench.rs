@@ -10,10 +10,10 @@
 use std::time::Instant;
 
 use bitcoin_hashes::{sha256, Hash};
+use bwk_address::sp::Network;
 use bwk_sp::core::{
     receiving::{Label, Receiver},
     secp256k1::{PublicKey, Secp256k1, SecretKey},
-    utils::common::Network,
 };
 
 fn main() {

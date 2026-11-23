@@ -6,11 +6,11 @@ mod sp_common;
 #[cfg(test)]
 mod tests {
     use bitcoin_hashes::{hash160, Hash};
+    use bwk_address::{backend::rust_bitcoin::SilentPaymentAddress, sp::Network};
     use bwk_sp::core::{
         receiving::Label,
         secp256k1::{Scalar, Secp256k1, SecretKey},
         sending::{calculate_ecdh_shared_secret, calculate_partial_secret},
-        utils::common::{Network, SilentPaymentAddress},
     };
     use std::{collections::HashSet, str::FromStr};
 
