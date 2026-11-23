@@ -1,0 +1,21 @@
+[package]
+name = "bwk-address"
+version = "0.0.1"
+description = "BIP-321 bitcoin: URI parsing, with silent payment addresses; no_std core"
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+keywords.workspace = true
+readme = "README.md"
+
+[dependencies]
+bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
+bitcoin_0_32 = { package = "bitcoin", version = "0.32", default-features = false, optional = true }
+serde = { version = "1.0.218", default-features = false, features = ["alloc", "derive"], optional = true }
+
+[features]
+default = ["bitcoin_latest"]
+bitcoin_0_32 = ["dep:bitcoin_0_32"]
+bitcoin_latest = ["bitcoin_0_32"]
+serde = ["dep:serde"]

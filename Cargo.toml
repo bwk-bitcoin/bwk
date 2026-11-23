@@ -17,6 +17,7 @@ members = [
     "bbqr",
     "qr",
     "camera",
+    "address",
 ]
 
 [workspace.package]
@@ -94,6 +95,7 @@ bwk-p2p = { path = "p2p" }
 bwk = { path = "bwk" }
 bwk-qr = { path = "qr", default-features = false }
 bwk-camera = { path = "camera" }
+bwk-address = { path = "address" }
 # bwk-error is the in-house derive. Aliasing the package as `thiserror` is deliberate,
 # not an oversight: error definitions across the tree keep reading `thiserror::Error`,
 # so the switch is a one-line manifest change instead of a rename touching every error

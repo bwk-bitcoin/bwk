@@ -61,6 +61,8 @@ tests locally. Commit messages must be single-line and follow existing style
 | bwk-qr         | QR generation and scanning, BBQR framing, bipqr protocol    |
 | bwk-camera     | Camera capture for QR scanning (V4L2, Media Foundation,     |
 |                | AVFoundation, through nokhwa)                               |
+| bwk-address    | BIP-321 `bitcoin:` URI parsing, with silent payment         |
+|                | addresses; no_std core                                      |
 | bwk-utils      | Test helpers (behind `test` feature)                        |
 +----------------+-------------------------------------------------------------+
 ```
