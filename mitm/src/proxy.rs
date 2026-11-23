@@ -464,12 +464,12 @@ fn worker<S: Endpoint, D: Endpoint>(ctx: ConnContext, dir: Direction, mut src: S
             }
         }
     };
-    src.shutdown_both();
-    dst.shutdown_both();
     if !ctx.closed.swap(true, Ordering::SeqCst) {
         ctx.metrics.close_conn(ctx.id, side, clean, error);
         ctx.registry.lock().expect("poisoned").remove(&ctx.id);
     }
+    src.shutdown_both();
+    dst.shutdown_both();
 }
 
 /// The side whose `read()` ending the loop (EOF or error) closed the
