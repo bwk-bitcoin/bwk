@@ -2260,6 +2260,11 @@ mod tests {
             None
         );
 
+        assert_eq!(
+            input_key(&[vec![0x50; 64]]).unwrap(),
+            Some(PublicKey::from_x_only_public_key(output_key, Parity::Even))
+        );
+
         assert!(matches!(
             input_key(&[sig, script, vec![0xc0; 32]]),
             Err(crate::core::error::Error::InvalidInput(_))
