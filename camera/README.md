@@ -7,7 +7,10 @@ platforms (Android, iOS) are not targeted.
 - `list()` offers the cameras that capture video and asks for the camera permission
   first where the platform has one (macOS). It returns a receiver at once and answers
   on it from a thread of its own, once the user answered the permission dialog on
-  macOS, at once elsewhere, so it never blocks a UI thread.
+  macOS, at once elsewhere, so it never blocks a UI thread. On Linux a node the user
+  may not open is left out, as the raw nodes behind a MIPI camera relayed through
+  v4l2loopback are, unless no other camera is found: starting one then fails with
+  `PermissionDenied`.
 - A camera is known by its `CameraId`, the OS's identifier for the device: its node on
   Linux (`/dev/videoN`), its symbolic link on Windows, its `AVCaptureDevice` unique ID
   on macOS. It stays the same while the camera is connected, whatever other cameras
