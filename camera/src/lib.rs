@@ -14,7 +14,7 @@ pub mod error;
 pub mod frame;
 #[cfg(target_os = "macos")]
 mod macos;
-mod mode;
+pub mod mode;
 #[cfg(not(target_os = "macos"))]
 mod native;
 

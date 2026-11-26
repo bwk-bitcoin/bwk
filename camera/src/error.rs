@@ -1,6 +1,6 @@
-use nokhwa::{utils::CameraFormat, NokhwaError};
+use nokhwa::NokhwaError;
 
-use crate::mode::describe;
+use crate::mode::{describe, Mode};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
@@ -12,7 +12,7 @@ pub enum Error {
         "no camera mode meets the minimum side and frame rate, offered: {}",
         describe(offered)
     )]
-    NoSuitableMode { offered: Vec<CameraFormat> },
+    NoSuitableMode { offered: Vec<Mode> },
     #[error("camera permission refused")]
     PermissionDenied,
     #[error("camera capture failed: {0}")]
@@ -44,19 +44,29 @@ impl From<NokhwaError> for Error {
 
 #[cfg(test)]
 mod tests {
-    use nokhwa::{
-        utils::{CameraFormat, FrameFormat},
-        NokhwaError,
-    };
+    use nokhwa::NokhwaError;
 
-    use crate::error::Error;
+    use crate::{
+        error::Error,
+        mode::{Format, Mode},
+    };
 
     #[test]
     fn no_suitable_mode_lists_the_modes_offered() {
         let error = Error::NoSuitableMode {
             offered: vec![
-                CameraFormat::new_from(640, 480, FrameFormat::MJPEG, 30),
-                CameraFormat::new_from(320, 240, FrameFormat::YUYV, 15),
+                Mode {
+                    width: 640,
+                    height: 480,
+                    frame_rate: 30,
+                    format: Format::Mjpeg,
+                },
+                Mode {
+                    width: 320,
+                    height: 240,
+                    frame_rate: 15,
+                    format: Format::Yuyv,
+                },
             ],
         };
         assert_eq!(

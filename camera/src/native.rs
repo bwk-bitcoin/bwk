@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use nokhwa::{
     pixel_format::LumaFormat,
-    utils::{RequestedFormat, RequestedFormatType},
+    utils::{CameraFormat, FrameFormat, RequestedFormat, RequestedFormatType},
     Camera,
 };
 
@@ -12,7 +12,7 @@ use crate::{
     capture::CameraId,
     error::Error,
     frame::Rgb,
-    mode::{choose_mode, describe, fallback_note},
+    mode::{choose_mode, describe, fallback_note, Format, Mode},
     Config,
 };
 
@@ -28,18 +28,20 @@ impl Stream {
             id.index()?,
             RequestedFormat::new::<LumaFormat>(RequestedFormatType::None),
         )?;
-        let offered = camera.compatible_camera_formats()?;
+        let formats = camera.compatible_camera_formats()?;
+        let offered: Vec<Mode> = formats.iter().map(mode).collect();
         log::debug!("camera {id} offers {}", describe(&offered));
         let Some((chosen, met)) = choose_mode(&offered, config) else {
             return Err(Error::NoSuitableMode { offered });
         };
         log::info!(
-            "camera {id} streams at {}{}",
-            describe(&[chosen]),
+            "camera {id} streams at {chosen}{}",
             fallback_note(config, met)
         );
+        let position = offered.iter().position(|mode| *mode == chosen);
+        let format = formats[position.expect("chosen among the offered modes")];
         camera.set_camera_requset(RequestedFormat::new::<LumaFormat>(
-            RequestedFormatType::Exact(chosen),
+            RequestedFormatType::Exact(format),
         ))?;
         camera.open_stream()?;
         Ok(Self {
@@ -71,5 +73,21 @@ impl Stream {
             );
         }
         Ok(None)
+    }
+}
+
+fn mode(format: &CameraFormat) -> Mode {
+    Mode {
+        width: format.width(),
+        height: format.height(),
+        frame_rate: format.frame_rate(),
+        format: match format.format() {
+            FrameFormat::MJPEG => Format::Mjpeg,
+            FrameFormat::YUYV => Format::Yuyv,
+            FrameFormat::NV12 => Format::Nv12,
+            FrameFormat::GRAY => Format::Gray,
+            FrameFormat::RAWRGB => Format::Rgb,
+            FrameFormat::RAWBGR => Format::Bgr,
+        },
     }
 }

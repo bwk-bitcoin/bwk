@@ -15,7 +15,7 @@ use std::{
 };
 
 use flume::{Receiver, RecvTimeoutError, Sender};
-use nokhwa::utils::{CameraFormat, FrameFormat};
+use nokhwa::utils::FrameFormat;
 use nokhwa_bindings_macos::{
     AVCaptureDevice, AVCaptureDeviceInput, AVCaptureSession, AVCaptureVideoCallback,
     AVCaptureVideoDataOutput,
@@ -30,7 +30,7 @@ use crate::{
     capture::CameraId,
     error::Error,
     frame::{pack_rows, unreadable, Rgb},
-    mode::{fallback_note, met_rate},
+    mode::{fallback_note, met_rate, Format, Mode},
     Config,
 };
 
@@ -47,7 +47,7 @@ extern "C" {
 type NativeFrame = (Vec<u8>, FrameFormat, Option<Duration>);
 
 pub struct Stream {
-    format: CameraFormat,
+    format: Mode,
     session: AVCaptureSession,
     input: AVCaptureDeviceInput,
     output: AVCaptureVideoDataOutput,
@@ -80,11 +80,12 @@ impl Stream {
         session.start()?;
         let active = device.active_format()?;
         let stream = Self {
-            format: CameraFormat::new(
-                active.resolution(),
-                FrameFormat::RAWRGB,
-                active.frame_rate(),
-            ),
+            format: Mode {
+                width: active.width(),
+                height: active.height(),
+                frame_rate: active.frame_rate(),
+                format: Format::Rgb,
+            },
             session,
             input,
             output,
@@ -103,9 +104,9 @@ impl Stream {
         };
         log::info!(
             "camera {id} streams at {}x{}@{}{}",
-            stream.format.width(),
-            stream.format.height(),
-            stream.format.frame_rate(),
+            stream.format.width,
+            stream.format.height,
+            stream.format.frame_rate,
             fallback_note(config, met)
         );
         Ok(stream)
@@ -131,7 +132,7 @@ impl Stream {
             .drain()
             .last()
             .map_or(raw, |(newer, _, _)| newer);
-        let (width, height) = (self.format.width(), self.format.height());
+        let (width, height) = (self.format.width, self.format.height);
         let data = pack_rows(raw, width, height).ok_or_else(unreadable)?;
         Rgb::from_frame(data, width, height).map(Some)
     }

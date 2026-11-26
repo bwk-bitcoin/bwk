@@ -49,9 +49,9 @@ The tuning stays the caller's: the minimum frame rate and the fine scan toggle c
 in the `Config`, how often frames are read and decoded is up to the reader.
 
 The `capture` module holds `list`, `Camera`, `CameraId` and `CameraInfo`, the `frame`
-module `Rgb`, the `error` module `Error`, and `Config` sits at the crate root.
-`Error::NoSuitableMode` lists the modes offered as `nokhwa::utils::CameraFormat`, so a
-caller that reads them depends on `nokhwa`.
+module `Rgb`, the `error` module `Error`, the `mode` module `Mode`, and `Config` sits
+at the crate root.
+`Error::NoSuitableMode` lists the modes offered as `mode::Mode`.
 
 Features:
 
