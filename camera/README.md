@@ -1,7 +1,7 @@
 # bwk-camera
 
 Camera capture for QR scanning on desktop: the built-in or USB cameras of Linux
-(V4L2), Windows (Media Foundation) and macOS (AVFoundation), through `nokhwa`. Mobile
+(V4L2, through `nokhwa`), Windows (Media Foundation) and macOS (AVFoundation). Mobile
 platforms (Android, iOS) are not targeted.
 
 - `list()` offers the cameras that capture video and asks for the camera permission
@@ -40,6 +40,11 @@ Among the readable modes, raw formats (YUYV, NV12, GRAY, RGB, BGR) and MJPEG wit
 4. raw formats over MJPEG;
 5. the highest frame rate.
 
+On Windows the modes are those Media Foundation offers in YUY2, NV12, I420, RGB24,
+RGB32 or MJPEG, with their frame rate rounded (`10000000/333333` is 30 fps). Media
+Foundation converts the chosen mode to RGB32, MJPEG included, so MJPEG qualifies there
+without the `mjpeg` feature.
+
 When no mode meets a rate the camera fails with `NoSuitableMode`. On macOS the
 session runs at AVFoundation's 1920x1080 preset, or 1280x720 when the camera has no
 1080p mode, with `fine_scan` 3840x2160 first; its frame rate is checked against
@@ -58,4 +63,4 @@ Features:
 - `mjpeg` (default) decodes MJPEG frames through `mozjpeg`, which needs a C toolchain.
   An MJPEG frame that does not decode, which a UVC webcam sends now and then, is
   logged and skipped; any other unreadable frame stops the capture. Without the
-  feature an MJPEG mode never qualifies.
+  feature an MJPEG mode never qualifies, except on Windows.

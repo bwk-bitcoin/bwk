@@ -61,6 +61,17 @@ fn readable(format: Format) -> bool {
     format != Format::Mjpeg || cfg!(any(feature = "mjpeg", target_os = "windows"))
 }
 
+/// A frame rate fraction rounded to frames per second, so `10000000/333333` is 30. None
+/// when it is not a rate.
+#[cfg(any(target_os = "windows", test))]
+pub fn rounded_frame_rate(numerator: u32, denominator: u32) -> Option<u32> {
+    if denominator == 0 {
+        return None;
+    }
+    let rate = (u64::from(numerator) + u64::from(denominator) / 2) / u64::from(denominator);
+    u32::try_from(rate).ok().filter(|&rate| rate > 0)
+}
+
 /// The minimum frame rates a mode is chosen at, in order: `min_fps`, then the fallback
 /// when it is lower.
 fn frame_rates(config: &Config) -> impl Iterator<Item = u32> {
@@ -139,7 +150,7 @@ pub fn describe(modes: &[Mode]) -> String {
 #[cfg(test)]
 mod tests {
     use crate::{
-        mode::{choose_mode, describe, fallback_note, met_rate, Format, Mode},
+        mode::{choose_mode, describe, fallback_note, met_rate, rounded_frame_rate, Format, Mode},
         Config,
     };
 
@@ -387,5 +398,20 @@ mod tests {
     fn the_log_says_when_the_fallback_rate_was_met() {
         assert_eq!(fallback_note(&preferring_24(), 24), "");
         assert_eq!(fallback_note(&preferring_24(), 10), " (fallback to 10 fps)");
+    }
+
+    #[test]
+    fn a_fractional_frame_rate_is_rounded() {
+        assert_eq!(rounded_frame_rate(10_000_000, 333_333), Some(30));
+        assert_eq!(rounded_frame_rate(30_000, 1001), Some(30));
+        assert_eq!(rounded_frame_rate(15, 2), Some(8));
+        assert_eq!(rounded_frame_rate(30, 1), Some(30));
+    }
+
+    #[test]
+    fn a_fraction_that_is_not_a_rate_is_none() {
+        assert_eq!(rounded_frame_rate(30, 0), None);
+        assert_eq!(rounded_frame_rate(0, 1), None);
+        assert_eq!(rounded_frame_rate(1, 3), None);
     }
 }

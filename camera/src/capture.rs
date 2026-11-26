@@ -9,11 +9,14 @@ use std::{
     time::Duration,
 };
 
+#[cfg(not(target_os = "windows"))]
 use nokhwa::utils::{ApiBackend, CameraIndex};
 
 #[cfg(target_os = "macos")]
 use crate::macos::Stream;
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+use crate::media_foundation::{self, Stream};
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use crate::native::Stream;
 use crate::{error::Error, frame::Rgb, Config};
 
@@ -46,7 +49,7 @@ impl CameraId {
         Ok(Self(format!("{V4L2_NODE}{}", info.index().as_index()?)))
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     fn from_query(info: &nokhwa::utils::CameraInfo) -> Result<Self, Error> {
         Ok(Self(info.misc()))
     }
@@ -61,8 +64,8 @@ impl CameraId {
             .ok_or(Error::NoCamera)
     }
 
-    /// Media Foundation and AVFoundation open a device by its id, `NoCamera` once gone.
-    #[cfg(not(target_os = "linux"))]
+    /// AVFoundation opens a device by its id, `NoCamera` once gone.
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     pub fn index(&self) -> Result<CameraIndex, Error> {
         Ok(CameraIndex::String(self.0.clone()))
     }
@@ -99,6 +102,7 @@ pub fn list() -> mpsc::Receiver<Result<Vec<CameraInfo>, Error>> {
     receiver
 }
 
+#[cfg(not(target_os = "windows"))]
 fn query() -> Result<Vec<CameraInfo>, Error> {
     request_access()?;
     let mut cameras = Vec::new();
@@ -129,7 +133,25 @@ fn query() -> Result<Vec<CameraInfo>, Error> {
     Ok(cameras.into_iter().map(|(_, camera)| camera).collect())
 }
 
+/// Windows lists no camera while access is refused in its privacy settings, and fails
+/// opening one with `PermissionDenied`.
+#[cfg(target_os = "windows")]
+fn query() -> Result<Vec<CameraInfo>, Error> {
+    let cameras: Vec<CameraInfo> = media_foundation::devices()?
+        .into_iter()
+        .map(|device| CameraInfo {
+            id: CameraId(device.link),
+            name: device.name,
+        })
+        .collect();
+    if cameras.is_empty() {
+        return Err(Error::NoCamera);
+    }
+    Ok(cameras)
+}
+
 /// Only macOS asks, and blocks until the user answers; elsewhere it is granted at once.
+#[cfg(not(target_os = "windows"))]
 fn request_access() -> Result<(), Error> {
     if nokhwa::nokhwa_check() {
         return Ok(());
@@ -177,13 +199,14 @@ fn probe(id: &CameraId) -> Node {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn probe(_id: &CameraId) -> Node {
     Node::Captures
 }
 
 /// The devices the user is refused are offered only when no other is, so that starting
 /// one says the permission is missing instead of no camera being found.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn offered<T>(cameras: Vec<T>, refused: Vec<T>) -> Vec<T> {
     if cameras.is_empty() {
         refused
@@ -204,7 +227,7 @@ impl Camera {
     /// for camera access, and until granted this is `PermissionDenied`. A camera gone
     /// since [`list`] fails with `NoCamera`, never opens another one.
     pub fn start(id: &CameraId, config: Config) -> Result<Self, Error> {
-        if !nokhwa::nokhwa_check() {
+        if !access_granted() {
             return Err(Error::PermissionDenied);
         }
         let lease = Lease::take(id.clone()).ok_or(Error::Busy)?;
@@ -249,6 +272,17 @@ impl Drop for Camera {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
     }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn access_granted() -> bool {
+    nokhwa::nokhwa_check()
+}
+
+/// A refusal shows when the camera opens.
+#[cfg(target_os = "windows")]
+fn access_granted() -> bool {
+    true
 }
 
 fn capture(

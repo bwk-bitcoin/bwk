@@ -1,6 +1,8 @@
+#[cfg(not(target_os = "windows"))]
 use std::panic;
 
 use bwk_qr::image::{box_shrink, crop_center_square, shrink_factor, Image};
+#[cfg(not(target_os = "windows"))]
 use nokhwa::{
     pixel_format::RgbFormat,
     utils::{FrameFormat, Resolution},
@@ -28,6 +30,7 @@ impl Rgb {
     /// MJPEG frame does not decode: a UVC webcam sends a damaged one now and then, and
     /// the next frame is fine. `raw` may be longer than a raw frame: what follows it is
     /// dropped.
+    #[cfg(not(target_os = "windows"))]
     pub fn convert(
         format: FrameFormat,
         width: u32,
@@ -104,6 +107,7 @@ pub fn unreadable() -> Error {
 }
 
 /// `raw` in `format` as RGB888, None when it is an MJPEG frame that does not decode.
+#[cfg(not(target_os = "windows"))]
 fn decode(
     format: FrameFormat,
     width: u32,
@@ -125,6 +129,7 @@ fn decode(
 
 /// The bytes a `width` x `height` frame takes in a raw `format`, None for MJPEG, whose
 /// frames have no fixed length, or when it overflows.
+#[cfg(not(target_os = "windows"))]
 fn raw_len(format: FrameFormat, width: u32, height: u32) -> Option<usize> {
     let pixels = (width as usize).checked_mul(height as usize)?;
     match format {
@@ -159,19 +164,45 @@ pub fn pack_rows(raw: Vec<u8>, width: u32, height: u32) -> Option<Vec<u8>> {
     Some(packed)
 }
 
+/// Media Foundation's RGB32: rows of `width` four byte pixels, blue first, `stride` bytes
+/// apart, bottom-up when `stride` is negative. None when `raw` is too short for them.
+#[cfg(any(target_os = "windows", test))]
+pub fn rgb32_rows(raw: &[u8], width: u32, height: u32, stride: i32) -> Option<Vec<u8>> {
+    let row = (width as usize).checked_mul(4)?;
+    let pitch = stride.unsigned_abs() as usize;
+    if pitch < row {
+        return None;
+    }
+    let mut data =
+        Vec::with_capacity((width as usize * height as usize).checked_mul(RGB_CHANNELS)?);
+    for line in 0..height as usize {
+        let stored = if stride < 0 {
+            height as usize - 1 - line
+        } else {
+            line
+        };
+        let start = stored.checked_mul(pitch)?;
+        for pixel in raw.get(start..start.checked_add(row)?)?.chunks_exact(4) {
+            data.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+        }
+    }
+    Some(data)
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_os = "windows"))]
     use nokhwa::utils::FrameFormat;
 
-    use crate::{
-        error::Error,
-        frame::{pack_rows, unreadable, Rgb},
-    };
+    use crate::frame::{pack_rows, rgb32_rows, Rgb};
+    #[cfg(not(target_os = "windows"))]
+    use crate::{error::Error, frame::unreadable};
 
     fn rgb(data: Vec<u8>, side: u32) -> Rgb {
         Rgb { data, side }
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn yuyv_converts_two_pixels_per_four_bytes() {
         // Y0 U Y1 V with no chroma: (Y - 16) * 298 / 256, rounded
@@ -184,6 +215,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn nv12_shares_one_chroma_pair_over_a_two_by_two_block() {
         // the Y plane, then one U V pair
@@ -199,6 +231,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn grey_is_spread_over_the_three_channels() {
         assert_eq!(
@@ -209,6 +242,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn raw_rgb_is_kept_and_raw_bgr_is_swapped() {
         assert_eq!(
@@ -221,6 +255,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_frame_of_the_wrong_length_is_refused() {
         assert_eq!(
@@ -241,6 +276,7 @@ mod tests {
         ));
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn what_follows_a_raw_frame_is_dropped() {
         // a 2 x 2 frame in each raw format, in a buffer 5 bytes longer
@@ -259,7 +295,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "mjpeg")]
+    #[cfg(all(feature = "mjpeg", not(target_os = "windows")))]
     #[test]
     fn a_corrupt_mjpeg_frame_is_skipped() {
         // no JPEG at all, then a JPEG cut after its start of image marker
@@ -272,7 +308,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "mjpeg"))]
+    #[cfg(all(not(feature = "mjpeg"), not(target_os = "windows")))]
     #[test]
     fn an_mjpeg_frame_is_refused_without_the_mjpeg_feature() {
         assert!(matches!(
@@ -281,18 +317,16 @@ mod tests {
         ));
     }
 
-    /// A raw RGB `width` x `height` frame whose pixel n is (n, 10 n, 255 - n), converted.
+    /// A `width` x `height` frame whose pixel n is (n, 10 n, 255 - n).
     fn numbered(width: u32, height: u32) -> Rgb {
         let raw: Vec<u8> = (0..(width * height) as u8)
             .flat_map(|n| [n, 10 * n, 255 - n])
             .collect();
-        Rgb::convert(FrameFormat::RAWRGB, width, height, &raw)
-            .unwrap()
-            .unwrap()
+        Rgb::from_frame(raw, width, height).unwrap()
     }
 
     #[test]
-    fn a_square_frame_is_kept_as_is_at_conversion() {
+    fn a_square_frame_is_kept_as_is() {
         let frame = numbered(2, 2);
         assert_eq!(
             frame,
@@ -301,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wide_frame_is_cropped_to_its_centered_square_at_conversion() {
+    fn a_wide_frame_is_cropped_to_its_centered_square() {
         // 4 x 2: pixels 1, 2, 5 and 6
         assert_eq!(
             numbered(4, 2),
@@ -310,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tall_frame_is_cropped_to_its_centered_square_at_conversion() {
+    fn a_tall_frame_is_cropped_to_its_centered_square() {
         // 1 x 3: pixel 1
         assert_eq!(numbered(1, 3), rgb(vec![1, 10, 254], 1));
     }
@@ -364,5 +398,24 @@ mod tests {
         assert_eq!(pack_rows(vec![0; 7], 1, 2), None);
         assert_eq!(pack_rows(vec![0; 4], 1, 2), None);
         assert_eq!(pack_rows(vec![0; 3], 1, 0), None);
+    }
+
+    #[test]
+    fn rgb32_drops_the_fourth_byte_and_the_row_padding() {
+        // a 1 x 2 frame, rows padded to 8 bytes
+        let raw = [3, 2, 1, 0, 9, 9, 9, 9, 6, 5, 4, 0, 9, 9, 9, 9];
+        assert_eq!(rgb32_rows(&raw, 1, 2, 8), Some(vec![1, 2, 3, 4, 5, 6]));
+    }
+
+    #[test]
+    fn rgb32_with_a_negative_stride_is_bottom_up() {
+        let raw = [6, 5, 4, 0, 3, 2, 1, 0];
+        assert_eq!(rgb32_rows(&raw, 1, 2, -4), Some(vec![1, 2, 3, 4, 5, 6]));
+    }
+
+    #[test]
+    fn rgb32_too_short_for_its_rows_is_refused() {
+        assert_eq!(rgb32_rows(&[0; 7], 1, 2, 4), None);
+        assert_eq!(rgb32_rows(&[0; 8], 2, 1, 4), None);
     }
 }

@@ -1,4 +1,4 @@
-//! Linux (V4L2) and Windows (Media Foundation), through nokhwa.
+//! Linux (V4L2), through nokhwa.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

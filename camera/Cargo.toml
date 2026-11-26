@@ -11,11 +11,16 @@ readme = "README.md"
 [dependencies]
 bwk-qr = { workspace = true }
 log = { workspace = true }
-nokhwa = { workspace = true }
 thiserror = { workspace = true }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+nokhwa = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 v4l = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 flume = { workspace = true }
@@ -25,5 +30,6 @@ objc = { workspace = true }
 [features]
 default = ["mjpeg"]
 # Decodes MJPEG frames, through mozjpeg and so a C toolchain. Without it an MJPEG mode
-# never qualifies, and a camera that offers nothing else gets no suitable mode.
+# never qualifies, and a camera that offers nothing else gets no suitable mode. Windows
+# decodes MJPEG through Media Foundation, with or without it.
 mjpeg = ["nokhwa/decoding"]
