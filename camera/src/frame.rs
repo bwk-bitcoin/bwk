@@ -24,13 +24,20 @@ pub struct Rgb {
 }
 
 impl Rgb {
-    /// The centered square of a captured frame in `format`, as RGB888.
+    /// The centered square of a captured frame in `format`, as RGB888. `raw` may be
+    /// longer than a raw frame: what follows it is dropped.
     pub fn convert(
         format: FrameFormat,
         width: u32,
         height: u32,
         raw: &[u8],
     ) -> Result<Self, Error> {
+        // nokhwa hands the whole V4L2 buffer over, and a driver may allocate it longer
+        // than its frame: v4l2loopback rounds it up to a page
+        let raw = match raw_len(format, width, height) {
+            Some(len) if raw.len() > len => &raw[..len],
+            _ => raw,
+        };
         // mozjpeg reports a corrupt MJPEG frame by panicking
         let data = panic::catch_unwind(|| {
             RgbFormat::write_output(format, Resolution::new(width, height), raw)
@@ -94,6 +101,19 @@ impl Rgb {
 
 pub fn unreadable() -> Error {
     Error::Capture("the camera returned an unreadable frame".to_owned())
+}
+
+/// The bytes a `width` x `height` frame takes in a raw `format`, None for MJPEG, whose
+/// frames have no fixed length, or when it overflows.
+fn raw_len(format: FrameFormat, width: u32, height: u32) -> Option<usize> {
+    let pixels = (width as usize).checked_mul(height as usize)?;
+    match format {
+        FrameFormat::MJPEG => None,
+        FrameFormat::YUYV => pixels.checked_mul(2),
+        FrameFormat::NV12 => pixels.checked_mul(3).map(|bytes| bytes / 2),
+        FrameFormat::GRAY => Some(pixels),
+        FrameFormat::RAWRGB | FrameFormat::RAWBGR => pixels.checked_mul(RGB_CHANNELS),
+    }
 }
 
 /// AVFoundation may pad each row of `width` x `height` RGB888 pixels: the padding is
@@ -193,6 +213,23 @@ mod tests {
             Rgb::convert(FrameFormat::NV12, 2, 2, &[0; 5]),
             Err(Error::Capture(_))
         ));
+    }
+
+    #[test]
+    fn what_follows_a_raw_frame_is_dropped() {
+        // a 2 x 2 frame in each raw format, in a buffer 5 bytes longer
+        for (format, frame) in [
+            (FrameFormat::YUYV, 8),
+            (FrameFormat::NV12, 6),
+            (FrameFormat::GRAY, 4),
+            (FrameFormat::RAWRGB, 12),
+            (FrameFormat::RAWBGR, 12),
+        ] {
+            let mut raw: Vec<u8> = (0..frame).map(|n| 16 + 10 * n).collect();
+            let exact = Rgb::convert(format, 2, 2, &raw).unwrap();
+            raw.extend([255; 5]);
+            assert_eq!(Rgb::convert(format, 2, 2, &raw), Ok(exact), "{format}");
+        }
     }
 
     #[cfg(feature = "mjpeg")]
