@@ -18,7 +18,7 @@ platforms (Android, iOS) are not targeted.
   again by comparing it with the ids `list()` returns. On Linux a node freed by an
   unplugged camera can go to the next one plugged.
 - `Camera::start(&id, config)` streams one camera on a capture thread that keeps only
-  the latest frame, and fails with `NoCamera` once that camera is gone.
+  the latest frame, and fails once that camera is gone.
   `Camera::frame()` moves that frame out, so it returns each frame once, then None
   until a newer one is captured. `Camera::wait_frame(timeout)` blocks until a newer
   frame or the capture failure, at most `timeout`. Dropping the `Camera` stops the capture.

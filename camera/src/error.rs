@@ -28,26 +28,10 @@ pub enum Error {
     Capture(String),
 }
 
-/// nokhwa reports every failure as text, so the kinds a caller acts on are told apart
-/// by it.
 #[cfg(not(target_os = "windows"))]
 impl From<NokhwaError> for Error {
     fn from(error: NokhwaError) -> Self {
-        let text = error.to_string();
-        let lowercase = text.to_ascii_lowercase();
-        if lowercase.contains("permission") || lowercase.contains("denied") {
-            Self::PermissionDenied
-        } else if lowercase.contains("busy") || lowercase.contains("in use") {
-            Self::Busy
-        } else if lowercase.contains("no camera")
-            || lowercase.contains("no such file or directory")
-            || lowercase.contains("no such device")
-            || lowercase.contains("device is null")
-        {
-            Self::NoCamera
-        } else {
-            Self::Capture(text)
-        }
+        Self::Capture(error.to_string())
     }
 }
 
@@ -69,9 +53,6 @@ impl From<windows::core::Error> for Error {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(target_os = "windows"))]
-    use nokhwa::NokhwaError;
-
     use crate::{
         error::Error,
         mode::{Format, Mode},
@@ -100,26 +81,5 @@ mod tests {
             "no camera mode meets the minimum side and frame rate, offered: \
              640x480@30 MJPEG, 320x240@15 YUYV"
         );
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn a_missing_linux_device_is_no_camera() {
-        for reason in [
-            "No such file or directory (os error 2)",
-            "No such device (os error 19)",
-        ] {
-            let error =
-                NokhwaError::OpenDeviceError("0".to_string(), format!("V4L2 Error: {reason}"));
-            assert_eq!(Error::from(error), Error::NoCamera, "{reason}");
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn a_camera_gone_since_the_list_is_no_camera() {
-        // what AVFoundation reports for an id no longer present
-        let error = NokhwaError::OpenDeviceError("id".to_string(), "Device is null".to_string());
-        assert_eq!(Error::from(error), Error::NoCamera);
     }
 }

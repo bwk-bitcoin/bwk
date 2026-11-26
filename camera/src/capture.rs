@@ -64,7 +64,7 @@ impl CameraId {
             .ok_or(Error::NoCamera)
     }
 
-    /// AVFoundation opens a device by its id, `NoCamera` once gone.
+    /// AVFoundation opens a device by its id.
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     pub fn index(&self) -> Result<CameraIndex, Error> {
         Ok(CameraIndex::String(self.0.clone()))
@@ -225,7 +225,7 @@ impl Camera {
     /// The device opens on the capture thread, so a failure there shows up later
     /// through [`Camera::failure`]. On macOS, [`list`] must have answered first: it asks
     /// for camera access, and until granted this is `PermissionDenied`. A camera gone
-    /// since [`list`] fails with `NoCamera`, never opens another one.
+    /// since [`list`] fails, never opens another one.
     pub fn start(id: &CameraId, config: Config) -> Result<Self, Error> {
         if !access_granted() {
             return Err(Error::PermissionDenied);
