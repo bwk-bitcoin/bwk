@@ -17,9 +17,11 @@
 ///
 /// [`QrDensity`] is the coarse alternative, five of these sizes for a UI setting.
 ///
-/// The [`Encoder`](crate::encoder::Encoder) renders a plain text code at the smallest size
-/// it fits, up to the size it is built with, and every BBQR frame at exactly that size,
-/// each frame carrying the largest part that fills it.
+/// The [`Encoder`](crate::encoder::Encoder) takes the size it is built with as a ceiling.
+/// It renders a plain text code at the smallest size it fits. It cuts a BBQR payload into
+/// as few parts as that ceiling allows, all of equal length, and renders every frame of
+/// the series at one size, the smallest that holds such a part: the ceiling when the
+/// parts fill it, a smaller size when they do not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QrSize {
     S21 = 1,
@@ -121,10 +123,10 @@ impl QrSize {
     }
 
     /// The largest BBQR part, in bytes, whose part string fits a code of exactly this size.
-    /// A part renders in alphanumeric mode at error correction Low: the data codewords of the
-    /// size (ISO 18004 Table 7), less the 4 bit mode indicator and the character count field,
-    /// hold 2 characters per 11 bits and a last odd one in 6. After the BBQR header, each
-    /// byte takes two hex characters.
+    /// A part that long renders in alphanumeric mode at error correction Low: the data
+    /// codewords of the size (ISO 18004 Table 7), less the 4 bit mode indicator and the
+    /// character count field, hold 2 characters per 11 bits and a last odd one in 6. After
+    /// the BBQR header, each byte takes two hex characters.
     #[cfg(feature = "bbqr")]
     pub fn bbqr_part_bytes(self) -> usize {
         let count_bits = match self.version() {
@@ -135,6 +137,16 @@ impl QrSize {
         let bits = DATA_CODEWORDS_ECC_LOW[usize::from(self.version()) - 1] * 8 - 4 - count_bits;
         let chars = 2 * (bits / 11) + usize::from(bits % 11 >= 6);
         (chars - bwk_bbqr::HEADER_LEN) / 2
+    }
+
+    /// The smallest size, up to this one, that holds a BBQR part of `part_bytes` bytes,
+    /// and this one when none does.
+    #[cfg(feature = "bbqr")]
+    pub(crate) fn smallest_for_bbqr_part(self, part_bytes: usize) -> Self {
+        (1..self.version())
+            .filter_map(Self::from_version)
+            .find(|size| size.bbqr_part_bytes() >= part_bytes)
+            .unwrap_or(self)
     }
 }
 
@@ -147,12 +159,15 @@ const DATA_CODEWORDS_ECC_LOW: [usize; 40] = [
 
 /// A coarse choice of [`QrSize`] for a UI setting, each level a QR size. A denser level
 /// means fewer, bigger BBQR frames, that need a sharper camera to be read. Per BBQR
-/// frame, a level holds:
+/// frame, a level holds at most:
 /// - `Lowest`, `S33`: 53 bytes;
 /// - `Low`, `S45`: 108 bytes;
 /// - `Medium`, `S53`: 163 bytes;
 /// - `High`, `S61`: 230 bytes;
 /// - `Highest`, `S65`: 263 bytes.
+///
+/// A payload whose equal parts do not fill the level's size renders at a smaller one, see
+/// [`QrSize`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]

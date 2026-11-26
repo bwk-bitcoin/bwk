@@ -13,7 +13,11 @@ fn frame_encoder() -> Encoder {
 }
 
 fn payload() -> Vec<u8> {
-    (0..=255u8).cycle().take(100).collect()
+    payload_of(100)
+}
+
+fn payload_of(len: usize) -> Vec<u8> {
+    (0..=255u8).cycle().take(len).collect()
 }
 
 fn decode_raw(decoder: &mut Decoder, frames: &[Image]) -> Vec<Decoded> {
@@ -53,6 +57,31 @@ fn raw_payload_is_only_returned_once_every_part_is_seen() {
         decoder.process_raw(last).unwrap(),
         Some(Decoded::Bytes(payload()))
     );
+}
+
+// parts that do not fill the encoder's size: the series renders smaller, and a frame
+// with room left at a higher error correction level
+#[test]
+fn a_series_smaller_than_the_encoder_size_round_trips() {
+    let encoder = Encoder::new(QrSize::S53);
+    let full = encoder
+        .encode_bbqr(&payload_of(QrSize::S53.bbqr_part_bytes()))
+        .unwrap()[0]
+        .side();
+    for len in [1, 40, 164, 500] {
+        let frames = encoder.encode_bbqr(&payload_of(len)).unwrap();
+        assert!(
+            frames.iter().all(|frame| frame.side() < full),
+            "{len} bytes"
+        );
+
+        let mut decoder = Decoder::new();
+        assert_eq!(
+            decode_raw(&mut decoder, &frames),
+            vec![Decoded::Bytes(payload_of(len))],
+            "{len} bytes"
+        );
+    }
 }
 
 #[test]

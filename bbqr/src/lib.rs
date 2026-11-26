@@ -53,6 +53,18 @@ pub struct Split {
     pub parts: Vec<String>,
 }
 
+impl Split {
+    /// The bytes the longest part carries. [`split`] gives every part as many, except the
+    /// last, which may carry fewer.
+    pub fn part_bytes(&self) -> usize {
+        self.parts
+            .iter()
+            .map(|part| part.len().saturating_sub(HEADER_LEN) / 2)
+            .max()
+            .unwrap_or(0)
+    }
+}
+
 /// The first [`HEADER_LEN`] chars of a part, e.g. `B$HB0A03`: `B$`, `H` for hex
 /// encoding, `B` for binary file type, then the part count (10) and the part index (3),
 /// each as two base36 digits. The digits are `0` to `9` then `A` to `Z`, uppercase only
@@ -200,11 +212,16 @@ pub fn is_part(s: &str) -> bool {
     s.starts_with(PREFIX)
 }
 
-/// Cuts `data` into BBQR parts, in index order: each part carries the next
-/// `max_part_bytes` bytes of `data` (the last one what remains), written as an 8-char
-/// header such as `B$HB0A03` (index 3 of 10 parts) followed by the bytes in hex. A
-/// `max_part_bytes` below [`MIN_PART_BYTES`] is raised to it. Refuses empty `data` and a
-/// `data` that needs more than [`MAX_PARTS`] parts.
+/// Cuts `data` into BBQR parts of equal length, in index order: as few parts as
+/// `max_part_bytes` bytes each allows, then the shortest length that fills that many.
+/// Every part carries the same number of bytes and only the last may carry fewer, by
+/// less than the part count: 164 bytes at a maximum of 163 are two parts of 82, not 163
+/// and 1. A part is written as an 8-char header such as `B$HB0A03` (index 3 of 10 parts)
+/// followed by its bytes in hex.
+///
+/// A `max_part_bytes` below [`MIN_PART_BYTES`] is raised to it, which only bounds the
+/// part count: an equal part may still be shorter. Refuses empty `data` and a `data`
+/// that needs more than [`MAX_PARTS`] parts.
 pub fn split(data: &[u8], max_part_bytes: usize) -> Result<Split, Error> {
     let max_part_bytes = max_part_bytes.max(MIN_PART_BYTES);
     if data.is_empty() {
@@ -214,8 +231,10 @@ pub fn split(data: &[u8], max_part_bytes: usize) -> Result<Split, Error> {
     if total > MAX_PARTS {
         return Err(Error::TooManyParts(total));
     }
+    // at most `max_part_bytes`, and cuts `data` into exactly `total` chunks
+    let part_bytes = data.len().div_ceil(total);
     let mut parts = Vec::new();
-    for (index, chunk) in data.chunks(max_part_bytes).enumerate() {
+    for (index, chunk) in data.chunks(part_bytes).enumerate() {
         let mut part = Header { total, index }.serialize();
         part.push_str(&hex(chunk));
         parts.push(part);
@@ -259,9 +278,31 @@ fn hex_value(b: u8) -> Result<u8, Error> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{split, Error, Joiner, Progress, MAX_PARTS, MIN_PART_BYTES};
+    use crate::{split, Error, Joiner, Progress, Split, HEADER_LEN, MAX_PARTS, MIN_PART_BYTES};
 
     const DATA: &[u8] = b"abcdefghijklmnopqrst";
+
+    fn payload(len: usize) -> Vec<u8> {
+        (0..len).map(|index| index as u8).collect()
+    }
+
+    fn part_lengths(split: &Split) -> Vec<usize> {
+        split
+            .parts
+            .iter()
+            .map(|part| (part.len() - HEADER_LEN) / 2)
+            .collect()
+    }
+
+    fn join(split: &Split) -> Option<Vec<u8>> {
+        let mut joiner = Joiner::new();
+        let mut joined = None;
+        for part in &split.parts {
+            assert_eq!(joined, None);
+            joined = joiner.add_part(part).unwrap();
+        }
+        joined
+    }
 
     #[test]
     fn split_join_round_trip() {
@@ -269,9 +310,9 @@ mod tests {
         assert_eq!(
             split.parts,
             vec![
-                "B$HB03006162636465666768",
-                "B$HB0301696A6B6C6D6E6F70",
-                "B$HB030271727374",
+                "B$HB030061626364656667",
+                "B$HB030168696A6B6C6D6E",
+                "B$HB03026F7071727374",
             ]
         );
         let mut joiner = Joiner::new();
@@ -336,6 +377,41 @@ mod tests {
             joiner.add_part("B$HB030063"),
             Err(Error::ConflictingPartCount)
         );
+    }
+
+    #[test]
+    fn parts_are_equal_except_a_last_one_that_may_be_shorter() {
+        for max in MIN_PART_BYTES..=70 {
+            for len in 1..=300 {
+                let data = payload(len);
+                let split = split(&data, max).unwrap();
+                let lengths = part_lengths(&split);
+                let (last, rest) = lengths.split_last().unwrap();
+                let part_bytes = split.part_bytes();
+                assert_eq!(lengths.len(), len.div_ceil(max), "{len} at {max}");
+                assert!(part_bytes <= max, "{len} at {max}");
+                assert!(rest.iter().all(|length| *length == part_bytes));
+                assert!((1..=part_bytes).contains(last), "{len} at {max}");
+                assert!(part_bytes - last < lengths.len(), "{len} at {max}");
+                assert_eq!(join(&split), Some(data), "{len} at {max}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_split_leaves_no_runt_part() {
+        let cases: [(usize, usize, &[usize]); 5] = [
+            (17, 8, &[6, 6, 5]),
+            (163, 163, &[163]),
+            (164, 163, &[82, 82]),
+            (327, 163, &[109, 109, 109]),
+            (1000, 163, &[143, 143, 143, 143, 143, 143, 142]),
+        ];
+        for (len, max, lengths) in cases {
+            let split = split(&payload(len), max).unwrap();
+            assert_eq!(part_lengths(&split), lengths, "{len} at {max}");
+            assert_eq!(split.part_bytes(), lengths[0], "{len} at {max}");
+        }
     }
 
     #[test]
