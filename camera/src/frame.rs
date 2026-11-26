@@ -24,26 +24,26 @@ pub struct Rgb {
 }
 
 impl Rgb {
-    /// The centered square of a captured frame in `format`, as RGB888. `raw` may be
-    /// longer than a raw frame: what follows it is dropped.
+    /// The centered square of a captured frame in `format`, as RGB888, None when an
+    /// MJPEG frame does not decode: a UVC webcam sends a damaged one now and then, and
+    /// the next frame is fine. `raw` may be longer than a raw frame: what follows it is
+    /// dropped.
     pub fn convert(
         format: FrameFormat,
         width: u32,
         height: u32,
         raw: &[u8],
-    ) -> Result<Self, Error> {
+    ) -> Result<Option<Self>, Error> {
         // nokhwa hands the whole V4L2 buffer over, and a driver may allocate it longer
         // than its frame: v4l2loopback rounds it up to a page
         let raw = match raw_len(format, width, height) {
             Some(len) if raw.len() > len => &raw[..len],
             _ => raw,
         };
-        // mozjpeg reports a corrupt MJPEG frame by panicking
-        let data = panic::catch_unwind(|| {
-            RgbFormat::write_output(format, Resolution::new(width, height), raw)
-        })
-        .map_err(|_| unreadable())??;
-        Self::from_frame(data, width, height)
+        let Some(data) = decode(format, width, height, raw)? else {
+            return Ok(None);
+        };
+        Self::from_frame(data, width, height).map(Some)
     }
 
     /// The centered square of a `width` x `height` RGB888 frame without row padding.
@@ -103,6 +103,26 @@ pub fn unreadable() -> Error {
     Error::Capture("the camera returned an unreadable frame".to_owned())
 }
 
+/// `raw` in `format` as RGB888, None when it is an MJPEG frame that does not decode.
+fn decode(
+    format: FrameFormat,
+    width: u32,
+    height: u32,
+    raw: &[u8],
+) -> Result<Option<Vec<u8>>, Error> {
+    // mozjpeg reports a corrupt MJPEG frame by panicking
+    let decoded = panic::catch_unwind(|| {
+        RgbFormat::write_output(format, Resolution::new(width, height), raw)
+    });
+    match (format, decoded) {
+        (_, Ok(Ok(data))) => Ok(Some(data)),
+        #[cfg(feature = "mjpeg")]
+        (FrameFormat::MJPEG, _) => Ok(None),
+        (_, Ok(Err(error))) => Err(error.into()),
+        (_, Err(_)) => Err(unreadable()),
+    }
+}
+
 /// The bytes a `width` x `height` frame takes in a raw `format`, None for MJPEG, whose
 /// frames have no fixed length, or when it overflows.
 fn raw_len(format: FrameFormat, width: u32, height: u32) -> Option<usize> {
@@ -157,7 +177,9 @@ mod tests {
         // Y0 U Y1 V with no chroma: (Y - 16) * 298 / 256, rounded
         let raw = [16, 128, 235, 128, 235, 128, 16, 128];
         assert_eq!(
-            Rgb::convert(FrameFormat::YUYV, 2, 2, &raw).unwrap(),
+            Rgb::convert(FrameFormat::YUYV, 2, 2, &raw)
+                .unwrap()
+                .unwrap(),
             rgb(vec![0, 0, 0, 255, 255, 255, 255, 255, 255, 0, 0, 0], 2)
         );
     }
@@ -167,7 +189,9 @@ mod tests {
         // the Y plane, then one U V pair
         let raw = [16, 128, 128, 235, 128, 128];
         assert_eq!(
-            Rgb::convert(FrameFormat::NV12, 2, 2, &raw).unwrap(),
+            Rgb::convert(FrameFormat::NV12, 2, 2, &raw)
+                .unwrap()
+                .unwrap(),
             rgb(
                 vec![0, 0, 0, 130, 130, 130, 130, 130, 130, 255, 255, 255],
                 2
@@ -178,7 +202,9 @@ mod tests {
     #[test]
     fn grey_is_spread_over_the_three_channels() {
         assert_eq!(
-            Rgb::convert(FrameFormat::GRAY, 2, 2, &[7, 9, 11, 13]).unwrap(),
+            Rgb::convert(FrameFormat::GRAY, 2, 2, &[7, 9, 11, 13])
+                .unwrap()
+                .unwrap(),
             rgb(vec![7, 7, 7, 9, 9, 9, 11, 11, 11, 13, 13, 13], 2)
         );
     }
@@ -187,11 +213,11 @@ mod tests {
     fn raw_rgb_is_kept_and_raw_bgr_is_swapped() {
         assert_eq!(
             Rgb::convert(FrameFormat::RAWRGB, 1, 1, &[1, 2, 3]).unwrap(),
-            rgb(vec![1, 2, 3], 1)
+            Some(rgb(vec![1, 2, 3], 1))
         );
         assert_eq!(
             Rgb::convert(FrameFormat::RAWBGR, 1, 1, &[1, 2, 3]).unwrap(),
-            rgb(vec![3, 2, 1], 1)
+            Some(rgb(vec![3, 2, 1], 1))
         );
     }
 
@@ -227,6 +253,7 @@ mod tests {
         ] {
             let mut raw: Vec<u8> = (0..frame).map(|n| 16 + 10 * n).collect();
             let exact = Rgb::convert(format, 2, 2, &raw).unwrap();
+            assert!(exact.is_some(), "{format}");
             raw.extend([255; 5]);
             assert_eq!(Rgb::convert(format, 2, 2, &raw), Ok(exact), "{format}");
         }
@@ -234,11 +261,24 @@ mod tests {
 
     #[cfg(feature = "mjpeg")]
     #[test]
-    fn a_corrupt_mjpeg_frame_is_refused() {
-        assert_eq!(
+    fn a_corrupt_mjpeg_frame_is_skipped() {
+        // no JPEG at all, then a JPEG cut after its start of image marker
+        for raw in [&[0; 16][..], &[0xFF, 0xD8, 0xFF]] {
+            assert_eq!(
+                Rgb::convert(FrameFormat::MJPEG, 1, 1, raw),
+                Ok(None),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "mjpeg"))]
+    #[test]
+    fn an_mjpeg_frame_is_refused_without_the_mjpeg_feature() {
+        assert!(matches!(
             Rgb::convert(FrameFormat::MJPEG, 1, 1, &[0; 16]),
-            Err(unreadable())
-        );
+            Err(Error::Capture(_))
+        ));
     }
 
     /// A raw RGB `width` x `height` frame whose pixel n is (n, 10 n, 255 - n), converted.
@@ -246,7 +286,9 @@ mod tests {
         let raw: Vec<u8> = (0..(width * height) as u8)
             .flat_map(|n| [n, 10 * n, 255 - n])
             .collect();
-        Rgb::convert(FrameFormat::RAWRGB, width, height, &raw).unwrap()
+        Rgb::convert(FrameFormat::RAWRGB, width, height, &raw)
+            .unwrap()
+            .unwrap()
     }
 
     #[test]

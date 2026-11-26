@@ -56,4 +56,6 @@ caller that reads them depends on `nokhwa`.
 Features:
 
 - `mjpeg` (default) decodes MJPEG frames through `mozjpeg`, which needs a C toolchain.
-  Without it an MJPEG mode never qualifies.
+  An MJPEG frame that does not decode, which a UVC webcam sends now and then, is
+  logged and skipped; any other unreadable frame stops the capture. Without the
+  feature an MJPEG mode never qualifies.

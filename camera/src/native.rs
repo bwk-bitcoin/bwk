@@ -1,6 +1,6 @@
 //! Linux (V4L2) and Windows (Media Foundation), through nokhwa.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use nokhwa::{
     pixel_format::LumaFormat,
@@ -17,6 +17,7 @@ use crate::{
 };
 
 pub struct Stream {
+    id: CameraId,
     camera: Camera,
 }
 
@@ -41,19 +42,34 @@ impl Stream {
             RequestedFormatType::Exact(chosen),
         ))?;
         camera.open_stream()?;
-        Ok(Self { camera })
+        Ok(Self {
+            id: id.clone(),
+            camera,
+        })
     }
 
-    /// Blocks until the next frame: a v4l2 read has no timeout.
-    pub fn read(&mut self, _stop: &AtomicBool) -> Result<Option<Rgb>, Error> {
-        let buffer = self.camera.frame()?;
-        let resolution = buffer.resolution();
-        Rgb::convert(
-            buffer.source_frame_format(),
-            resolution.width(),
-            resolution.height(),
-            buffer.buffer(),
-        )
-        .map(Some)
+    /// Blocks until the next frame that decodes: a v4l2 read has no timeout. None once
+    /// stopped.
+    pub fn read(&mut self, stop: &AtomicBool) -> Result<Option<Rgb>, Error> {
+        while !stop.load(Ordering::Acquire) {
+            let buffer = self.camera.frame()?;
+            let resolution = buffer.resolution();
+            let converted = Rgb::convert(
+                buffer.source_frame_format(),
+                resolution.width(),
+                resolution.height(),
+                buffer.buffer(),
+            )?;
+            if converted.is_some() {
+                return Ok(converted);
+            }
+            log::warn!(
+                "camera {} sent a {resolution} MJPEG frame of {} bytes that does not decode, \
+                 skipped",
+                self.id,
+                buffer.buffer().len()
+            );
+        }
+        Ok(None)
     }
 }
