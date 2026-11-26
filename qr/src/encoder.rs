@@ -1,3 +1,6 @@
+#[cfg(feature = "bbqr")]
+use bwk_bbqr::Encoding;
+
 use crate::{config::QrSize, error::Error, gen, image::Image};
 
 #[derive(Debug, Clone)]
@@ -35,8 +38,8 @@ impl Encoder {
     /// frames of one series may then not share.
     #[cfg(feature = "bbqr")]
     pub fn encode_bbqr(&self, data: &[u8]) -> Result<Vec<Image>, Error> {
-        let split = bwk_bbqr::split(data, self.size.bbqr_part_bytes())?;
-        let size = self.size.smallest_for_bbqr_part(split.part_bytes());
+        let split = bwk_bbqr::split(data, Encoding::Hex, self.size.alphanumeric_chars())?;
+        let size = self.size.smallest_for_bbqr_part(split.part_len());
         split
             .parts
             .iter()
@@ -47,6 +50,8 @@ impl Encoder {
 
 #[cfg(all(test, feature = "bbqr"))]
 mod tests {
+    use bwk_bbqr::{Encoding, HEADER_LEN, MIN_PART_LEN};
+
     use crate::{
         config::{QrDensity, QrSize},
         encoder::Encoder,
@@ -77,13 +82,17 @@ mod tests {
 
     fn part_fits(part_bytes: usize, size: impl Into<QrSize>) -> bool {
         let size = size.into();
-        bwk_bbqr::split(&vec![0; part_bytes], part_bytes)
-            .is_ok_and(|split| gen::encode_alphanumeric(&split.parts[0], size).is_ok())
+        bwk_bbqr::split(
+            &vec![0; part_bytes],
+            Encoding::Hex,
+            HEADER_LEN + 2 * part_bytes,
+        )
+        .is_ok_and(|split| gen::encode_alphanumeric(&split.parts[0], size).is_ok())
     }
 
     #[test]
     fn the_smallest_size_holds_the_smallest_bbqr_part() {
-        assert_eq!(QrSize::S21.bbqr_part_bytes(), bwk_bbqr::MIN_PART_BYTES);
+        assert_eq!(QrSize::S21.alphanumeric_chars(), MIN_PART_LEN);
     }
 
     #[test]

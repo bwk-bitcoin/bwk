@@ -57,7 +57,7 @@ tests locally. Commit messages must be single-line and follow existing style
 | bwk-hwi        | Hardware wallet transport and device drivers                |
 | bwk-error      | In-house derive for error impls, reached as `thiserror`     |
 | bwk-backoff    | Exponential backoff utility                                 |
-| bwk-bbqr       | BBQR split and join, hex encoding                           |
+| bwk-bbqr       | BBQR split and join, hex and base32 encoding                |
 | bwk-qr         | QR generation and scanning, BBQR framing, bipqr protocol    |
 | bwk-camera     | Camera capture for QR scanning (V4L2, Media Foundation,     |
 |                | AVFoundation, through nokhwa)                               |

@@ -1,3 +1,6 @@
+#[cfg(feature = "bbqr")]
+use bwk_bbqr::Encoding;
+
 /// The size of a QR code, named after its side in modules (the black and white squares):
 /// a code of size `Sn` is n modules wide and n high. The QR spec (ISO 18004) calls this
 /// the version, from 1 to 40, a code of version v being 17 + 4 * v modules wide, so
@@ -122,30 +125,35 @@ impl QrSize {
         })
     }
 
-    /// The largest BBQR part, in bytes, whose part string fits a code of exactly this size.
-    /// A part that long renders in alphanumeric mode at error correction Low: the data
-    /// codewords of the size (ISO 18004 Table 7), less the 4 bit mode indicator and the
-    /// character count field, hold 2 characters per 11 bits and a last odd one in 6. After
-    /// the BBQR header, each byte takes two hex characters.
+    /// The chars a code of exactly this size holds in alphanumeric mode at error
+    /// correction Low, the longest BBQR part it renders: the data codewords of the size
+    /// (ISO 18004 Table 7), less the 4 bit mode indicator and the character count field,
+    /// hold 2 characters per 11 bits and a last odd one in 6.
     #[cfg(feature = "bbqr")]
-    pub fn bbqr_part_bytes(self) -> usize {
+    pub(crate) fn alphanumeric_chars(self) -> usize {
         let count_bits = match self.version() {
             1..=9 => 9,
             10..=26 => 11,
             _ => 13,
         };
         let bits = DATA_CODEWORDS_ECC_LOW[usize::from(self.version()) - 1] * 8 - 4 - count_bits;
-        let chars = 2 * (bits / 11) + usize::from(bits % 11 >= 6);
-        (chars - bwk_bbqr::HEADER_LEN) / 2
+        2 * (bits / 11) + usize::from(bits % 11 >= 6)
     }
 
-    /// The smallest size, up to this one, that holds a BBQR part of `part_bytes` bytes,
-    /// and this one when none does.
+    /// The largest BBQR part, in bytes, whose part string fits a code of exactly this
+    /// size: after the BBQR header, each byte takes two hex characters.
     #[cfg(feature = "bbqr")]
-    pub(crate) fn smallest_for_bbqr_part(self, part_bytes: usize) -> Self {
+    pub fn bbqr_part_bytes(self) -> usize {
+        Encoding::Hex.part_bytes(self.alphanumeric_chars())
+    }
+
+    /// The smallest size, up to this one, that holds a BBQR part of `part_len` chars, and
+    /// this one when none does.
+    #[cfg(feature = "bbqr")]
+    pub(crate) fn smallest_for_bbqr_part(self, part_len: usize) -> Self {
         (1..self.version())
             .filter_map(Self::from_version)
-            .find(|size| size.bbqr_part_bytes() >= part_bytes)
+            .find(|size| size.alphanumeric_chars() >= part_len)
             .unwrap_or(self)
     }
 }

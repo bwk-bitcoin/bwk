@@ -1,12 +1,72 @@
+mod base32;
 mod hex;
 
-const PREFIX: &str = "B$HB";
+const MAGIC: &str = "B$";
+/// The binary file type, the only one this crate reads and writes.
+const FILE_TYPE: u8 = b'B';
 pub const HEADER_LEN: usize = 8;
 pub const MAX_PARTS: usize = 36 * 36 - 1;
-// A version 1 QR code at error correction Low holds 25 alphanumeric chars: after the
-// header, 8 bytes fill it, `/ 2` as each byte takes two hex chars. A smaller part
-// still needs a version 1 code, so it only adds parts.
-pub const MIN_PART_BYTES: usize = (25 - HEADER_LEN) / 2;
+// A version 1 QR code at error correction Low holds 25 alphanumeric chars. A shorter
+// part still needs a version 1 code, so it only adds parts.
+pub const MIN_PART_LEN: usize = 25;
+
+/// How a part writes its bytes after the header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encoding {
+    /// `H`: two uppercase hex digits per byte.
+    Hex,
+    /// `2`: base32 in the RFC 4648 alphabet, without padding, 8 chars per 5 bytes.
+    Base32,
+}
+
+impl Encoding {
+    /// The bytes a part of `part_len` chars carries, header included, when another part
+    /// follows it: as many whole units as fit after the header, a unit being 2 hex chars
+    /// for a byte or 8 base32 chars for 5 bytes. A sole part needs not end on a unit, so
+    /// in base32 it may carry up to 4 bytes more.
+    pub fn part_bytes(self, part_len: usize) -> usize {
+        let (unit_chars, unit_bytes) = self.unit();
+        part_len.saturating_sub(HEADER_LEN) / unit_chars * unit_bytes
+    }
+
+    /// The chars, then the bytes they decode to, of the shortest run of chars that
+    /// decodes on its own to whole bytes whatever the bytes.
+    fn unit(self) -> (usize, usize) {
+        match self {
+            Self::Hex => (2, 1),
+            Self::Base32 => (8, 5),
+        }
+    }
+
+    fn code(self) -> char {
+        match self {
+            Self::Hex => 'H',
+            Self::Base32 => '2',
+        }
+    }
+
+    fn from_code(code: u8) -> Result<Self, Error> {
+        match code {
+            b'H' => Ok(Self::Hex),
+            b'2' => Ok(Self::Base32),
+            _ => Err(Error::InvalidEncoding(code)),
+        }
+    }
+
+    fn encode(self, bytes: &[u8]) -> String {
+        match self {
+            Self::Hex => hex::encode(bytes),
+            Self::Base32 => base32::encode(bytes),
+        }
+    }
+
+    fn decode(self, body: &str) -> Result<Vec<u8>, Error> {
+        match self {
+            Self::Hex => hex::decode(body),
+            Self::Base32 => base32::decode(body),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Progress {
@@ -32,12 +92,16 @@ pub enum Error {
     TooManyParts(usize),
     #[error("conflicting part count")]
     ConflictingPartCount,
+    #[error("conflicting encoding")]
+    ConflictingEncoding,
     #[error("part index {0} is out of range")]
     PartIndexOutOfRange(usize),
     #[error("conflicting duplicate part at index {0}")]
     ConflictingDuplicatePart(usize),
     #[error("invalid part header")]
     InvalidPartHeader,
+    #[error("invalid encoding {0:#04x}")]
+    InvalidEncoding(u8),
     #[error("invalid file type")]
     InvalidFileType,
     #[error("part count is zero")]
@@ -48,44 +112,52 @@ pub enum Error {
     OddHexLength(usize),
     #[error("invalid hex digit {0:#04x}")]
     InvalidHexDigit(u8),
+    #[error("invalid base32 length {0}")]
+    InvalidBase32Length(usize),
+    #[error("invalid base32 digit {0:#04x}")]
+    InvalidBase32Digit(u8),
+    #[error("base32 bits set past the last byte")]
+    Base32TrailingBits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Split {
+    /// The encoding of every part.
+    pub encoding: Encoding,
     pub parts: Vec<String>,
 }
 
 impl Split {
-    /// The bytes the longest part carries. [`split`] gives every part as many, except the
-    /// last, which may carry fewer.
-    pub fn part_bytes(&self) -> usize {
-        self.parts
-            .iter()
-            .map(|part| part.len().saturating_sub(HEADER_LEN) / 2)
-            .max()
-            .unwrap_or(0)
+    /// The chars of the longest part, header included. [`split`] gives every part as
+    /// many, except the last, which may be shorter.
+    pub fn part_len(&self) -> usize {
+        self.parts.iter().map(String::len).max().unwrap_or(0)
     }
 }
 
-/// The first [`HEADER_LEN`] chars of a part, e.g. `B$HB0A03`: `B$`, `H` for hex
-/// encoding, `B` for binary file type, then the part count (10) and the part index (3),
-/// each as two base36 digits. The digits are `0` to `9` then `A` to `Z`, uppercase only
-/// so a part stays in the QR alphanumeric set: a field runs from `00` to `ZZ` (1295,
-/// [`MAX_PARTS`]) and a lowercase digit is refused.
+/// The first [`HEADER_LEN`] chars of a part, e.g. `B$HB0A03`: `B$`, the encoding (`H`
+/// for hex, `2` for base32), `B` for the binary file type, then the part count (10) and
+/// the part index (3), each as two base36 digits. The digits are `0` to `9` then `A` to
+/// `Z`, uppercase only so a part stays in the QR alphanumeric set: a field runs from
+/// `00` to `ZZ` (1295, [`MAX_PARTS`]) and a lowercase digit is refused.
 struct Header {
+    encoding: Encoding,
     total: usize,
     index: usize,
 }
 
 impl Header {
     fn parse(part: &str) -> Result<Self, Error> {
-        if part.len() < HEADER_LEN || !part.is_ascii() {
+        let Some(bytes) = part.as_bytes().get(..HEADER_LEN) else {
+            return Err(Error::InvalidPartHeader);
+        };
+        if !bytes.starts_with(MAGIC.as_bytes()) {
             return Err(Error::InvalidPartHeader);
         }
-        if !part.starts_with(PREFIX) {
+        let encoding = Encoding::from_code(bytes[2])?;
+        if bytes[3] != FILE_TYPE {
             return Err(Error::InvalidFileType);
         }
-        let bytes = part.as_bytes();
         let total = Self::parse_field(bytes[4], bytes[5])?;
         if total == 0 {
             return Err(Error::ZeroParts);
@@ -94,14 +166,20 @@ impl Header {
         if index >= total {
             return Err(Error::PartIndexOutOfRange(index));
         }
-        Ok(Self { total, index })
+        Ok(Self {
+            encoding,
+            total,
+            index,
+        })
     }
 
     /// `split` keeps `total` at most [`MAX_PARTS`] and `index` below it, so both fields
     /// fit two digits.
     fn serialize(&self) -> String {
         let mut header = String::with_capacity(HEADER_LEN);
-        header.push_str(PREFIX);
+        header.push_str(MAGIC);
+        header.push(self.encoding.code());
+        header.push(FILE_TYPE as char);
         for field in [self.total, self.index] {
             header.push(Self::digit(field / 36));
             header.push(Self::digit(field % 36));
@@ -131,6 +209,7 @@ impl Header {
 }
 
 struct Part {
+    encoding: Encoding,
     total: usize,
     index: usize,
     data: Vec<u8>,
@@ -138,15 +217,28 @@ struct Part {
 
 impl Part {
     fn parse(part: &str) -> Result<Self, Error> {
-        let Header { total, index } = Header::parse(part)?;
-        let data = hex::decode(&part[HEADER_LEN..])?;
-        Ok(Self { total, index, data })
+        let Header {
+            encoding,
+            total,
+            index,
+        } = Header::parse(part)?;
+        // a header that parses is ASCII, so the body starts on a char boundary
+        let data = encoding.decode(&part[HEADER_LEN..])?;
+        Ok(Self {
+            encoding,
+            total,
+            index,
+            data,
+        })
     }
 }
 
+/// Takes the parts of one series in any order, each decoded on its own as it comes.
 #[derive(Debug, Clone)]
 pub struct Joiner {
-    total: Option<usize>,
+    /// The encoding and the part count of the first part accepted, that every other
+    /// part must carry.
+    series: Option<(Encoding, usize)>,
     parts: Vec<Option<Vec<u8>>>,
     last: Option<usize>,
 }
@@ -154,7 +246,7 @@ pub struct Joiner {
 impl Joiner {
     pub fn new() -> Self {
         Self {
-            total: None,
+            series: None,
             parts: Vec::new(),
             last: None,
         }
@@ -162,8 +254,13 @@ impl Joiner {
 
     pub fn add_part(&mut self, part: &str) -> Result<Option<Vec<u8>>, Error> {
         let parsed = Part::parse(part)?;
-        if self.total.is_some_and(|total| total != parsed.total) {
-            return Err(Error::ConflictingPartCount);
+        if let Some((encoding, total)) = self.series {
+            if total != parsed.total {
+                return Err(Error::ConflictingPartCount);
+            }
+            if encoding != parsed.encoding {
+                return Err(Error::ConflictingEncoding);
+            }
         }
         match self.parts.get(parsed.index) {
             Some(Some(existing)) if existing != &parsed.data => {
@@ -174,8 +271,8 @@ impl Joiner {
                 return Ok(None);
             }
             Some(None) | None => {
-                if self.total.is_none() {
-                    self.total = Some(parsed.total);
+                if self.series.is_none() {
+                    self.series = Some((parsed.encoding, parsed.total));
                     self.parts = vec![None; parsed.total];
                 }
                 self.parts[parsed.index] = Some(parsed.data);
@@ -193,7 +290,7 @@ impl Joiner {
     }
 
     fn is_complete(&self) -> bool {
-        self.total.is_some() && self.parts.iter().all(Option::is_some)
+        self.series.is_some() && self.parts.iter().all(Option::is_some)
     }
 
     pub fn progress(&self) -> Option<Progress> {
@@ -210,71 +307,111 @@ impl Default for Joiner {
     }
 }
 
+/// Whether `s` starts like a part this crate reads: `B$`, an encoding it knows, and the
+/// binary file type. A part of another file type, such as `B$HP...`, is not one.
 pub fn is_part(s: &str) -> bool {
-    s.starts_with(PREFIX)
+    match s.as_bytes() {
+        [b'B', b'$', encoding, FILE_TYPE, ..] => Encoding::from_code(*encoding).is_ok(),
+        _ => false,
+    }
 }
 
 /// Cuts `data` into BBQR parts of equal length, in index order: as few parts as
-/// `max_part_bytes` bytes each allows, then the shortest length that fills that many.
-/// Every part carries the same number of bytes and only the last may carry fewer, by
-/// less than the part count: 164 bytes at a maximum of 163 are two parts of 82, not 163
-/// and 1. A part is written as an 8-char header such as `B$HB0A03` (index 3 of 10 parts)
-/// followed by its bytes in hex.
+/// `max_part_len` chars each allows, header included, then the shortest length that
+/// fills that many. Every part carries the same number of bytes and only the last may
+/// carry fewer: 164 bytes in hex, at 163 a part, are two parts of 82, not 163 and 1. A
+/// part is written as an 8-char header such as `B$HB0A03` (index 3 of 10 parts, in hex)
+/// followed by its bytes in `encoding`.
 ///
-/// A `max_part_bytes` below [`MIN_PART_BYTES`] is raised to it, which only bounds the
-/// part count: an equal part may still be shorter. Refuses empty `data` and a `data`
-/// that needs more than [`MAX_PARTS`] parts.
-pub fn split(data: &[u8], max_part_bytes: usize) -> Result<Split, Error> {
-    let max_part_bytes = max_part_bytes.max(MIN_PART_BYTES);
+/// A part that another follows decodes on its own, so it carries whole units of its
+/// encoding: 2 hex chars for a byte, 8 base32 chars for 5 bytes. The last part is then
+/// shorter than the others by less than one unit per part: in bytes, less than the part
+/// count in hex and less than 5 times it in base32. A payload that fits a sole part
+/// needs no whole unit, which in base32 packs up to 4 bytes more into it.
+///
+/// A `max_part_len` below [`MIN_PART_LEN`] is raised to it, which only bounds the part
+/// count: an equal part may still be shorter. Refuses empty `data` and a `data` that
+/// needs more than [`MAX_PARTS`] parts.
+pub fn split(data: &[u8], encoding: Encoding, max_part_len: usize) -> Result<Split, Error> {
     if data.is_empty() {
         return Err(Error::EmptyPayload);
     }
-    let total = data.len().div_ceil(max_part_bytes);
+    let max_part_len = max_part_len.max(MIN_PART_LEN);
+    let (unit_chars, unit_bytes) = encoding.unit();
+    let body = max_part_len - HEADER_LEN;
+    let sole_part_bytes =
+        body / unit_chars * unit_bytes + body % unit_chars * unit_bytes / unit_chars;
+    let total = if data.len() <= sole_part_bytes {
+        1
+    } else {
+        data.len().div_ceil(encoding.part_bytes(max_part_len))
+    };
     if total > MAX_PARTS {
         return Err(Error::TooManyParts(total));
     }
-    // at most `max_part_bytes`, and cuts `data` into exactly `total` chunks
-    let part_bytes = data.len().div_ceil(total);
+    // whole units, at most those of `max_part_len`, that cut `data` into exactly `total`
+    // chunks
+    let part_bytes = data.len().div_ceil(total * unit_bytes) * unit_bytes;
     let mut parts = Vec::new();
     for (index, chunk) in data.chunks(part_bytes).enumerate() {
-        let mut part = Header { total, index }.serialize();
-        part.push_str(&hex::encode(chunk));
+        let header = Header {
+            encoding,
+            total,
+            index,
+        };
+        let mut part = header.serialize();
+        part.push_str(&encoding.encode(chunk));
         parts.push(part);
     }
-    Ok(Split { parts })
+    Ok(Split { encoding, parts })
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{split, Error, Joiner, Progress, Split, HEADER_LEN, MAX_PARTS, MIN_PART_BYTES};
+    use crate::{
+        is_part, split, Encoding, Error, Joiner, Progress, Split, HEADER_LEN, MAX_PARTS,
+        MIN_PART_LEN,
+    };
 
     const DATA: &[u8] = b"abcdefghijklmnopqrst";
+    const ENCODINGS: [Encoding; 2] = [Encoding::Hex, Encoding::Base32];
 
     fn payload(len: usize) -> Vec<u8> {
         (0..len).map(|index| index as u8).collect()
     }
 
-    fn part_lengths(split: &Split) -> Vec<usize> {
+    /// The length of a part carrying `bytes` bytes in hex.
+    fn hex_len(bytes: usize) -> usize {
+        HEADER_LEN + 2 * bytes
+    }
+
+    fn split_hex(data: &[u8], max_part_bytes: usize) -> Result<Split, Error> {
+        split(data, Encoding::Hex, hex_len(max_part_bytes))
+    }
+
+    /// The bytes each part of `split` carries.
+    fn part_bytes(split: &Split) -> Vec<usize> {
         split
             .parts
             .iter()
-            .map(|part| (part.len() - HEADER_LEN) / 2)
+            .map(|part| split.encoding.decode(&part[HEADER_LEN..]).unwrap().len())
             .collect()
     }
 
-    fn join(split: &Split) -> Option<Vec<u8>> {
+    fn join<S: AsRef<str>>(parts: &[S]) -> Option<Vec<u8>> {
         let mut joiner = Joiner::new();
         let mut joined = None;
-        for part in &split.parts {
+        for part in parts {
             assert_eq!(joined, None);
-            joined = joiner.add_part(part).unwrap();
+            joined = joiner.add_part(part.as_ref()).unwrap();
         }
         joined
     }
 
     #[test]
     fn split_join_round_trip() {
-        let split = split(DATA, 8).unwrap();
+        let split = split_hex(DATA, 8).unwrap();
+        assert_eq!(split.encoding, Encoding::Hex);
         assert_eq!(
             split.parts,
             vec![
@@ -300,8 +437,19 @@ mod tests {
     }
 
     #[test]
+    fn base32_parts_carry_five_bytes_in_eight_chars() {
+        let split = split(DATA, Encoding::Base32, MIN_PART_LEN).unwrap();
+        assert_eq!(split.encoding, Encoding::Base32);
+        assert_eq!(
+            split.parts,
+            vec!["B$2B0200MFRGGZDFMZTWQ2LK", "B$2B0201NNWG23TPOBYXE43U"]
+        );
+        assert_eq!(join(&split.parts), Some(DATA.to_vec()));
+    }
+
+    #[test]
     fn progress_tracks_out_of_order_parts() {
-        let split = split(DATA, 8).unwrap();
+        let split = split_hex(DATA, 8).unwrap();
         let mut joiner = Joiner::new();
         assert_eq!(joiner.add_part(&split.parts[2]), Ok(None));
         assert_eq!(joiner.progress().unwrap().last, 2);
@@ -321,7 +469,7 @@ mod tests {
 
     #[test]
     fn a_part_of_a_completed_message_is_a_duplicate() {
-        let split = split(DATA, 8).unwrap();
+        let split = split_hex(DATA, 8).unwrap();
         let mut joiner = Joiner::new();
         assert_eq!(joiner.add_part(&split.parts[0]), Ok(None));
         assert_eq!(joiner.add_part(&split.parts[1]), Ok(None));
@@ -349,19 +497,30 @@ mod tests {
 
     #[test]
     fn parts_are_equal_except_a_last_one_that_may_be_shorter() {
-        for max in MIN_PART_BYTES..=70 {
-            for len in 1..=300 {
-                let data = payload(len);
-                let split = split(&data, max).unwrap();
-                let lengths = part_lengths(&split);
-                let (last, rest) = lengths.split_last().unwrap();
-                let part_bytes = split.part_bytes();
-                assert_eq!(lengths.len(), len.div_ceil(max), "{len} at {max}");
-                assert!(part_bytes <= max, "{len} at {max}");
-                assert!(rest.iter().all(|length| *length == part_bytes));
-                assert!((1..=part_bytes).contains(last), "{len} at {max}");
-                assert!(part_bytes - last < lengths.len(), "{len} at {max}");
-                assert_eq!(join(&split), Some(data), "{len} at {max}");
+        for encoding in ENCODINGS {
+            let (unit_chars, unit_bytes) = encoding.unit();
+            for max in MIN_PART_LEN..=150 {
+                let sole = (max - HEADER_LEN) * unit_bytes / unit_chars;
+                for len in 1..=300 {
+                    let case = format!("{len} bytes at {max} in {encoding:?}");
+                    let data = payload(len);
+                    let split = split(&data, encoding, max).unwrap();
+                    assert_eq!(split.encoding, encoding, "{case}");
+                    assert!(split.part_len() <= max, "{case}");
+                    let lengths = part_bytes(&split);
+                    let (last, rest) = lengths.split_last().unwrap();
+                    if len <= sole {
+                        assert_eq!(lengths, [len], "{case}");
+                        continue;
+                    }
+                    let part = encoding.part_bytes(split.part_len());
+                    assert_eq!(lengths.len(), len.div_ceil(encoding.part_bytes(max)));
+                    assert!(rest.iter().all(|length| *length == part), "{case}");
+                    assert_eq!(part % unit_bytes, 0, "{case}");
+                    assert!((1..=part).contains(last), "{case}");
+                    assert!(part - last < unit_bytes * lengths.len(), "{case}");
+                    assert_eq!(join(&split.parts), Some(data), "{case}");
+                }
             }
         }
     }
@@ -376,17 +535,93 @@ mod tests {
             (1000, 163, &[143, 143, 143, 143, 143, 143, 142]),
         ];
         for (len, max, lengths) in cases {
-            let split = split(&payload(len), max).unwrap();
-            assert_eq!(part_lengths(&split), lengths, "{len} at {max}");
-            assert_eq!(split.part_bytes(), lengths[0], "{len} at {max}");
+            let split = split_hex(&payload(len), max).unwrap();
+            assert_eq!(part_bytes(&split), lengths, "{len} at {max}");
+            assert_eq!(split.part_len(), hex_len(lengths[0]), "{len} at {max}");
+        }
+    }
+
+    // 335 chars hold 327 after the header: 40 units of 5 bytes, or 204 bytes off a unit
+    #[test]
+    fn a_base32_part_before_another_ends_on_five_bytes() {
+        let cases: [(usize, usize, &[usize]); 9] = [
+            (10, 25, &[10]),
+            (11, 25, &[10, 1]),
+            (21, 25, &[10, 10, 1]),
+            (200, 335, &[200]),
+            (204, 335, &[204]),
+            (205, 335, &[105, 100]),
+            (400, 335, &[200, 200]),
+            (401, 335, &[135, 135, 131]),
+            (1000, 335, &[200, 200, 200, 200, 200]),
+        ];
+        for (len, max, lengths) in cases {
+            let split = split(&payload(len), Encoding::Base32, max).unwrap();
+            assert_eq!(part_bytes(&split), lengths, "{len} at {max}");
         }
     }
 
     #[test]
-    fn raises_a_part_size_below_the_minimum_to_it() {
-        let minimum = split(DATA, MIN_PART_BYTES).unwrap();
-        assert_eq!(split(DATA, 0), Ok(minimum.clone()));
-        assert_eq!(split(DATA, 7), Ok(minimum));
+    fn a_part_carries_whole_units_after_its_header() {
+        let cases = [
+            (Encoding::Hex, 0, 0),
+            (Encoding::Hex, 25, 8),
+            (Encoding::Hex, 26, 9),
+            (Encoding::Hex, 335, 163),
+            (Encoding::Base32, 7, 0),
+            (Encoding::Base32, 15, 0),
+            (Encoding::Base32, 16, 5),
+            (Encoding::Base32, 25, 10),
+            (Encoding::Base32, 335, 200),
+        ];
+        for (encoding, part_len, bytes) in cases {
+            assert_eq!(encoding.part_bytes(part_len), bytes, "{encoding:?}");
+        }
+    }
+
+    #[test]
+    fn raises_a_part_length_below_the_minimum_to_it() {
+        for encoding in ENCODINGS {
+            let minimum = split(DATA, encoding, MIN_PART_LEN).unwrap();
+            assert_eq!(split(DATA, encoding, 0), Ok(minimum.clone()));
+            assert_eq!(split(DATA, encoding, MIN_PART_LEN - 1), Ok(minimum));
+        }
+    }
+
+    #[test]
+    fn handles_unbounded_part_length_without_overflow() {
+        for encoding in ENCODINGS {
+            for max in [usize::MAX, usize::MAX / 5 + HEADER_LEN + 1] {
+                let split = split(DATA, encoding, max).unwrap();
+                assert_eq!(split.parts.len(), 1, "{encoding:?} at {max}");
+                assert_eq!(join(&split.parts), Some(DATA.to_vec()));
+            }
+        }
+    }
+
+    // the two series the reference implementation cuts 23 bytes into, at 16 and at 8
+    // base32 chars a part:
+    //   body = base64.b32encode(bytes(range(23))).decode().rstrip("=")
+    //   parts = [header(index) + body[at:at + chars] for at in range(0, len(body), chars)]
+    #[test]
+    fn joins_the_base32_parts_of_the_reference_in_any_order() {
+        let series: [&[&str]; 2] = [
+            &[
+                "B$2B0302CQKRM",
+                "B$2B0300AAAQEAYEAUDAOCAJ",
+                "B$2B0301BIFQYDIOB4IBCEQT",
+            ],
+            &[
+                "B$2B0503B4IBCEQT",
+                "B$2B0501AUDAOCAJ",
+                "B$2B0504CQKRM",
+                "B$2B0500AAAQEAYE",
+                "B$2B0502BIFQYDIO",
+            ],
+        ];
+        for parts in series {
+            assert_eq!(join(parts), Some(payload(23)));
+        }
     }
 
     #[test]
@@ -403,12 +638,71 @@ mod tests {
         assert!(joiner.add_part("B$HB0000").is_err());
         assert!(joiner.add_part("B$HB0100F").is_err());
         assert!(joiner.add_part("B$HB0100FG").is_err());
+        assert_eq!(
+            Joiner::new().add_part("B$HB0100\u{00e9}"),
+            Err(Error::InvalidHexDigit(0xc3))
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_base32() {
+        let cases = [
+            ("B$2B0100M", Error::InvalidBase32Length(1)),
+            ("B$2B0100my", Error::InvalidBase32Digit(b'm')),
+            ("B$2B0100MY======", Error::InvalidBase32Digit(b'=')),
+            ("B$2B0100MZ", Error::Base32TrailingBits),
+            ("B$2B0100\u{00e9}", Error::InvalidBase32Digit(0xc3)),
+        ];
+        for (part, error) in cases {
+            assert_eq!(Joiner::new().add_part(part), Err(error), "{part}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_malformed_header() {
+        let cases = [
+            ("B$HB010", Error::InvalidPartHeader),
+            ("A$HB0100", Error::InvalidPartHeader),
+            ("B$XB0100", Error::InvalidEncoding(b'X')),
+            ("B$hB0100", Error::InvalidEncoding(b'h')),
+            ("B$HP0100", Error::InvalidFileType),
+            ("B$2B0000", Error::ZeroParts),
+            ("B$2B0a00", Error::InvalidBase36Digit(b'a')),
+            // a char that starts in the header and ends past it
+            ("B$HB010\u{e9}", Error::InvalidBase36Digit(0xc3)),
+        ];
+        for (part, error) in cases {
+            assert_eq!(Joiner::new().add_part(part), Err(error), "{part}");
+        }
+    }
+
+    #[test]
+    fn only_a_binary_part_in_a_known_encoding_is_a_part() {
+        for part in ["B$HB", "B$2B", "B$HB0100FF", "B$2B0100MY"] {
+            assert!(is_part(part), "{part}");
+        }
+        for text in [
+            "",
+            "B$H",
+            "B$HP0100FF",
+            "B$2P0100MY",
+            "B$XB0100",
+            "b$HB0100",
+            "bitcoin:",
+        ] {
+            assert!(!is_part(text), "{text}");
+        }
     }
 
     #[test]
     fn rejects_too_many_parts() {
+        let part_bytes = Encoding::Hex.part_bytes(MIN_PART_LEN);
         assert_eq!(
-            split(&[0; (MAX_PARTS + 1) * MIN_PART_BYTES], MIN_PART_BYTES),
+            split(
+                &vec![0; (MAX_PARTS + 1) * part_bytes],
+                Encoding::Hex,
+                MIN_PART_LEN
+            ),
             Err(Error::TooManyParts(MAX_PARTS + 1))
         );
     }
@@ -424,6 +718,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_conflicting_encoding() {
+        let mut joiner = Joiner::new();
+        assert_eq!(joiner.add_part("B$HB020061"), Ok(None));
+        assert_eq!(
+            joiner.add_part("B$2B0201MI"),
+            Err(Error::ConflictingEncoding)
+        );
+        assert_eq!(joiner.add_part("B$HB020162"), Ok(Some(b"ab".to_vec())));
+    }
+
+    #[test]
     fn rejects_a_part_index_out_of_range() {
         let mut joiner = Joiner::new();
         assert_eq!(
@@ -433,17 +738,17 @@ mod tests {
     }
 
     #[test]
-    fn a_rejected_first_part_does_not_lock_the_part_count() {
+    fn a_rejected_first_part_locks_neither_the_part_count_nor_the_encoding() {
         let mut joiner = Joiner::new();
         assert_eq!(
             joiner.add_part("B$HB020261"),
             Err(Error::PartIndexOutOfRange(2))
         );
         assert_eq!(joiner.progress(), None);
-        assert_eq!(joiner.add_part("B$HB03006162"), Ok(None));
-        assert_eq!(joiner.add_part("B$HB03016364"), Ok(None));
+        assert_eq!(joiner.add_part("B$2B0300MFRA"), Ok(None));
+        assert_eq!(joiner.add_part("B$2B0301MNSA"), Ok(None));
         assert_eq!(
-            joiner.add_part("B$HB03026566"),
+            joiner.add_part("B$2B0302MVTA"),
             Ok(Some(b"abcdef".to_vec()))
         );
     }

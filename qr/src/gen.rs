@@ -53,6 +53,7 @@ pub fn qr_to_image(qr: QrCode) -> Image {
 
 #[cfg(all(test, feature = "bbqr"))]
 mod tests {
+    use bwk_bbqr::{Encoding, HEADER_LEN};
     use qrcodegen::QrCodeEcc;
 
     use crate::{config::QrSize, gen::alphanumeric_code};
@@ -65,7 +66,8 @@ mod tests {
             (53, QrSize::S33, QrCodeEcc::Low),
         ];
         for (bytes, size, level) in cases {
-            let split = bwk_bbqr::split(&vec![7; bytes], bytes).unwrap();
+            let part_len = HEADER_LEN + 2 * bytes;
+            let split = bwk_bbqr::split(&vec![7; bytes], Encoding::Hex, part_len).unwrap();
             let code = alphanumeric_code(&split.parts[0], size).unwrap();
             assert_eq!(code.version().value(), size.version(), "{bytes} bytes");
             assert_eq!(code.error_correction_level(), level, "{bytes} bytes");
