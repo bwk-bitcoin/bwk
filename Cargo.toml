@@ -71,6 +71,8 @@ objc = "0.2"
 v4l = "0.14"
 windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_System_Com"] }
 bwk-bbqr = { path = "bbqr" }
+# A second deflate, for bwk-bbqr's tests only: its own inflates and is inflated by it.
+miniz_oxide = "0.9.1"
 bipqr = { git = "https://github.com/pythcoiner/bipqr", rev = "d7363e0ea67af01b0407deff5f33c499a627f897", default-features = false }
 
 # spdk dependencies

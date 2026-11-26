@@ -11,3 +11,6 @@ keywords.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+
+[dev-dependencies]
+miniz_oxide.workspace = true

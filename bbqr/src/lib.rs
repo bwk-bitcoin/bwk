@@ -1,5 +1,8 @@
 mod base32;
 mod hex;
+mod inflate;
+#[cfg(test)]
+mod test_data;
 
 const MAGIC: &str = "B$";
 /// The binary file type, the only one this crate reads and writes.
@@ -9,6 +12,11 @@ pub const MAX_PARTS: usize = 36 * 36 - 1;
 // A version 1 QR code at error correction Low holds 25 alphanumeric chars. A shorter
 // part still needs a version 1 code, so it only adds parts.
 pub const MIN_PART_LEN: usize = 25;
+/// The most bytes [`Joiner`] inflates a compressed series to: what the [`MAX_PARTS`]
+/// parts of a series carry at most in base32, 2680 bytes in each QR code of version 40.
+/// A compressed series then takes no more memory than an uncompressed one may, when a
+/// deflate stream can hold a thousand times its own length.
+pub const MAX_INFLATED_BYTES: usize = MAX_PARTS * 2680;
 
 /// How a part writes its bytes after the header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,13 +25,19 @@ pub enum Encoding {
     Hex,
     /// `2`: base32 in the RFC 4648 alphabet, without padding, 8 chars per 5 bytes.
     Base32,
+    /// `Z`: the whole payload compressed into one raw deflate stream, with neither a
+    /// zlib header nor a checksum, that the parts then carry as [`Encoding::Base32`].
+    /// [`Joiner`] reads it. [`split`] does not compress yet and writes such a payload in
+    /// base32, as the format has a sender do with one that compression does not shrink.
+    Zlib,
 }
 
 impl Encoding {
     /// The bytes a part of `part_len` chars carries, header included, when another part
     /// follows it: as many whole units as fit after the header, a unit being 2 hex chars
     /// for a byte or 8 base32 chars for 5 bytes. A sole part needs not end on a unit, so
-    /// in base32 it may carry up to 4 bytes more.
+    /// in base32 it may carry up to 4 bytes more. A compressed part carries bytes of the
+    /// deflate stream, not of the payload.
     pub fn part_bytes(self, part_len: usize) -> usize {
         let (unit_chars, unit_bytes) = self.unit();
         part_len.saturating_sub(HEADER_LEN) / unit_chars * unit_bytes
@@ -34,7 +48,7 @@ impl Encoding {
     fn unit(self) -> (usize, usize) {
         match self {
             Self::Hex => (2, 1),
-            Self::Base32 => (8, 5),
+            Self::Base32 | Self::Zlib => (8, 5),
         }
     }
 
@@ -42,6 +56,7 @@ impl Encoding {
         match self {
             Self::Hex => 'H',
             Self::Base32 => '2',
+            Self::Zlib => 'Z',
         }
     }
 
@@ -49,6 +64,7 @@ impl Encoding {
         match code {
             b'H' => Ok(Self::Hex),
             b'2' => Ok(Self::Base32),
+            b'Z' => Ok(Self::Zlib),
             _ => Err(Error::InvalidEncoding(code)),
         }
     }
@@ -56,14 +72,14 @@ impl Encoding {
     fn encode(self, bytes: &[u8]) -> String {
         match self {
             Self::Hex => hex::encode(bytes),
-            Self::Base32 => base32::encode(bytes),
+            Self::Base32 | Self::Zlib => base32::encode(bytes),
         }
     }
 
     fn decode(self, body: &str) -> Result<Vec<u8>, Error> {
         match self {
             Self::Hex => hex::decode(body),
-            Self::Base32 => base32::decode(body),
+            Self::Base32 | Self::Zlib => base32::decode(body),
         }
     }
 }
@@ -118,11 +134,23 @@ pub enum Error {
     InvalidBase32Digit(u8),
     #[error("base32 bits set past the last byte")]
     Base32TrailingBits,
+    #[error("deflate stream ends before its last block")]
+    TruncatedDeflate,
+    #[error("bytes after the last block of the deflate stream")]
+    TrailingDeflateData,
+    #[error("invalid deflate block")]
+    InvalidDeflateBlock,
+    #[error("invalid deflate code")]
+    InvalidDeflateCode,
+    #[error("deflate distance is out of range")]
+    InvalidDeflateDistance,
+    #[error("inflated payload exceeds {max} bytes", max = MAX_INFLATED_BYTES)]
+    InflatedTooLarge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Split {
-    /// The encoding of every part.
+    /// The encoding of every part, which is not always the one [`split`] was asked for.
     pub encoding: Encoding,
     pub parts: Vec<String>,
 }
@@ -136,8 +164,8 @@ impl Split {
 }
 
 /// The first [`HEADER_LEN`] chars of a part, e.g. `B$HB0A03`: `B$`, the encoding (`H`
-/// for hex, `2` for base32), `B` for the binary file type, then the part count (10) and
-/// the part index (3), each as two base36 digits. The digits are `0` to `9` then `A` to
+/// for hex, `2` for base32, `Z` for zlib), `B` for the binary file type, then the part
+/// count (10) and the part index (3), each as two base36 digits. The digits are `0` to `9` then `A` to
 /// `Z`, uppercase only so a part stays in the QR alphanumeric set: a field runs from
 /// `00` to `ZZ` (1295, [`MAX_PARTS`]) and a lowercase digit is refused.
 struct Header {
@@ -233,7 +261,13 @@ impl Part {
     }
 }
 
-/// Takes the parts of one series in any order, each decoded on its own as it comes.
+/// Takes the parts of one series in any order, each decoded on its own as it comes, and
+/// gives the payload with the last one: the bytes of the parts in index order, inflated
+/// when the series is compressed.
+///
+/// A compressed series that does not inflate, or to more than [`MAX_INFLATED_BYTES`],
+/// is an error of the part that completes it. Its parts are then duplicates like those
+/// of any complete series, until a new `Joiner` takes over.
 #[derive(Debug, Clone)]
 pub struct Joiner {
     /// The encoding and the part count of the first part accepted, that every other
@@ -280,13 +314,22 @@ impl Joiner {
             }
         }
         if self.is_complete() {
-            let mut data = Vec::new();
-            for item in &self.parts {
-                data.extend_from_slice(item.as_ref().expect("checked complete"));
-            }
-            return Ok(Some(data));
+            return self.join().map(Some);
         }
         Ok(None)
+    }
+
+    fn join(&self) -> Result<Vec<u8>, Error> {
+        let mut data = Vec::new();
+        for item in &self.parts {
+            data.extend_from_slice(item.as_ref().expect("checked complete"));
+        }
+        match self.series {
+            Some((Encoding::Zlib, _)) => {
+                inflate::inflate(&data, MAX_INFLATED_BYTES, inflate::MAX_DISTANCE)
+            }
+            _ => Ok(data),
+        }
     }
 
     fn is_complete(&self) -> bool {
@@ -329,6 +372,9 @@ pub fn is_part(s: &str) -> bool {
 /// count in hex and less than 5 times it in base32. A payload that fits a sole part
 /// needs no whole unit, which in base32 packs up to 4 bytes more into it.
 ///
+/// [`Encoding::Zlib`] is written as [`Encoding::Base32`] for now, which
+/// [`Split::encoding`] then is.
+///
 /// A `max_part_len` below [`MIN_PART_LEN`] is raised to it, which only bounds the part
 /// count: an equal part may still be shorter. Refuses empty `data` and a `data` that
 /// needs more than [`MAX_PARTS`] parts.
@@ -336,6 +382,10 @@ pub fn split(data: &[u8], encoding: Encoding, max_part_len: usize) -> Result<Spl
     if data.is_empty() {
         return Err(Error::EmptyPayload);
     }
+    let encoding = match encoding {
+        Encoding::Zlib => Encoding::Base32,
+        encoding => encoding,
+    };
     let max_part_len = max_part_len.max(MIN_PART_LEN);
     let (unit_chars, unit_bytes) = encoding.unit();
     let body = max_part_len - HEADER_LEN;
@@ -369,16 +419,13 @@ pub fn split(data: &[u8], encoding: Encoding, max_part_len: usize) -> Result<Spl
 #[cfg(test)]
 mod tests {
     use crate::{
-        is_part, split, Encoding, Error, Joiner, Progress, Split, HEADER_LEN, MAX_PARTS,
-        MIN_PART_LEN,
+        is_part, split, test_data::ramp, Encoding, Error, Joiner, Progress, Split, HEADER_LEN,
+        MAX_PARTS, MIN_PART_LEN,
     };
 
     const DATA: &[u8] = b"abcdefghijklmnopqrst";
+    const TEXT: &[u8] = b"the quick brown fox jumps over the lazy dog, ";
     const ENCODINGS: [Encoding; 2] = [Encoding::Hex, Encoding::Base32];
-
-    fn payload(len: usize) -> Vec<u8> {
-        (0..len).map(|index| index as u8).collect()
-    }
 
     /// The length of a part carrying `bytes` bytes in hex.
     fn hex_len(bytes: usize) -> usize {
@@ -503,7 +550,7 @@ mod tests {
                 let sole = (max - HEADER_LEN) * unit_bytes / unit_chars;
                 for len in 1..=300 {
                     let case = format!("{len} bytes at {max} in {encoding:?}");
-                    let data = payload(len);
+                    let data = ramp(len);
                     let split = split(&data, encoding, max).unwrap();
                     assert_eq!(split.encoding, encoding, "{case}");
                     assert!(split.part_len() <= max, "{case}");
@@ -535,7 +582,7 @@ mod tests {
             (1000, 163, &[143, 143, 143, 143, 143, 143, 142]),
         ];
         for (len, max, lengths) in cases {
-            let split = split_hex(&payload(len), max).unwrap();
+            let split = split_hex(&ramp(len), max).unwrap();
             assert_eq!(part_bytes(&split), lengths, "{len} at {max}");
             assert_eq!(split.part_len(), hex_len(lengths[0]), "{len} at {max}");
         }
@@ -556,7 +603,7 @@ mod tests {
             (1000, 335, &[200, 200, 200, 200, 200]),
         ];
         for (len, max, lengths) in cases {
-            let split = split(&payload(len), Encoding::Base32, max).unwrap();
+            let split = split(&ramp(len), Encoding::Base32, max).unwrap();
             assert_eq!(part_bytes(&split), lengths, "{len} at {max}");
         }
     }
@@ -573,6 +620,8 @@ mod tests {
             (Encoding::Base32, 16, 5),
             (Encoding::Base32, 25, 10),
             (Encoding::Base32, 335, 200),
+            (Encoding::Zlib, 25, 10),
+            (Encoding::Zlib, 335, 200),
         ];
         for (encoding, part_len, bytes) in cases {
             assert_eq!(encoding.part_bytes(part_len), bytes, "{encoding:?}");
@@ -590,7 +639,7 @@ mod tests {
 
     #[test]
     fn handles_unbounded_part_length_without_overflow() {
-        for encoding in ENCODINGS {
+        for encoding in [Encoding::Hex, Encoding::Base32, Encoding::Zlib] {
             for max in [usize::MAX, usize::MAX / 5 + HEADER_LEN + 1] {
                 let split = split(DATA, encoding, max).unwrap();
                 assert_eq!(split.parts.len(), 1, "{encoding:?} at {max}");
@@ -620,8 +669,61 @@ mod tests {
             ],
         ];
         for parts in series {
-            assert_eq!(join(parts), Some(payload(23)));
+            assert_eq!(join(parts), Some(ramp(23)));
         }
+    }
+
+    // series the reference implementation compresses and cuts, at 8 then at 32 base32
+    // chars a part:
+    //   c = zlib.compressobj(wbits=-10); stream = c.compress(payload) + c.flush()
+    //   body = base64.b32encode(stream).decode().rstrip("=")
+    #[test]
+    fn joins_the_zlib_parts_of_the_reference_in_any_order() {
+        let series: [(&[&str], Vec<u8>); 2] = [
+            (&["B$ZB0201AA", "B$ZB0200MNT2OPIA"], vec![7; 100]),
+            (
+                &[
+                    "B$ZB0301ZAVM2LJIK3EC6SZNKIUACSXHERLFKKVE",
+                    "B$ZB03024ST6XADZQNADCAA",
+                    "B$ZB0300FPEUQVJIFTGUZTSWJAVMUL6PKNEMXL2Q",
+                ],
+                TEXT.repeat(4),
+            ),
+        ];
+        for (parts, payload) in series {
+            assert_eq!(join(parts), Some(payload));
+        }
+    }
+
+    // the stream of the series above in one part, less its last byte, then with one more
+    #[test]
+    fn rejects_a_zlib_series_that_does_not_inflate() {
+        let cases = [
+            (
+                "B$ZB0100FPEUQVJIFTGUZTSWJAVMUL6PKNEMXL2QZAVM2LJIK3EC6SZNKIUACSXHERLFKKVE4ST6XADZQ\
+                 NADC",
+                Error::TruncatedDeflate,
+            ),
+            (
+                "B$ZB0100FPEUQVJIFTGUZTSWJAVMUL6PKNEMXL2QZAVM2LJIK3EC6SZNKIUACSXHERLFKKVE4ST6XADZQ\
+                 NADCAAA",
+                Error::TrailingDeflateData,
+            ),
+        ];
+        for (part, error) in cases {
+            let mut joiner = Joiner::new();
+            assert_eq!(joiner.add_part(part), Err(error), "{part}");
+            assert_eq!(joiner.add_part(part), Ok(None), "{part}");
+        }
+    }
+
+    #[test]
+    fn writes_base32_for_zlib() {
+        let split = split(DATA, Encoding::Zlib, MIN_PART_LEN).unwrap();
+        assert_eq!(
+            Ok(split),
+            super::split(DATA, Encoding::Base32, MIN_PART_LEN)
+        );
     }
 
     #[test]
@@ -678,18 +780,28 @@ mod tests {
 
     #[test]
     fn only_a_binary_part_in_a_known_encoding_is_a_part() {
-        for part in ["B$HB", "B$2B", "B$HB0100FF", "B$2B0100MY"] {
+        let parts = [
+            "B$HB",
+            "B$2B",
+            "B$ZB",
+            "B$HB0100FF",
+            "B$2B0100MY",
+            "B$ZB0100AMAA",
+        ];
+        for part in parts {
             assert!(is_part(part), "{part}");
         }
-        for text in [
+        let texts = [
             "",
             "B$H",
             "B$HP0100FF",
             "B$2P0100MY",
+            "B$ZP0100AMAA",
             "B$XB0100",
             "b$HB0100",
             "bitcoin:",
-        ] {
+        ];
+        for text in texts {
             assert!(!is_part(text), "{text}");
         }
     }
@@ -721,10 +833,9 @@ mod tests {
     fn rejects_a_conflicting_encoding() {
         let mut joiner = Joiner::new();
         assert_eq!(joiner.add_part("B$HB020061"), Ok(None));
-        assert_eq!(
-            joiner.add_part("B$2B0201MI"),
-            Err(Error::ConflictingEncoding)
-        );
+        for part in ["B$2B0201MI", "B$ZB0201MI"] {
+            assert_eq!(joiner.add_part(part), Err(Error::ConflictingEncoding));
+        }
         assert_eq!(joiner.add_part("B$HB020162"), Ok(Some(b"ab".to_vec())));
     }
 
