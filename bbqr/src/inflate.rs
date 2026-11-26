@@ -4,32 +4,32 @@ use crate::Error;
 pub(crate) const MAX_DISTANCE: usize = 32768;
 
 /// The longest code of a deflate stream, in bits.
-const MAX_BITS: usize = 15;
-const END_OF_BLOCK: usize = 256;
+pub(crate) const MAX_BITS: usize = 15;
+pub(crate) const END_OF_BLOCK: usize = 256;
 /// The symbols of the literal and length code, 286 and 287 being none.
 const LITERAL_SYMBOLS: usize = 288;
 /// The symbols of the distance code, 30 and 31 being none.
 const DISTANCE_SYMBOLS: usize = 32;
 // RFC 1951 section 3.2.5: the length of symbol 257 + n is `LENGTH_BASE[n]` plus the
 // value of `LENGTH_EXTRA[n]` more bits, and likewise the distance of symbol n
-const LENGTH_BASE: [u16; 29] = [
+pub(crate) const LENGTH_BASE: [u16; 29] = [
     3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
     163, 195, 227, 258,
 ];
-const LENGTH_EXTRA: [u8; 29] = [
+pub(crate) const LENGTH_EXTRA: [u8; 29] = [
     0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
 ];
-const DISTANCE_BASE: [u16; 30] = [
+pub(crate) const DISTANCE_BASE: [u16; 30] = [
     1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
     2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
 ];
-const DISTANCE_EXTRA: [u8; 30] = [
+pub(crate) const DISTANCE_EXTRA: [u8; 30] = [
     0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
     13,
 ];
 /// The symbols of the code length code, in the order a dynamic block sends their
 /// lengths.
-const CODE_LENGTH_ORDER: [usize; 19] = [
+pub(crate) const CODE_LENGTH_ORDER: [usize; 19] = [
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
 ];
 
@@ -235,15 +235,20 @@ fn stored(reader: &mut Reader, output: &mut Output) -> Result<(), Error> {
     output.extend(reader.bytes(usize::from(length))?)
 }
 
-/// The literal and length code, then the distance code, of a fixed block (RFC 1951
-/// section 3.2.6).
+/// The code lengths of the literal and length code, then of the distance code, of a
+/// fixed block (RFC 1951 section 3.2.6).
+pub(crate) fn fixed_lengths() -> ([u8; LITERAL_SYMBOLS], [u8; DISTANCE_SYMBOLS]) {
+    let mut literals = [8; LITERAL_SYMBOLS];
+    literals[144..256].fill(9);
+    literals[256..280].fill(7);
+    (literals, [5; DISTANCE_SYMBOLS])
+}
+
 fn fixed_codes() -> Result<(Huffman, Huffman), Error> {
-    let mut lengths = [8u8; LITERAL_SYMBOLS];
-    lengths[144..256].fill(9);
-    lengths[256..280].fill(7);
+    let (literals, distances) = fixed_lengths();
     Ok((
-        Huffman::new(&lengths, false)?,
-        Huffman::new(&[5; DISTANCE_SYMBOLS], false)?,
+        Huffman::new(&literals, false)?,
+        Huffman::new(&distances, false)?,
     ))
 }
 

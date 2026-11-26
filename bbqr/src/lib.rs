@@ -1,4 +1,5 @@
 mod base32;
+mod deflate;
 mod hex;
 mod inflate;
 #[cfg(test)]
@@ -15,7 +16,8 @@ pub const MIN_PART_LEN: usize = 25;
 /// The most bytes [`Joiner`] inflates a compressed series to: what the [`MAX_PARTS`]
 /// parts of a series carry at most in base32, 2680 bytes in each QR code of version 40.
 /// A compressed series then takes no more memory than an uncompressed one may, when a
-/// deflate stream can hold a thousand times its own length.
+/// deflate stream can hold a thousand times its own length. [`split`] compresses no
+/// payload above it.
 pub const MAX_INFLATED_BYTES: usize = MAX_PARTS * 2680;
 
 /// How a part writes its bytes after the header.
@@ -26,9 +28,9 @@ pub enum Encoding {
     /// `2`: base32 in the RFC 4648 alphabet, without padding, 8 chars per 5 bytes.
     Base32,
     /// `Z`: the whole payload compressed into one raw deflate stream, with neither a
-    /// zlib header nor a checksum, that the parts then carry as [`Encoding::Base32`].
-    /// [`Joiner`] reads it. [`split`] does not compress yet and writes such a payload in
-    /// base32, as the format has a sender do with one that compression does not shrink.
+    /// zlib header nor a checksum, that the parts then carry as [`Encoding::Base32`]. A
+    /// decoder inflates the stream with a window of 1024 bytes (zlib's `wbits=10`).
+    /// [`split`] writes a payload that compression does not shrink in base32 instead.
     Zlib,
 }
 
@@ -372,8 +374,11 @@ pub fn is_part(s: &str) -> bool {
 /// count in hex and less than 5 times it in base32. A payload that fits a sole part
 /// needs no whole unit, which in base32 packs up to 4 bytes more into it.
 ///
-/// [`Encoding::Zlib`] is written as [`Encoding::Base32`] for now, which
-/// [`Split::encoding`] then is.
+/// With [`Encoding::Zlib`] the payload is compressed first, and the parts carry the
+/// bytes of its deflate stream. A stream that is not shorter than the payload is
+/// dropped for the payload in [`Encoding::Base32`], as the format has a sender do, and
+/// [`Split::encoding`] then says so. A payload above [`MAX_INFLATED_BYTES`], which no
+/// [`Joiner`] would inflate back, is written in base32 too.
 ///
 /// A `max_part_len` below [`MIN_PART_LEN`] is raised to it, which only bounds the part
 /// count: an equal part may still be shorter. Refuses empty `data` and a `data` that
@@ -382,9 +387,15 @@ pub fn split(data: &[u8], encoding: Encoding, max_part_len: usize) -> Result<Spl
     if data.is_empty() {
         return Err(Error::EmptyPayload);
     }
-    let encoding = match encoding {
-        Encoding::Zlib => Encoding::Base32,
-        encoding => encoding,
+    // compressed if that shrinks it, and only what a `Joiner` inflates back
+    let stream = match encoding {
+        Encoding::Zlib if data.len() <= MAX_INFLATED_BYTES => Some(deflate::deflate(data)),
+        _ => None,
+    };
+    let (encoding, data) = match (encoding, &stream) {
+        (Encoding::Zlib, Some(stream)) if stream.len() < data.len() => (encoding, &stream[..]),
+        (Encoding::Zlib, _) => (Encoding::Base32, data),
+        _ => (encoding, data),
     };
     let max_part_len = max_part_len.max(MIN_PART_LEN);
     let (unit_chars, unit_bytes) = encoding.unit();
@@ -419,8 +430,12 @@ pub fn split(data: &[u8], encoding: Encoding, max_part_len: usize) -> Result<Spl
 #[cfg(test)]
 mod tests {
     use crate::{
-        is_part, split, test_data::ramp, Encoding, Error, Joiner, Progress, Split, HEADER_LEN,
-        MAX_PARTS, MIN_PART_LEN,
+        base32,
+        deflate::deflate,
+        is_part, split,
+        test_data::{noise, ramp, records},
+        Encoding, Error, Joiner, Progress, Split, HEADER_LEN, MAX_INFLATED_BYTES, MAX_PARTS,
+        MIN_PART_LEN,
     };
 
     const DATA: &[u8] = b"abcdefghijklmnopqrst";
@@ -718,12 +733,75 @@ mod tests {
     }
 
     #[test]
-    fn writes_base32_for_zlib() {
-        let split = split(DATA, Encoding::Zlib, MIN_PART_LEN).unwrap();
-        assert_eq!(
-            Ok(split),
-            super::split(DATA, Encoding::Base32, MIN_PART_LEN)
-        );
+    fn compresses_a_payload_that_shrinks() {
+        let cases = [
+            (TEXT.repeat(4), 40),
+            (records(40), 335),
+            (vec![7; 5000], MIN_PART_LEN),
+        ];
+        for (data, max) in cases {
+            let split = split(&data, Encoding::Zlib, max).unwrap();
+            let base32 = super::split(&data, Encoding::Base32, max).unwrap();
+            assert_eq!(split.encoding, Encoding::Zlib);
+            assert!(split.parts.iter().all(|part| part.starts_with("B$ZB")));
+            assert!(split.parts.len() < base32.parts.len());
+            assert!(split.part_len() <= max);
+            assert_eq!(join(&split.parts), Some(data));
+        }
+    }
+
+    // noise, and payloads too short for a stream to be shorter
+    #[test]
+    fn writes_base32_when_compression_does_not_shrink() {
+        for data in [noise(300, 1), DATA.to_vec(), b"a".to_vec()] {
+            let split = split(&data, Encoding::Zlib, MIN_PART_LEN).unwrap();
+            assert_eq!(split.encoding, Encoding::Base32);
+            let base32 = super::split(&data, Encoding::Base32, MIN_PART_LEN);
+            assert_eq!(Ok(split), base32);
+        }
+    }
+
+    #[test]
+    fn zlib_parts_are_equal_except_a_last_one_that_may_be_shorter() {
+        for max in [MIN_PART_LEN, 40, 77, 335] {
+            for len in (1..=1500).step_by(7) {
+                let case = format!("{len} bytes at {max}");
+                let data = records(len / 50 + 1)[..len].to_vec();
+                let split = split(&data, Encoding::Zlib, max).unwrap();
+                let (last, rest) = split.parts.split_last().unwrap();
+                assert!(split.part_len() <= max, "{case}");
+                assert!(last.len() <= split.part_len(), "{case}");
+                for part in rest {
+                    assert_eq!(part.len(), split.part_len(), "{case}");
+                    assert_eq!((part.len() - HEADER_LEN) % 8, 0, "{case}");
+                }
+                assert_eq!(join(&split.parts), Some(data), "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn inflates_a_payload_up_to_the_maximum() {
+        let cases = [
+            (MAX_INFLATED_BYTES, Ok(Some(MAX_INFLATED_BYTES))),
+            (MAX_INFLATED_BYTES + 1, Err(Error::InflatedTooLarge)),
+        ];
+        for (len, joined) in cases {
+            let part = format!("B$ZB0100{}", base32::encode(&deflate(&vec![0; len])));
+            let payload = Joiner::new().add_part(&part);
+            assert_eq!(payload.map(|bytes| bytes.map(|bytes| bytes.len())), joined);
+        }
+    }
+
+    #[test]
+    fn does_not_compress_a_payload_no_joiner_inflates() {
+        let data = vec![0; MAX_INFLATED_BYTES + 1];
+        let max = HEADER_LEN + 2 * data.len();
+        let split = super::split(&data, Encoding::Zlib, max).unwrap();
+        assert_eq!(split.encoding, Encoding::Base32);
+        let split = super::split(&data[1..], Encoding::Zlib, max).unwrap();
+        assert_eq!(split.encoding, Encoding::Zlib);
+        assert_eq!(split.parts.len(), 1);
     }
 
     #[test]
