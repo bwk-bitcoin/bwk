@@ -41,7 +41,8 @@ and scanning are crate-internal helpers. The `Encoder` is built with a size, a
 `QrSize` or the coarser `QrDensity`, and has no default one. That size is a
 ceiling: a plain text code renders at the smallest size it fits, and a BBQR
 payload is cut into as few equal parts as the ceiling allows, every frame of the
-series at the smallest size that holds such a part. `Image` is an 8-bit
+series at the smallest size that holds such a part. A BBQR frame with room left
+at that size takes a higher error-correction level. `Image` is an 8-bit
 grayscale square, row-major, `side * side` bytes, `0` dark and `255` light: a camera
 frame on the way in, cropped to its centered square by `Image::from_frame`, a
 rendered QR on the way out. The `Decoder` reads it shrunk by the largest integer

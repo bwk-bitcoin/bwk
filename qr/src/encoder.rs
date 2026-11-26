@@ -30,7 +30,9 @@ impl Encoder {
     /// the encoder's size allows, all of equal length but a last one that may be shorter.
     ///
     /// Every frame has the same size, the smallest that holds the longest part, so the
-    /// series is smaller than the encoder's size when its parts do not fill it.
+    /// series is smaller than the encoder's size when its parts do not fill it. A frame
+    /// whose part leaves room at that size takes a higher error correction level, which
+    /// frames of one series may then not share.
     #[cfg(feature = "bbqr")]
     pub fn encode_bbqr(&self, data: &[u8]) -> Result<Vec<Image>, Error> {
         let split = bwk_bbqr::split(data, self.size.bbqr_part_bytes())?;

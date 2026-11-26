@@ -59,7 +59,8 @@ fn raw_payload_is_only_returned_once_every_part_is_seen() {
     );
 }
 
-// parts that do not fill the encoder's size: the series renders smaller
+// parts that do not fill the encoder's size: the series renders smaller, and a frame
+// with room left at a higher error correction level
 #[test]
 fn a_series_smaller_than_the_encoder_size_round_trips() {
     let encoder = Encoder::new(QrSize::S53);

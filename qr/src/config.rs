@@ -123,10 +123,10 @@ impl QrSize {
     }
 
     /// The largest BBQR part, in bytes, whose part string fits a code of exactly this size.
-    /// A part renders in alphanumeric mode at error correction Low: the data codewords of the
-    /// size (ISO 18004 Table 7), less the 4 bit mode indicator and the character count field,
-    /// hold 2 characters per 11 bits and a last odd one in 6. After the BBQR header, each
-    /// byte takes two hex characters.
+    /// A part that long renders in alphanumeric mode at error correction Low: the data
+    /// codewords of the size (ISO 18004 Table 7), less the 4 bit mode indicator and the
+    /// character count field, hold 2 characters per 11 bits and a last odd one in 6. After
+    /// the BBQR header, each byte takes two hex characters.
     #[cfg(feature = "bbqr")]
     pub fn bbqr_part_bytes(self) -> usize {
         let count_bits = match self.version() {
