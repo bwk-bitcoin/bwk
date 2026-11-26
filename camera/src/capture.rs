@@ -106,7 +106,7 @@ fn query() -> Result<Vec<CameraInfo>, Error> {
     for info in nokhwa::query(ApiBackend::Auto)? {
         let id = CameraId::from_query(&info)?;
         let listed = match probe(&id) {
-            Node::Captures => &mut cameras,
+            Node::Captures | Node::Unknown => &mut cameras,
             Node::Refused => &mut refused,
             Node::Other => continue,
         };
@@ -152,13 +152,15 @@ enum Node {
     Refused,
     /// It streams something else than video.
     Other,
+    /// Its caps cannot be read for another reason: it is kept, so opening it reports
+    /// why.
+    Unknown,
 }
 
 /// V4L2 lists a UVC webcam twice: its capture node and a node that only streams
 /// metadata. It also lists nodes the user is refused: behind a MIPI camera relayed
 /// through v4l2loopback sit the raw nodes of its image processing unit, which udev
-/// keeps from the user. A node whose caps cannot be read for another reason is kept,
-/// so opening it reports why.
+/// keeps from the user.
 #[cfg(target_os = "linux")]
 fn probe(id: &CameraId) -> Node {
     match v4l::Device::with_path(id.as_str()).and_then(|device| device.query_caps()) {
@@ -171,7 +173,7 @@ fn probe(id: &CameraId) -> Node {
         }
         Ok(_) => Node::Other,
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Node::Refused,
-        Err(_) => Node::Captures,
+        Err(_) => Node::Unknown,
     }
 }
 
