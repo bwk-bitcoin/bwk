@@ -1212,9 +1212,8 @@ enum BlockOutcome {
 }
 
 /// Consume `BlockData` from `receiver` (produced by [`fetch_blocks`]), derive the
-/// owned outputs of each block, and commit them in height order. Returns
-/// `Interrupted` if the scan was stopped via `stop` (state already persisted); on
-/// normal completion it records the receive-scan frontier and returns `Completed`.
+/// owned outputs of each block, and advance the frontier over the contiguous
+/// completed range. Save that frontier on completion, cancellation, or error.
 fn process_blocks<P: SpStorageProfile>(
     backend: &BackendContext,
     scan: &mut ScanContext<P>,
@@ -1275,60 +1274,59 @@ fn process_blocks<P: SpStorageProfile>(
 
     // Collector = this thread: derive owned outputs for the rare matches (with the
     // backend), commit every block in arrival order.
-    for msg in rx {
-        let (blkheight, blkhash, outs) = match msg? {
-            BlockOutcome::NoMatch { height, hash } => (height, hash, HashMap::new()),
-            BlockOutcome::Matched {
-                height,
-                hash,
-                tweaks,
-            } => {
-                let outs = derive_owned(
-                    &backend.agent,
-                    &backend.url,
-                    scan.sp_receiver,
+    let collected: Result<(), receiver::error::Error> = (|| {
+        for msg in rx {
+            let (blkheight, blkhash, outs) = match msg? {
+                BlockOutcome::NoMatch { height, hash } => (height, hash, HashMap::new()),
+                BlockOutcome::Matched {
                     height,
-                    &tweaks,
-                )?;
-                (height, hash, outs)
+                    hash,
+                    tweaks,
+                } => {
+                    let outs = derive_owned(
+                        &backend.agent,
+                        &backend.url,
+                        scan.sp_receiver,
+                        height,
+                        &tweaks,
+                    )?;
+                    (height, hash, outs)
+                }
+            };
+            commit_block(
+                scan,
+                start_u32,
+                end_u32,
+                blkheight,
+                blkhash,
+                outs,
+                &mut done,
+                &mut hashes,
+                &mut recv_tip,
+                &mut last_progress,
+                &mut notified_any,
+                &mut last_checkpoint,
+            )?;
+            if should_interrupt(scan.stop) {
+                break;
             }
-        };
-        commit_block(
-            scan,
-            start_u32,
-            end_u32,
-            blkheight,
-            blkhash,
-            outs,
-            &mut done,
-            &mut hashes,
-            &mut recv_tip,
-            &mut last_progress,
-            &mut notified_any,
-            &mut last_checkpoint,
-        )?;
-        if should_interrupt(scan.stop) {
-            if let Some(tip) = recv_tip {
-                record_scan_frontier(scan.stores, start_u32, tip, &hashes)?;
-            }
-            save_state(scan.stores)?;
-            return Ok(ScanOutcome::interrupted(&scan.stores.scan_state));
         }
-    }
+        Ok(())
+    })();
 
+    if let Some(tip) = recv_tip {
+        record_scan_frontier(scan.stores, start_u32, tip, &hashes)?;
+    }
+    save_state(scan.stores)?;
+
+    collected?;
+    if should_interrupt(scan.stop) {
+        return Ok(ScanOutcome::interrupted(&scan.stores.scan_state));
+    }
     if recv_tip != Some(end_u32) {
-        if should_interrupt(scan.stop) {
-            if let Some(tip) = recv_tip {
-                record_scan_frontier(scan.stores, start_u32, tip, &hashes)?;
-            }
-            save_state(scan.stores)?;
-            return Ok(ScanOutcome::interrupted(&scan.stores.scan_state));
-        }
         return Err(receiver::error::Error::MissingBlockHash(end_u32));
     }
-    record_scan_frontier(scan.stores, start_u32, end_u32, &hashes)?;
     record_receive_progress(scan.stores, scan.end, scan.end)?;
-    save_state(scan.stores)?;
     Ok(ScanOutcome::Completed)
 }
 
@@ -2095,6 +2093,63 @@ mod tests {
             )),
         };
         (stores, rx)
+    }
+
+    #[test]
+    fn receive_error_keeps_the_contiguous_checkpoint() {
+        let (stores, events) = test_stores(&[]);
+        let stop = Arc::new(AtomicBool::new(false));
+        let sp_receiver = SpReceiver::default();
+        let runtime = ScanRuntimeConfig::default();
+        let backend = BackendContext {
+            agent: Arc::new(blindbit::agent().unwrap()),
+            url: String::new(),
+            dust_limit: None,
+            with_cutthrough: false,
+            runtime,
+        };
+        let mut scan = ScanContext {
+            sp_receiver: &sp_receiver,
+            stores: &stores,
+            stop: &stop,
+            start: Height::from_consensus(199).unwrap(),
+            end: Height::from_consensus(200).unwrap(),
+            runtime,
+            block_data_observer: None,
+        };
+        let hash = BlockHash::from_byte_array([1; 32]);
+        let (tx, rx) = channel::unbounded();
+        tx.send(Ok(BlockData {
+            blkheight: scan.start,
+            blkhash: hash,
+            tweaks: vec![],
+            new_utxo_filter: FilterData {
+                block_hash: hash,
+                data: vec![0],
+            },
+        }))
+        .unwrap();
+        let producer = std::thread::spawn(move || {
+            let event = events
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert!(matches!(
+                event,
+                Notification::Sp(SpNotification::ScanReceiveProgress { current: 199, .. })
+            ));
+            tx.send(Err(receiver::error::Error::MissingBlockHash(200)))
+                .unwrap();
+        });
+        let result = process_blocks(&backend, &mut scan, rx);
+        producer.join().unwrap();
+
+        assert!(matches!(
+            result,
+            Err(receiver::error::Error::MissingBlockHash(200))
+        ));
+        let state = stores.scan_state.lock().unwrap();
+        assert_eq!(state.next_scan_start(), 200);
+        assert_eq!(state.block_hashes().get(&199), Some(&hash.to_byte_array()));
     }
 
     /// In-order fake recording which heights were asked for, reporting a spend set
