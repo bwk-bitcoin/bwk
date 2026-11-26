@@ -102,13 +102,16 @@ pub fn list() -> mpsc::Receiver<Result<Vec<CameraInfo>, Error>> {
 fn query() -> Result<Vec<CameraInfo>, Error> {
     request_access()?;
     let mut cameras = Vec::new();
+    let mut refused = Vec::new();
     for info in nokhwa::query(ApiBackend::Auto)? {
         let id = CameraId::from_query(&info)?;
-        if !can_capture(&id) {
-            continue;
-        }
+        let listed = match probe(&id) {
+            Node::Captures => &mut cameras,
+            Node::Refused => &mut refused,
+            Node::Other => continue,
+        };
         let index = info.index().as_index()?;
-        cameras.push((
+        listed.push((
             index,
             CameraInfo {
                 id,
@@ -116,6 +119,7 @@ fn query() -> Result<Vec<CameraInfo>, Error> {
             },
         ));
     }
+    let mut cameras = offered(cameras, refused);
     if cameras.is_empty() {
         return Err(Error::NoCamera);
     }
@@ -140,21 +144,50 @@ fn request_access() -> Result<(), Error> {
     }
 }
 
+/// What a listed device turns out to be once probed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum Node {
+    Captures,
+    /// The user may not open it.
+    Refused,
+    /// It streams something else than video.
+    Other,
+}
+
 /// V4L2 lists a UVC webcam twice: its capture node and a node that only streams
-/// metadata. A node whose caps cannot be read is kept, so opening it reports why.
+/// metadata. It also lists nodes the user is refused: behind a MIPI camera relayed
+/// through v4l2loopback sit the raw nodes of its image processing unit, which udev
+/// keeps from the user. A node whose caps cannot be read for another reason is kept,
+/// so opening it reports why.
 #[cfg(target_os = "linux")]
-fn can_capture(id: &CameraId) -> bool {
+fn probe(id: &CameraId) -> Node {
     match v4l::Device::with_path(id.as_str()).and_then(|device| device.query_caps()) {
-        Ok(caps) => caps
-            .capabilities
-            .contains(v4l::capability::Flags::VIDEO_CAPTURE),
-        Err(_) => true,
+        Ok(caps)
+            if caps
+                .capabilities
+                .contains(v4l::capability::Flags::VIDEO_CAPTURE) =>
+        {
+            Node::Captures
+        }
+        Ok(_) => Node::Other,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Node::Refused,
+        Err(_) => Node::Captures,
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn can_capture(_id: &CameraId) -> bool {
-    true
+fn probe(_id: &CameraId) -> Node {
+    Node::Captures
+}
+
+/// The devices the user is refused are offered only when no other is, so that starting
+/// one says the permission is missing instead of no camera being found.
+fn offered<T>(cameras: Vec<T>, refused: Vec<T>) -> Vec<T> {
+    if cameras.is_empty() {
+        refused
+    } else {
+        cameras
+    }
 }
 
 /// A camera streaming on its own thread. Dropping it stops the capture.
@@ -307,7 +340,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::{
-        capture::{CameraId, LatestFrame, Lease},
+        capture::{offered, CameraId, LatestFrame, Lease},
         error::Error,
         frame::Rgb,
     };
@@ -359,6 +392,13 @@ mod tests {
         assert!(Lease::take(id.clone()).is_none());
         drop(lease);
         assert!(Lease::take(id).is_some());
+    }
+
+    #[test]
+    fn a_refused_device_is_offered_only_when_no_other_is() {
+        assert_eq!(offered(vec![32], vec![0, 1]), [32]);
+        assert_eq!(offered(vec![], vec![0, 1]), [0, 1]);
+        assert_eq!(offered::<u32>(vec![], vec![]), []);
     }
 
     #[cfg(target_os = "linux")]
