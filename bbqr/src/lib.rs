@@ -1,3 +1,5 @@
+mod hex;
+
 const PREFIX: &str = "B$HB";
 pub const HEADER_LEN: usize = 8;
 pub const MAX_PARTS: usize = 36 * 36 - 1;
@@ -137,7 +139,7 @@ struct Part {
 impl Part {
     fn parse(part: &str) -> Result<Self, Error> {
         let Header { total, index } = Header::parse(part)?;
-        let data = parse_hex(&part[HEADER_LEN..])?;
+        let data = hex::decode(&part[HEADER_LEN..])?;
         Ok(Self { total, index, data })
     }
 }
@@ -236,44 +238,10 @@ pub fn split(data: &[u8], max_part_bytes: usize) -> Result<Split, Error> {
     let mut parts = Vec::new();
     for (index, chunk) in data.chunks(part_bytes).enumerate() {
         let mut part = Header { total, index }.serialize();
-        part.push_str(&hex(chunk));
+        part.push_str(&hex::encode(chunk));
         parts.push(part);
     }
     Ok(Split { parts })
-}
-
-/// `bytes` as uppercase hex, two digits per byte, high nibble first: `[0x1f, 0xa0]` is
-/// `1FA0`. Uppercase keeps the part in the QR alphanumeric set.
-fn hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
-
-/// The inverse of [`hex`]: `1FA0` is `[0x1f, 0xa0]`, and so is `1fa0`. An odd length is
-/// refused.
-fn parse_hex(s: &str) -> Result<Vec<u8>, Error> {
-    if s.len() % 2 != 0 {
-        return Err(Error::OddHexLength(s.len()));
-    }
-    s.as_bytes()
-        .chunks_exact(2)
-        .map(|pair| Ok(hex_value(pair[0])? << 4 | hex_value(pair[1])?))
-        .collect()
-}
-
-/// The value of the hex digit `b`, 0 to 15.
-fn hex_value(b: u8) -> Result<u8, Error> {
-    match b {
-        b'0'..=b'9' => Ok(b - b'0'),
-        b'A'..=b'F' => Ok(b - b'A' + 10),
-        b'a'..=b'f' => Ok(b - b'a' + 10),
-        _ => Err(Error::InvalidHexDigit(b)),
-    }
 }
 
 #[cfg(test)]
