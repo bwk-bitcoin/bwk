@@ -23,8 +23,14 @@ Features, all on by default:
 - `bbqr` implies `gen` and `scan`, and adds BBQR generic-binary framing for any
   payload: `Encoder::encode_bbqr` splits bytes into frames, and
   `Decoder::process_raw` joins them back into `Decoded::Bytes`, undecoded.
-  `Decoder::progress` returns a `bwk_bbqr::Progress`, so a caller that reads it
-  depends on `bwk-bbqr`.
+  The parts go out in zlib, which compresses the payload first and writes one
+  that does not shrink in base32: the fewest frames. `Encoder::with_bbqr_encoding`
+  picks base32 as such, or hex, which carries a fifth less per frame than base32
+  but is the one encoding a reader that knows no other reads, such as a `bwk-qr`
+  from before the other two. The `Decoder` reads all three.
+  `Decoder::progress` returns a `bwk_bbqr::Progress` and `with_bbqr_encoding`
+  takes a `bwk_bbqr::Encoding`, so a caller that uses either depends on
+  `bwk-bbqr`.
 - `protocol` implies `bbqr`, and decodes the joined payloads as the signing-flow
   codec, which lives in `bipqr`: the codec under `bipqr::ll`, and with its
   `bitcoin_0_32` feature on, `bipqr::backend` converts between its byte-level
@@ -38,7 +44,11 @@ caller can store the setting.
 `DecoderConfig`), the `image` module (`Image`, `crop_center_square`, `box_shrink`,
 `shrink_factor`, `SCAN_SIDE`) and `Error` are the whole public surface; generation
 and scanning are crate-internal helpers. The `Encoder` is built with a size, a
-`QrSize` or the coarser `QrDensity`, and has no default one. `Image` is an 8-bit
+`QrSize` or the coarser `QrDensity`, and has no default one. That size is a
+ceiling: a plain text code renders at the smallest size it fits, and a BBQR
+payload is cut into as few equal parts as the ceiling allows, every frame of the
+series at the smallest size that holds such a part. A BBQR frame with room left
+at that size takes a higher error-correction level. `Image` is an 8-bit
 grayscale square, row-major, `side * side` bytes, `0` dark and `255` light: a camera
 frame on the way in, cropped to its centered square by `Image::from_frame`, a
 rendered QR on the way out. The `Decoder` reads it shrunk by the largest integer

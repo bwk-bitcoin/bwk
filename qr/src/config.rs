@@ -1,3 +1,6 @@
+#[cfg(feature = "bbqr")]
+use bwk_bbqr::Encoding;
+
 /// The size of a QR code, named after its side in modules (the black and white squares):
 /// a code of size `Sn` is n modules wide and n high. The QR spec (ISO 18004) calls this
 /// the version, from 1 to 40, a code of version v being 17 + 4 * v modules wide, so
@@ -17,9 +20,11 @@
 ///
 /// [`QrDensity`] is the coarse alternative, five of these sizes for a UI setting.
 ///
-/// The [`Encoder`](crate::encoder::Encoder) renders a plain text code at the smallest size
-/// it fits, up to the size it is built with, and every BBQR frame at exactly that size,
-/// each frame carrying the largest part that fills it.
+/// The [`Encoder`](crate::encoder::Encoder) takes the size it is built with as a ceiling.
+/// It renders a plain text code at the smallest size it fits. It cuts a BBQR payload into
+/// as few parts as that ceiling allows, all of equal length, and renders every frame of
+/// the series at one size, the smallest that holds such a part: the ceiling when the
+/// parts fill it, a smaller size when they do not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QrSize {
     S21 = 1,
@@ -120,21 +125,38 @@ impl QrSize {
         })
     }
 
-    /// The largest BBQR part, in bytes, whose part string fits a code of exactly this size.
-    /// A part renders in alphanumeric mode at error correction Low: the data codewords of the
-    /// size (ISO 18004 Table 7), less the 4 bit mode indicator and the character count field,
-    /// hold 2 characters per 11 bits and a last odd one in 6. After the BBQR header, each
-    /// byte takes two hex characters.
+    /// The chars a code of exactly this size holds in alphanumeric mode at error
+    /// correction Low, the longest BBQR part it renders: the data codewords of the size
+    /// (ISO 18004 Table 7), less the 4 bit mode indicator and the character count field,
+    /// hold 2 characters per 11 bits and a last odd one in 6.
     #[cfg(feature = "bbqr")]
-    pub fn bbqr_part_bytes(self) -> usize {
+    pub(crate) fn alphanumeric_chars(self) -> usize {
         let count_bits = match self.version() {
             1..=9 => 9,
             10..=26 => 11,
             _ => 13,
         };
         let bits = DATA_CODEWORDS_ECC_LOW[usize::from(self.version()) - 1] * 8 - 4 - count_bits;
-        let chars = 2 * (bits / 11) + usize::from(bits % 11 >= 6);
-        (chars - bwk_bbqr::HEADER_LEN) / 2
+        2 * (bits / 11) + usize::from(bits % 11 >= 6)
+    }
+
+    /// The bytes a BBQR part carries at most in a code of exactly this size when another
+    /// part follows it: after the BBQR header, two chars a byte in hex and 8 chars per 5
+    /// bytes in base32. In zlib these are bytes of the compressed payload, as many as in
+    /// base32.
+    #[cfg(feature = "bbqr")]
+    pub fn bbqr_part_bytes(self, encoding: Encoding) -> usize {
+        encoding.part_bytes(self.alphanumeric_chars())
+    }
+
+    /// The smallest size, up to this one, that holds a BBQR part of `part_len` chars, and
+    /// this one when none does.
+    #[cfg(feature = "bbqr")]
+    pub(crate) fn smallest_for_bbqr_part(self, part_len: usize) -> Self {
+        (1..self.version())
+            .filter_map(Self::from_version)
+            .find(|size| size.alphanumeric_chars() >= part_len)
+            .unwrap_or(self)
     }
 }
 
@@ -147,12 +169,16 @@ const DATA_CODEWORDS_ECC_LOW: [usize; 40] = [
 
 /// A coarse choice of [`QrSize`] for a UI setting, each level a QR size. A denser level
 /// means fewer, bigger BBQR frames, that need a sharper camera to be read. Per BBQR
-/// frame, a level holds:
-/// - `Lowest`, `S33`: 53 bytes;
-/// - `Low`, `S45`: 108 bytes;
-/// - `Medium`, `S53`: 163 bytes;
-/// - `High`, `S61`: 230 bytes;
-/// - `Highest`, `S65`: 263 bytes.
+/// frame, a level holds at most, in hex then in base32:
+/// - `Lowest`, `S33`: 53 or 65 bytes;
+/// - `Low`, `S45`: 108 or 135 bytes;
+/// - `Medium`, `S53`: 163 or 200 bytes;
+/// - `High`, `S61`: 230 or 285 bytes;
+/// - `Highest`, `S65`: 263 or 325 bytes.
+///
+/// In zlib a frame holds as many bytes as in base32, of the compressed payload. A payload
+/// whose equal parts do not fill the level's size renders at a smaller one, see
+/// [`QrSize`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]

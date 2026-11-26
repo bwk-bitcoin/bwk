@@ -1,7 +1,7 @@
 [package]
 name = "bwk-bbqr"
 version = "0.1.0"
-description = "BBQR split and join, hex encoding of binary data"
+description = "BBQR split and join of binary data, in hex, base32 or zlib"
 readme = "README.md"
 license-file.workspace = true
 edition.workspace = true
@@ -11,3 +11,6 @@ keywords.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+
+[dev-dependencies]
+miniz_oxide.workspace = true
