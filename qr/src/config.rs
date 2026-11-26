@@ -140,11 +140,13 @@ impl QrSize {
         2 * (bits / 11) + usize::from(bits % 11 >= 6)
     }
 
-    /// The largest BBQR part, in bytes, whose part string fits a code of exactly this
-    /// size: after the BBQR header, each byte takes two hex characters.
+    /// The bytes a BBQR part carries at most in a code of exactly this size when another
+    /// part follows it: after the BBQR header, two chars a byte in hex and 8 chars per 5
+    /// bytes in base32. In zlib these are bytes of the compressed payload, as many as in
+    /// base32.
     #[cfg(feature = "bbqr")]
-    pub fn bbqr_part_bytes(self) -> usize {
-        Encoding::Hex.part_bytes(self.alphanumeric_chars())
+    pub fn bbqr_part_bytes(self, encoding: Encoding) -> usize {
+        encoding.part_bytes(self.alphanumeric_chars())
     }
 
     /// The smallest size, up to this one, that holds a BBQR part of `part_len` chars, and
@@ -167,14 +169,15 @@ const DATA_CODEWORDS_ECC_LOW: [usize; 40] = [
 
 /// A coarse choice of [`QrSize`] for a UI setting, each level a QR size. A denser level
 /// means fewer, bigger BBQR frames, that need a sharper camera to be read. Per BBQR
-/// frame, a level holds at most:
-/// - `Lowest`, `S33`: 53 bytes;
-/// - `Low`, `S45`: 108 bytes;
-/// - `Medium`, `S53`: 163 bytes;
-/// - `High`, `S61`: 230 bytes;
-/// - `Highest`, `S65`: 263 bytes.
+/// frame, a level holds at most, in hex then in base32:
+/// - `Lowest`, `S33`: 53 or 65 bytes;
+/// - `Low`, `S45`: 108 or 135 bytes;
+/// - `Medium`, `S53`: 163 or 200 bytes;
+/// - `High`, `S61`: 230 or 285 bytes;
+/// - `Highest`, `S65`: 263 or 325 bytes.
 ///
-/// A payload whose equal parts do not fill the level's size renders at a smaller one, see
+/// In zlib a frame holds as many bytes as in base32, of the compressed payload. A payload
+/// whose equal parts do not fill the level's size renders at a smaller one, see
 /// [`QrSize`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

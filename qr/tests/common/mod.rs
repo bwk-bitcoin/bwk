@@ -19,3 +19,14 @@ pub fn assert_round_trip(text: &str) {
     let decoded = decoder.process(&render(text)).unwrap();
     assert_eq!(decoded, Some(Decoded::Text(text.to_string())));
 }
+
+/// `len` bytes that no compressor shrinks.
+pub fn noise(len: usize) -> Vec<u8> {
+    let mut state = 1u64;
+    (0..len)
+        .map(|_| {
+            state = (state * 1_103_515_245 + 12_345) & 0x7fff_ffff;
+            (state >> 16) as u8
+        })
+        .collect()
+}

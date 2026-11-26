@@ -23,8 +23,12 @@ Features, all on by default:
 - `bbqr` implies `gen` and `scan`, and adds BBQR generic-binary framing for any
   payload: `Encoder::encode_bbqr` splits bytes into frames, and
   `Decoder::process_raw` joins them back into `Decoded::Bytes`, undecoded.
-  `Decoder::progress` returns a `bwk_bbqr::Progress`, so a caller that reads it
-  depends on `bwk-bbqr`.
+  The parts go out in hex unless `Encoder::with_bbqr_encoding` picks base32,
+  which carries a quarter more per frame, or zlib, which compresses the payload
+  first and writes one that does not shrink in base32. The `Decoder` reads all
+  three. `Decoder::progress` returns a `bwk_bbqr::Progress` and
+  `with_bbqr_encoding` takes a `bwk_bbqr::Encoding`, so a caller that uses
+  either depends on `bwk-bbqr`.
 - `protocol` implies `bbqr`, and decodes the joined payloads as the signing-flow
   codec, which lives in `bipqr`: the codec under `bipqr::ll`, and with its
   `bitcoin_0_32` feature on, `bipqr::backend` converts between its byte-level

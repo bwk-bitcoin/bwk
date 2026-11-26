@@ -1,11 +1,17 @@
 #![cfg(feature = "bbqr")]
 
+mod common;
+
+use bwk_bbqr::Encoding;
 use bwk_qr::{
     config::QrSize,
     decoder::{Decoded, Decoder},
     encoder::Encoder,
     image::Image,
 };
+use common::noise;
+
+const ENCODINGS: [Encoding; 3] = [Encoding::Hex, Encoding::Base32, Encoding::Zlib];
 
 // a small size forces a payload across several BBQR frames
 fn frame_encoder() -> Encoder {
@@ -18,6 +24,13 @@ fn payload() -> Vec<u8> {
 
 fn payload_of(len: usize) -> Vec<u8> {
     (0..=255u8).cycle().take(len).collect()
+}
+
+/// A payload that compresses: records that share most of their bytes.
+fn records(count: u8) -> Vec<u8> {
+    (0..count)
+        .flat_map(|index| [b"record ".as_slice(), &[index], &[0xab; 24]].concat())
+        .collect()
 }
 
 fn decode_raw(decoder: &mut Decoder, frames: &[Image]) -> Vec<Decoded> {
@@ -59,13 +72,60 @@ fn raw_payload_is_only_returned_once_every_part_is_seen() {
     );
 }
 
+#[test]
+fn every_encoding_round_trips_through_bbqr_frames() {
+    let payloads = [vec![7], payload(), noise(300), records(40)];
+    for encoding in ENCODINGS {
+        let encoder = frame_encoder().with_bbqr_encoding(encoding);
+        for payload in &payloads {
+            let case = format!("{} bytes in {encoding:?}", payload.len());
+            let frames = encoder.encode_bbqr(payload).unwrap();
+            let mut decoder = Decoder::new();
+            assert_eq!(
+                decode_raw(&mut decoder, &frames),
+                vec![Decoded::Bytes(payload.clone())],
+                "{case}"
+            );
+            assert_eq!(decoder.progress().unwrap().total(), frames.len(), "{case}");
+        }
+    }
+}
+
+// in base32 a frame carries a quarter more than in hex, and zlib shrinks the payload
+// first
+#[test]
+fn a_denser_encoding_takes_fewer_frames() {
+    let frames = |encoding, payload: &[u8]| {
+        let encoder = frame_encoder().with_bbqr_encoding(encoding);
+        encoder.encode_bbqr(payload).unwrap().len()
+    };
+    let payload = records(40);
+    let hex = frames(Encoding::Hex, &payload);
+    let base32 = frames(Encoding::Base32, &payload);
+    let zlib = frames(Encoding::Zlib, &payload);
+    assert!(base32 < hex, "{base32} frames in base32, {hex} in hex");
+    assert!(zlib < base32, "{zlib} frames in zlib, {base32} in base32");
+}
+
+// a payload that compression does not shrink goes out in base32
+#[test]
+fn zlib_takes_the_frames_of_base32_for_noise() {
+    let payload = noise(300);
+    let zlib = frame_encoder().with_bbqr_encoding(Encoding::Zlib);
+    let base32 = frame_encoder().with_bbqr_encoding(Encoding::Base32);
+    assert_eq!(
+        zlib.encode_bbqr(&payload).unwrap(),
+        base32.encode_bbqr(&payload).unwrap()
+    );
+}
+
 // parts that do not fill the encoder's size: the series renders smaller, and a frame
 // with room left at a higher error correction level
 #[test]
 fn a_series_smaller_than_the_encoder_size_round_trips() {
-    let encoder = Encoder::new(QrSize::S53);
+    let encoder = Encoder::new(QrSize::S53).with_bbqr_encoding(Encoding::Hex);
     let full = encoder
-        .encode_bbqr(&payload_of(QrSize::S53.bbqr_part_bytes()))
+        .encode_bbqr(&payload_of(QrSize::S53.bbqr_part_bytes(Encoding::Hex)))
         .unwrap()[0]
         .side();
     for len in [1, 40, 164, 500] {
