@@ -12,19 +12,21 @@ pub struct Encoder {
 
 impl Encoder {
     /// Takes a [`QrSize`] or a [`QrDensity`](crate::config::QrDensity): the largest size
-    /// of a plain text code and of a BBQR frame. BBQR parts are written in hex unless
+    /// of a plain text code and of a BBQR frame. BBQR parts are written in zlib unless
     /// [`Encoder::with_bbqr_encoding`] says otherwise.
     pub fn new(size: impl Into<QrSize>) -> Self {
         Self {
             size: size.into(),
             #[cfg(feature = "bbqr")]
-            encoding: Encoding::Hex,
+            encoding: Encoding::Zlib,
         }
     }
 
-    /// Writes the BBQR parts in `encoding`. Base32 takes 8 chars per 5 bytes where hex
-    /// takes 10, so a frame carries a quarter more. Zlib compresses the payload first,
-    /// and writes one that does not shrink in base32.
+    /// Writes the BBQR parts in `encoding` rather than in zlib, which compresses the
+    /// payload first and writes one that does not shrink in base32: the fewest frames.
+    /// Base32 as such skips the compression. Hex takes 10 chars per 5 bytes where base32
+    /// takes 8, so a frame carries a fifth less, but it is the one encoding a reader
+    /// that knows no other reads.
     #[cfg(feature = "bbqr")]
     pub fn with_bbqr_encoding(mut self, encoding: Encoding) -> Self {
         self.encoding = encoding;
@@ -306,8 +308,10 @@ mod tests {
     }
 
     #[test]
-    fn parts_are_written_in_hex_unless_told_otherwise() {
+    fn parts_are_compressed_unless_told_otherwise() {
         let split = Encoder::new(QrSize::S53).split(&[7; 100]).unwrap();
-        assert_eq!(split.encoding, Encoding::Hex);
+        assert_eq!(split.encoding, Encoding::Zlib);
+        let hex = encoder(QrSize::S53, Encoding::Hex);
+        assert_eq!(hex.split(&[7; 100]).unwrap().encoding, Encoding::Hex);
     }
 }

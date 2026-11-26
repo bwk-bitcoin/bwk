@@ -107,6 +107,16 @@ fn a_denser_encoding_takes_fewer_frames() {
     assert!(zlib < base32, "{zlib} frames in zlib, {base32} in base32");
 }
 
+#[test]
+fn a_payload_is_compressed_unless_told_otherwise() {
+    let payload = records(40);
+    let zlib = frame_encoder().with_bbqr_encoding(Encoding::Zlib);
+    assert_eq!(
+        frame_encoder().encode_bbqr(&payload).unwrap(),
+        zlib.encode_bbqr(&payload).unwrap()
+    );
+}
+
 // a payload that compression does not shrink goes out in base32
 #[test]
 fn zlib_takes_the_frames_of_base32_for_noise() {

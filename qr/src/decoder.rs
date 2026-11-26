@@ -61,8 +61,8 @@ impl Decoder {
     /// Reads the code in `image`, shrunk by
     /// [`shrink_factor`](crate::image::shrink_factor) unless [`DecoderConfig::fine_scan`]:
     /// a plain code as [`Decoded::Text`], or [`Decoded::Binary`] when not UTF-8, and a BBQR
-    /// part fed to the joiner, yielding the [`Decoded::Bytes`] payload, left undecoded,
-    /// once the join completes.
+    /// part, in hex, base32 or zlib, fed to the joiner, yielding the [`Decoded::Bytes`]
+    /// payload, left undecoded, once the join completes.
     pub fn process_raw(&mut self, image: &Image) -> Result<Option<Decoded>, Error> {
         let Some(scanned) = scan::scan(image, self.config.scan_inverted, self.config.fine_scan)
         else {

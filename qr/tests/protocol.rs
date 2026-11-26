@@ -5,7 +5,7 @@ use bipqr::{
     ll::{self as protocol, request, response},
 };
 use bitcoin::{absolute, bip32, transaction, Psbt, Transaction};
-use bwk_bbqr::Progress;
+use bwk_bbqr::{Encoding, Progress};
 use bwk_qr::{
     config::QrSize,
     decoder::{Decoded, Decoder},
@@ -56,9 +56,10 @@ fn encoder() -> Encoder {
     Encoder::new(QrSize::S125)
 }
 
-// a small size forces a message across several BBQR frames
+// a small size forces a message across several BBQR frames, in hex for their count not
+// to depend on how well the message compresses
 fn frame_encoder() -> Encoder {
-    Encoder::new(QrSize::S29)
+    Encoder::new(QrSize::S29).with_bbqr_encoding(Encoding::Hex)
 }
 
 fn decoder() -> Decoder {
@@ -199,6 +200,20 @@ fn protocol_request_round_trips_through_bbqr_frames() {
             received: vec![true; 3],
             last: 0,
         })
+    );
+}
+
+// the encoder's own encoding, zlib
+#[test]
+fn compressed_request_round_trips_through_bbqr_frames() {
+    let request = sign_request();
+    let frames = Encoder::new(QrSize::S21).encode_request(&request).unwrap();
+    assert!(frames.len() > 1);
+    let hex = Encoder::new(QrSize::S21).with_bbqr_encoding(Encoding::Hex);
+    assert!(frames.len() < hex.encode_request(&request).unwrap().len());
+    assert_eq!(
+        decode_all(&mut decoder(), &frames),
+        vec![Decoded::Request(request)]
     );
 }
 
