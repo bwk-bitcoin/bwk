@@ -17,9 +17,11 @@
 ///
 /// [`QrDensity`] is the coarse alternative, five of these sizes for a UI setting.
 ///
-/// The [`Encoder`](crate::encoder::Encoder) renders a plain text code at the smallest size
-/// it fits, up to the size it is built with, and every BBQR frame at exactly that size,
-/// each frame carrying the largest part that fills it.
+/// The [`Encoder`](crate::encoder::Encoder) takes the size it is built with as a ceiling.
+/// It renders a plain text code at the smallest size it fits. It cuts a BBQR payload into
+/// as few parts as that ceiling allows, all of equal length, and renders every frame of
+/// the series at one size, the smallest that holds such a part: the ceiling when the
+/// parts fill it, a smaller size when they do not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QrSize {
     S21 = 1,
@@ -136,6 +138,16 @@ impl QrSize {
         let chars = 2 * (bits / 11) + usize::from(bits % 11 >= 6);
         (chars - bwk_bbqr::HEADER_LEN) / 2
     }
+
+    /// The smallest size, up to this one, that holds a BBQR part of `part_bytes` bytes,
+    /// and this one when none does.
+    #[cfg(feature = "bbqr")]
+    pub(crate) fn smallest_for_bbqr_part(self, part_bytes: usize) -> Self {
+        (1..self.version())
+            .filter_map(Self::from_version)
+            .find(|size| size.bbqr_part_bytes() >= part_bytes)
+            .unwrap_or(self)
+    }
 }
 
 #[cfg(feature = "bbqr")]
@@ -147,12 +159,15 @@ const DATA_CODEWORDS_ECC_LOW: [usize; 40] = [
 
 /// A coarse choice of [`QrSize`] for a UI setting, each level a QR size. A denser level
 /// means fewer, bigger BBQR frames, that need a sharper camera to be read. Per BBQR
-/// frame, a level holds:
+/// frame, a level holds at most:
 /// - `Lowest`, `S33`: 53 bytes;
 /// - `Low`, `S45`: 108 bytes;
 /// - `Medium`, `S53`: 163 bytes;
 /// - `High`, `S61`: 230 bytes;
 /// - `Highest`, `S65`: 263 bytes.
+///
+/// A payload whose equal parts do not fill the level's size renders at a smaller one, see
+/// [`QrSize`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
